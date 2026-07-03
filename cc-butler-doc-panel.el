@@ -209,29 +209,48 @@ on failure stderr is shown so the error is still visible."
                        (insert text)
                        (goto-char (point-min))))))))))))))
 
-(defvar cc-butler-doc-file-mode-map
-  (let ((m (make-sparse-keymap)))
-    (define-key m (kbd "C-c C-e") #'cc-butler-doc-file-toggle-edit)
-    (define-key m (kbd "C-c C-q") #'cc-butler-doc-hide)
-    m)
-  "Keymap active in file documents shown in the panel.")
+(defvar cc-butler-doc-file-mode-map (make-sparse-keymap)
+  "Keymap active while a file document is in read-only view.
+Turned off (with its single-key nav bindings) when the file is made
+editable, so editing is never shadowed.")
+
+;; Top-level so a reload updates the existing keymap (a defvar would not
+;; re-initialize an already-bound map).  Emacs-conventional viewer keys.
+(define-key cc-butler-doc-file-mode-map "n" #'cc-butler-doc-next)
+(define-key cc-butler-doc-file-mode-map "p" #'cc-butler-doc-prev)
+(define-key cc-butler-doc-file-mode-map "g" #'cc-butler-doc-reload)
+(define-key cc-butler-doc-file-mode-map "q" #'cc-butler-doc-hide)
+(define-key cc-butler-doc-file-mode-map "k" #'cc-butler-doc-remove)
+(define-key cc-butler-doc-file-mode-map (kbd "C-c C-e") #'cc-butler-doc-file-toggle-edit)
+(define-key cc-butler-doc-file-mode-map (kbd "C-c C-q") #'cc-butler-doc-hide)
 
 (define-minor-mode cc-butler-doc-file-mode
   "Minor mode for a local file shown in a cc-butler document panel.
-The file opens read-only (forge-style); `C-c C-e' toggles editability."
+When on, the file is a read-only viewer with single-key navigation
+(`n'/`p' next/prev, `g' reload, `q' close, `k' remove).  `C-c C-e' turns
+it off to edit the file (nav keys step aside so they can be typed); turn
+it back on with `C-c d e' or \\[cc-butler-doc-file-mode]."
   :lighter " cc-butler-Doc"
   :keymap cc-butler-doc-file-mode-map
-  (when cc-butler-doc-file-mode
-    (setq buffer-read-only t)
-    ;; Wrap unconditionally in the narrow side panel (see `cc-butler-doc-mode').
-    (setq-local truncate-lines nil)
-    (setq-local truncate-partial-width-windows nil)))
+  (if cc-butler-doc-file-mode
+      (progn
+        (setq buffer-read-only t)
+        ;; Wrap unconditionally in the narrow side panel (see `cc-butler-doc-mode').
+        (setq-local truncate-lines nil)
+        (setq-local truncate-partial-width-windows nil))
+    (setq buffer-read-only nil)))
 
 (defun cc-butler-doc-file-toggle-edit ()
-  "Toggle read-only on a file document so you can edit it in place."
+  "Toggle a file document between read-only view and editing.
+View turns the nav keys on and the buffer read-only; editing turns them
+off so every key types normally."
   (interactive)
-  (setq buffer-read-only (not buffer-read-only))
-  (message "cc-butler doc: %s" (if buffer-read-only "read-only" "editable")))
+  (unless (or cc-butler-doc-file-mode
+              (local-variable-p 'cc-butler--doc-session-dir))
+    (user-error "Not a cc-butler file document"))
+  (cc-butler-doc-file-mode 'toggle)
+  (message "cc-butler doc: %s"
+           (if cc-butler-doc-file-mode "read-only view" "editable")))
 
 (defun cc-butler--doc-file-buffer (dir ref)
   "Return a buffer visiting file REF (relative to DIR), or an error buffer.
@@ -434,8 +453,11 @@ changes the terminal window's width."
 ;;;; ------------------------------------------------------------------
 
 (defun cc-butler--doc-target-dir ()
-  "Return the session to act on: the list entry at point, else the visible one."
+  "Return the session to act on.
+The list entry at point (in the manager), else this doc buffer's own
+session (when invoked inside a document), else the visible session."
   (or (and (derived-mode-p 'cc-butler-mode) (cc-butler--dir-at-point))
+      cc-butler--doc-session-dir
       (cc-butler--visible-dir)))
 
 (defun cc-butler--doc-step (dir delta)
@@ -481,6 +503,35 @@ changes the terminal window's width."
       (cc-butler--doc-refresh-layout dir))
     (when (window-live-p cc-butler--main-window)
       (select-window cc-butler--main-window))))
+
+(defun cc-butler-doc-reopen ()
+  "Re-open the document panel for the selected session (after it was closed).
+From the manager, previews the session so its panel shows again."
+  (interactive)
+  (let* ((dir (cc-butler--doc-target-dir))
+         (state (and dir (cc-butler--doc-state dir))))
+    (cond
+     ((not dir) (user-error "No session"))
+     ((not (and state (plist-get state :items)))
+      (message "cc-butler: no documents to reopen for this session"))
+     (t (puthash dir (plist-put state :open t) cc-butler--docs)
+        (if (derived-mode-p 'cc-butler-mode)
+            (cc-butler-preview)          ; show the session + its panel
+          (cc-butler--doc-refresh-layout dir))
+        (message "cc-butler doc: panel reopened")))))
+
+(defun cc-butler-doc-reload ()
+  "Reload the current document: re-fetch a gh document, re-read a file.
+Stays read-only."
+  (interactive)
+  (cond
+   (cc-butler--doc-buffer-kind (cc-butler-doc-revert))     ; gh doc → re-fetch
+   ((buffer-file-name)                                     ; file doc → re-read
+    (let ((inhibit-read-only t))
+      (revert-buffer 'ignore-auto 'noconfirm))
+    (message "cc-butler doc: reloaded %s"
+             (file-name-nondirectory (buffer-file-name))))
+   (t (cc-butler-doc-revert))))
 
 (defun cc-butler-doc-remove ()
   "Drop the current document from the selected session's panel.
@@ -646,11 +697,15 @@ prefix elsewhere."
     (define-key cc-butler-mode-map "[" #'cc-butler-doc-prev)
     (define-key cc-butler-mode-map "d" #'cc-butler-doc-toggle)
     (define-key cc-butler-mode-map "D" #'cc-butler-doc-remove)
+    (define-key cc-butler-mode-map "v" #'cc-butler-doc-reopen)
     (define-key cc-butler-mode-map "o" #'cc-butler-doc-open)))
 
+;; In a document: Emacs-conventional read-only viewer keys.
+(define-key cc-butler-doc-mode-map "n" #'cc-butler-doc-next)
+(define-key cc-butler-doc-mode-map "p" #'cc-butler-doc-prev)
 (define-key cc-butler-doc-mode-map "]" #'cc-butler-doc-next)
 (define-key cc-butler-doc-mode-map "[" #'cc-butler-doc-prev)
-(define-key cc-butler-doc-mode-map "g" #'cc-butler-doc-revert)
+(define-key cc-butler-doc-mode-map "g" #'cc-butler-doc-reload)
 (define-key cc-butler-doc-mode-map "k" #'cc-butler-doc-remove)
 (define-key cc-butler-doc-mode-map "q" #'cc-butler-doc-hide)
 (define-key cc-butler-doc-mode-map "w" #'cc-butler-doc-browse)
@@ -658,20 +713,22 @@ prefix elsewhere."
 (define-key cc-butler-doc-mode-map (kbd "C-c C-o") #'cc-butler-doc-browse)
 
 ;; A global prefix so the panel is controllable from the session terminal
-;; (or anywhere), not only from the session list.
-(defvar cc-butler-doc-prefix-map
-  (let ((m (make-sparse-keymap)))
-    (define-key m "]" #'cc-butler-doc-next)
-    (define-key m "[" #'cc-butler-doc-prev)
-    (define-key m "d" #'cc-butler-doc-toggle)
-    (define-key m "z" #'cc-butler-doc-hide)
-    (define-key m "o" #'cc-butler-doc-open)
-    (define-key m "g" #'cc-butler-doc-revert)
-    (define-key m "k" #'cc-butler-doc-remove)
-    (define-key m "n" #'cc-butler-doc-comment)
-    (define-key m "w" #'cc-butler-doc-browse)
-    m)
+;; (or anywhere), not only from the session list.  Top-level define-keys so a
+;; reload updates the existing map.
+(defvar cc-butler-doc-prefix-map (make-sparse-keymap)
   "Keymap for cc-butler document-panel commands, bound under a global prefix.")
+
+(define-key cc-butler-doc-prefix-map "]" #'cc-butler-doc-next)
+(define-key cc-butler-doc-prefix-map "[" #'cc-butler-doc-prev)
+(define-key cc-butler-doc-prefix-map "d" #'cc-butler-doc-toggle)
+(define-key cc-butler-doc-prefix-map "z" #'cc-butler-doc-hide)
+(define-key cc-butler-doc-prefix-map "v" #'cc-butler-doc-reopen)
+(define-key cc-butler-doc-prefix-map "o" #'cc-butler-doc-open)
+(define-key cc-butler-doc-prefix-map "g" #'cc-butler-doc-reload)
+(define-key cc-butler-doc-prefix-map "k" #'cc-butler-doc-remove)
+(define-key cc-butler-doc-prefix-map "e" #'cc-butler-doc-file-toggle-edit)
+(define-key cc-butler-doc-prefix-map "c" #'cc-butler-doc-comment)
+(define-key cc-butler-doc-prefix-map "w" #'cc-butler-doc-browse)
 
 (global-set-key (kbd "C-c d") cc-butler-doc-prefix-map)
 
