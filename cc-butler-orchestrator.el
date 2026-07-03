@@ -136,32 +136,68 @@ a prior butler home) to reuse its contents."
   :type 'directory
   :group 'cc-butler)
 
-(defun cc-butler--butler-claude-md ()
-  "Return the bootstrap CLAUDE.md text describing the butler's role."
+(defun cc-butler--roles-metaphor (which)
+  "Return the shared household-metaphor section; WHICH is `butler' or `steward'."
   (concat
-   "# Butler\n\n"
-   "You are the **butler** of a cc-butler fleet: several Claude Code *worker*\n"
-   "sessions run in this Emacs, and you coordinate them on the human's behalf\n"
-   "(who may be driving you from their phone). Emacs is the bus; you reach the\n"
-   "workers through MCP tools.\n\n"
+   "## Household roles (don't confuse them)\n\n"
+   "A cc-butler fleet has two coordinating roles. In Korean both translate to\n"
+   "\"집사\", but they are different:\n\n"
+   "- **butler** — *front-of-house*: faces the master (the human), keeps a calm\n"
+   "  channel, holds the decision queue. Never relays worker chatter to the boss.\n"
+   "- **steward** — *below-stairs, operations chief*: faces the workers, receives\n"
+   "  their reports, dispatches and tracks them, and escalates only *decisions*\n"
+   "  up to the butler.\n\n"
+   (format "You are the **%s**.\n\n" which)))
+
+(defun cc-butler--butler-claude-md ()
+  "Return the bootstrap CLAUDE.md text for the butler (front-of-house) role."
+  (concat
+   "# Butler (front-of-house)\n\n"
+   (cc-butler--roles-metaphor "butler")
+   "The human speaks to **you**, in a calm channel — worker nudges do NOT reach\n"
+   "you. Your job is to present the decisions that need the human, cleanly, and\n"
+   "to relay the answers back down.\n\n"
    "## Each turn\n\n"
-   "1. Call `pending_events` first — it drains what changed (a worker finished,\n"
-   "   asked a question, got blocked) without anything being typed at you.\n"
-   "2. Triage: for anything needing action, `read_session_output` to see a\n"
-   "   worker's screen and `send_to_session` to answer, unblock, or task it.\n"
-   "3. Keep the picture current: `butler_dashboard` (the sessions table is built\n"
-   "   automatically — you supply a short overview and the open decisions), and\n"
-   "   `butler_log` the decisions/progress worth remembering.\n"
-   "4. Relay a concise status up to the human.\n\n"
+   "1. Call `pending_decisions` — the decisions the steward has escalated for the\n"
+   "   human. Present them plainly; never dump the worker firehose at the boss.\n"
+   "2. Get the human's answer, then relay it down to the steward with\n"
+   "   `send_to_session` (find its name via `list_claude_sessions`).\n"
+   "3. When the human asks something specific about a worker, you may\n"
+   "   `read_session_output` / `send_to_session` that worker directly.\n\n"
    "## Tools\n\n"
-   "- `list_claude_sessions` — the workers, who is WAITING-FOR-INPUT, branches.\n"
-   "- `read_session_output` — a worker's recent terminal screen.\n"
-   "- `send_to_session` — type a prompt into a worker and submit it.\n"
-   "- `pending_events` — drain your inbox of worker events.\n"
-   "- `butler_log` / `butler_dashboard` — your durable log and snapshot, under\n"
-   "  `docs/` in this home.\n\n"
-   "Keep workers moving, surface only what needs the human, and never let the\n"
-   "state of the fleet live only in the chat scrollback.\n"))
+   "- `pending_decisions` — drain your quiet decision queue.\n"
+   "- `list_claude_sessions` / `read_session_output` / `send_to_session`.\n"
+   "- `butler_dashboard` — the current snapshot (read it to brief the human).\n\n"
+   "## Single mode\n\n"
+   "If no steward session is running, you also play the steward: drain\n"
+   "`pending_events`, dispatch workers, and maintain `butler_dashboard` /\n"
+   "`butler_log`. Once a steward is started, hand that firehose over to it.\n"))
+
+(defun cc-butler--steward-claude-md ()
+  "Return the bootstrap CLAUDE.md text for the steward (operations) role."
+  (concat
+   "# Steward (below-stairs, operations chief)\n\n"
+   (cc-butler--roles-metaphor "steward")
+   "You receive the worker firehose and run operations. You do NOT face the\n"
+   "human directly — you escalate decisions to the butler, who does.\n\n"
+   "## Each turn\n\n"
+   "1. Call `pending_events` first — worker reports (`report_to_butler`) and\n"
+   "   notifications land here; nudges are also typed at you. This is your inbox.\n"
+   "2. Dispatch and unblock: `read_session_output` to see a worker's screen,\n"
+   "   `send_to_session` to answer, task, or unblock it. Track each toward its DoD.\n"
+   "3. Keep the picture current: `butler_dashboard` (the sessions table is built\n"
+   "   automatically — you add the overview and open decisions) and `butler_log`\n"
+   "   the durable timeline.\n"
+   "4. When something needs a human decision, `escalate_to_butler(summary, needs)`\n"
+   "   — do NOT ask the human yourself; route it through the butler, who presents\n"
+   "   it and relays the answer back to you.\n\n"
+   "## Tools\n\n"
+   "- `list_claude_sessions` / `read_session_output` / `send_to_session`.\n"
+   "- `pending_events` — drain the worker firehose.\n"
+   "- `butler_log` / `butler_dashboard` — durable log + snapshot, under `docs/`.\n"
+   "- `escalate_to_butler` — raise a decision to the butler.\n\n"
+   "Keep workers moving, and never let the state of the fleet live only in the\n"
+   "chat scrollback.\n"))
 
 (defun cc-butler--ensure-butler-home ()
   "Create `cc-butler-home' with its markers if missing; return the directory."
@@ -201,9 +237,50 @@ if a butler session is already running there, it is just focused."
     (setq cc-butler--butler home)
     (cc-butler)))
 
+(defcustom cc-butler-steward-home
+  (expand-file-name "cc-butler-steward" user-emacs-directory)
+  "Working directory the steward (operations) session runs in.
+`cc-butler-start-steward' creates it on demand with a role `CLAUDE.md'.
+Must differ from `cc-butler-home' (two sessions cannot share a directory)."
+  :type 'directory
+  :group 'cc-butler)
+
+(defun cc-butler--ensure-steward-home ()
+  "Create `cc-butler-steward-home' with its markers if missing; return it."
+  (let ((home (file-name-as-directory (expand-file-name cc-butler-steward-home))))
+    (make-directory home t)
+    (let ((proj (expand-file-name ".projectile" home))
+          (cmd  (expand-file-name "CLAUDE.md" home)))
+      (unless (file-exists-p proj) (write-region "" nil proj nil 'silent))
+      (unless (file-exists-p cmd)
+        (write-region (cc-butler--steward-claude-md) nil cmd nil 'silent)))
+    home))
+
+;;;###autoload
+(defun cc-butler-start-steward ()
+  "Launch (or focus) the steward session in `cc-butler-steward-home'.
+Scaffolds the home (`.projectile' + steward role `CLAUDE.md') on first run,
+designates it the steward, and opens the manager.  Once the steward runs,
+the worker firehose (nudges + `report_to_butler') routes to it instead of
+the butler (split mode).  Idempotent."
+  (interactive)
+  (let ((home (cc-butler--ensure-steward-home)))
+    (when (equal (file-name-as-directory (expand-file-name home))
+                 (and cc-butler-home
+                      (file-name-as-directory (expand-file-name cc-butler-home))))
+      (user-error "Steward home must differ from the butler home"))
+    (if (cc-butler--live-dir-p home)
+        (message "cc-butler: steward already running in %s" home)
+      (let ((default-directory home))
+        (cc-butler--with-channel (claude-code-ide)))
+      (message "cc-butler: started steward in %s (worker firehose now routes here)" home))
+    (setq cc-butler--steward home)
+    (cc-butler)))
+
 (with-eval-after-load 'cc-butler-session
   (when (boundp 'cc-butler-mode-map)
-    (define-key cc-butler-mode-map "B" #'cc-butler-start-butler)))
+    (define-key cc-butler-mode-map "B" #'cc-butler-start-butler)
+    (define-key cc-butler-mode-map "S" #'cc-butler-start-steward)))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Launch a session joined to the cc-butler channel
@@ -233,22 +310,135 @@ submit  -> type the summary and submit it, so the butler reacts at once"
                  (const :tag "Type and submit" submit))
   :group 'cc-butler)
 
-(defun cc-butler--forward-to-butler (event)
-  "Forward a worker EVENT into the butler session's terminal."
+(defvar cc-butler--steward nil
+  "Working-dir of the designated steward session, or nil.
+The steward is the internal-orchestration role: it receives the worker
+firehose (nudges + `report_to_butler') and escalates only decisions to the
+butler.  When nil, cc-butler runs in single mode and the butler plays both
+roles (backward compatible).")
+
+(defun cc-butler--ops-dir ()
+  "The session that receives the worker firehose.
+The steward when one is designated, else the butler (single mode)."
+  (or cc-butler--steward cc-butler--butler))
+
+(defun cc-butler--split-p ()
+  "Return non-nil when a distinct steward session is designated (split mode)."
+  (and cc-butler--steward (not (equal cc-butler--steward cc-butler--butler))))
+
+(defun cc-butler--forward-to-ops (event)
+  "Forward a worker EVENT into the ops (steward, else butler) terminal.
+The user-facing butler is never nudged in split mode; only the steward is."
   (when-let* ((mode cc-butler-forward)
-              (butler cc-butler--butler)
+              (ops (cc-butler--ops-dir))
               (dir (plist-get event :session))
-              ((not (equal dir butler)))
-              (mbuf (get-buffer (claude-code-ide--get-buffer-name butler)))
+              ((not (equal dir ops)))
+              (mbuf (get-buffer (claude-code-ide--get-buffer-name ops)))
               ((buffer-live-p mbuf)))
     (cc-butler--send-input
-     butler
+     ops
      (format "[cc-butler] Worker %s needs attention: %s"
              (cc-butler--who-dir dir)
              (or (plist-get event :body) (plist-get event :title) ""))
      (eq mode 'submit))))
 
-(add-hook 'cc-butler-notification-functions #'cc-butler--forward-to-butler)
+;; Swap the old single-target forwarder for the ops-aware one (idempotent on
+;; reload; the old symbol is simply removed from the hook if present).
+(remove-hook 'cc-butler-notification-functions 'cc-butler--forward-to-butler)
+(add-hook 'cc-butler-notification-functions #'cc-butler--forward-to-ops)
+
+;;;; ------------------------------------------------------------------
+;;;; butler <- steward: the quiet decision channel
+;;;; ------------------------------------------------------------------
+
+(defvar cc-butler--butler-inbox nil
+  "The butler's quiet decision queue: escalations from the steward.
+Separate from the worker firehose (`cc-butler--inbox') so the user-facing
+butler only ever sees decisions, drained via `pending_decisions'.")
+
+(defun cc-butler--decisions-file ()
+  "Return the shared open-decisions Org file (under the butler home), or nil."
+  (when cc-butler--butler
+    (expand-file-name "docs/decisions.org"
+                      (file-name-as-directory (expand-file-name cc-butler--butler)))))
+
+(defun cc-butler--append-decision (from summary needs)
+  "Append a decision (SUMMARY/NEEDS from session FROM) to the shared doc."
+  (when-let ((file (cc-butler--decisions-file)))
+    (make-directory (file-name-directory file) t)
+    (let ((new (not (file-exists-p file))))
+      (write-region
+       (concat (when new "#+TITLE: Open decisions\n#+STARTUP: showeverything\n\n")
+               (format "* %s %s\n" (format-time-string "[%Y-%m-%d %a %H:%M]") summary)
+               (when from (format "  from: %s\n" (cc-butler--who-dir from)))
+               (when (and needs (stringp needs) (not (string-empty-p (string-trim needs))))
+                 (format "  needs: %s\n" (string-trim needs))))
+       nil file t 'silent))))
+
+(defun cc-butler-tool-escalate-to-butler (summary &optional needs)
+  "MCP tool (steward -> butler): raise a decision to the butler's quiet queue.
+Pushes onto the butler's decision inbox, appends to the shared
+`decisions.org', and types ONE quiet line into the butler (never submitted
+automatically).  This is the only thing that reaches the user-facing butler."
+  (unless (and summary (stringp summary) (not (string-empty-p (string-trim summary))))
+    (error "A decision summary is required"))
+  (let ((self (cc-butler--caller-dir))
+        (s (string-trim summary)))
+    (push (list :time (current-time) :dir self
+                :name (and self (cc-butler--display-name self))
+                :summary s
+                :needs (and needs (stringp needs)
+                            (not (string-empty-p (string-trim needs))) (string-trim needs)))
+          cc-butler--butler-inbox)
+    (cc-butler--append-decision self s needs)
+    (cc-butler--log "%s -> butler [decision] | %s"
+                    (if self (cc-butler--who-dir self) "steward") s)
+    (when-let* ((butler cc-butler--butler)
+                (buf (get-buffer (claude-code-ide--get-buffer-name butler)))
+                ((buffer-live-p buf)))
+      (cc-butler--send-input butler (format "[decision waiting] %s" s) nil))
+    (cc-butler--maybe-refresh)
+    "Escalated to the butler's decision queue."))
+
+(defun cc-butler-tool-pending-decisions ()
+  "MCP tool (butler): drain the quiet decision queue (steward escalations)."
+  (if (null cc-butler--butler-inbox)
+      "No pending decisions."
+    (let ((events (reverse cc-butler--butler-inbox)))
+      (setq cc-butler--butler-inbox nil)
+      (mapconcat
+       (lambda (e)
+         (format "- [%s] %s%s%s"
+                 (format-time-string "%H:%M" (plist-get e :time))
+                 (plist-get e :summary)
+                 (if (plist-get e :name) (format " (from %s)" (plist-get e :name)) "")
+                 (if (plist-get e :needs) (format " . needs: %s" (plist-get e :needs)) "")))
+       events "\n"))))
+
+(setq claude-code-ide-mcp-server-tools
+      (seq-remove
+       (lambda (spec)
+         (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
+                 '("escalate_to_butler" "pending_decisions")))
+       claude-code-ide-mcp-server-tools))
+
+(claude-code-ide-make-tool
+ :function #'cc-butler-tool-escalate-to-butler
+ :name "escalate_to_butler"
+ :description "Steward only: raise a DECISION to the user-facing butler's quiet queue, for the butler to present to the human. Use it when something genuinely needs a human decision or input (not routine progress — that stays with you). The butler drains this via pending_decisions and relays the answer back to you with send_to_session. State the decision plainly in `summary' and exactly what is needed in `needs'."
+ :args '((:name "summary"
+                :type string
+                :description "The decision to be made, stated plainly (e.g. 'billing worker: use Stripe or Paddle?').")
+         (:name "needs"
+                :type string
+                :description "Exactly what you need from the human (a choice, an approval, missing info). Optional."
+                :optional t)))
+
+(claude-code-ide-make-tool
+ :function #'cc-butler-tool-pending-decisions
+ :name "pending_decisions"
+ :description "Butler only: drain your quiet decision queue — the decisions the steward has escalated for the human to decide. Call it at the start of a turn (and when nudged) to see what needs the boss's attention, without the worker firehose. Returns the decisions and clears them; present them cleanly to the human, then relay each answer down to the steward with send_to_session."
+ :args nil)
 
 ;;;; ------------------------------------------------------------------
 ;;;; MCP tools (the butler's hands)
