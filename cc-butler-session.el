@@ -300,8 +300,8 @@ the cc-butler log."
   "Return the sidebar label for session DIR.
 The two coordinating roles show as fixed names; everything else uses
 DEFAULT (its title / topic name)."
-  (cond ((eq (cc-butler--role-rank dir) 0) "버틀러")
-        ((eq (cc-butler--role-rank dir) 1) "스튜어드")
+  (cond ((eq (cc-butler--role-rank dir) 0) "Butler")
+        ((eq (cc-butler--role-rank dir) 1) "Steward")
         (t default)))
 
 (defun cc-butler--ordered (sessions)

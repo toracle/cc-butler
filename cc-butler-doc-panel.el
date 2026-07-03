@@ -209,70 +209,32 @@ on failure stderr is shown so the error is still visible."
                        (insert text)
                        (goto-char (point-min))))))))))))))
 
-(defvar cc-butler-doc-file-mode-map (make-sparse-keymap)
-  "Keymap active while a file document is in read-only view.
-Turned off (with its single-key nav bindings) when the file is made
-editable, so editing is never shadowed.")
+;; File documents are shown in a read-only `cc-butler-doc-mode' (special-mode)
+;; buffer — the same as gh documents — so read-only and the panel keymap hold
+;; naturally, without a minor mode that can fail to engage.  There is no
+;; in-panel editing: the panel is a viewer, and the file on disk is untouched.
 
-;; Top-level so a reload updates the existing keymap (a defvar would not
-;; re-initialize an already-bound map).  Emacs-conventional viewer keys.
-(define-key cc-butler-doc-file-mode-map "n" #'cc-butler-doc-next)
-(define-key cc-butler-doc-file-mode-map "p" #'cc-butler-doc-prev)
-(define-key cc-butler-doc-file-mode-map "g" #'cc-butler-doc-reload)
-(define-key cc-butler-doc-file-mode-map "q" #'cc-butler-doc-hide)
-(define-key cc-butler-doc-file-mode-map "k" #'cc-butler-doc-remove)
-(define-key cc-butler-doc-file-mode-map (kbd "C-c C-e") #'cc-butler-doc-file-toggle-edit)
-(define-key cc-butler-doc-file-mode-map (kbd "C-c C-q") #'cc-butler-doc-hide)
-
-(define-minor-mode cc-butler-doc-file-mode
-  "Minor mode for a local file shown in a cc-butler document panel.
-When on, the file is a read-only viewer with single-key navigation
-(`n'/`p' next/prev, `g' reload, `q' close, `k' remove).  `C-c C-e' turns
-it off to edit the file (nav keys step aside so they can be typed); turn
-it back on with `C-c d e' or \\[cc-butler-doc-file-mode]."
-  :lighter " cc-butler-Doc"
-  :keymap cc-butler-doc-file-mode-map
-  (if cc-butler-doc-file-mode
-      (progn
-        (setq buffer-read-only t)
-        ;; Wrap unconditionally in the narrow side panel (see `cc-butler-doc-mode').
-        (setq-local truncate-lines nil)
-        (setq-local truncate-partial-width-windows nil))
-    (setq buffer-read-only nil)))
-
-(defun cc-butler-doc-file-toggle-edit ()
-  "Toggle a file document between read-only view and editing.
-View turns the nav keys on and the buffer read-only; editing turns them
-off so every key types normally."
-  (interactive)
-  (unless (or cc-butler-doc-file-mode
-              (local-variable-p 'cc-butler--doc-session-dir))
-    (user-error "Not a cc-butler file document"))
-  (cc-butler-doc-file-mode 'toggle)
-  (message "cc-butler doc: %s"
-           (if cc-butler-doc-file-mode "read-only view" "editable")))
+(defvar-local cc-butler--doc-file-path nil
+  "Absolute path of the file a file-document buffer mirrors, for reloading.")
 
 (defun cc-butler--doc-file-buffer (dir ref)
-  "Return a buffer visiting file REF (relative to DIR), or an error buffer.
-The file opens read-only via `cc-butler-doc-file-mode'."
-  (let ((path (expand-file-name ref (file-name-as-directory dir))))
-    (if (file-readable-p path)
-        (let ((buf (find-file-noselect path)))
-          (with-current-buffer buf
-            (cc-butler-doc-file-mode 1)
-            ;; A read-only Org buffer must not try to modify itself: Org
-            ;; realigns tables on TAB/navigation, which signals "Buffer is
-            ;; read-only".  Disable automatic realignment here.
-            (when (derived-mode-p 'org-mode)
-              (setq-local org-table-automatic-realign nil)))
-          buf)
-      (let ((buf (get-buffer-create (format "*cc-butler-doc:%s*" ref))))
-        (with-current-buffer buf
-          (unless (derived-mode-p 'cc-butler-doc-mode) (cc-butler-doc-mode))
-          (let ((inhibit-read-only t))
-            (erase-buffer)
-            (insert (format "Cannot read file: %s\n" path))))
-        buf))))
+  "Return a read-only `cc-butler-doc-mode' buffer mirroring file REF.
+A special-mode buffer (not the visited file) so read-only and the panel
+keymap hold naturally, and the file on disk is never touched."
+  (let* ((path (expand-file-name ref (file-name-as-directory dir)))
+         (name (cc-butler--display-name dir))
+         (buf (get-buffer-create
+               (format "*cc-butler-doc:%s:%s*" name (file-name-nondirectory ref)))))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'cc-butler-doc-mode) (cc-butler-doc-mode))
+      (setq-local cc-butler--doc-file-path path)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (if (file-readable-p path)
+            (insert-file-contents path)
+          (insert (format "Cannot read file: %s\n" path)))
+        (goto-char (point-min))))
+    buf))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Mutating the document set
@@ -302,7 +264,7 @@ rather than duplicated."
              (doc (list :kind kind :ref ref
                         :label (cc-butler--doc-label kind ref)
                         :cwd cwd
-                        :buffer buf :owned (not (eq kind 'file)))))
+                        :buffer buf :owned t)))
         (unless (eq kind 'file) (cc-butler--doc-render doc dir))
         (setq items (append items (list doc)))
         (setq state (plist-put (plist-put state :items items)
@@ -526,11 +488,15 @@ Stays read-only."
   (interactive)
   (cond
    (cc-butler--doc-buffer-kind (cc-butler-doc-revert))     ; gh doc → re-fetch
-   ((buffer-file-name)                                     ; file doc → re-read
-    (let ((inhibit-read-only t))
-      (revert-buffer 'ignore-auto 'noconfirm))
+   (cc-butler--doc-file-path                               ; file doc → re-read
+    (let ((inhibit-read-only t) (p (point)))
+      (erase-buffer)
+      (if (file-readable-p cc-butler--doc-file-path)
+          (insert-file-contents cc-butler--doc-file-path)
+        (insert (format "Cannot read file: %s\n" cc-butler--doc-file-path)))
+      (goto-char (min p (point-max))))
     (message "cc-butler doc: reloaded %s"
-             (file-name-nondirectory (buffer-file-name))))
+             (file-name-nondirectory cc-butler--doc-file-path)))
    (t (cc-butler-doc-revert))))
 
 (defun cc-butler-doc-remove ()
@@ -726,7 +692,6 @@ prefix elsewhere."
 (define-key cc-butler-doc-prefix-map "o" #'cc-butler-doc-open)
 (define-key cc-butler-doc-prefix-map "g" #'cc-butler-doc-reload)
 (define-key cc-butler-doc-prefix-map "k" #'cc-butler-doc-remove)
-(define-key cc-butler-doc-prefix-map "e" #'cc-butler-doc-file-toggle-edit)
 (define-key cc-butler-doc-prefix-map "c" #'cc-butler-doc-comment)
 (define-key cc-butler-doc-prefix-map "w" #'cc-butler-doc-browse)
 
