@@ -683,8 +683,10 @@ prefix elsewhere."
   "Return the trimmed S when it is a non-empty string, else nil."
   (and (stringp s) (let ((v (string-trim s))) (and (not (string-empty-p v)) v))))
 
-(defun cc-butler-tool-show-document (&optional kind ref repo path)
+(defun cc-butler-tool-show-document (&optional path kind ref repo)
   "MCP tool: open a document in the calling session's panel.
+The parameter order MUST match the `:args' order below — the MCP layer
+builds the positional argument list from `:args' and applies it.
 Call it as (kind=file|pr|issue|run, ref=…) — or, for a local file, simply
 as (path=…).  REPO names a child repo for gh kinds in a multi-repo
 workspace.  Display is best-effort: a layout error is logged, never
