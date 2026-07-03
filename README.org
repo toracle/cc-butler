@@ -1,0 +1,81 @@
+#+TITLE: cc-butler
+#+AUTHOR: Jeongsoo Park
+#+OPTIONS: toc:nil num:nil
+
+/A cmux-like manager and control plane for running many concurrent Claude Code
+sessions in one Emacs./
+
+=cc-butler= turns [[https://github.com/manzaltu/claude-code-ide.el][claude-code-ide]] into a multi-session cockpit: a sticky list of
+every live session, a *butler/worker* orchestration layer where one designated
+session drives the others, a per-session *document panel*, and a butler-owned
+*document repository* that keeps a live dashboard and an append-only log.
+
+The original motivation: when you run several Claude Code agents at once, their
+output scrolls away and the overall state of the work becomes impossible to
+hold in your head. cc-butler makes the fleet legible — and lets one *butler*
+session (which you can drive from your phone) coordinate the rest.
+
+* Features
+
+- *Session list* (~M-x cc-butler~) — a sticky left side window listing every
+  live session as a readable multi-line block (title / current activity /
+  status / branch + PR). Navigating previews the session's terminal.
+- *Per-session metadata* — a running Claude sets its own title/status via the
+  ~set_session_info~ MCP tool, so you can track many sessions at a glance.
+- *Topic workspaces* — ~cc-butler-new-topic~ scaffolds a workspace (clones +
+  markers) and launches a session; ~cc-butler-close-topic~ (~K~) tears one down
+  *safely* (it refuses to delete unless every git clone has no local-only
+  commits, a clean tree, and no stashes — checked with real =git=).
+- *Butler / worker control plane* — a designated /butler/ session drives the
+  /workers/ through MCP tools (~list_claude_sessions~, ~read_session_output~,
+  ~send_to_session~) and receives their events (~report_to_butler~ →
+  ~pending_events~). You remote-control one session; it becomes the situation
+  room for the rest.
+- *Document panel* — a running Claude opens a PR, issue, CI run, or file into a
+  right-hand panel beside its terminal (~show_document~), shown as a tab line;
+  the set is remembered per session. Read-only with explicit actions
+  (comment / browse).
+- *Butler document repository* — the butler keeps a regenerated =dashboard.org=
+  (sessions table auto-built from live state + overview + open decisions) and
+  an append-only daily log, updated via ~butler_log~ / ~butler_dashboard~ and
+  auto-captured worker events.
+
+* Requirements
+
+- *Emacs* 29.1 or newer.
+- [[https://github.com/manzaltu/claude-code-ide.el][claude-code-ide.el]] — the Claude Code IDE integration for Emacs (the session
+  backend and MCP bridge this package builds on).
+- *ghostel* — the terminal backend that claude-code-ide drives; cc-butler reads
+  its live terminal state (OSC titles, screen capture) and rides its
+  notification callback.
+
+The [[https://claude.com/claude-code][Claude Code]] CLI itself must be installed and on ~claude-code-ide-cli-path~.
+
+* Installation
+
+Not on a package archive yet. Clone and put it on your ~load-path~:
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "/path/to/cc-butler")
+(require 'cc-butler)
+#+end_src
+
+* Usage
+
+~M-x cc-butler~ opens the session manager. In the list buffer:
+
+| Key   | Action                                              |
+|-------+-----------------------------------------------------|
+| ~n~/~p~   | move + preview a session                            |
+| ~RET~   | select the session's terminal                       |
+| ~N~     | create a topic workspace                            |
+| ~K~     | close a topic safely (vet → kill → delete)          |
+| ~b~     | designate the session at point as the butler        |
+| ~g~     | refresh                                             |
+
+A running Claude drives its own panel and reports to the butler through the MCP
+tools listed above.
+
+* License
+
+TBD.
