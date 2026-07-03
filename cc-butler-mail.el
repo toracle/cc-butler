@@ -170,6 +170,36 @@ Return the recipient agent."
     (cc-butler--ch-poke ops-agent)))
 
 ;;;; ------------------------------------------------------------------
+;;;; Up-direction transport (B): report / escalate / drain over the channel
+;;;; ------------------------------------------------------------------
+;;
+;; These back the existing report_to_butler / escalate_to_butler /
+;; pending_events / pending_decisions tools when `cc-butler-message-transport'
+;; is `maildir': the message is delivered to the recipient's durable file
+;; inbox, and draining archives it (the audit trail).  No poke — up-direction
+;; is pull-only, so nothing is typed into any terminal.
+
+(defun cc-butler-mail-up-report (from-dir body)
+  "Deliver a worker report (BODY, from session FROM-DIR) to the ops inbox."
+  (cc-butler--ch-deliver
+   (cc-butler--display-name (cc-butler--ops-dir))
+   (list :kind 'report
+         :from (and from-dir (cc-butler--display-name from-dir))
+         :body body)))
+
+(defun cc-butler-mail-up-decision (from-dir summary needs)
+  "Deliver a decision (SUMMARY/NEEDS, from FROM-DIR) to the butler inbox."
+  (cc-butler--ch-deliver
+   (cc-butler--mail-butler-agent)
+   (list :kind 'decision
+         :from (and from-dir (cc-butler--display-name from-dir))
+         :summary summary :needs needs)))
+
+(defun cc-butler-mail-up-drain (agent-dir)
+  "Drain AGENT-DIR's own durable inbox (archives each; returns the messages)."
+  (and agent-dir (cc-butler--ch-drain (cc-butler--display-name agent-dir))))
+
+;;;; ------------------------------------------------------------------
 ;;;; MCP tools (resolve session -> agent id, then route)
 ;;;; ------------------------------------------------------------------
 

@@ -23,6 +23,13 @@
 (require 'cc-butler-notifications)
 (require 'claude-code-ide)
 
+;; The up-direction tools optionally route through the durable maildir inbox
+;; (`cc-butler-mail', loaded after this file); declared so the byte-compiler is
+;; content and the runtime dispatch on `cc-butler-message-transport' works.
+(declare-function cc-butler-mail-up-report "cc-butler-mail" (from-dir body))
+(declare-function cc-butler-mail-up-decision "cc-butler-mail" (from-dir summary needs))
+(declare-function cc-butler-mail-up-drain "cc-butler-mail" (agent-dir))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Addressing, reading, sending
 ;;;; ------------------------------------------------------------------
@@ -470,15 +477,17 @@ pulls decisions with `pending_decisions', so the human's input box is never
 polluted and never needs a manual Return."
   (unless (and summary (stringp summary) (not (string-empty-p (string-trim summary))))
     (error "A decision summary is required"))
-  (let ((self (cc-butler--caller-dir))
-        (s (string-trim summary)))
-    (push (list :time (current-time) :dir self
-                :name (and self (cc-butler--display-name self))
-                :summary s
-                :needs (and needs (stringp needs)
-                            (not (string-empty-p (string-trim needs))) (string-trim needs)))
-          cc-butler--butler-inbox)
-    (cc-butler--append-decision self s needs)
+  (let* ((self (cc-butler--caller-dir))
+         (s (string-trim summary))
+         (n (and needs (stringp needs)
+                 (not (string-empty-p (string-trim needs))) (string-trim needs))))
+    (if (eq cc-butler-message-transport 'maildir)
+        (cc-butler-mail-up-decision self s n)
+      (push (list :time (current-time) :dir self
+                  :name (and self (cc-butler--display-name self))
+                  :summary s :needs n)
+            cc-butler--butler-inbox))
+    (cc-butler--append-decision self s needs)   ; decisions.org audit doc, both transports
     (cc-butler--log "%s -> butler [decision] | %s"
                     (if self (cc-butler--who-dir self) "steward") s)
     (cc-butler--maybe-refresh)
@@ -486,18 +495,27 @@ polluted and never needs a manual Return."
 
 (defun cc-butler-tool-pending-decisions ()
   "MCP tool (butler): drain the quiet decision queue (steward escalations)."
-  (if (null cc-butler--butler-inbox)
-      "No pending decisions."
-    (let ((events (reverse cc-butler--butler-inbox)))
-      (setq cc-butler--butler-inbox nil)
-      (mapconcat
-       (lambda (e)
-         (format "- [%s] %s%s%s"
-                 (format-time-string "%H:%M" (plist-get e :time))
-                 (plist-get e :summary)
-                 (if (plist-get e :name) (format " (from %s)" (plist-get e :name)) "")
-                 (if (plist-get e :needs) (format " . needs: %s" (plist-get e :needs)) "")))
-       events "\n"))))
+  (if (eq cc-butler-message-transport 'maildir)
+      (let ((msgs (cc-butler-mail-up-drain (cc-butler--caller-dir))))
+        (if (null msgs) "No pending decisions."
+          (mapconcat
+           (lambda (m)
+             (format "- %s%s%s" (plist-get m :summary)
+                     (if (plist-get m :from) (format " (from %s)" (plist-get m :from)) "")
+                     (if (plist-get m :needs) (format " . needs: %s" (plist-get m :needs)) "")))
+           msgs "\n")))
+    (if (null cc-butler--butler-inbox)
+        "No pending decisions."
+      (let ((events (reverse cc-butler--butler-inbox)))
+        (setq cc-butler--butler-inbox nil)
+        (mapconcat
+         (lambda (e)
+           (format "- [%s] %s%s%s"
+                   (format-time-string "%H:%M" (plist-get e :time))
+                   (plist-get e :summary)
+                   (if (plist-get e :name) (format " (from %s)" (plist-get e :name)) "")
+                   (if (plist-get e :needs) (format " . needs: %s" (plist-get e :needs)) "")))
+         events "\n")))))
 
 (setq claude-code-ide-mcp-server-tools
       (seq-remove
@@ -585,7 +603,9 @@ log).  The caller's session name and id are attached automatically."
                               (and (stringp needs) (not (string-empty-p needs))
                                    (concat "needs: " needs)))))
            (msg (if parts (string-join parts " · ") "(empty report)")))
-      (cc-butler--inbox-push self msg)
+      (if (eq cc-butler-message-transport 'maildir)
+          (cc-butler-mail-up-report self msg)
+        (cc-butler--inbox-push self msg))
       (cc-butler--maybe-refresh)
       (format "Reported to the butler as %s." (cc-butler--who-dir self)))))
 
@@ -594,16 +614,23 @@ log).  The caller's session name and id are attached automatically."
 This is the pull side of the bus: worker notifications (needs input /
 done) are queued in Emacs and drained here, so the butler gets them
 without anything being typed into its input box."
-  (if (null cc-butler--inbox)
-      "No pending worker events."
-    (let ((events (reverse cc-butler--inbox)))
-      (setq cc-butler--inbox nil)
-      (mapconcat (lambda (e)
-                   (format "- [%s] %s: %s"
-                           (format-time-string "%H:%M" (plist-get e :time))
-                           (cc-butler--who (plist-get e :name) (plist-get e :id))
-                           (plist-get e :body)))
-                 events "\n"))))
+  (if (eq cc-butler-message-transport 'maildir)
+      (let ((msgs (cc-butler-mail-up-drain (cc-butler--caller-dir))))
+        (if (null msgs) "No pending worker events."
+          (mapconcat (lambda (m)
+                       (format "- %s: %s" (or (plist-get m :from) "?")
+                               (plist-get m :body)))
+                     msgs "\n")))
+    (if (null cc-butler--inbox)
+        "No pending worker events."
+      (let ((events (reverse cc-butler--inbox)))
+        (setq cc-butler--inbox nil)
+        (mapconcat (lambda (e)
+                     (format "- [%s] %s: %s"
+                             (format-time-string "%H:%M" (plist-get e :time))
+                             (cc-butler--who (plist-get e :name) (plist-get e :id))
+                             (plist-get e :body)))
+                   events "\n")))))
 
 ;; Idempotent (re)registration: drop prior copies before adding.
 (setq claude-code-ide-mcp-server-tools

@@ -227,6 +227,15 @@ oldest request first (FIFO); absence means the session is not waiting.")
   "Mark session DIR as no longer awaiting input."
   (when dir (remhash dir cc-butler--waiting)))
 
+(defcustom cc-butler-message-transport 'in-memory
+  "Transport for up-direction agent messages (report / escalate / drains).
+`in-memory' (default) keeps the volatile queues; `maildir' routes them
+through a durable, lock-free, auditable file inbox (see `cc-butler-mail').
+Switchable at runtime for rollback."
+  :type '(choice (const :tag "In-memory queues" in-memory)
+                 (const :tag "Durable maildir inbox" maildir))
+  :group 'cc-butler)
+
 (defvar cc-butler--inbox nil
   "Pending worker events for the butler to pull (newest pushed to the front).
 Each entry is a plist (:time :dir :name :body).  Drained by the
