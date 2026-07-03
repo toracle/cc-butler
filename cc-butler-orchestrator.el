@@ -418,9 +418,10 @@ butler only ever sees decisions, drained via `pending_decisions'.")
 
 (defun cc-butler-tool-escalate-to-butler (summary &optional needs)
   "MCP tool (steward -> butler): raise a decision to the butler's quiet queue.
-Pushes onto the butler's decision inbox, appends to the shared
-`decisions.org', and types ONE quiet line into the butler (never submitted
-automatically).  This is the only thing that reaches the user-facing butler."
+Pushes onto the butler's decision inbox and appends to the shared
+`decisions.org'.  It types NOTHING into the butler's terminal — the butler
+pulls decisions with `pending_decisions', so the human's input box is never
+polluted and never needs a manual Return."
   (unless (and summary (stringp summary) (not (string-empty-p (string-trim summary))))
     (error "A decision summary is required"))
   (let ((self (cc-butler--caller-dir))
@@ -434,12 +435,8 @@ automatically).  This is the only thing that reaches the user-facing butler."
     (cc-butler--append-decision self s needs)
     (cc-butler--log "%s -> butler [decision] | %s"
                     (if self (cc-butler--who-dir self) "steward") s)
-    (when-let* ((butler cc-butler--butler)
-                (buf (get-buffer (claude-code-ide--get-buffer-name butler)))
-                ((buffer-live-p buf)))
-      (cc-butler--send-input butler (format "[decision waiting] %s" s) nil))
     (cc-butler--maybe-refresh)
-    "Escalated to the butler's decision queue."))
+    "Escalated to the butler's decision queue (butler drains it with pending_decisions)."))
 
 (defun cc-butler-tool-pending-decisions ()
   "MCP tool (butler): drain the quiet decision queue (steward escalations)."
