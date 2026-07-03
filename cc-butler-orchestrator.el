@@ -136,6 +136,35 @@ a prior butler home) to reuse its contents."
   :type 'directory
   :group 'cc-butler)
 
+(defun cc-butler--claude-memory-dir (project-dir)
+  "Return the Claude per-project memory directory for PROJECT-DIR, or nil.
+Claude encodes a project path by replacing `/' and `.' with `-'."
+  (when project-dir
+    (expand-file-name
+     (concat (replace-regexp-in-string
+              "[/.]" "-" (directory-file-name (expand-file-name project-dir)))
+             "/memory/")
+     "~/.claude/projects/")))
+
+(defun cc-butler--shared-state-note ()
+  "Return a CLAUDE.md section pointing both roles at the shared docs + memory.
+Locations are derived from the butler home (the shared operational home)."
+  (let* ((home (or cc-butler--butler cc-butler-home))
+         (docs (abbreviate-file-name (expand-file-name "docs/" home)))
+         (mem (cc-butler--claude-memory-dir home)))
+    (concat
+     "## Shared state (both roles read this)\n\n"
+     (format "Operational state is shared under `%s`:\n" docs)
+     (format "- `%sdashboard.org` — current fleet snapshot + open decisions.\n" docs)
+     (format "- `%ssteward-handoff.md` — in-flight dispatch handoff (when present).\n" docs)
+     (when mem
+       (format (concat "- shared memory: `%sMEMORY.md` and the notes it indexes"
+                       " (decision-routing,\n  DoD-vs-goal, evaluation-independence,"
+                       " decision-proposal-format,\n  warmblood-talent-philosophy, …)"
+                       " — load these to keep operating discipline.\n")
+               (abbreviate-file-name mem)))
+     "\n")))
+
 (defun cc-butler--roles-metaphor (which)
   "Return the shared household-metaphor section; WHICH is `butler' or `steward'."
   (concat
@@ -171,7 +200,8 @@ a prior butler home) to reuse its contents."
    "## Single mode\n\n"
    "If no steward session is running, you also play the steward: drain\n"
    "`pending_events`, dispatch workers, and maintain `butler_dashboard` /\n"
-   "`butler_log`. Once a steward is started, hand that firehose over to it.\n"))
+   "`butler_log`. Once a steward is started, hand that firehose over to it.\n\n"
+   (cc-butler--shared-state-note)))
 
 (defun cc-butler--steward-claude-md ()
   "Return the bootstrap CLAUDE.md text for the steward (operations) role."
@@ -180,6 +210,17 @@ a prior butler home) to reuse its contents."
    (cc-butler--roles-metaphor "steward")
    "You receive the worker firehose and run operations. You do NOT face the\n"
    "human directly — you escalate decisions to the butler, who does.\n\n"
+   "## On startup — do this FIRST, before any action\n\n"
+   "You are a fresh session inheriting a running fleet. Load context before you\n"
+   "dispatch anything:\n\n"
+   "1. Read the handoff + snapshot: `steward-handoff.md` and `dashboard.org` in\n"
+   "   the shared docs dir (below) — the in-flight dispatch state (what was sent\n"
+   "   to which worker, what is awaited) and the open decisions.\n"
+   "2. Load the shared memory (below).\n"
+   "3. `pending_events` (drain the inbox) + `list_claude_sessions` (see the live\n"
+   "   fleet). Reconcile with the handoff.\n"
+   "4. THEN act. Do not re-dispatch or duplicate in-flight work.\n\n"
+   (cc-butler--shared-state-note)
    "## Each turn\n\n"
    "1. Call `pending_events` first — worker reports (`report_to_butler`) and\n"
    "   notifications land here; nudges are also typed at you. This is your inbox.\n"
