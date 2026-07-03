@@ -239,7 +239,13 @@ The file opens read-only via `cc-butler-doc-file-mode'."
   (let ((path (expand-file-name ref (file-name-as-directory dir))))
     (if (file-readable-p path)
         (let ((buf (find-file-noselect path)))
-          (with-current-buffer buf (cc-butler-doc-file-mode 1))
+          (with-current-buffer buf
+            (cc-butler-doc-file-mode 1)
+            ;; A read-only Org buffer must not try to modify itself: Org
+            ;; realigns tables on TAB/navigation, which signals "Buffer is
+            ;; read-only".  Disable automatic realignment here.
+            (when (derived-mode-p 'org-mode)
+              (setq-local org-table-automatic-realign nil)))
           buf)
       (let ((buf (get-buffer-create (format "*cc-butler-doc:%s*" ref))))
         (with-current-buffer buf
@@ -673,38 +679,60 @@ prefix elsewhere."
 ;;;; MCP tool: a session opens a document into its own panel
 ;;;; ------------------------------------------------------------------
 
-(defun cc-butler-tool-show-document (kind ref &optional repo)
-  "MCP tool: open a KIND/REF document in the calling session's panel.
-REPO names a child repo for gh kinds in a multi-repo topic workspace."
+(defun cc-butler--nonempty (s)
+  "Return the trimmed S when it is a non-empty string, else nil."
+  (and (stringp s) (let ((v (string-trim s))) (and (not (string-empty-p v)) v))))
+
+(defun cc-butler-tool-show-document (&optional kind ref repo path)
+  "MCP tool: open a document in the calling session's panel.
+Call it as (kind=file|pr|issue|run, ref=…) — or, for a local file, simply
+as (path=…).  REPO names a child repo for gh kinds in a multi-repo
+workspace.  Display is best-effort: a layout error is logged, never
+signalled, so the tool always returns a result."
   (let ((dir (plist-get (claude-code-ide-mcp-server-get-session-context)
                         :project-dir)))
     (unless dir
       (error "No active Claude session context for this request"))
-    (let ((k (intern (downcase (string-trim (or kind ""))))))
-      (unless (memq k '(pr issue run file))
-        (error "Unknown document kind %S (use pr, issue, run, or file)" kind))
-      (when (or (null ref) (string-empty-p (string-trim ref)))
-        (error "A document reference is required"))
-      (let ((cwd nil))
-        ;; gh kinds need a git repo; a topic-workspace root is not one.
-        (unless (eq k 'file)
-          (let ((g (cc-butler--doc-git-dir dir (and repo (string-trim repo)))))
-            (pcase g
+    (let* ((path (cc-butler--nonempty path))
+           (kind (cc-butler--nonempty kind))
+           (ref (cc-butler--nonempty ref)))
+      ;; A `path', or a path-like `ref' with no `kind', means a file document.
+      (when (and (not path) (not kind) ref
+                 (string-match-p "[/.]" ref)
+                 (not (string-match-p "\\`[0-9]+\\'" ref)))
+        (setq path ref))
+      (when path (setq kind "file" ref path))
+      (unless kind
+        (error "Give `path' (a file), or `kind' (file/pr/issue/run) plus `ref'"))
+      (let ((k (intern (downcase kind))))
+        (unless (memq k '(pr issue run file))
+          (error "Unknown document kind %S (use pr, issue, run, or file)" kind))
+        (unless ref (error "A document reference is required"))
+        (let ((cwd nil))
+          ;; gh kinds need a git repo; a topic-workspace root is not one.
+          (unless (eq k 'file)
+            (pcase (cc-butler--doc-git-dir dir (and repo (string-trim repo)))
               (`(:dir ,d) (setq cwd d))
               (`(:badrepo ,name)
                (error "No git repo %S under this workspace; pass a valid `repo'" name))
               (`(:ambiguous ,names)
                (error "This workspace holds several repos (%s). Re-call show_document with `repo' set to the one this %s belongs to."
-                      (mapconcat #'identity names ", ") k)))))
-        (cc-butler--doc-add dir k (string-trim ref) cwd)
-        (cc-butler--doc-refresh-layout dir)
-        (cc-butler--maybe-refresh)
-        (format "Opened %s%s in the document panel for session '%s'."
-                (cc-butler--doc-label k (string-trim ref))
-                (if cwd (format " (repo %s)"
-                                (file-name-nondirectory (directory-file-name cwd)))
-                  "")
-                (cc-butler--display-name dir))))))
+                      (mapconcat #'identity names ", ") k))))
+          (cc-butler--doc-add dir k ref cwd)
+          ;; Display is best-effort: never let a layout error escape into the
+          ;; MCP process filter — that would drop the JSON-RPC response and the
+          ;; client would time out.  The document is already in the panel state.
+          (condition-case err
+              (progn (cc-butler--doc-refresh-layout dir)
+                     (cc-butler--maybe-refresh))
+            (error (message "cc-butler show_document: display deferred (%s)"
+                            (error-message-string err))))
+          (format "Opened %s%s in the document panel for session '%s'."
+                  (cc-butler--doc-label k ref)
+                  (if cwd (format " (repo %s)"
+                                  (file-name-nondirectory (directory-file-name cwd)))
+                    "")
+                  (cc-butler--display-name dir)))))))
 
 ;; Idempotent (re)registration.
 (setq claude-code-ide-mcp-server-tools
@@ -718,12 +746,18 @@ REPO names a child repo for gh kinds in a multi-repo topic workspace."
  :function #'cc-butler-tool-show-document
  :name "show_document"
  :description "Open a reference document in THIS session's side document panel in the Emacs session manager, so the human can read it next to your terminal (and it stays pinned to this session when they switch away and back). Use it to surface the PR under review, the issue you are working, a failing CI run, or a design/markdown file. You can open several; they accumulate and the human can cycle through them. The panel persists per session."
- :args '((:name "kind"
+ :args '((:name "path"
                 :type string
-                :description "Document type: 'pr' (pull request), 'issue', 'run' (GitHub Actions workflow run), or 'file' (a local file in the working tree).")
+                :description "Shortcut for a local file: its path (absolute, or relative to the working directory), e.g. '~/.ccsm/docs/dashboard.org' or 'docs/DESIGN.md'. When given, kind/ref are not needed."
+                :optional t)
+         (:name "kind"
+                :type string
+                :description "Document type: 'file' (a local file), 'pr' (pull request), 'issue', or 'run' (GitHub Actions workflow run). Optional when 'path' is given."
+                :optional t)
          (:name "ref"
                 :type string
-                :description "The reference: a PR/issue/run NUMBER for pr/issue/run (e.g. '42'), or a file path relative to the working directory for 'file' (e.g. 'docs/DESIGN.md').")
+                :description "The reference: a PR/issue/run NUMBER (e.g. '42') for pr/issue/run, or a file path for 'file'. A path-like ref with no kind is treated as a file. Optional when 'path' is given."
+                :optional t)
          (:name "repo"
                 :type string
                 :description "For pr/issue/run only: the child repo this reference belongs to, when the session's workspace holds several repos (e.g. 'monocle', 'stark'). Omit for a single-repo session; if the workspace is multi-repo and this is omitted, the tool returns the list of repos to choose from."
