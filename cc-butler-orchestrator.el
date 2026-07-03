@@ -186,6 +186,23 @@ Locations are derived from the butler home (the shared operational home)."
    "The human speaks to **you**, in a calm channel — worker nudges do NOT reach\n"
    "you. Your job is to present the decisions that need the human, cleanly, and\n"
    "to relay the answers back down.\n\n"
+   "## How to communicate\n\n"
+   "Explain *kindly* — meaning the explanation is kind, not merely the tone.\n"
+   "Write in sentences and short narrative, not word-lists or fragment bullets.\n"
+   "Be concise but complete: tell the boss what they need to know, fully, and no\n"
+   "more. Aim for the register of a good coach or consultant — clear and\n"
+   "unhurried, never verbose, and never leaving the boss confused.\n\n"
+   "## On a clean start — get to know the boss\n\n"
+   "At startup, read `user-profile.org` in this home — it records what you've\n"
+   "learned about the boss (how to address them, how they like you to explain).\n"
+   "If it is filled, begin already knowing them.\n\n"
+   "If it is a clean start (the profile is still unfilled), *interview the boss*\n"
+   "before diving in: work through `interview-inventory.org`, ask each item\n"
+   "plainly — do not assume the answers (e.g. how to address them) — and record\n"
+   "the answers into `user-profile.org`. As you go, if you notice something worth\n"
+   "asking every new boss up front, append it to `interview-inventory.org` so\n"
+   "future starts know to ask it. Keep this complementary to the memory system:\n"
+   "the profile holds interview-confirmed preferences only.\n\n"
    "## Each turn\n\n"
    "1. Call `pending_decisions` — the decisions the steward has escalated for the\n"
    "   human. Present them plainly; never dump the worker firehose at the boss.\n"
@@ -240,15 +257,44 @@ Locations are derived from the butler home (the shared operational home)."
    "Keep workers moving, and never let the state of the fleet live only in the\n"
    "chat scrollback.\n"))
 
+(defun cc-butler--user-profile-template ()
+  "Return the initial (empty) user-profile file the interview fills."
+  (concat
+   "#+TITLE: User profile — interview-confirmed preferences\n"
+   "#+STARTUP: showeverything\n\n"
+   "The butler loads this at startup to begin already knowing the boss. It holds\n"
+   "ONLY preferences confirmed by the clean-start interview — complementary to,\n"
+   "not overlapping with, the memory system's general user notes.\n\n"
+   "* Address :: how to address the boss (name / honorific) — [not yet asked]\n"
+   "* Communication :: preferred tone, level of detail, explanation style — [not yet asked]\n"
+   "* Working style :: pace, ask-vs-decide, preferred formats — [not yet asked]\n"))
+
+(defun cc-butler--interview-inventory-template ()
+  "Return the initial clean-start interview inventory (grows over time)."
+  (concat
+   "#+TITLE: Clean-start interview — inventory\n"
+   "#+STARTUP: showeverything\n\n"
+   "What the butler asks the boss on a clean start, to personalize. This list\n"
+   "GROWS over time: when you find something worth asking every new boss up\n"
+   "front, append it here.\n\n"
+   "* How should I address you? (name / honorific) — never assume.\n"
+   "* How do you prefer I communicate? (tone, level of detail, explanation style)\n"
+   "* Any other working-style preferences? (pace, when to ask vs. decide, formats)\n"))
+
 (defun cc-butler--ensure-butler-home ()
-  "Create `cc-butler-home' with its markers if missing; return the directory."
+  "Create `cc-butler-home' with its markers if missing; return the directory.
+Scaffolds the role `CLAUDE.md', an empty `user-profile.org' (the interview
+fills it), and an `interview-inventory.org' (the questions to ask)."
   (let ((home (file-name-as-directory (expand-file-name cc-butler-home))))
     (make-directory home t)
-    (let ((proj (expand-file-name ".projectile" home))
-          (cmd  (expand-file-name "CLAUDE.md" home)))
-      (unless (file-exists-p proj) (write-region "" nil proj nil 'silent))
-      (unless (file-exists-p cmd)
-        (write-region (cc-butler--butler-claude-md) nil cmd nil 'silent)))
+    (pcase-dolist (`(,name . ,gen)
+                   `((".projectile" . ,(lambda () ""))
+                     ("CLAUDE.md" . cc-butler--butler-claude-md)
+                     ("user-profile.org" . cc-butler--user-profile-template)
+                     ("interview-inventory.org" . cc-butler--interview-inventory-template)))
+      (let ((file (expand-file-name name home)))
+        (unless (file-exists-p file)
+          (write-region (funcall gen) nil file nil 'silent))))
     home))
 
 (defun cc-butler--live-dir-p (dir)

@@ -286,24 +286,43 @@ the cc-butler log."
         cc-butler--inbox)
   (cc-butler--log "%s → butler │ %s" (cc-butler--who-dir dir) (or body "")))
 
+;; The steward is designated in `cc-butler-orchestrator' (loaded after this
+;; file); forward-declare it so the list UI can pin/label it.
+(defvar cc-butler--steward)
+
+(defun cc-butler--role-rank (dir)
+  "Return the pin rank for DIR: butler 0, steward 1, everything else 2."
+  (cond ((and (boundp 'cc-butler--butler) (equal dir cc-butler--butler)) 0)
+        ((and (boundp 'cc-butler--steward) (equal dir cc-butler--steward)) 1)
+        (t 2)))
+
+(defun cc-butler--session-label (dir default)
+  "Return the sidebar label for session DIR.
+The two coordinating roles show as fixed names; everything else uses
+DEFAULT (its title / topic name)."
+  (cond ((eq (cc-butler--role-rank dir) 0) "버틀러")
+        ((eq (cc-butler--role-rank dir) 1) "스튜어드")
+        (t default)))
+
 (defun cc-butler--ordered (sessions)
   "Sort SESSIONS for display.
-The butler session is pinned to the very top.  Then sessions awaiting
-user input (FIFO, oldest request first) form an approval queue, and the
-rest keep their natural order (the sort is stable)."
+The butler is pinned to slot 1 and the steward to slot 2.  Below them,
+sessions awaiting user input form a FIFO approval queue (oldest first),
+and the rest keep their natural order (the sort is stable)."
   (sort (copy-sequence sessions)
         (lambda (a b)
-          (let ((butler-a (equal (plist-get a :dir) cc-butler--butler))
-                (butler-b (equal (plist-get b :dir) cc-butler--butler)))
+          (let ((ra (cc-butler--role-rank (plist-get a :dir)))
+                (rb (cc-butler--role-rank (plist-get b :dir))))
             (cond
-             (butler-a t)
-             (butler-b nil)
-             (t (let ((wa (cc-butler--waiting-p (plist-get a :dir)))
-                      (wb (cc-butler--waiting-p (plist-get b :dir))))
-                  (cond ((and wa wb) (< wa wb))
-                        (wa t)
-                        (wb nil)
-                        (t nil)))))))))
+             ((/= ra rb) (< ra rb))
+             ((= ra 2)
+              (let ((wa (cc-butler--waiting-p (plist-get a :dir)))
+                    (wb (cc-butler--waiting-p (plist-get b :dir))))
+                (cond ((and wa wb) (< wa wb))
+                      (wa t)
+                      (wb nil)
+                      (t nil))))
+             (t nil))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; List UI (multi-line entries in a sticky side window)
@@ -368,13 +387,15 @@ rest keep their natural order (the sort is stable)."
               (forge (plist-get s :forge)))
           (push (cons (plist-get s :dir) start) entries)
           (let* ((d (plist-get s :dir))
-                 (waiting (cc-butler--waiting-p d))
-                 (butler (equal d cc-butler--butler)))
-            (insert (propertize (concat (cond (butler "★ ")
+                 (rank (cc-butler--role-rank d))
+                 (waiting (cc-butler--waiting-p d)))
+            (insert (propertize (concat (cond ((= rank 0) "★ ")   ; butler
+                                              ((= rank 1) "⚙ ")   ; steward
                                               (waiting "⏳ ")
                                               (t "● "))
-                                        title)
-                                'face (cond (butler 'font-lock-keyword-face)
+                                        (cc-butler--session-label d title))
+                                'face (cond ((= rank 0) 'font-lock-keyword-face)
+                                            ((= rank 1) 'font-lock-function-name-face)
                                             (waiting 'warning)
                                             (t 'bold)))
                     "\n"))
