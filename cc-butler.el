@@ -41,6 +41,7 @@
 (require 'cc-butler-doc-panel)
 (require 'cc-butler-docs)
 (require 'cc-butler-persist)
+(require 'cc-butler-mail)
 
 (provide 'cc-butler)
 ;;; cc-butler.el ends here
