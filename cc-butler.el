@@ -40,6 +40,7 @@
 (require 'cc-butler-orchestrator)
 (require 'cc-butler-doc-panel)
 (require 'cc-butler-docs)
+(require 'cc-butler-persist)
 
 (provide 'cc-butler)
 ;;; cc-butler.el ends here
