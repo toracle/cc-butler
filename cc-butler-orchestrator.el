@@ -119,6 +119,93 @@ processed."
     (define-key cc-butler-mode-map "b" #'cc-butler-set-butler)))
 
 ;;;; ------------------------------------------------------------------
+;;;; The butler as a first-class session (home + bootstrap + launch)
+;;;; ------------------------------------------------------------------
+;;
+;; Rather than marking an arbitrary session the butler, the package launches a
+;; dedicated butler session in its own home directory, scaffolding a role
+;; `CLAUDE.md' there on first run.  This makes "start the butler" a one-command
+;; operation for a fresh install.
+
+(defcustom cc-butler-home
+  (expand-file-name "cc-butler" user-emacs-directory)
+  "Working directory the butler session runs in (its home).
+`cc-butler-start-butler' creates it on demand, scaffolding a `.projectile'
+marker and a role `CLAUDE.md'.  Point this at an existing directory (e.g.
+a prior butler home) to reuse its contents."
+  :type 'directory
+  :group 'cc-butler)
+
+(defun cc-butler--butler-claude-md ()
+  "Return the bootstrap CLAUDE.md text describing the butler's role."
+  (concat
+   "# Butler\n\n"
+   "You are the **butler** of a cc-butler fleet: several Claude Code *worker*\n"
+   "sessions run in this Emacs, and you coordinate them on the human's behalf\n"
+   "(who may be driving you from their phone). Emacs is the bus; you reach the\n"
+   "workers through MCP tools.\n\n"
+   "## Each turn\n\n"
+   "1. Call `pending_events` first — it drains what changed (a worker finished,\n"
+   "   asked a question, got blocked) without anything being typed at you.\n"
+   "2. Triage: for anything needing action, `read_session_output` to see a\n"
+   "   worker's screen and `send_to_session` to answer, unblock, or task it.\n"
+   "3. Keep the picture current: `butler_dashboard` (the sessions table is built\n"
+   "   automatically — you supply a short overview and the open decisions), and\n"
+   "   `butler_log` the decisions/progress worth remembering.\n"
+   "4. Relay a concise status up to the human.\n\n"
+   "## Tools\n\n"
+   "- `list_claude_sessions` — the workers, who is WAITING-FOR-INPUT, branches.\n"
+   "- `read_session_output` — a worker's recent terminal screen.\n"
+   "- `send_to_session` — type a prompt into a worker and submit it.\n"
+   "- `pending_events` — drain your inbox of worker events.\n"
+   "- `butler_log` / `butler_dashboard` — your durable log and snapshot, under\n"
+   "  `docs/` in this home.\n\n"
+   "Keep workers moving, surface only what needs the human, and never let the\n"
+   "state of the fleet live only in the chat scrollback.\n"))
+
+(defun cc-butler--ensure-butler-home ()
+  "Create `cc-butler-home' with its markers if missing; return the directory."
+  (let ((home (file-name-as-directory (expand-file-name cc-butler-home))))
+    (make-directory home t)
+    (let ((proj (expand-file-name ".projectile" home))
+          (cmd  (expand-file-name "CLAUDE.md" home)))
+      (unless (file-exists-p proj) (write-region "" nil proj nil 'silent))
+      (unless (file-exists-p cmd)
+        (write-region (cc-butler--butler-claude-md) nil cmd nil 'silent)))
+    home))
+
+(defun cc-butler--live-dir-p (dir)
+  "Return non-nil when a live Claude session runs in DIR."
+  (let ((target (file-name-as-directory (expand-file-name dir))) found)
+    (maphash (lambda (d proc)
+               (when (and (process-live-p proc)
+                          (equal (file-name-as-directory (expand-file-name d))
+                                 target))
+                 (setq found t)))
+             claude-code-ide--processes)
+    found))
+
+;;;###autoload
+(defun cc-butler-start-butler ()
+  "Launch (or focus) the dedicated butler session in `cc-butler-home'.
+Scaffolds the home (`.projectile' + role `CLAUDE.md') on first run,
+designates the session as the butler, and opens the manager.  Idempotent:
+if a butler session is already running there, it is just focused."
+  (interactive)
+  (let ((home (cc-butler--ensure-butler-home)))
+    (if (cc-butler--live-dir-p home)
+        (message "cc-butler: butler already running in %s" home)
+      (let ((default-directory home))
+        (cc-butler--with-channel (claude-code-ide)))
+      (message "cc-butler: started butler in %s" home))
+    (setq cc-butler--butler home)
+    (cc-butler)))
+
+(with-eval-after-load 'cc-butler-session
+  (when (boundp 'cc-butler-mode-map)
+    (define-key cc-butler-mode-map "B" #'cc-butler-start-butler)))
+
+;;;; ------------------------------------------------------------------
 ;;;; Launch a session joined to the cc-butler channel
 ;;;; ------------------------------------------------------------------
 

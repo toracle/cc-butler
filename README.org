@@ -68,6 +68,7 @@ Not on a package archive yet. Clone and put it on your ~load-path~:
 |-------+-----------------------------------------------------|
 | ~n~/~p~   | move + preview a session                            |
 | ~RET~   | select the session's terminal                       |
+| ~B~     | start (or focus) the dedicated butler session       |
 | ~N~     | create a topic workspace                            |
 | ~K~     | close a topic safely (vet → kill → delete)          |
 | ~b~     | designate the session at point as the butler        |
@@ -75,6 +76,14 @@ Not on a package archive yet. Clone and put it on your ~load-path~:
 
 A running Claude drives its own panel and reports to the butler through the MCP
 tools listed above.
+
+** The butler
+
+~M-x cc-butler-start-butler~ (~B~) launches a dedicated *butler* session in
+~cc-butler-home~ (default =~/.emacs.d/cc-butler=), scaffolding a =.projectile=
+marker and a role =CLAUDE.md= there on first run, and designating it the butler.
+Point ~cc-butler-home~ at an existing directory to reuse it. (~b~ still lets you
+mark any session the butler by hand.)
 
 * License
 
