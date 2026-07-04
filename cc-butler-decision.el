@@ -80,6 +80,31 @@ From MSG's explicit :topic, else its normalized summary/body."
            (cc-butler--decision-normalize
             (or (plist-get msg :summary) (plist-get msg :body) "")))))
 
+(defun cc-butler--decision-when (id)
+  "An absolute time string from ID's leading timestamp, or empty."
+  (if (and id (string-match "\\`\\([0-9]\\{4\\}\\)\\([0-9][0-9]\\)\\([0-9][0-9]\\)T\\([0-9][0-9]\\)\\([0-9][0-9]\\)" id))
+      (format "%s-%s-%s %s:%s" (match-string 1 id) (match-string 2 id)
+              (match-string 3 id) (match-string 4 id) (match-string 5 id))
+    ""))
+
+(defun cc-butler--decision-envelope (msg)
+  "An email-style envelope header (From/To/When/Kind/Re) — the provenance graph
+edges made visible at the top of every inbox document."
+  (let ((kind (or (plist-get msg :kind) 'decision))
+        (whenstr (cc-butler--decision-when (plist-get msg :id)))
+        (re (plist-get msg :in-reply-to)))
+    (concat
+     "#+begin_example\n"                     ; a visible, monospace envelope block
+     (format "From: %s\n" (or (plist-get msg :from) "?"))
+     (format "To:   %s\n" cc-butler-human-agent)
+     (if (string-empty-p whenstr) "" (format "When: %s\n" whenstr))
+     (format "Kind: %s%s\n" kind
+             (cond ((eq kind 'decision) " — needs your answer (C-c C-c)")
+                   ((memq kind '(note relay)) " — read (r to close)")
+                   (t "")))
+     (if re (format "Re:   %s — resolve_reference for the original\n" re) "")
+     "#+end_example\n\n")))
+
 (defun cc-butler--decision-doc-string (msg)
   "Return the org document text rendering decision MSG.
 MSG: (:id :kind :from :reply-to :summary :needs :options).  `decision' kind is
@@ -97,6 +122,7 @@ answerable; `note'/`relay' render a read-only notification."
       (if (eq kind 'decision)
           (progn
             (insert (format "#+TITLE: Decision — %s\n\n" first))
+            (insert (cc-butler--decision-envelope msg))
             (insert "* Decision\n" summary "\n")
             (when needs (insert "\nNeeds: " needs "\n"))
             (when from (insert (format "\n_(from %s)_\n" from)))
@@ -117,6 +143,7 @@ answerable; `note'/`relay' render a read-only notification."
             (insert cc-butler--decision-answer-end "\n"))
         ;; note / relay — read-only notification, no answer region
         (insert (format "#+TITLE: Note — %s\n\n" first))
+        (insert (cc-butler--decision-envelope msg))
         (insert "* Notification (read-only)\n" summary "\n")
         (when from (insert (format "\n_(from %s)_\n" from))))
       (insert (format "\n# cc-butler decision id=%s to=%s topic=%s  (routing — do not edit)\n"
@@ -448,13 +475,11 @@ org-edit-special pattern): edit freely — no command-key collisions — then
 
 (defhydra cc-butler-decision-hydra (:color blue :hint nil)
   "
- cc-butler decision:  _r_ead   _c_onfirm/answer   _k_ remove   _n_ext   _p_rev   _g_ reload   _q_ close ⇄ _v_ reopen
+ cc-butler decision (answer-only; move between items in the inbox, i):  _r_ead   _c_ompose/answer   _g_ reload   _q_ close ⇄ _v_ reopen   _k_ remove
 "
   ("r" cc-butler-decision-mark-read)
   ("c" cc-butler-decision-compose)
   ("k" cc-butler-decision-quit)
-  ("n" cc-butler-decision-next :color pink)
-  ("p" cc-butler-decision-prev :color pink)
   ("g" cc-butler-decision-revert)
   ("q" cc-butler-decision-quit)
   ("v" cc-butler-doc-reopen)        ; the close (q) ⇄ reopen (v) pair, discoverable
@@ -468,8 +493,11 @@ org-edit-special pattern): edit freely — no command-key collisions — then
 (define-key cc-butler-decision-mode-map "r" #'cc-butler-decision-mark-read)
 (define-key cc-butler-decision-mode-map "c" #'cc-butler-decision-compose)
 (define-key cc-butler-decision-mode-map "k" #'cc-butler-decision-quit)
-(define-key cc-butler-decision-mode-map "n" #'cc-butler-decision-next)
-(define-key cc-butler-decision-mode-map "p" #'cc-butler-decision-prev)
+;; The reader is ANSWER-ONLY (surface model (b)): n/p move the cursor within the
+;; doc; navigation BETWEEN items is the inbox list's job (i), not the reader's —
+;; this removes the n-leak (in the reader `n' no longer jumps to another doc).
+(define-key cc-butler-decision-mode-map "n" #'next-line)
+(define-key cc-butler-decision-mode-map "p" #'previous-line)
 (define-key cc-butler-decision-mode-map "g" #'cc-butler-decision-revert)
 (define-key cc-butler-decision-mode-map "q" #'cc-butler-decision-quit)
 (define-key cc-butler-decision-mode-map "v" #'cc-butler-doc-reopen)
