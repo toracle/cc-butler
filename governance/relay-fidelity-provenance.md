@@ -35,3 +35,14 @@ Ties to [[butler-institutionalize-learning]] (durable, runtime-neutral home — 
 lives in cc-butler/maildir, not Claude Code memory), [[butler-communication-style]] (RFC-form:
 carry detail/original, don't compress to fragments), [[butler-state-desync]] (anchor in real
 state). A steward duty on every worker dispatch that derives from a user decision.
+
+**From = origin, not the last hop (envelope + bidirectional bus).** The inbox envelope's `From`
+must name the ORIGINAL author, never the last relayer: a worker's own message → From=worker;
+a 정수님 document → From=정수님. The relay-path travels ALONGSIDE in a separate `Via:` field
+(e.g. `Via: steward`) — never clobbering `From`. The inbox is a **bidirectional bus**: decisions
+flow DOWN (to 정수님) and worker deliverables flow UP (to 정수님's inbox as first-class items,
+From=worker) through the same envelope + document-graph. On a DOWN dispatch that enriches a
+정수님-authored decision ("do this, by when"), 정수님's original text travels with it as
+`Re`/appendix (the verbatim reference) so the worker can resolve the exact words. Envelope fields:
+From (origin) · Via (path) · To · When · Kind · Re — origin + relay-path + reference, both
+directions. (See docs/cc-butler-provenance-sdd.md §8.)
