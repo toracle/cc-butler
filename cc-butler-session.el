@@ -404,7 +404,12 @@ and the rest keep their natural order (the sort is stable)."
                                               ((= rank 1) "⚙ ")   ; steward
                                               (waiting "⏳ ")
                                               (t "● "))
-                                        (cc-butler--session-label d title))
+                                        (cc-butler--session-label d title)
+                                        ;; inbox unread badge next to the butler
+                                        (or (and (= rank 0) (fboundp 'cc-butler-inbox-count)
+                                                 (let ((n (cc-butler-inbox-count)))
+                                                   (and (> n 0) (format "  ⚖%d" n))))
+                                            ""))
                                 'face (cond ((= rank 0) 'font-lock-keyword-face)
                                             ((= rank 1) 'font-lock-function-name-face)
                                             (waiting 'warning)

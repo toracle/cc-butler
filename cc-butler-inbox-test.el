@@ -5,6 +5,7 @@
 
 (require 'ert)
 (require 'cc-butler-inbox)
+(require 'cc-butler-decision-test)   ; the --fill helper
 
 (ert-deftest cc-butler-inbox/items-lists-open-queue ()
   "The pending queue lists the OPEN decision/note docs with title + kind +
@@ -69,6 +70,37 @@ Faithful: assert the rendered buffer state."
           (should (string-match-p "0 pending" (buffer-string)))
           (should (string-match-p "empty" (buffer-string))))
       (delete-directory cc-butler-decision-dir t))))
+
+(ert-deftest cc-butler-inbox/sign-and-next-registered-and-guarded ()
+  "Sign & next is registered on submit, and no-ops for non-inbox docs."
+  (should (memq #'cc-butler--inbox-sign-and-next cc-butler-decision-after-submit-functions))
+  (with-temp-buffer
+    (should-not cc-butler--inbox-opened)
+    (cc-butler--inbox-sign-and-next nil)))   ; guarded — no error, no schedule
+
+(ert-deftest cc-butler-inbox/end-to-end-answer-removes-from-queue ()
+  "END TO END: an open decision is in the pending queue; after it is answered it
+LEAVES the queue (archived to done/) — the inbox reflects sign & next."
+  (let ((cc-butler-decision-dir (make-temp-file "cc-e2e" t))
+        (cc-butler-mail-dir (make-temp-file "cc-e2e-mail" t))
+        (cc-butler--channel nil)
+        (cc-butler-human-agent "정수님"))
+    (unwind-protect
+        (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+          (cc-butler--decision-render
+           '(:id "e1" :kind decision :from "steward" :reply-to "steward"
+                 :summary "Ship?" :options ("yes" "no")))
+          (should (= 1 (cc-butler-inbox-count)))
+          (let* ((file (plist-get (car (cc-butler-inbox-items)) :file))
+                 (doc (with-temp-buffer (insert-file-contents file) (buffer-string)))
+                 (create-lockfiles nil) (kill-buffer-query-functions nil))
+            (with-temp-file file (insert (cc-butler-decision-test--fill doc ?A "go")))
+            (let ((buf (find-file-noselect file)))
+              (unwind-protect (with-current-buffer buf (cc-butler-decision-submit))
+                (ignore-errors (kill-buffer buf)))))
+          (should (= 0 (cc-butler-inbox-count))))   ; signed → gone from the queue
+      (delete-directory cc-butler-decision-dir t)
+      (delete-directory cc-butler-mail-dir t))))
 
 (provide 'cc-butler-inbox-test)
 ;;; cc-butler-inbox-test.el ends here

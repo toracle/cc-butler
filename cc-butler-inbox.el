@@ -92,6 +92,9 @@ by the read-receipt `r'.  Reference documents are NOT queued here."
       (cc-butler--inbox-render))
     (pop-to-buffer buf)))
 
+(defvar-local cc-butler--inbox-opened nil
+  "Non-nil in a doc buffer opened from the inbox — drives sign & next.")
+
 (defun cc-butler-inbox-open ()
   "Open the inbox item at point for reading/answering (the reading surface)."
   (interactive)
@@ -99,7 +102,22 @@ by the read-receipt `r'.  Reference documents are NOT queued here."
     (if (not file)
         (message "cc-butler: no inbox item on this line")
       (let ((create-lockfiles nil)) (find-file file))
-      (cc-butler-decision-mode 1))))
+      (cc-butler-decision-mode 1)
+      (setq-local cc-butler--inbox-opened t))))
+
+(defun cc-butler--inbox-sign-and-next (_info)
+  "Sign & next: after answering an inbox-opened decision, drop it from view and
+return to the inbox list (now one fewer) — \"sign, next; sign, next\".  Only
+fires for inbox-opened docs, so other flows (e.g. the demo) are untouched."
+  (when cc-butler--inbox-opened
+    (let ((buf (current-buffer)) (kill-buffer-query-functions nil))
+      (run-at-time
+       0 nil
+       (lambda ()
+         (when (buffer-live-p buf) (ignore-errors (kill-buffer buf)))
+         (cc-butler-inbox))))))
+
+(add-hook 'cc-butler-decision-after-submit-functions #'cc-butler--inbox-sign-and-next)
 
 (with-eval-after-load 'cc-butler-session
   (when (boundp 'cc-butler-mode-map)
