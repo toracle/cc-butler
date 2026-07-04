@@ -133,5 +133,45 @@ and moves the file open/ → done/."
              '(:id "n1" :kind note :from "steward" :summary "CI green")))
     (should-error (cc-butler-decision-submit) :type 'user-error)))
 
+;;;; ---- arrival-render layer (Emacs-native, arrival-driven) ---------
+
+(defmacro cc-butler-decision-test--with-arrival (&rest body)
+  "Fresh temp mail + decision dirs, file adapter, no auto-display."
+  (declare (indent 0))
+  `(let* ((cc-butler-mail-dir (make-temp-file "cc-butler-arr-mail" t))
+          (cc-butler-decision-dir (make-temp-file "cc-butler-arr-dec" t))
+          (cc-butler--channel nil)                 ; real file adapter
+          (cc-butler-human-agent "정수님")
+          (cc-butler-decision-auto-display nil)
+          (cc-butler--decision-indicator ""))
+     (unwind-protect (progn ,@body)
+       (delete-directory cc-butler-mail-dir t)
+       (delete-directory cc-butler-decision-dir t))))
+
+(ert-deftest cc-butler-decision/arrival-renders-and-indicates ()
+  "A decision ARRIVING in 정수님's inbox renders to open/ and sets the mode-line
+indicator — driven by arrival, with no agent turn involved."
+  (cc-butler-decision-test--with-arrival
+    (cc-butler--mail-file-deliver
+     "정수님" '(:id "d9" :kind decision :from "worker-a" :reply-to "worker-a"
+                 :summary "ship it?" :options ("yes" "no")))
+    (let ((n (cc-butler--decision-on-arrival)))     ; the watcher's callback, called directly
+      (should (= 1 n))
+      (should (= 1 (length (directory-files (cc-butler--decision-open-dir) nil "\\.org\\'"))))
+      (should (= 0 (length (directory-files (cc-butler--decision-done-dir) nil "\\.org\\'"))))
+      (should (equal " ⚖1" cc-butler--decision-indicator)))))
+
+(ert-deftest cc-butler-decision/arrival-note-not-queued ()
+  "A note arrival renders read-only to done/, never the answer queue, and leaves
+the indicator clear."
+  (cc-butler-decision-test--with-arrival
+    (cc-butler--mail-file-deliver
+     "정수님" '(:id "n9" :kind note :from "steward" :summary "CI is green"))
+    (let ((n (cc-butler--decision-on-arrival)))
+      (should (= 0 n))
+      (should (= 0 (length (directory-files (cc-butler--decision-open-dir) nil "\\.org\\'"))))
+      (should (= 1 (length (directory-files (cc-butler--decision-done-dir) nil "\\.org\\'"))))
+      (should (equal "" cc-butler--decision-indicator)))))
+
 (provide 'cc-butler-decision-test)
 ;;; cc-butler-decision-test.el ends here

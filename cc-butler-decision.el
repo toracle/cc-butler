@@ -106,11 +106,12 @@ answerable; `note'/`relay' render a read-only notification."
                       id to))
       (buffer-string))))
 
-(defun cc-butler--decision-render (msg)
-  "Render decision MSG to a timestamped file in open/; return the file path."
+(defun cc-butler--decision-render (msg &optional dir)
+  "Render decision MSG to a timestamped file in DIR (default open/); return the path."
   (let* ((id (or (plist-get msg :id) (cc-butler--mail-id)))
          (msg (plist-put msg :id id))
-         (file (expand-file-name (format "%s.org" id) (cc-butler--decision-open-dir))))
+         (file (expand-file-name (format "%s.org" id)
+                                 (or dir (cc-butler--decision-open-dir)))))
     (with-temp-file file (insert (cc-butler--decision-doc-string msg)))
     file))
 
@@ -236,6 +237,105 @@ answer region is editable and parsed."
   :keymap cc-butler-decision-mode-map
   (when cc-butler-decision-mode
     (cc-butler--decision-protect)))
+
+;;;; ------------------------------------------------------------------
+;;;; Arrival-render layer — Emacs-native, arrival-driven (not agent-turn)
+;;;; ------------------------------------------------------------------
+;;
+;; The render half of the human adapter belongs to Emacs, not the butler
+;; agent: a decision must be surfaced the moment it ARRIVES in 정수님's inbox,
+;; not when the butler agent next takes a conversational turn.  A file-watcher
+;; on the inbox renders the doc + sets a mode-line indicator (and gently shows
+;; the panel) with no agent turn and nothing typed into any input box.  The
+;; conversation half (answering, C-c C-c) stays 정수님-driven.
+
+(require 'filenotify)
+
+(defcustom cc-butler-decision-auto-display t
+  "When non-nil, a freshly-arrived decision is shown in a side window.
+Uses `display-buffer' (no focus stealing); the mode-line indicator fires
+regardless."
+  :type 'boolean
+  :group 'cc-butler)
+
+(defvar cc-butler--decision-indicator ""
+  "Mode-line indicator string for open decisions (in `global-mode-string').")
+(put 'cc-butler--decision-indicator 'risky-local-variable t)
+
+(defvar cc-butler--decision-watch nil
+  "The `file-notify' descriptor for 정수님's inbox, or nil.")
+
+(defun cc-butler--decision-open-count ()
+  (length (ignore-errors
+            (directory-files (cc-butler--decision-open-dir) nil "\\.org\\'"))))
+
+(defun cc-butler--decision-update-indicator ()
+  "Set the mode-line indicator to the open-decision count; return it."
+  (let ((n (cc-butler--decision-open-count)))
+    (setq cc-butler--decision-indicator (if (> n 0) (format " ⚖%d" n) ""))
+    (force-mode-line-update t)
+    n))
+
+(defun cc-butler--decision-display (file)
+  "Show decision FILE in a side window without stealing focus."
+  (let ((buf (find-file-noselect file)))
+    (with-current-buffer buf (cc-butler-decision-mode 1))
+    (display-buffer buf '(display-buffer-in-side-window (side . right)))))
+
+(defun cc-butler--decision-on-arrival ()
+  "Render newly-arrived inbox messages and refresh the indicator.
+Arrival-driven: this runs on an inbox change, independent of any agent turn.
+`decision' messages render into open/ (the answer queue); `note'/`relay'
+render read-only straight to done/.  Returns the count of new decisions."
+  (let ((msgs (cc-butler--ch-drain cc-butler-human-agent))
+        (fresh '()))
+    (dolist (m msgs)
+      (let ((decision (eq (or (plist-get m :kind) 'decision) 'decision)))
+        (let ((file (cc-butler--decision-render
+                     m (if decision (cc-butler--decision-open-dir)
+                         (cc-butler--decision-done-dir)))))
+          (when decision (push file fresh)))))
+    (cc-butler--decision-update-indicator)
+    (when (and fresh cc-butler-decision-auto-display)
+      (cc-butler--decision-display (car (last fresh))))
+    (length fresh)))
+
+(defun cc-butler-decision-watch-start ()
+  "Watch 정수님's inbox and render on arrival (Emacs-native, no agent turn)."
+  (cc-butler-decision-watch-stop)
+  (let ((newdir (expand-file-name "new/" (cc-butler--mail-inbox cc-butler-human-agent))))
+    (make-directory newdir t)
+    (setq cc-butler--decision-watch
+          (file-notify-add-watch
+           newdir '(change)
+           (lambda (event)
+             (when (memq (nth 1 event) '(created renamed))
+               (cc-butler--decision-on-arrival))))))
+  (add-to-list 'global-mode-string 'cc-butler--decision-indicator t)
+  (cc-butler--decision-update-indicator))
+
+(defun cc-butler-decision-watch-stop ()
+  "Stop watching 정수님's inbox and clear the indicator."
+  (when cc-butler--decision-watch
+    (ignore-errors (file-notify-rm-watch cc-butler--decision-watch))
+    (setq cc-butler--decision-watch nil))
+  (setq global-mode-string (delq 'cc-butler--decision-indicator global-mode-string))
+  (force-mode-line-update t))
+
+;;;###autoload
+(defun cc-butler-decision-workflow-toggle (&optional arg)
+  "Toggle the arrival-driven decision workflow (render + indicator).
+With ARG, enable if positive.  Reversible; touches no worker and types
+nothing into any input box."
+  (interactive "P")
+  (setq cc-butler-decision-workflow
+        (if arg (> (prefix-numeric-value arg) 0)
+          (not cc-butler-decision-workflow)))
+  (if cc-butler-decision-workflow
+      (progn (cc-butler-decision-watch-start)
+             (message "cc-butler decision workflow: ON (arrival-driven render + indicator)"))
+    (cc-butler-decision-watch-stop)
+    (message "cc-butler decision workflow: OFF")))
 
 ;;;###autoload
 (defun cc-butler-decision-answer-next ()
