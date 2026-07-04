@@ -85,5 +85,32 @@ mode-line shows a clean read-only doc, not a stray `*'."
               (kill-buffer buf))))
       (delete-file tmp))))
 
+(ert-deftest cc-butler-doc/remove-keeps-panel-on-neighbor ()
+  "④ edge-grace: removing a document keeps the panel OPEN on a neighbour (a live
+current buffer); removing the LAST closes it (open nil) — never a silent dangle."
+  (let ((tmp1 (make-temp-file "cc-d1" nil ".org"))
+        (tmp2 (make-temp-file "cc-d2" nil ".org"))
+        (cc-butler--docs (make-hash-table :test 'equal))
+        (kill-buffer-query-functions nil))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp1 (insert "* a\n")) (with-temp-file tmp2 (insert "* b\n"))
+          (cc-butler--doc-add "/s/" 'file tmp1)
+          (cc-butler--doc-add "/s/" 'file tmp2)
+          ;; remove the current (tmp2) → tmp1 remains, panel stays open on a live buf
+          (cc-butler--doc-remove-buffer "/s/" (cc-butler--current-doc-buffer "/s/"))
+          (let ((st (cc-butler--doc-state "/s/")))
+            (should (= 1 (length (plist-get st :items))))
+            (should (plist-get st :open))
+            (should (buffer-live-p (cc-butler--current-doc-buffer "/s/"))))
+          ;; remove the last → panel closes cleanly (open nil), not left dangling
+          (cc-butler--doc-remove-buffer "/s/" (cc-butler--current-doc-buffer "/s/"))
+          (should-not (plist-get (cc-butler--doc-state "/s/") :open))
+          (should-not (plist-get (cc-butler--doc-state "/s/") :items)))
+      (dolist (f (list tmp1 tmp2))
+        (dolist (b (buffer-list))
+          (when (equal (buffer-file-name b) (expand-file-name f)) (kill-buffer b)))
+        (ignore-errors (delete-file f))))))
+
 (provide 'cc-butler-doc-panel-test)
 ;;; cc-butler-doc-panel-test.el ends here

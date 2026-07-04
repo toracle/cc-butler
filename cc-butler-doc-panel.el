@@ -374,7 +374,14 @@ rather than duplicated."
       (unless items (setq state (plist-put state :open nil)))
       (puthash dir state cc-butler--docs)
       (cc-butler--doc-refresh-layout dir)
-      (message "cc-butler doc: removed %s" (plist-get doc :label)))))
+      ;; Edge-grace (guarantee 1/6): removing a doc stays on a neighbour; removing
+      ;; the LAST closes the panel, but say so clearly — never a silent vanish.
+      (if items
+          (message "cc-butler doc: removed %s (now showing %s)"
+                   (plist-get doc :label)
+                   (plist-get (cc-butler--current-doc dir) :label))
+        (message "cc-butler doc: removed %s — no documents left; panel closed (reopen with v)"
+                 (plist-get doc :label))))))
 
 (defun cc-butler--doc-tab-close (tab &optional _)
   "`tab-line-close-tab-function': remove the clicked document TAB (a buffer)."

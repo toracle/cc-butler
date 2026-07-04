@@ -403,6 +403,18 @@ outside, in the read-only decision text, they remain commands."
       ;; outside the region, the letters are commands
       (should (eq #'cc-butler-decision-quit (key-binding "k" nil nil (point-min)))))))
 
+(ert-deftest cc-butler-decision/mode-line-signals-mode ()
+  "Guarantee 7 visibility: the lighter shows compose when point is in the answer
+region, command otherwise — so the current mode is always visible."
+  (with-temp-buffer
+    (insert (cc-butler--decision-doc-string cc-butler-decision-test--msg))
+    (cc-butler-decision-mode 1)
+    (let ((b (cc-butler--decision-answer-bounds)))
+      (goto-char (car b))
+      (should (string-match-p "compose" (cc-butler--decision-mode-lighter)))
+      (goto-char (point-min))
+      (should (string-match-p "cmd" (cc-butler--decision-mode-lighter))))))
+
 ;;;; ---- demo (staged, isolated, reversible) -------------------------
 
 (ert-deftest cc-butler-decision/demo-roundtrip ()

@@ -428,13 +428,24 @@ bare command letters TYPE inside it (compose safety — a data-loss guard)."
                                (list 'keymap cc-butler--decision-compose-map)))
       (add-text-properties (point-min) (point-max) '(read-only t)))))
 
+(defun cc-butler--decision-in-compose-p ()
+  "Non-nil when point is inside the editable answer region (compose mode)."
+  (let ((b (cc-butler--decision-answer-bounds)))
+    (and b (>= (point) (car b)) (< (point) (cdr b)))))
+
+(defun cc-butler--decision-mode-lighter ()
+  "Mode-line signal (guarantee 7): show whether keys TYPE or ACT right now."
+  (if (cc-butler--decision-in-compose-p) " ✎compose" " ⌘cmd"))
+
 ;;;###autoload
 (define-minor-mode cc-butler-decision-mode
   "Answer a cc-butler decision document: pick an option and/or write Other,
 then \\[cc-butler-decision-submit].  Keeps org-mode (highlighting); the
 decision text, option labels, and routing footer are read-only — only the
-answer region is editable and parsed."
-  :lighter " ccDecide"
+answer region is editable and parsed.  The mode-line shows the current mode —
+`⌘cmd' (bare keys act) vs `✎compose' (keys type) — so a keystroke is never a
+surprise."
+  :lighter (:eval (cc-butler--decision-mode-lighter))
   :keymap cc-butler-decision-mode-map
   (when cc-butler-decision-mode
     (cc-butler--decision-protect)))
