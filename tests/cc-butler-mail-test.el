@@ -221,5 +221,22 @@ queue and the durable maildir inbox — proving rollback."
         (should cc-butler--inbox)
         (should (null (cc-butler--ch-drain "steward")))))))
 
+(ert-deftest cc-butler-mail/rearm-all-targets ()
+  "cc-butler-rearm-all re-arms ALL sessions (scope `all') or skips the butler and
+steward (scope `workers').  Faithful: assert which dirs actually got re-armed."
+  (let ((armed '()))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () '((:dir "butler") (:dir "steward") (:dir "worker-a") (:dir "worker-b"))))
+              ((symbol-function 'cc-butler--rearm)
+               (lambda (dir) (push dir armed) t))
+              ((symbol-function 'cc-butler--role-rank)
+               (lambda (dir) (cond ((equal dir "butler") 0) ((equal dir "steward") 1) (t 9)))))
+      (setq armed nil)
+      (cc-butler-rearm-all 'all)
+      (should (= 4 (length armed)))
+      (setq armed nil)
+      (cc-butler-rearm-all 'workers)
+      (should (equal (sort (copy-sequence armed) #'string<) '("worker-a" "worker-b"))))))
+
 (provide 'cc-butler-mail-test)
 ;;; cc-butler-mail-test.el ends here
