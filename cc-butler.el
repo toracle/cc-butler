@@ -1,5 +1,8 @@
 ;;; cc-butler.el --- Manage & orchestrate multiple Claude Code sessions  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; Author: Jeongsoo Park <jeongsoo@warmblood.kr>
 ;; Maintainer: Jeongsoo Park <jeongsoo@warmblood.kr>
 ;; Version: 0.1.0

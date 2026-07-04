@@ -1,5 +1,8 @@
 ;;; cc-butler-mail-test.el --- BDD acceptance tests for the message channel  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; Acceptance oracle for `cc-butler-mail'.  The routing scenarios run against an
 ;; in-memory MOCK channel (no real Emacs sessions or files needed — ports &
 ;; adapters), and the transport-level guarantees (atomicity) plus a delivery +

@@ -1,5 +1,8 @@
 ;;; cc-butler-decision-test.el --- BDD tests for the human decision adapter  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; Acceptance oracle for `cc-butler-decision' (the human adapter of maildir B).
 ;; Routing runs against B's in-memory MOCK channel (reused from
 ;; cc-butler-mail-test); rendering/parse/integrity are pure buffer operations.

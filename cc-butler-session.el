@@ -1,5 +1,8 @@
 ;;; cc-butler-session.el --- Claude Code Session Manager (cc-butler)  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; A lightweight, cmux-like session manager for `claude-code-ide':
 ;;
 ;;  - A sticky left-hand list of live Claude sessions, each rendered as a

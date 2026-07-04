@@ -1,5 +1,8 @@
 ;;; cc-butler-notifications.el --- Claude session notification events  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; Claude Code raises a terminal notification (OSC 9 / OSC 777) when its agent
 ;; loop ends or it needs you (a question, a permission prompt, "done").  In a
 ;; local GUI terminal that becomes a system-tray notification; ghostel already

@@ -1,5 +1,8 @@
 ;;; cc-butler-docs.el --- Butler self-document repository for cc-butler  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; The butler is where every worker session's work converges — but that
 ;; convergence currently happens only in a chat stream that scrolls away, so
 ;; the actual state of the world is hard to grasp.  This module gives the

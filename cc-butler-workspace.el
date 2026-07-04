@@ -1,5 +1,8 @@
 ;;; cc-butler-workspace.el --- Topic workspace scaffolding for cc-butler  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; Create a "topic workspace" for a known project and drop straight into a
 ;; Claude session there.  A topic workspace is a plain (non-git) directory
 ;; that holds one or more checked-out repos plus two markers:

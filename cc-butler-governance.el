@@ -1,5 +1,8 @@
 ;;; cc-butler-governance.el --- runtime-neutral operating-principles store  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; The butler/steward operating principles live in a repo-owned, runtime-neutral
 ;; store (governance/, one file per principle) — the single source of truth.
 ;; Runtime files (Claude Code role CLAUDE.md + memory notes, a future Codex

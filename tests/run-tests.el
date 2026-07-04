@@ -1,5 +1,8 @@
 ;;; run-tests.el --- run the cc-butler ERT suite  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; Usage:  emacs -Q --batch -l tests/run-tests.el
 ;;
 ;; Puts the package root (the modules) and this tests/ dir (cross-test helpers)

@@ -1,5 +1,8 @@
 ;;; cc-butler-inbox-test.el --- tests for the inbox pending queue  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;;   emacs -Q --batch -L . -l ert -l cc-butler-inbox-test.el \
 ;;     -f ert-run-tests-batch-and-exit
 

@@ -1,5 +1,8 @@
 ;;; cc-butler-mail.el --- Minimal durable inter-agent message channel  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; A small, reliable message bus for cc-butler agents — the first iteration
 ;; toward the full maildir design, built test-first.  It fixes two channel bugs:
 ;;

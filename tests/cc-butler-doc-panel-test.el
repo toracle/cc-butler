@@ -1,5 +1,8 @@
 ;;; cc-butler-doc-panel-test.el --- tests for the doc panel  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;;   emacs -Q --batch -L . -l ert -l cc-butler-doc-panel-test.el \
 ;;     -f ert-run-tests-batch-and-exit
 

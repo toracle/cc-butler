@@ -1,5 +1,8 @@
 ;;; cc-butler-orchestrator.el --- Butler/worker orchestration for cc-butler  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; Turns the session manager into a control plane: a designated *butler*
 ;; Claude session drives the *worker* sessions through Emacs.  Emacs is the
 ;; bus — workers are reached through their ghostel shells.

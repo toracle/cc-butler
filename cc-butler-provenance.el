@@ -1,5 +1,8 @@
 ;;; cc-butler-provenance.el --- relay fidelity: verbatim + resolvable refs  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; Provenance layer (SDD: docs/cc-butler-provenance-sdd.md).  A relay must not
 ;; degrade 정수님's words into a summary of a summary.  Every dispatch carries a
 ;; DIGEST (act on this) plus a RESOLVABLE REFERENCE to the verbatim original

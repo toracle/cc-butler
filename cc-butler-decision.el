@@ -1,5 +1,8 @@
 ;;; cc-butler-decision.el --- Human adapter: decision documents  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; The HUMAN adapter of the cc-butler message bus (maildir B).  Where an agent
 ;; drains its inbox programmatically (`check_inbox' / `pending_*'), the human
 ;; (정수님) reads and answers.  This module renders a `decision' message as an

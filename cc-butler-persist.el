@@ -1,5 +1,8 @@
 ;;; cc-butler-persist.el --- Persist the session roster for crash recovery  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; Claude Code sessions live only in the running Emacs: if the daemon dies (for
 ;; example under mosh, when a disconnected client stops draining a pipe and the
 ;; daemon blocks on a write), the whole fleet is lost.  This module keeps a

@@ -1,5 +1,8 @@
 ;;; cc-butler-inbox.el --- 정수님's inbox: the pending queue (Option C)  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; The inbox is the *pending queue* half of the documents↔inbox coexistence
 ;; model (Option C, docs/cc-butler-inbox-vs-documents-ux.md): a browsable index
 ;; of the push/transient items 정수님 must attend to — the open decision and note

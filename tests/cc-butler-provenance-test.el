@@ -1,5 +1,8 @@
 ;;; cc-butler-provenance-test.el --- tests for the provenance layer  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 (require 'ert)
 (require 'cc-butler-provenance)
 

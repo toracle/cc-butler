@@ -1,5 +1,8 @@
 ;;; cc-butler-session-test.el --- tests for session launch config  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;;   emacs -Q --batch -L . -l ert -l cc-butler-session-test.el \
 ;;     -f ert-run-tests-batch-and-exit
 

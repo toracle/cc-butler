@@ -1,5 +1,8 @@
 ;;; cc-butler-doc-panel.el --- Per-session document panel for cc-butler  -*- lexical-binding: t; -*-
 
+;; Copyright (C) 2026 Jeongsoo Park
+;; SPDX-License-Identifier: MIT
+
 ;; A Claude Code session is a stream of TUI output that scrolls away — hard to
 ;; refer back to, and poor for holding the *context* a task needs (the PR under
 ;; review, the issue it closes, the CI run that just failed, a design doc).
