@@ -112,8 +112,8 @@ and moves the file open/ → done/."
             (should (string-match-p "Stripe" (plist-get r :body)))
             (should (string-match-p "sandbox" (plist-get r :body))))
           ;; the file moved open/ → done/
-          (should (null (directory-files (cc-butler--decision-open-dir) nil "\\.org\\'")))
-          (should (= 1 (length (directory-files (cc-butler--decision-done-dir) nil "\\.org\\'")))))
+          (should (null (directory-files (cc-butler--decision-open-dir) nil "\\`[^.].*\\.org\\'")))
+          (should (= 1 (length (directory-files (cc-butler--decision-done-dir) nil "\\`[^.].*\\.org\\'")))))
       (delete-directory cc-butler-decision-dir t))))
 
 (ert-deftest cc-butler-decision/submit-refuses-empty ()
@@ -157,8 +157,8 @@ indicator — driven by arrival, with no agent turn involved."
                  :summary "ship it?" :options ("yes" "no")))
     (let ((n (cc-butler--decision-on-arrival)))     ; the watcher's callback, called directly
       (should (= 1 n))
-      (should (= 1 (length (directory-files (cc-butler--decision-open-dir) nil "\\.org\\'"))))
-      (should (= 0 (length (directory-files (cc-butler--decision-done-dir) nil "\\.org\\'"))))
+      (should (= 1 (length (directory-files (cc-butler--decision-open-dir) nil "\\`[^.].*\\.org\\'"))))
+      (should (= 0 (length (directory-files (cc-butler--decision-done-dir) nil "\\`[^.].*\\.org\\'"))))
       (should (equal " ⚖1" cc-butler--decision-indicator)))))
 
 (ert-deftest cc-butler-decision/arrival-note-not-queued ()
@@ -169,9 +169,43 @@ the indicator clear."
      "정수님" '(:id "n9" :kind note :from "steward" :summary "CI is green"))
     (let ((n (cc-butler--decision-on-arrival)))
       (should (= 0 n))
-      (should (= 0 (length (directory-files (cc-butler--decision-open-dir) nil "\\.org\\'"))))
-      (should (= 1 (length (directory-files (cc-butler--decision-done-dir) nil "\\.org\\'"))))
+      (should (= 0 (length (directory-files (cc-butler--decision-open-dir) nil "\\`[^.].*\\.org\\'"))))
+      (should (= 1 (length (directory-files (cc-butler--decision-done-dir) nil "\\`[^.].*\\.org\\'"))))
       (should (equal "" cc-butler--decision-indicator)))))
+
+;;;; ---- demo (staged, isolated, reversible) -------------------------
+
+(ert-deftest cc-butler-decision/demo-roundtrip ()
+  "The staged demo renders a decision + indicator; submitting routes the answer
+and auto-restores every setting (nothing leaks)."
+  (let ((orig-mail cc-butler-mail-dir)
+        (orig-dec cc-butler-decision-dir)
+        (orig-human cc-butler-human-agent)
+        (cc-butler-message-transport 'in-memory)
+        (cc-butler--decision-watch nil)
+        (cc-butler--channel nil)
+        (cc-butler-decision-auto-display nil))   ; no side-window in batch
+    (unwind-protect
+        (progn
+          (cc-butler-decision-demo)
+          (should cc-butler--decision-demo-state)
+          (should (= 1 (length (directory-files (cc-butler--decision-open-dir) nil "\\`[^.].*\\.org\\'"))))
+          (should (string-match-p "⚖1" cc-butler--decision-indicator))
+          (let* ((file (car (directory-files (cc-butler--decision-open-dir) t "\\`[^.].*\\.org\\'")))
+                 (doc (with-temp-buffer (insert-file-contents file) (buffer-string))))
+            (with-temp-file file
+              (insert (cc-butler-decision-test--fill doc ?A "sandbox")))
+            (let ((buf (find-file-noselect file)))
+              (unwind-protect (with-current-buffer buf (cc-butler-decision-submit))
+                (kill-buffer buf))))
+          ;; the after-submit hook fired demo-result → demo-end restored settings
+          (should (null cc-butler--decision-demo-state))
+          (should (equal orig-mail cc-butler-mail-dir))
+          (should (equal orig-dec cc-butler-decision-dir)))
+      (when cc-butler--decision-demo-state (cc-butler-decision-demo-end))
+      (setq cc-butler-mail-dir orig-mail
+            cc-butler-decision-dir orig-dec
+            cc-butler-human-agent orig-human))))
 
 (provide 'cc-butler-decision-test)
 ;;; cc-butler-decision-test.el ends here

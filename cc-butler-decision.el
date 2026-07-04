@@ -47,6 +47,10 @@ A reversible toggle, independent of `cc-butler-message-transport'."
   "# <<< end answer <<<"
   "Marker line closing the editable answer region.")
 
+(defvar cc-butler-decision-after-submit-functions nil
+  "Abnormal hook run after a decision is submitted.
+Each function is called with one plist argument (:to :id :answer).")
+
 ;;;; ------------------------------------------------------------------
 ;;;; Rendering a message → an org document
 ;;;; ------------------------------------------------------------------
@@ -205,6 +209,8 @@ moves the file to done/."
             (rename-file file dest t)
             (set-visited-file-name dest nil t)))
         (set-buffer-modified-p nil))
+      (run-hook-with-args 'cc-butler-decision-after-submit-functions
+                          (list :to to :id id :answer answer))
       (message "cc-butler: answer sent to %s; decision archived to done/" to)
       answer)))
 
@@ -265,9 +271,13 @@ regardless."
 (defvar cc-butler--decision-watch nil
   "The `file-notify' descriptor for 정수님's inbox, or nil.")
 
+(defconst cc-butler--decision-org-re "\\`[^.].*\\.org\\'"
+  "Match decision .org files, excluding dotfiles like lock files (.#foo.org).")
+
 (defun cc-butler--decision-open-count ()
   (length (ignore-errors
-            (directory-files (cc-butler--decision-open-dir) nil "\\.org\\'"))))
+            (directory-files (cc-butler--decision-open-dir) nil
+                             cc-butler--decision-org-re))))
 
 (defun cc-butler--decision-update-indicator ()
   "Set the mode-line indicator to the open-decision count; return it."
@@ -278,7 +288,8 @@ regardless."
 
 (defun cc-butler--decision-display (file)
   "Show decision FILE in a side window without stealing focus."
-  (let ((buf (find-file-noselect file)))
+  (let* ((create-lockfiles nil)
+         (buf (find-file-noselect file)))
     (with-current-buffer buf (cc-butler-decision-mode 1))
     (display-buffer buf '(display-buffer-in-side-window (side . right)))))
 
@@ -344,14 +355,108 @@ Renders any freshly-arrived decisions from the human inbox first."
   (interactive)
   (cc-butler-decision-refresh)
   (let* ((open (cc-butler--decision-open-dir))
-         (files (sort (directory-files open t "\\.org\\'") #'string<)))
+         (files (sort (directory-files open t cc-butler--decision-org-re) #'string<)))
     (if (null files)
         (message "cc-butler: no open decisions.")
-      (find-file (car files))
+      (let ((create-lockfiles nil)) (find-file (car files)))
       (cc-butler-decision-mode 1)
       (goto-char (point-min))
       (when (search-forward cc-butler--decision-answer-begin nil t)
         (forward-line 1)))))
+
+;;;; ------------------------------------------------------------------
+;;;; Demo — a self-contained, reversible walkthrough of the whole flow
+;;;; ------------------------------------------------------------------
+;;
+;; `cc-butler-decision-demo' stages the full flow (arrival → indicator →
+;; render → tick → C-c C-c → routing) in isolated temp directories with no
+;; live wiring: it flips nothing permanent, touches no worker, and restores
+;; every setting on exit (`cc-butler-decision-demo-end', run automatically
+;; after you submit).  Meant to let 정수님 feel the UX before we wire it live.
+
+(defvar cc-butler--decision-demo-state nil
+  "Saved (mail-dir decision-dir human-agent) while a demo is staged.")
+
+(defun cc-butler-decision-demo-end ()
+  "End the staged demo: delete temp dirs, remove the hook, restore settings."
+  (interactive)
+  (remove-hook 'cc-butler-decision-after-submit-functions
+               #'cc-butler--decision-demo-result)
+  (when cc-butler--decision-demo-state
+    (ignore-errors (delete-directory cc-butler-mail-dir t))
+    (ignore-errors (delete-directory cc-butler-decision-dir t))
+    (setq cc-butler-mail-dir (nth 0 cc-butler--decision-demo-state)
+          cc-butler-decision-dir (nth 1 cc-butler--decision-demo-state)
+          cc-butler-human-agent (nth 2 cc-butler--decision-demo-state)
+          cc-butler--decision-demo-state nil))
+  (cc-butler--decision-update-indicator))
+
+(defun cc-butler--decision-demo-result (info)
+  "Show the routed demo answer (INFO plist) in the demo buffer, then clean up."
+  (let ((to (plist-get info :to)))
+    (with-current-buffer (get-buffer-create "*cc-butler-decision-demo*")
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert (format "\n✓ answer routed to %s (in-reply-to %s):\n    %s\n"
+                        to (plist-get info :id) (plist-get info :answer)))
+        (let ((delivered (car (cc-butler--ch-drain to))))
+          (insert (format "  → landed in %s's inbox as: kind=%s in-reply-to=%s\n"
+                          to (plist-get delivered :kind)
+                          (plist-get delivered :in-reply-to))))
+        (insert "  → decision file moved open/ → done/ (audit trail)\n"
+                "\nDemo complete; temp state cleaned up. Replay: M-x cc-butler-decision-demo\n"))))
+  (cc-butler-decision-demo-end))
+
+;;;###autoload
+(defun cc-butler-decision-demo ()
+  "Stage an isolated, reversible walkthrough of the decision workflow.
+Delivers a sample decision (and a note) into a throwaway inbox, renders it
+arrival-driven, and opens it for you to answer with C-c C-c.  Nothing live is
+touched; end early with `cc-butler-decision-demo-end'."
+  (interactive)
+  (when (or (eq cc-butler-message-transport 'maildir) cc-butler--decision-watch)
+    (user-error "Run the demo with B flag-off and the decision watcher stopped (to stay isolated)"))
+  (when cc-butler--decision-demo-state (cc-butler-decision-demo-end))
+  (setq cc-butler--decision-demo-state
+        (list cc-butler-mail-dir cc-butler-decision-dir cc-butler-human-agent)
+        cc-butler-mail-dir (file-name-as-directory (make-temp-file "cc-butler-demo-mail" t))
+        cc-butler-decision-dir (file-name-as-directory (make-temp-file "cc-butler-demo-dec" t)))
+  (add-hook 'cc-butler-decision-after-submit-functions #'cc-butler--decision-demo-result)
+  (cc-butler--mail-file-deliver
+   cc-butler-human-agent
+   (list :id "demo-1" :kind 'decision :from "monocle-billing" :reply-to "monocle-billing"
+         :summary "Which billing provider for the SaaS?"
+         :needs "pick one; we can start in sandbox"
+         :options '((:label "Stripe" :tradeoff "lower fees, great API")
+                    (:label "Paddle" :tradeoff "merchant-of-record, handles VAT")
+                    (:label "other"))))
+  (cc-butler--mail-file-deliver
+   cc-butler-human-agent
+   (list :id "demo-note" :kind 'note :from "steward" :summary "FYI: CI is green on main."))
+  (cc-butler--decision-on-arrival)             ; arrival-driven render + indicator + display
+  (with-current-buffer (get-buffer-create "*cc-butler-decision-demo*")
+    (erase-buffer)
+    (insert "cc-butler decision workflow — DEMO  (isolated · reversible · nothing live)\n"
+            "========================================================================\n\n"
+            "1. ARRIVAL → RENDER → INDICATOR (Emacs-native, no agent turn):\n"
+            "   A decision just 'arrived' in your inbox and was rendered automatically.\n"
+            (format "   Mode-line now shows:  %s   (⚖N = N open decisions)\n"
+                    (string-trim cc-butler--decision-indicator))
+            "   The decision opened in a side window — org highlighting, and read-only\n"
+            "   everywhere except the answer region (the integrity guarantee).\n"
+            "   (The `note' message did NOT queue — it went straight to done/.)\n\n"
+            "2. ANSWER (your turn — the conversation half):\n"
+            "   In the decision buffer:\n"
+            "     a. tick an option:  - [ ] A   →   - [X] A\n"
+            "     b. optionally type after `Other:'\n"
+            "     c. press  C-c C-c\n\n"
+            "3. ROUTING: your answer returns to the asking session (monocle-billing)\n"
+            "   via the maildir correlation, and the file moves open/ → done/.\n\n"
+            "   End anytime:  M-x cc-butler-decision-demo-end\n"
+            "   ------------------------------------------------------------------\n")
+    (setq buffer-read-only t)
+    (display-buffer (current-buffer)))
+  (message "cc-butler demo staged — tick an option and press C-c C-c in the decision buffer."))
 
 (provide 'cc-butler-decision)
 ;;; cc-butler-decision.el ends here
