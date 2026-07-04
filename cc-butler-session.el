@@ -560,6 +560,51 @@ first."
                    (ignore-errors (ghostel--adjust-size window))
                  (setq-default window-adjust-process-window-size-function orig))))))))))
 
+(defun cc-butler--fit-pty-largest (window)
+  "Size the current ghostel buffer's PTY to WINDOW under the -largest policy
+(so a second, smaller window showing the session does not shrink the grid)."
+  (when (and (derived-mode-p 'ghostel-mode) (fboundp 'ghostel--adjust-size)
+             (window-live-p window))
+    (let ((orig (default-value 'window-adjust-process-window-size-function)))
+      (setq-default window-adjust-process-window-size-function
+                    #'window-adjust-process-window-size-largest)
+      (unwind-protect (ignore-errors (ghostel--adjust-size window))
+        (setq-default window-adjust-process-window-size-function orig)))))
+
+(defun cc-butler--session-refit-on-change ()
+  "Buffer-local `window-configuration-change-hook': re-fit the PTY to the
+LARGEST window on any layout change (windmove / `C-x o'), not only on a
+cc-butler preview — so a session never shrinks to the smallest window."
+  (when-let ((win (get-buffer-window (current-buffer))))
+    (cc-butler--fit-pty-largest win)))
+
+(defun cc-butler--configure-session-buffer (buf)
+  "Install the uniform cc-butler session config on ghostel BUF (idempotent).
+Currently: a persistent -largest window-fit that covers windmove, not just
+previews.  Return BUF."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (add-hook 'window-configuration-change-hook
+                #'cc-butler--session-refit-on-change nil t)))
+  buf)
+
+(defun cc-butler--configure-session (dir)
+  "Apply the uniform config to session DIR's buffer once it exists (deferred,
+since the launch is async)."
+  (run-at-time
+   0.5 nil
+   (lambda ()
+     (cc-butler--configure-session-buffer
+      (get-buffer (claude-code-ide--get-buffer-name dir))))))
+
+(defun cc-butler--launch-session (dir)
+  "The ONE path every role launches through — butler, steward, and workers —
+so their ghostel config cannot diverge (global-consistency).  Launches a
+channel-joined Claude session in DIR and applies the uniform config."
+  (let ((default-directory (file-name-as-directory (expand-file-name dir))))
+    (cc-butler--with-channel (claude-code-ide))
+    (cc-butler--configure-session dir)))
+
 (defvar cc-butler-after-preview-functions nil
   "Abnormal hook run after a session terminal is shown in the main window.
 Each function receives (DIR MAIN-WINDOW).  The document-panel module

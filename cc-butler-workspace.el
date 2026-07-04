@@ -83,9 +83,9 @@ Existing files are never clobbered."
 
 (defun cc-butler--start-session-in (dir)
   "Start a Claude session with DIR as the working directory.
-Honors `cc-butler-channel-args' so topic sessions can join the cc-butler channel."
-  (let ((default-directory (file-name-as-directory (expand-file-name dir))))
-    (cc-butler--with-channel (claude-code-ide))))
+Routes through `cc-butler--launch-session' — the single launch+config path all
+roles share — so worker, butler, and steward ghostel config cannot diverge."
+  (cc-butler--launch-session dir))
 
 (defun cc-butler--clone-repos (topic-dir repos done-fn)
   "Clone REPOS into TOPIC-DIR sequentially and asynchronously.
