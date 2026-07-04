@@ -298,31 +298,6 @@ Return non-nil if the session buffer was live and the command was sent."
         (message "cc-butler: re-armed %s (sent %S)" name cc-butler-rearm-command)
       (user-error "Could not re-arm %s" name))))
 
-;;;###autoload
-(defun cc-butler-rearm-all (&optional scope)
-  "Re-arm live sessions in bulk — type `cc-butler-rearm-command' into each so it
-re-fetches the MCP tool list and picks up tools registered after it connected.
-
-This is 정수님's OWN command (M-x): agents cannot inject a re-arm into sessions
-they did not create (the auto-mode classifier blocks it), but a human M-x is
-clean.  Interactively, choose the scope: workers only (default — leaves the
-butler and steward undisturbed) or all sessions.  Reports how many were re-armed."
-  (interactive
-   (list (if (y-or-n-p "Re-arm workers only (skip butler + steward)? ") 'workers 'all)))
-  (let* ((sessions (cc-butler--sessions))
-         (targets (if (and (eq scope 'workers) (fboundp 'cc-butler--role-rank))
-                      (seq-remove (lambda (s)
-                                    (memq (cc-butler--role-rank (plist-get s :dir)) '(0 1)))
-                                  sessions)
-                    sessions))
-         (n 0) (fail 0))
-    (dolist (s targets)
-      (if (cc-butler--rearm (plist-get s :dir)) (setq n (1+ n)) (setq fail (1+ fail))))
-    (message "cc-butler: re-armed %d session%s%s (sent %S)"
-             n (if (= n 1) "" "s")
-             (if (> fail 0) (format ", %d unreachable" fail) "")
-             cc-butler-rearm-command)))
-
 (defun cc-butler-tool-rearm-session (name)
   "MCP tool: re-arm session NAME so it picks up newly-registered tools."
   (let ((dir (cc-butler--dir-by-name name)))
