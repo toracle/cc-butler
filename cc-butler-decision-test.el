@@ -348,6 +348,21 @@ closes a decision (correctness: an unanswered decision is never lost)."
       (should (null (cc-butler--ch-drain "steward")))
       (should (null (cc-butler--ch-drain "worker-a"))))))
 
+;;;; ---- reply notification (poke the escalator, never the butler) ---
+
+(ert-deftest cc-butler-decision/notify-recipient-pokes-non-butler-only ()
+  "Delivering an answer wakes the escalator to drain pending_events, but never
+the butler (its box stays clean) and never a bad target."
+  (let (poked)
+    (cl-letf (((symbol-function 'cc-butler--mail-butler-agent) (lambda () "butler"))
+              ((symbol-function 'cc-butler--dir-by-name) (lambda (n) (concat "/dir/" n)))
+              ((symbol-function 'cc-butler--send-input)
+               (lambda (dir &rest _) (push dir poked))))
+      (cc-butler--decision-notify-recipient "steward")
+      (cc-butler--decision-notify-recipient "butler")   ; skipped (butler)
+      (cc-butler--decision-notify-recipient "?")         ; skipped (bad target)
+      (should (equal '("/dir/steward") poked)))))
+
 ;;;; ---- doc-view operations + hydra (item 3) ------------------------
 
 (ert-deftest cc-butler-decision/confirm-adds-answer-region-to-note ()

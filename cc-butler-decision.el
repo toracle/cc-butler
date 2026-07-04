@@ -224,6 +224,16 @@ answerable decision document.  Only the answer region is read; routing (:id
                         "; ")))
           (list :id id :to to :selected selected :other other :answer answer))))))
 
+(defun cc-butler--decision-notify-recipient (to)
+  "Wake agent TO to drain its inbox for 정수님's answer — unless TO is the
+butler (whose box stays clean; the human drives it).  The nudge is a signal
+only; the answer itself travels in the maildir inbox (read via pending_events)."
+  (unless (or (null to) (equal to "?") (equal to (cc-butler--mail-butler-agent)))
+    (when-let ((dir (cc-butler--dir-by-name to)))
+      (ignore-errors
+        (cc-butler--send-input
+         dir "[cc-butler] 정수님 answered a decision — run pending_events to read it." t)))))
+
 (defun cc-butler-decision-submit ()
   "Submit the current decision document's answer (bound to `C-c C-c').
 Routes 정수님's answer back to the asker via the maildir correlation, then
@@ -242,6 +252,7 @@ moves the file to done/."
       (cc-butler--ch-deliver
        to (list :kind 'reply :from cc-butler-human-agent
                 :in-reply-to id :body answer))
+      (cc-butler--decision-notify-recipient to)
       (let ((file (buffer-file-name)))
         (when (and file (file-exists-p file))
           (let ((dest (expand-file-name (file-name-nondirectory file)
