@@ -88,18 +88,25 @@ From MSG's explicit :topic, else its normalized summary/body."
     ""))
 
 (defun cc-butler--decision-envelope (msg)
-  "An email-style envelope header (From/To/When/Kind/Re) — the provenance graph
-edges made visible at the top of every inbox document."
-  (let ((kind (or (plist-get msg :kind) 'decision))
-        (whenstr (cc-butler--decision-when (plist-get msg :id)))
-        (re (plist-get msg :in-reply-to)))
+  "An org PROPERTIES-drawer envelope (From/Via/To/When/Kind/Re) at the top of an
+inbox document — the provenance graph edges made visible.  `From' is the ORIGIN
+author (:origin, else :from) — never the last relayer; `Via' is the relay-path
+(:via, a hop list or string) carried alongside, so origin and path both show."
+  (let* ((kind (or (plist-get msg :kind) 'decision))
+         (whenstr (cc-butler--decision-when (plist-get msg :id)))
+         (re (plist-get msg :in-reply-to))
+         (from (or (plist-get msg :origin) (plist-get msg :from) "?"))
+         (via (plist-get msg :via)))
     (concat
      ":PROPERTIES:\n"                        ; the document's own org properties
-     (format ":From: %s\n" (or (plist-get msg :from) "?"))
+     (format ":From: %s\n" from)
+     (if via (format ":Via: %s\n"
+                     (if (listp via) (mapconcat #'identity via " → ") via)) "")
      (format ":To: %s\n" cc-butler-human-agent)
      (if (string-empty-p whenstr) "" (format ":When: %s\n" whenstr))
      (format ":Kind: %s%s\n" kind
              (cond ((eq kind 'decision) " — needs your answer (C-c C-c)")
+                   ((eq kind 'briefing) " — result; read (r), c to reply")
                    ((memq kind '(note relay)) " — read (r to close)")
                    (t "")))
      (if re (format ":Re: %s\n" re) "")
@@ -141,9 +148,14 @@ answerable; `note'/`relay' render a read-only notification."
                 (setq letter (1+ letter))))
             (insert "Other: \n")
             (insert cc-butler--decision-answer-end "\n"))
-        ;; note / relay — read-only notification, no answer region
-        (insert (format "#+TITLE: Note — %s\n\n" first))
-        (insert "* Notification (read-only)\n" summary "\n")
+        ;; note / relay / briefing — read-only, no answer region (reply is
+        ;; optional via `c'); a briefing is a worker deliverable flowing UP.
+        (insert (format "#+TITLE: %s — %s\n\n"
+                        (if (eq kind 'briefing) "Briefing" "Note") first))
+        (insert (format "* %s\n" (if (eq kind 'briefing)
+                                     "Briefing (result — read, c to reply)"
+                                   "Notification (read-only)"))
+                summary "\n")
         (when from (insert (format "\n_(from %s)_\n" from))))
       (insert (format "\n# cc-butler decision id=%s to=%s topic=%s  (routing — do not edit)\n"
                       id to (cc-butler--decision-topic-key msg)))
@@ -194,6 +206,20 @@ The arrival watcher renders it when the workflow is active."
      cc-butler-human-agent
      (list :id id :kind 'decision :from from :reply-to from
            :summary summary :needs needs :options options))
+    id))
+
+(defun cc-butler-briefing-create (from-dir summary &optional via)
+  "Deliver a worker BRIEFING (a deliverable/result) UP to 정수님's inbox — the
+bidirectional bus's up-direction.  FROM-DIR is the worker (the ORIGIN, shown as
+`From', never a relayer); VIA is the relay-path (a hop list/string, shown as
+`Via').  Renders read-only in the inbox (r to acknowledge) with an OPTIONAL reply
+(c) routed back to the worker via the correlation.  Returns the id."
+  (let ((id (cc-butler--mail-id))
+        (from (and from-dir (cc-butler--display-name from-dir))))
+    (cc-butler--ch-deliver
+     cc-butler-human-agent
+     (list :id id :kind 'briefing :from from :origin from :reply-to from
+           :via via :summary summary))
     id))
 
 ;;;; ------------------------------------------------------------------

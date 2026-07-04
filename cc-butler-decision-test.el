@@ -380,6 +380,43 @@ example block."
     ;; the PROPERTIES drawer is at BOB, before the TITLE (file-level properties)
     (should (< (string-match ":PROPERTIES:" doc) (string-match "#\\+TITLE:" doc)))))
 
+(ert-deftest cc-butler-decision/envelope-from-origin-and-via ()
+  "C: From = the ORIGIN (:origin), never the last relayer; Via carries the path."
+  (let ((doc (cc-butler--decision-doc-string
+              '(:id "20260704T1900-1-1" :kind decision :from "steward" :origin "worker-a"
+                    :via ("worker-a" "steward") :reply-to "steward"
+                    :summary "x" :options ("a")))))
+    (should (string-match-p "^:From: worker-a$" doc))            ; origin, not steward
+    (should (string-match-p "^:Via: worker-a → steward$" doc))
+    (should-not (string-match-p "^:From: steward$" doc))))
+
+(ert-deftest cc-butler-decision/briefing-renders-readonly ()
+  "C: a briefing (up-direction deliverable) renders read-only — Kind=briefing, no
+answer region (reply is optional via c)."
+  (let ((doc (cc-butler--decision-doc-string
+              '(:id "20260704T1901-1-1" :kind briefing :from "worker-a"
+                    :origin "worker-a" :summary "shipped feature X"))))
+    (should (string-match-p "Briefing" doc))
+    (should (string-match-p "^:Kind: briefing" doc))
+    (should (string-match-p "shipped feature X" doc))
+    (should-not (string-match-p (regexp-quote cc-butler--decision-answer-begin) doc))))
+
+(ert-deftest cc-butler-decision/briefing-create-delivers-up ()
+  "C: cc-butler-briefing-create delivers a briefing UP to 정수님's inbox with
+From=worker (origin) and the relay-path in :via."
+  (let ((cc-butler-mail-dir (make-temp-file "cc-brief" t))
+        (cc-butler--channel nil)
+        (cc-butler-human-agent "정수님"))
+    (unwind-protect
+        (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+          (cc-butler-briefing-create "worker-a" "shipped X" '("worker-a" "steward"))
+          (let ((m (car (cc-butler--ch-drain "정수님"))))
+            (should m)
+            (should (eq 'briefing (plist-get m :kind)))
+            (should (equal "worker-a" (plist-get m :origin)))
+            (should (equal '("worker-a" "steward") (plist-get m :via)))))
+      (delete-directory cc-butler-mail-dir t))))
+
 ;;;; ---- doc-view operations + hydra (item 3) ------------------------
 
 (ert-deftest cc-butler-decision/confirm-adds-answer-region-to-note ()
