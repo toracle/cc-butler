@@ -258,12 +258,59 @@ Return the recipient agent."
                                       (string-trim body))))
       (format "Replied to %s." to))))
 
+;;;; ------------------------------------------------------------------
+;;;; Re-arming: make already-connected sessions pick up new tools
+;;;; ------------------------------------------------------------------
+;;
+;; The custom-tools HTTP MCP server advertises tools.listChanged=false and has
+;; no SSE push, so a session that connected before a tool was registered never
+;; re-fetches the list and can't see the channel tools.  Reconnecting its MCP
+;; client re-fetches tools/list — a tool-layer reconnect, NOT a session restart,
+;; so the conversation context and in-progress work are preserved.
+
+(defcustom cc-butler-rearm-command "/mcp reconnect"
+  "Command typed into a session to make its MCP client re-fetch the tool list.
+Re-arms a session with tools registered after it connected, without
+restarting it (context preserved)."
+  :type 'string
+  :group 'cc-butler)
+
+(defun cc-butler--rearm (dir)
+  "Type `cc-butler-rearm-command' into session DIR so it re-fetches MCP tools.
+Return non-nil if the session buffer was live and the command was sent."
+  (when (and dir (buffer-live-p
+                  (get-buffer (claude-code-ide--get-buffer-name dir))))
+    (cc-butler--send-input dir cc-butler-rearm-command t)
+    t))
+
+;;;###autoload
+(defun cc-butler-rearm-session ()
+  "Re-arm a chosen session so it picks up newly-registered MCP tools."
+  (interactive)
+  (let* ((names (mapcar (lambda (s) (cc-butler--display-name (plist-get s :dir)))
+                        (cc-butler--sessions)))
+         (name (completing-read "Re-arm session (re-fetch MCP tools): " names nil t))
+         (dir (cc-butler--dir-by-name name)))
+    (if (and dir (cc-butler--rearm dir))
+        (message "cc-butler: re-armed %s (sent %S)" name cc-butler-rearm-command)
+      (user-error "Could not re-arm %s" name))))
+
+(defun cc-butler-tool-rearm-session (name)
+  "MCP tool: re-arm session NAME so it picks up newly-registered tools."
+  (let ((dir (cc-butler--dir-by-name name)))
+    (unless dir
+      (error "No live session named %S.  Use list_claude_sessions for names." name))
+    (if (cc-butler--rearm dir)
+        (format "Re-armed %s (typed %S); after it reconnects it will have the channel tools (check_inbox / reply_message / ask_worker)."
+                name cc-butler-rearm-command)
+      (error "Could not re-arm %s" name))))
+
 ;; Idempotent (re)registration.
 (setq claude-code-ide-mcp-server-tools
       (seq-remove
        (lambda (spec)
          (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
-                 '("ask_worker" "check_inbox" "reply_message")))
+                 '("ask_worker" "check_inbox" "reply_message" "rearm_session")))
        claude-code-ide-mcp-server-tools))
 
 (claude-code-ide-make-tool
@@ -289,6 +336,13 @@ Return the recipient agent."
                 :description "The reply_handle from check_inbox for the question you are answering.")
          (:name "body" :type string
                 :description "Your answer.")))
+
+(claude-code-ide-make-tool
+ :function #'cc-butler-tool-rearm-session
+ :name "rearm_session"
+ :description "Re-arm a running session so it picks up MCP tools registered after it connected (the custom-tools server can't push tool-list changes). It reconnects its MCP client without restarting — no work lost. Newly spawned sessions get the tools automatically and don't need this."
+ :args '((:name "name" :type string
+                :description "Target session name from list_claude_sessions.")))
 
 (provide 'cc-butler-mail)
 ;;; cc-butler-mail.el ends here
