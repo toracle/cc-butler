@@ -47,5 +47,23 @@
 (require 'cc-butler-governance)
 (require 'cc-butler-provenance)
 
+(defconst cc-butler--modules
+  '(cc-butler-session cc-butler-notifications cc-butler-workspace
+    cc-butler-orchestrator cc-butler-doc-panel cc-butler-docs cc-butler-persist
+    cc-butler-mail cc-butler-decision cc-butler-inbox cc-butler-governance
+    cc-butler-provenance)
+  "cc-butler modules, in dependency order.")
+
+;;;###autoload
+(defun cc-butler-reload ()
+  "Cleanly reload all cc-butler modules in dependency order — the hot-load
+teardown hygiene: reload WHOLE modules (so redefinitions replace cleanly), not
+stray defuns that can leave old keymaps/hooks/modes layered underneath.  Never
+restarts Emacs (the worker sessions are preserved)."
+  (interactive)
+  (dolist (m cc-butler--modules)
+    (load (symbol-name m) nil t))
+  (message "cc-butler: reloaded %d modules" (length cc-butler--modules)))
+
 (provide 'cc-butler)
 ;;; cc-butler.el ends here
