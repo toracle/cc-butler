@@ -87,4 +87,4 @@ mark any session the butler by hand.)
 
 * License
 
-TBD.
+MIT — see [[file:LICENSE][LICENSE]]. Copyright (c) 2026 Jeongsoo Park.

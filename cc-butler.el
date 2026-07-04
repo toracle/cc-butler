@@ -6,7 +6,7 @@
 ;; Author: Jeongsoo Park <jeongsoo@warmblood.kr>
 ;; Maintainer: Jeongsoo Park <jeongsoo@warmblood.kr>
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (claude-code-ide "0.2.7"))
+;; Package-Requires: ((emacs "29.1") (claude-code-ide "0.2.7") (hydra "0.15.0"))
 ;; Keywords: tools, processes, convenience
 ;; URL: https://github.com/toracle/cc-butler
 
