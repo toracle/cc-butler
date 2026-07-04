@@ -43,6 +43,7 @@
 (require 'cc-butler-persist)
 (require 'cc-butler-mail)
 (require 'cc-butler-decision)
+(require 'cc-butler-inbox)
 
 (provide 'cc-butler)
 ;;; cc-butler.el ends here
