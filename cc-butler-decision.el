@@ -337,6 +337,79 @@ notification into something you can comment on."
     (when bounds (goto-char (car bounds)))
     (message "Edit your answer, then C-c C-c to send.")))
 
+;;;; ---- dedicated-buffer compose (4b, org-edit-special style) --------
+
+(defvar-local cc-butler--compose-source nil
+  "The decision buffer a compose buffer writes back to.")
+
+(defvar cc-butler-compose-mode-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "C-c '")   #'cc-butler-decision-compose-commit)
+    (define-key m (kbd "C-c C-c") #'cc-butler-decision-compose-commit)
+    (define-key m (kbd "C-c C-k") #'cc-butler-decision-compose-abort)
+    m)
+  "Keymap for `cc-butler-compose-mode'.")
+
+(define-derived-mode cc-butler-compose-mode text-mode "cc-Compose"
+  "Compose a cc-butler decision answer in a dedicated buffer; `C-c '' commits
+it back into the decision document and sends it, `C-c C-k' aborts.")
+
+(defun cc-butler-decision-compose ()
+  "Answer this decision in a DEDICATED buffer opened as a bottom split (the
+org-edit-special pattern): edit freely — no command-key collisions — then
+`C-c '' writes it back into the answer region and sends it (sign & next)."
+  (interactive)
+  (let ((bounds (cc-butler--decision-answer-bounds)))
+    (unless bounds (cc-butler-decision-confirm)
+            (setq bounds (cc-butler--decision-answer-bounds)))
+    (unless bounds (user-error "No answer region to compose"))
+    (let ((content (buffer-substring-no-properties (car bounds) (cdr bounds)))
+          (src (current-buffer))
+          (cbuf (get-buffer-create "*cc-butler compose*")))
+      (with-current-buffer cbuf
+        (cc-butler-compose-mode)
+        (let ((inhibit-read-only t)) (erase-buffer) (insert content))
+        (setq cc-butler--compose-source src)
+        (set-buffer-modified-p nil)
+        (goto-char (point-min)))
+      (let ((cwin (split-window (selected-window) nil 'below)))
+        (set-window-buffer cwin cbuf)
+        (select-window cwin))
+      (message "Compose your answer; C-c ' to send, C-c C-k to abort."))))
+
+(defun cc-butler--compose-writeback (src content)
+  "Replace SRC decision buffer's answer region with CONTENT (record)."
+  (with-current-buffer src
+    (let ((bounds (cc-butler--decision-answer-bounds))
+          (inhibit-read-only t))
+      (when bounds
+        (delete-region (car bounds) (cdr bounds))
+        (goto-char (car bounds))
+        (insert content)
+        (unless (bolp) (insert "\n")))
+      (cc-butler--decision-protect))))
+
+(defun cc-butler-decision-compose-commit ()
+  "Write this compose buffer back into the decision and send it (one step)."
+  (interactive)
+  (let ((content (buffer-substring-no-properties (point-min) (point-max)))
+        (src cc-butler--compose-source)
+        (cbuf (current-buffer)))
+    (unless (buffer-live-p src) (user-error "The decision buffer is gone"))
+    (cc-butler--compose-writeback src content)
+    (let ((win (get-buffer-window cbuf)))
+      (when (and win (window-live-p win) (not (one-window-p))) (delete-window win)))
+    (let ((kill-buffer-query-functions nil)) (kill-buffer cbuf))
+    (with-current-buffer src (cc-butler-decision-submit)))) ; record + channel push + sign&next
+
+(defun cc-butler-decision-compose-abort ()
+  "Discard the compose buffer without sending."
+  (interactive)
+  (let ((win (get-buffer-window (current-buffer))))
+    (when (and win (window-live-p win) (not (one-window-p))) (delete-window win)))
+  (let ((kill-buffer-query-functions nil)) (kill-buffer))
+  (message "cc-butler: compose aborted (nothing sent)."))
+
 (defun cc-butler-decision-quit ()
   "Bury the decision view — the decision stays open in the queue (never deleted)."
   (interactive)
@@ -378,7 +451,7 @@ notification into something you can comment on."
  cc-butler decision:  _r_ead   _c_onfirm/answer   _k_ remove   _n_ext   _p_rev   _g_ reload   _q_ close ⇄ _v_ reopen
 "
   ("r" cc-butler-decision-mark-read)
-  ("c" cc-butler-decision-confirm)
+  ("c" cc-butler-decision-compose)
   ("k" cc-butler-decision-quit)
   ("n" cc-butler-decision-next :color pink)
   ("p" cc-butler-decision-prev :color pink)
@@ -393,7 +466,7 @@ notification into something you can comment on."
 ;; Unified lowercase scheme; `?' opens the discoverable hydra of all of them.
 (define-key cc-butler-decision-mode-map (kbd "C-c C-c") #'cc-butler-decision-submit)
 (define-key cc-butler-decision-mode-map "r" #'cc-butler-decision-mark-read)
-(define-key cc-butler-decision-mode-map "c" #'cc-butler-decision-confirm)
+(define-key cc-butler-decision-mode-map "c" #'cc-butler-decision-compose)
 (define-key cc-butler-decision-mode-map "k" #'cc-butler-decision-quit)
 (define-key cc-butler-decision-mode-map "n" #'cc-butler-decision-next)
 (define-key cc-butler-decision-mode-map "p" #'cc-butler-decision-prev)

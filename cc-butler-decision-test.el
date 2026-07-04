@@ -415,6 +415,38 @@ region, command otherwise — so the current mode is always visible."
       (goto-char (point-min))
       (should (string-match-p "cmd" (cc-butler--decision-mode-lighter))))))
 
+(ert-deftest cc-butler-decision/compose-commit-writes-back-and-sends ()
+  "Dedicated-buffer compose (4b): committing writes the composed answer back into
+the decision's answer region AND sends it (record + channel push) in one step;
+the doc is archived out of the queue.  Faithful: assert the routed reply + state."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cc-butler--decision-render
+       '(:id "cc1" :kind decision :from "worker-a" :reply-to "worker-a"
+             :summary "ship?" :options ("yes" "no")))
+      (let* ((file (car (directory-files (cc-butler--decision-open-dir) t cc-butler--decision-org-re)))
+             (create-lockfiles nil) (kill-buffer-query-functions nil)
+             (src (find-file-noselect file)))
+        (with-current-buffer src (cc-butler-decision-mode 1))
+        (let* ((bounds (with-current-buffer src (cc-butler--decision-answer-bounds)))
+               (content (with-current-buffer src
+                          (buffer-substring-no-properties (car bounds) (cdr bounds))))
+               (composed (with-temp-buffer
+                           (insert content)
+                           (goto-char (point-min))
+                           (when (re-search-forward "^- \\[ \\] A" nil t) (replace-match "- [X] A"))
+                           (goto-char (point-min))
+                           (when (re-search-forward "^Other:[ \t]*$" nil t) (replace-match "Other: compose-ok"))
+                           (buffer-string))))
+          (cc-butler--compose-writeback src composed)
+          (with-current-buffer src (cc-butler-decision-submit))
+          (ignore-errors (kill-buffer src)))
+        (let ((r (car (cc-butler--ch-drain "worker-a"))))
+          (should (eq 'reply (plist-get r :kind)))
+          (should (string-match-p "yes" (plist-get r :body)))
+          (should (string-match-p "compose-ok" (plist-get r :body))))
+        (should (= 0 (length (directory-files (cc-butler--decision-open-dir) nil cc-butler--decision-org-re))))))))
+
 ;;;; ---- demo (staged, isolated, reversible) -------------------------
 
 (ert-deftest cc-butler-decision/demo-roundtrip ()
