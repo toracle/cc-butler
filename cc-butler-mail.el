@@ -298,6 +298,39 @@ Return non-nil if the session buffer was live and the command was sent."
         (message "cc-butler: re-armed %s (sent %S)" name cc-butler-rearm-command)
       (user-error "Could not re-arm %s" name))))
 
+(defun cc-butler--send-escape (dir)
+  "Send a raw ESC to session DIR's terminal — dismisses a stuck /mcp panel and
+backs a session out of nav mode.  `cc-butler--send-input' deliberately strips
+ESC (breakout guard), so this uses the terminal send directly.  Returns non-nil
+if the session buffer was live."
+  (let ((buf (and dir (get-buffer (claude-code-ide--get-buffer-name dir)))))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (claude-code-ide--terminal-send-string "\e"))
+      t)))
+
+;;;###autoload
+(defun cc-butler-dismiss-mcp-all ()
+  "Send ESC to every WORKER session to dismiss a stuck /mcp panel — recovers
+sessions parked in nav mode (e.g. after a re-arm that only opened the panel).
+
+Iterates the session BUFFERS (not the MCP registry) and sends a raw ESC to each,
+SKIPPING the butler and the steward (the coordinators — and thus self).  This is
+정수님's own command (M-x): agents cannot inject keystrokes into sessions they
+did not create (the auto-mode classifier blocks it), so a human M-x is required.
+Reports how many were dismissed and how many coordinators were skipped."
+  (interactive)
+  (let ((n 0) (skip 0) (fail 0))
+    (dolist (s (cc-butler--sessions))
+      (let ((dir (plist-get s :dir)))
+        (cond
+         ((memq (cc-butler--role-rank dir) '(0 1)) (setq skip (1+ skip)))  ; butler/steward
+         ((cc-butler--send-escape dir) (setq n (1+ n)))
+         (t (setq fail (1+ fail))))))
+    (message "cc-butler: dismissed /mcp in %d worker session%s (skipped %d butler/steward%s)"
+             n (if (= n 1) "" "s") skip
+             (if (> fail 0) (format ", %d unreachable" fail) ""))))
+
 (defun cc-butler-tool-rearm-session (name)
   "MCP tool: re-arm session NAME so it picks up newly-registered tools."
   (let ((dir (cc-butler--dir-by-name name)))

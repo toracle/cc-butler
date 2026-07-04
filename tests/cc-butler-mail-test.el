@@ -221,5 +221,18 @@ queue and the durable maildir inbox — proving rollback."
         (should cc-butler--inbox)
         (should (null (cc-butler--ch-drain "steward")))))))
 
+(ert-deftest cc-butler-mail/dismiss-mcp-all-targets ()
+  "cc-butler-dismiss-mcp-all sends ESC to WORKER sessions, skipping the butler
+(rank 0) and steward (rank 1).  Faithful: assert which dirs actually got ESC."
+  (let ((escaped '()))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () '((:dir "butler") (:dir "steward") (:dir "worker-a") (:dir "worker-b"))))
+              ((symbol-function 'cc-butler--send-escape)
+               (lambda (dir) (push dir escaped) t))
+              ((symbol-function 'cc-butler--role-rank)
+               (lambda (dir) (cond ((equal dir "butler") 0) ((equal dir "steward") 1) (t 9)))))
+      (cc-butler-dismiss-mcp-all)
+      (should (equal (sort (copy-sequence escaped) #'string<) '("worker-a" "worker-b"))))))
+
 (provide 'cc-butler-mail-test)
 ;;; cc-butler-mail-test.el ends here
