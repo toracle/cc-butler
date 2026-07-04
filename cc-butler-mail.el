@@ -278,13 +278,18 @@ restarting it (context preserved)."
   :type 'string
   :group 'cc-butler)
 
-(defun cc-butler--rearm (dir)
-  "Type `cc-butler-rearm-command' into session DIR so it re-fetches MCP tools.
-Return non-nil if the session buffer was live and the command was sent."
-  (when (and dir (buffer-live-p
-                  (get-buffer (claude-code-ide--get-buffer-name dir))))
-    (cc-butler--send-input dir cc-butler-rearm-command t)
-    t))
+(defun cc-butler--rearm (_dir)
+  "DISABLED (2026-07-04 incident).  Typing `cc-butler-rearm-command' (\"/mcp
+reconnect\") does NOT headlessly re-fetch MCP tools: `/mcp' only opens the
+interactive MCP PANEL, which parks the session in nav mode.  Re-arming via a
+slash command cannot work — the real fix is transport-level (SSE +
+notifications/tools/list_changed on the HTTP MCP server; the WebSocket channel
+that has list_changed carries a hardcoded tool list, not the butler tools).
+
+Signals a `user-error' so no caller (rearm-session, the rearm_session MCP tool,
+or a bulk re-arm) silently parks the fleet again.  Recover a parked session with
+`cc-butler-dismiss-mcp-all'."
+  (user-error "cc-butler: re-arm via /mcp is disabled — it only opens the panel and parks the session (recover with M-x cc-butler-dismiss-mcp-all; real fix = HTTP SSE + list_changed)"))
 
 ;;;###autoload
 (defun cc-butler-rearm-session ()

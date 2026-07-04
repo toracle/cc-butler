@@ -234,5 +234,11 @@ queue and the durable maildir inbox — proving rollback."
       (cc-butler-dismiss-mcp-all)
       (should (equal (sort (copy-sequence escaped) #'string<) '("worker-a" "worker-b"))))))
 
+(ert-deftest cc-butler-mail/rearm-is-disabled ()
+  "Re-arm via /mcp is guarded off after the 2026-07-04 incident: cc-butler--rearm
+signals a user-error rather than typing /mcp reconnect (which parks the session).
+This neutralizes every caller (rearm-session, the MCP tool, any bulk re-arm)."
+  (should-error (cc-butler--rearm "worker-a") :type 'user-error))
+
 (provide 'cc-butler-mail-test)
 ;;; cc-butler-mail-test.el ends here
