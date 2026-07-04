@@ -43,9 +43,14 @@ store** (Emacs/file-based). The per-runtime context file (Claude Code memory/CLA
 AGENTS.md) is a *generated adapter* from that neutral source — never the source. cc-butler (the
 runtime-neutral orchestration layer) owns the knowledge and injects it per runtime; Claude
 Code's memory is at most a generated cache. (This aligns with the heterogeneous-agent
-governance-bus: neutral core + per-runtime adapters.) MIGRATION owed: the butler/steward
-operating memories currently in ~/.claude/…/memory/ should be re-homed to a cc-butler-owned
-neutral store, from which the runtime role docs are generated.
+governance-bus: neutral core + per-runtime adapters.) MIGRATION DONE: the butler/steward
+operating principles now live in the cc-butler repo store `governance/` (one .md each) as the
+single source of truth; `cc-butler-governance-regenerate` writes them back into Claude Code
+memory, which is now a *generated cache*. **Workflow (important):** route a new operational
+learning by **editing the store `governance/<principle>.md` + regenerating** — NOT by editing
+memory directly (a direct memory edit is overwritten on the next regenerate). The
+routing-target for operational/coordination learning is therefore the **store**, generated to
+memory.
 
 **SPT:** the system IS the routing-to-existing-durable-homes habit, NOT a heavy new tracker.
 Don't over-build it. Ties to [[warmblood-talent-philosophy]] (Leave It Better; Count the Outcome).
