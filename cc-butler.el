@@ -54,15 +54,20 @@
     cc-butler-provenance)
   "cc-butler modules, in dependency order.")
 
+(defconst cc-butler--dir
+  (file-name-directory (or load-file-name buffer-file-name default-directory))
+  "Directory holding the cc-butler source files.")
+
 ;;;###autoload
 (defun cc-butler-reload ()
   "Cleanly reload all cc-butler modules in dependency order — the hot-load
-teardown hygiene: reload WHOLE modules (so redefinitions replace cleanly), not
-stray defuns that can leave old keymaps/hooks/modes layered underneath.  Never
-restarts Emacs (the worker sessions are preserved)."
+teardown hygiene: reload WHOLE modules from source (so redefinitions replace
+cleanly), not stray defuns that can leave old keymaps/hooks/modes layered
+underneath.  Loads by absolute path (not the load-path).  Never restarts Emacs
+(the worker sessions are preserved)."
   (interactive)
   (dolist (m cc-butler--modules)
-    (load (symbol-name m) nil t))
+    (load (expand-file-name (concat (symbol-name m) ".el") cc-butler--dir) nil t))
   (message "cc-butler: reloaded %d modules" (length cc-butler--modules)))
 
 (provide 'cc-butler)
