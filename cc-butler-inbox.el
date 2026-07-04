@@ -43,5 +43,67 @@ by the read-receipt `r'.  Reference documents are NOT queued here."
   "Number of pending inbox items (the unread badge count)."
   (length (cc-butler-inbox-items)))
 
+;;;; ------------------------------------------------------------------
+;;;; The inbox list surface (browse the pending queue)
+;;;; ------------------------------------------------------------------
+
+(defvar cc-butler-inbox-mode-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "RET") #'cc-butler-inbox-open)
+    (define-key m "n" #'next-line)
+    (define-key m "p" #'previous-line)
+    (define-key m "g" #'cc-butler-inbox-refresh)
+    (define-key m "q" #'quit-window)
+    m)
+  "Keymap for `cc-butler-inbox-mode'.")
+
+(define-derived-mode cc-butler-inbox-mode special-mode "cc-Inbox"
+  "정수님's inbox — the pending queue of decisions and notes to attend to.")
+
+(defun cc-butler--inbox-render ()
+  "Render the pending queue into the current buffer as a read-only list."
+  (let ((inhibit-read-only t) (items (cc-butler-inbox-items)))
+    (erase-buffer)
+    (insert (format "cc-butler inbox — %d pending   (RET open · n/p move · g refresh · q quit)\n\n"
+                    (length items)))
+    (if (null items)
+        (insert "  (empty — nothing awaiting you)\n")
+      (dolist (it items)
+        (insert (propertize
+                 (format "  %s  %s\n"
+                         (if (eq (plist-get it :kind) 'decision) "⚖ decide" "• note  ")
+                         (plist-get it :title))
+                 'cc-butler-inbox-file (plist-get it :file)))))
+    (goto-char (point-min))
+    (forward-line (if items 2 0))))
+
+(defun cc-butler-inbox-refresh ()
+  "Re-read the pending queue into the inbox list."
+  (interactive)
+  (when (derived-mode-p 'cc-butler-inbox-mode) (cc-butler--inbox-render)))
+
+;;;###autoload
+(defun cc-butler-inbox ()
+  "Open 정수님's inbox — the pending queue of decisions and notes."
+  (interactive)
+  (let ((buf (get-buffer-create "*cc-butler-inbox*")))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'cc-butler-inbox-mode) (cc-butler-inbox-mode))
+      (cc-butler--inbox-render))
+    (pop-to-buffer buf)))
+
+(defun cc-butler-inbox-open ()
+  "Open the inbox item at point for reading/answering (the reading surface)."
+  (interactive)
+  (let ((file (get-text-property (point) 'cc-butler-inbox-file)))
+    (if (not file)
+        (message "cc-butler: no inbox item on this line")
+      (let ((create-lockfiles nil)) (find-file file))
+      (cc-butler-decision-mode 1))))
+
+(with-eval-after-load 'cc-butler-session
+  (when (boundp 'cc-butler-mode-map)
+    (define-key cc-butler-mode-map "i" #'cc-butler-inbox)))
+
 (provide 'cc-butler-inbox)
 ;;; cc-butler-inbox.el ends here

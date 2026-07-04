@@ -39,5 +39,36 @@ documents are not queued.  Faithful: assert the resulting data, not any call."
                (should (= 0 (cc-butler-inbox-count))))
       (delete-directory cc-butler-decision-dir t))))
 
+(ert-deftest cc-butler-inbox/render-lists-items ()
+  "The inbox list renders one line per pending item, with the count, a kind
+badge, and a text property linking each line back to its file (so RET opens it).
+Faithful: assert the rendered buffer state."
+  (let ((cc-butler-decision-dir (make-temp-file "cc-inbox-r" t)))
+    (unwind-protect
+        (progn
+          (cc-butler--decision-render
+           '(:id "d1" :kind decision :from "s" :reply-to "s"
+                 :summary "Which auth?" :options ("Stripe")))
+          (with-temp-buffer
+            (cc-butler--inbox-render)
+            (let ((s (buffer-string)))
+              (should (string-match-p "1 pending" s))
+              (should (string-match-p "Which auth?" s))
+              (should (string-match-p "decide" s)))
+            (goto-char (point-min))
+            (should (re-search-forward "Which auth?" nil t))
+            (should (get-text-property (match-beginning 0) 'cc-butler-inbox-file))))
+      (delete-directory cc-butler-decision-dir t))))
+
+(ert-deftest cc-butler-inbox/render-empty ()
+  "An empty inbox renders an explicit empty state, not a blank."
+  (let ((cc-butler-decision-dir (make-temp-file "cc-inbox-re" t)))
+    (unwind-protect
+        (with-temp-buffer
+          (cc-butler--inbox-render)
+          (should (string-match-p "0 pending" (buffer-string)))
+          (should (string-match-p "empty" (buffer-string))))
+      (delete-directory cc-butler-decision-dir t))))
+
 (provide 'cc-butler-inbox-test)
 ;;; cc-butler-inbox-test.el ends here
