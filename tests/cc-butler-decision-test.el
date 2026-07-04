@@ -568,6 +568,29 @@ to the butler so it knows what awaits 정수님."
       (delete-directory cc-butler-decision-dir t)
       (delete-directory cc-butler-mail-dir t))))
 
+(ert-deftest cc-butler-decision/arrival-pushes-notification ()
+  "Butler-away root fix: a decision ARRIVING actively PUSHES a notification (the
+always-on daemon's job) carrying the decision summary — not just a passive badge
+that a sleeping butler agent can't surface."
+  (let ((cc-butler-decision-dir (make-temp-file "cc-push" t))
+        (cc-butler-mail-dir (make-temp-file "cc-pushm" t))
+        (cc-butler--channel nil)
+        (cc-butler-decision-auto-display nil)
+        (cc-butler-human-agent "정수님")
+        (pushed nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'cc-butler--mail-butler-agent) (lambda () "butler"))
+                  ((symbol-function 'cc-butler-notify-decision)
+                   (lambda (title body) (setq pushed (cons title body)))))
+          (cc-butler--ch-deliver
+           "정수님" '(:id "p1" :kind decision :from "s" :reply-to "s"
+                      :summary "Ship the flow to staging?"))
+          (cc-butler--decision-on-arrival)
+          (should pushed)
+          (should (string-match-p "Ship the flow to staging" (cdr pushed))))
+      (delete-directory cc-butler-decision-dir t)
+      (delete-directory cc-butler-mail-dir t))))
+
 ;;;; ---- demo (staged, isolated, reversible) -------------------------
 
 (ert-deftest cc-butler-decision/demo-roundtrip ()

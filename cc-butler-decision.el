@@ -718,7 +718,15 @@ Returns the count of docs newly surfaced (new or superseded)."
                    (car (split-string (or (plist-get m :summary)
                                           (plist-get m :body) "") "\n"))
                    (plist-get m :id))
-           (plist-get m :id)))))
+           (plist-get m :id))
+          ;; Active PUSH to 정수님's real attention — the always-on daemon's job,
+          ;; so a decision reaches them even while the butler agent is asleep.
+          (when (and (eq (or (plist-get m :kind) 'decision) 'decision)
+                     (fboundp 'cc-butler-notify-decision))
+            (cc-butler-notify-decision
+             "cc-butler — a decision needs you"
+             (car (split-string (or (plist-get m :summary)
+                                    (plist-get m :body) "") "\n")))))))
     (cc-butler--decision-update-indicator)
     (when (and surfaced cc-butler-decision-auto-display)
       (cc-butler--decision-display (car (last surfaced))))

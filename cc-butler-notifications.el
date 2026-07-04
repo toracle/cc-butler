@@ -152,6 +152,28 @@ Runs asynchronously so a slow backend never blocks Emacs."
           (set-process-query-on-exit-flag proc nil))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; Active PUSH for a human decision arrival (the daemon's job)
+;;;; ------------------------------------------------------------------
+
+;; A decision arriving for the human must reach them even when they are AWAY —
+;; the conversation-paced butler agent is asleep then and cannot notify.  So the
+;; always-on daemon actively PUSHES on arrival: an OS desktop notification and
+;; the messenger command (e.g. Telegram), independent of any agent turn.  This
+;; is the notification half of "arrival is the daemon's job, not the agent's".
+
+;;;###autoload
+(defun cc-butler-notify-decision (title body)
+  "Actively PUSH a decision-arrival (TITLE, BODY) to the human's real attention.
+Fires the OS desktop notification AND the messenger command (`cc-butler-notify-
+command', e.g. Telegram) directly — not via the worker-session hook, so it does
+not add noise to every worker notification.  Best-effort; each backend that is
+unconfigured simply no-ops."
+  (let ((event (list :type 'notification :title title :body (or body "")
+                     :name title)))
+    (ignore-errors (cc-butler-notify-desktop event))
+    (ignore-errors (cc-butler-notify-command-listener event))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Built-in listener: input-waiting approval queue
 ;;;; ------------------------------------------------------------------
 
