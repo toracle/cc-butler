@@ -188,6 +188,41 @@ Locations are derived from the butler home (the shared operational home)."
    "  up to the butler.\n\n"
    (format "You are the **%s**.\n\n" which)))
 
+(defun cc-butler--learning-duty (which)
+  "Return the standing recurrence-prevention learning duty for role WHICH.
+WHICH is `butler' or `steward'."
+  (let ((mem (abbreviate-file-name
+              (or (cc-butler--claude-memory-dir (or cc-butler--butler cc-butler-home))
+                  "~/.claude/projects/-home-toracle--ccsm/memory/"))))
+    (concat
+     "## Standing duty — route recurrence-prevention learning to a durable home\n\n"
+     "When a recurring or circling problem is finally resolved well, do NOT let\n"
+     "the prevention knowledge die in this session's scrollback — it is lost on a\n"
+     "clear. Right after resolving, ask and ROUTE (this is the `reflective-learning`\n"
+     "discipline):\n\n"
+     "1. Will this recur?  2. What is the *minimal* artifact that prevents it?\n"
+     "3. Where must it live so it is *recalled* next time?\n\n"
+     "Route by scope:\n"
+     (format (concat "- **operational / coordination** → the shared ccsm memory"
+                     " (`%sMEMORY.md`\n  + the note it indexes) — the home you load"
+                     " at startup, so it is actually recalled.\n")
+             mem)
+     "- **reusable engineering discipline** → a warmblood-kr/skills skill (fires by\n"
+     "  trigger), e.g. global-consistency.\n"
+     "- **repo-specific pitfall** → that repo's own `CLAUDE.md` (e.g. one\n"
+     "  normalization point for a subdomain).\n"
+     "- **cross-repo fact** → the vault.\n\n"
+     (if (eq which 'steward)
+         (concat
+          "You see the worker/repo firehose, so you own **worker, repo, and\n"
+          "engineering** learnings: when the same friction recurs across turns or\n"
+          "workers, route it *now* rather than re-solving it later. Operational and\n"
+          "coordination learnings go to the shared ccsm memory above.\n\n")
+       (concat
+        "You own **operational** learnings — how the boss likes to decide and be\n"
+        "briefed, coordination patterns: route those to the shared ccsm memory\n"
+        "(and interview-confirmed preferences to `user-profile.org`).\n\n")))))
+
 (defun cc-butler--butler-claude-md ()
   "Return the bootstrap CLAUDE.md text for the butler (front-of-house) role."
   (concat
@@ -228,6 +263,7 @@ Locations are derived from the butler home (the shared operational home)."
    "If no steward session is running, you also play the steward: drain\n"
    "`pending_events`, dispatch workers, and maintain `butler_dashboard` /\n"
    "`butler_log`. Once a steward is started, hand that firehose over to it.\n\n"
+   (cc-butler--learning-duty 'butler)
    (cc-butler--shared-state-note)))
 
 (defun cc-butler--steward-claude-md ()
@@ -258,12 +294,16 @@ Locations are derived from the butler home (the shared operational home)."
    "   the durable timeline.\n"
    "4. When something needs a human decision, `escalate_to_butler(summary, needs)`\n"
    "   — do NOT ask the human yourself; route it through the butler, who presents\n"
-   "   it and relays the answer back to you.\n\n"
+   "   it and relays the answer back to you.\n"
+   "5. When a recurring issue finally resolves well, ROUTE the prevention learning\n"
+   "   to its durable home (the standing duty below) *before moving on* — don't\n"
+   "   leave it in scrollback to re-solve next time.\n\n"
    "## Tools\n\n"
    "- `list_claude_sessions` / `read_session_output` / `send_to_session`.\n"
    "- `pending_events` — drain the worker firehose.\n"
    "- `butler_log` / `butler_dashboard` — durable log + snapshot, under `docs/`.\n"
    "- `escalate_to_butler` — raise a decision to the butler.\n\n"
+   (cc-butler--learning-duty 'steward)
    "Keep workers moving, and never let the state of the fleet live only in the\n"
    "chat scrollback.\n"))
 
