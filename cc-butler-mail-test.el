@@ -93,7 +93,7 @@ signal only (never the body); and the butler is never poked."
     (should (equal "secret question"
                    (plist-get (car (cc-butler--ch-drain "worker-a")) :body)))
     ;; the poke text is a fixed signal with no body interpolation
-    (should-not (string-match-p "secret question" cc-butler-mail--poke-signal))
+    (should-not (string-match-p "secret question" cc-butler-mail-poke-signal))
     ;; a reply whose recipient is the butler must NOT poke the butler
     (setq cc-butler-mail-test--pokes nil)
     (cc-butler--route-reply "worker-a" "butler#abc" "answer")

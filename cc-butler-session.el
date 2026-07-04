@@ -134,8 +134,10 @@ terminal still tracks the title; read it straight from the term object."
                (not (string-empty-p (string-trim title)))
                (string-trim title)))))))
 
-(defvar cc-butler-enable-forge t
-  "When non-nil, fetch PR info via the `gh' CLI asynchronously.")
+(defcustom cc-butler-enable-forge t
+  "When non-nil, fetch PR info via the `gh' CLI asynchronously."
+  :type 'boolean
+  :group 'cc-butler)
 
 (defvar cc-butler--forge-cache (make-hash-table :test 'equal)
   "Map working-dir -> forge info string (e.g. \"PR #12\"), best effort.")

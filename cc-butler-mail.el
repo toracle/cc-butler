@@ -27,17 +27,23 @@
 (require 'subr-x)
 
 (defcustom cc-butler-mail-dir
-  (expand-file-name "cc-butler/mail/"
-                    (or (getenv "XDG_STATE_HOME")
-                        (expand-file-name ".local/state" "~")))
+  (expand-file-name
+   "cc-butler/mail/"
+   (let ((xdg (getenv "XDG_STATE_HOME")))
+     (if (and xdg (not (string-empty-p xdg))) xdg
+       (expand-file-name ".local/state" "~"))))
   "Root of the cc-butler inter-agent message bus.
-A durable directory independent of the sessions' `~/.claude' context."
+A durable directory independent of the sessions' `~/.claude' context.
+Defaults under `$XDG_STATE_HOME' (falling back to ~/.local/state); override
+here for a custom location."
   :type 'directory
   :group 'cc-butler)
 
-(defconst cc-butler-mail--poke-signal
+(defcustom cc-butler-mail-poke-signal
   "[cc-butler] New inbox message — run check_inbox, then reply_message to answer."
-  "The wake text a poke types: a signal only, never the message body.")
+  "The wake text a poke types: a signal only, never the message body."
+  :type 'string
+  :group 'cc-butler)
 
 (defvar cc-butler--mail-counter 0
   "Per-process counter making message ids unique within a second.")
@@ -125,7 +131,7 @@ Bind to a mock channel to contract-test the routing in isolation.")
   (when-let* ((dir (cc-butler--dir-by-name agent))
               (b (get-buffer (claude-code-ide--get-buffer-name dir)))
               ((buffer-live-p b)))
-    (ignore-errors (cc-butler--send-input dir cc-butler-mail--poke-signal t))))
+    (ignore-errors (cc-butler--send-input dir cc-butler-mail-poke-signal t))))
 
 (defun cc-butler--file-channel ()
   (cc-butler-make-channel
