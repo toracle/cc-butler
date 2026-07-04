@@ -94,16 +94,16 @@ edges made visible at the top of every inbox document."
         (whenstr (cc-butler--decision-when (plist-get msg :id)))
         (re (plist-get msg :in-reply-to)))
     (concat
-     "#+begin_example\n"                     ; a visible, monospace envelope block
-     (format "From: %s\n" (or (plist-get msg :from) "?"))
-     (format "To:   %s\n" cc-butler-human-agent)
-     (if (string-empty-p whenstr) "" (format "When: %s\n" whenstr))
-     (format "Kind: %s%s\n" kind
+     ":PROPERTIES:\n"                        ; the document's own org properties
+     (format ":From: %s\n" (or (plist-get msg :from) "?"))
+     (format ":To: %s\n" cc-butler-human-agent)
+     (if (string-empty-p whenstr) "" (format ":When: %s\n" whenstr))
+     (format ":Kind: %s%s\n" kind
              (cond ((eq kind 'decision) " — needs your answer (C-c C-c)")
                    ((memq kind '(note relay)) " — read (r to close)")
                    (t "")))
-     (if re (format "Re:   %s — resolve_reference for the original\n" re) "")
-     "#+end_example\n\n")))
+     (if re (format ":Re: %s\n" re) "")
+     ":END:\n")))
 
 (defun cc-butler--decision-doc-string (msg)
   "Return the org document text rendering decision MSG.
@@ -119,10 +119,10 @@ answerable; `note'/`relay' render a read-only notification."
          (options (plist-get msg :options))
          (first (car (split-string summary "\n"))))
     (with-temp-buffer
+      (insert (cc-butler--decision-envelope msg))   ; file-level org properties at BOB
       (if (eq kind 'decision)
           (progn
             (insert (format "#+TITLE: Decision — %s\n\n" first))
-            (insert (cc-butler--decision-envelope msg))
             (insert "* Decision\n" summary "\n")
             (when needs (insert "\nNeeds: " needs "\n"))
             (when from (insert (format "\n_(from %s)_\n" from)))
@@ -143,7 +143,6 @@ answerable; `note'/`relay' render a read-only notification."
             (insert cc-butler--decision-answer-end "\n"))
         ;; note / relay — read-only notification, no answer region
         (insert (format "#+TITLE: Note — %s\n\n" first))
-        (insert (cc-butler--decision-envelope msg))
         (insert "* Notification (read-only)\n" summary "\n")
         (when from (insert (format "\n_(from %s)_\n" from))))
       (insert (format "\n# cc-butler decision id=%s to=%s topic=%s  (routing — do not edit)\n"
@@ -306,6 +305,15 @@ moves the file to done/."
     (goto-char (point-min))
     (if (re-search-forward "^#\\+TITLE: \\(.*\\)$" nil t) (match-string 1) "document")))
 
+;;;###autoload
+(defun cc-butler-decision-to-inbox ()
+  "Go back to the inbox list from the reader (the reader is answer-only; item
+navigation lives in the list)."
+  (interactive)
+  (if (fboundp 'cc-butler-inbox)
+      (cc-butler-inbox)
+    (quit-window)))
+
 (defun cc-butler--decision-archive-current ()
   "Move the current decision file open/ → done/ (audit trail)."
   (let ((file (buffer-file-name)))
@@ -371,20 +379,20 @@ notification into something you can comment on."
 
 (defvar cc-butler-compose-mode-map
   (let ((m (make-sparse-keymap)))
-    (define-key m (kbd "C-c '")   #'cc-butler-decision-compose-commit)
-    (define-key m (kbd "C-c C-c") #'cc-butler-decision-compose-commit)
+    (define-key m (kbd "C-c C-c") #'cc-butler-decision-compose-commit) ; the Emacs-conventional submit
+    (define-key m (kbd "C-c '")   #'cc-butler-decision-compose-commit) ; org-edit-special alias
     (define-key m (kbd "C-c C-k") #'cc-butler-decision-compose-abort)
     m)
   "Keymap for `cc-butler-compose-mode'.")
 
 (define-derived-mode cc-butler-compose-mode text-mode "cc-Compose"
-  "Compose a cc-butler decision answer in a dedicated buffer; `C-c '' commits
+  "Compose a cc-butler decision answer in a dedicated buffer; `C-c C-c' commits
 it back into the decision document and sends it, `C-c C-k' aborts.")
 
 (defun cc-butler-decision-compose ()
   "Answer this decision in a DEDICATED buffer opened as a bottom split (the
 org-edit-special pattern): edit freely — no command-key collisions — then
-`C-c '' writes it back into the answer region and sends it (sign & next)."
+`C-c C-c' writes it back into the answer region and sends it (sign & next)."
   (interactive)
   (let ((bounds (cc-butler--decision-answer-bounds)))
     (unless bounds (cc-butler-decision-confirm)
@@ -402,7 +410,7 @@ org-edit-special pattern): edit freely — no command-key collisions — then
       (let ((cwin (split-window (selected-window) nil 'below)))
         (set-window-buffer cwin cbuf)
         (select-window cwin))
-      (message "Compose your answer; C-c ' to send, C-c C-k to abort."))))
+      (message "Compose your answer; C-c C-c to send, C-c C-k to abort."))))
 
 (defun cc-butler--compose-writeback (src content)
   "Replace SRC decision buffer's answer region with CONTENT (record)."
@@ -475,10 +483,11 @@ org-edit-special pattern): edit freely — no command-key collisions — then
 
 (defhydra cc-butler-decision-hydra (:color blue :hint nil)
   "
- cc-butler decision (answer-only; move between items in the inbox, i):  _r_ead   _c_ompose/answer   _g_ reload   _q_ close ⇄ _v_ reopen   _k_ remove
+ cc-butler decision (answer-only):  _r_ead   _c_ompose/answer   _u_ back to inbox   _g_ reload   _q_ close ⇄ _v_ reopen   _k_ remove
 "
   ("r" cc-butler-decision-mark-read)
   ("c" cc-butler-decision-compose)
+  ("u" cc-butler-decision-to-inbox)
   ("k" cc-butler-decision-quit)
   ("g" cc-butler-decision-revert)
   ("q" cc-butler-decision-quit)
@@ -498,6 +507,8 @@ org-edit-special pattern): edit freely — no command-key collisions — then
 ;; this removes the n-leak (in the reader `n' no longer jumps to another doc).
 (define-key cc-butler-decision-mode-map "n" #'next-line)
 (define-key cc-butler-decision-mode-map "p" #'previous-line)
+;; u — back to the inbox list (정수님's dogfood: "U 누르면 뒤로 목록으로").
+(define-key cc-butler-decision-mode-map "u" #'cc-butler-decision-to-inbox)
 (define-key cc-butler-decision-mode-map "g" #'cc-butler-decision-revert)
 (define-key cc-butler-decision-mode-map "q" #'cc-butler-decision-quit)
 (define-key cc-butler-decision-mode-map "v" #'cc-butler-doc-reopen)

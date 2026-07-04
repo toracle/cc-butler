@@ -364,17 +364,21 @@ the butler (its box stays clean) and never a bad target."
       (should (equal '("/dir/steward") poked)))))
 
 (ert-deftest cc-butler-decision/envelope-header-at-top ()
-  "Cleanup pass (A): every inbox doc carries a visible From/To/When/Kind envelope
-header at the TOP, before the body (the provenance graph edges made visible)."
+  "Polish (2): the envelope is an org PROPERTIES drawer (From/To/When/Kind/Re) at
+the top of the file, before #+TITLE — the document's own properties, not an
+example block."
   (let ((doc (cc-butler--decision-doc-string
               '(:id "20260704T171521-1-0054" :kind decision :from "steward"
                     :reply-to "steward" :summary "test decision" :options ("a")))))
-    (should (string-match-p "^From: steward$" doc))
-    (should (string-match-p "^To:   정수님$" doc))
-    (should (string-match-p "^When: 2026-07-04 17:15$" doc))
-    (should (string-match-p "^Kind: decision" doc))
-    (should (< (string-match "From: steward" doc)
-               (string-match "\\* Decision" doc)))))     ; envelope precedes the body
+    (should (string-match-p "^:PROPERTIES:$" doc))
+    (should (string-match-p "^:From: steward$" doc))
+    (should (string-match-p "^:To: 정수님$" doc))
+    (should (string-match-p "^:When: 2026-07-04 17:15$" doc))
+    (should (string-match-p "^:Kind: decision" doc))
+    (should (string-match-p "^:END:$" doc))
+    (should-not (string-match-p "begin_example" doc))
+    ;; the PROPERTIES drawer is at BOB, before the TITLE (file-level properties)
+    (should (< (string-match ":PROPERTIES:" doc) (string-match "#\\+TITLE:" doc)))))
 
 ;;;; ---- doc-view operations + hydra (item 3) ------------------------
 
@@ -397,6 +401,11 @@ header at the TOP, before the body (the provenance graph edges made visible)."
   ;; NOT navigate decisions (that was the n-leak source)
   (should (eq (lookup-key cc-butler-decision-mode-map "n") #'next-line))
   (should (eq (lookup-key cc-butler-decision-mode-map "p") #'previous-line))
+  ;; polish (1): u returns to the inbox list from the reader
+  (should (eq (lookup-key cc-butler-decision-mode-map "u") #'cc-butler-decision-to-inbox))
+  ;; polish (3): C-c C-c is the conventional submit in the compose buffer
+  (should (eq (lookup-key cc-butler-compose-mode-map (kbd "C-c C-c"))
+              #'cc-butler-decision-compose-commit))
   (should (eq (lookup-key cc-butler-decision-mode-map "r") #'cc-butler-decision-mark-read))
   (should (eq (lookup-key cc-butler-decision-mode-map "?") #'cc-butler-decision-hydra/body))
   (should (fboundp 'cc-butler-decision-hydra/body)))
