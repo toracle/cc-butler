@@ -289,6 +289,16 @@ only; the answer itself travels in the maildir inbox (read via pending_events)."
         (cc-butler--send-input
          dir "[cc-butler] 정수님 answered a decision — run pending_events to read it." t)))))
 
+(defun cc-butler--decision-cc-butler (summary &optional id)
+  "CC a terse receipt SUMMARY to the butler's inbox so the butler stays COHERENT
+with 정수님's decision state (visibility, not routing — never a hop that can drop
+or delay the answer).  No-op if the butler is unset or is the human node itself."
+  (let ((butler (cc-butler--mail-butler-agent)))
+    (when (and butler (not (equal butler cc-butler-human-agent)))
+      (cc-butler--ch-deliver
+       butler (list :kind 'receipt :from cc-butler-human-agent
+                    :in-reply-to id :body summary)))))
+
 (defun cc-butler-decision-submit ()
   "Submit the current decision document's answer (bound to `C-c C-c').
 Routes 정수님's answer back to the asker via the maildir correlation, then
@@ -308,6 +318,9 @@ moves the file to done/."
        to (list :kind 'reply :from cc-butler-human-agent
                 :in-reply-to id :body answer))
       (cc-butler--decision-notify-recipient to)
+      (unless (equal to (cc-butler--mail-butler-agent))   ; butler already got the direct reply
+        (cc-butler--decision-cc-butler
+         (format "정수님 answered decision %s (routed to %s): %s" id to answer) id))
       (let ((file (buffer-file-name)))
         (when (and file (file-exists-p file))
           (let ((dest (expand-file-name (file-name-nondirectory file)
@@ -692,7 +705,15 @@ Returns the count of docs newly surfaced (new or superseded)."
     (dolist (m msgs)
       (let ((r (cc-butler--decision-ingest m)))
         (when (memq (cdr r) '(new superseded))
-          (push (car r) surfaced))))
+          (push (car r) surfaced)
+          ;; CC the butler: a decision/note is now pending for 정수님 (visibility).
+          (cc-butler--decision-cc-butler
+           (format "Pending for 정수님: %s — %s [%s]"
+                   (or (plist-get m :kind) 'decision)
+                   (car (split-string (or (plist-get m :summary)
+                                          (plist-get m :body) "") "\n"))
+                   (plist-get m :id))
+           (plist-get m :id)))))
     (cc-butler--decision-update-indicator)
     (when (and surfaced cc-butler-decision-auto-display)
       (cc-butler--decision-display (car (last surfaced))))

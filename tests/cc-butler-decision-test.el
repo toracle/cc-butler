@@ -513,6 +513,61 @@ the doc is archived out of the queue.  Faithful: assert the routed reply + state
           (should (string-match-p "compose-ok" (plist-get r :body))))
         (should (= 0 (length (directory-files (cc-butler--decision-open-dir) nil cc-butler--decision-org-re))))))))
 
+(ert-deftest cc-butler-decision/answer-ccs-the-butler ()
+  "Butler coherence: 정수님's answer routes DIRECT to the asker AND CCs a terse
+receipt to the butler (visibility, not a routing hop)."
+  (let ((cc-butler-decision-dir (make-temp-file "cc-cc" t))
+        (cc-butler-mail-dir (make-temp-file "cc-ccm" t))
+        (cc-butler--channel nil)
+        (cc-butler-human-agent "정수님"))
+    (unwind-protect
+        (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d))
+                  ((symbol-function 'cc-butler--mail-butler-agent) (lambda () "butler"))
+                  ((symbol-function 'cc-butler--decision-notify-recipient) #'ignore))
+          (cc-butler--decision-render
+           '(:id "cc1" :kind decision :from "worker-a" :reply-to "worker-a"
+                 :summary "ship?" :options ("yes" "no")))
+          (let* ((file (car (directory-files (cc-butler--decision-open-dir) t cc-butler--decision-org-re)))
+                 (create-lockfiles nil) (kill-buffer-query-functions nil)
+                 (src (find-file-noselect file)))
+            (with-current-buffer src (cc-butler-decision-mode 1))
+            (let* ((bounds (with-current-buffer src (cc-butler--decision-answer-bounds)))
+                   (content (with-current-buffer src
+                              (buffer-substring-no-properties (car bounds) (cdr bounds))))
+                   (composed (with-temp-buffer (insert content) (goto-char (point-min))
+                               (when (re-search-forward "^- \\[ \\] A" nil t) (replace-match "- [X] A"))
+                               (buffer-string))))
+              (cc-butler--compose-writeback src composed)
+              (with-current-buffer src (cc-butler-decision-submit))
+              (ignore-errors (kill-buffer src))))
+          (should (cc-butler--ch-drain "worker-a"))          ; asker got the direct reply
+          (let ((b (car (cc-butler--ch-drain "butler"))))    ; butler got a receipt CC
+            (should b)
+            (should (eq 'receipt (plist-get b :kind)))
+            (should (string-match-p "정수님 answered" (plist-get b :body)))))
+      (delete-directory cc-butler-decision-dir t)
+      (delete-directory cc-butler-mail-dir t))))
+
+(ert-deftest cc-butler-decision/arrival-ccs-the-butler ()
+  "Butler coherence: a decision arriving in 정수님's inbox CCs a pending receipt
+to the butler so it knows what awaits 정수님."
+  (let ((cc-butler-decision-dir (make-temp-file "cc-ar" t))
+        (cc-butler-mail-dir (make-temp-file "cc-arm" t))
+        (cc-butler--channel nil)
+        (cc-butler-decision-auto-display nil)
+        (cc-butler-human-agent "정수님"))
+    (unwind-protect
+        (cl-letf (((symbol-function 'cc-butler--mail-butler-agent) (lambda () "butler")))
+          (cc-butler--ch-deliver
+           "정수님" '(:id "a1" :kind decision :from "s" :reply-to "s" :summary "ship it?"))
+          (cc-butler--decision-on-arrival)
+          (let ((b (car (cc-butler--ch-drain "butler"))))
+            (should b)
+            (should (string-match-p "Pending for 정수님" (plist-get b :body)))
+            (should (string-match-p "ship it?" (plist-get b :body)))))
+      (delete-directory cc-butler-decision-dir t)
+      (delete-directory cc-butler-mail-dir t))))
+
 ;;;; ---- demo (staged, isolated, reversible) -------------------------
 
 (ert-deftest cc-butler-decision/demo-roundtrip ()
