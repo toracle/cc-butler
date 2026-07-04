@@ -36,7 +36,7 @@ An empty string adds nothing."
   :group 'cc-butler)
 
 (defmacro cc-butler--with-channel (&rest body)
-  "Run BODY with `claude-code-ide-cli-extra-flags' augmented by `cc-butler-channel-args'."
+  "Run BODY with the channel args added to `claude-code-ide-cli-extra-flags'."
   (declare (indent 0))
   `(let ((claude-code-ide-cli-extra-flags
           (string-trim (concat (or claude-code-ide-cli-extra-flags "")

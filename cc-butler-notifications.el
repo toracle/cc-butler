@@ -80,6 +80,8 @@ ghostel notifier is chained so existing behavior is preserved."
                         #'cc-butler--on-ghostel-notification)))
       (ignore-errors (funcall cc-butler--prior-ghostel-notify title body)))))
 
+(defvar ghostel-notification-function)  ; defined by ghostel at runtime
+
 (defun cc-butler--install-notification-source ()
   "Take over `ghostel-notification-function', remembering the prior one."
   (when (and (boundp 'ghostel-notification-function)

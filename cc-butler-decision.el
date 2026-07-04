@@ -165,7 +165,8 @@ answerable; `note'/`relay' render a read-only notification."
       (buffer-string))))
 
 (defun cc-butler--decision-render (msg &optional dir)
-  "Render decision MSG to a timestamped file in DIR (default open/); return the path."
+  "Render decision MSG to a timestamped file in DIR; return the path.
+DIR defaults to open/."
   (let* ((id (or (plist-get msg :id) (cc-butler--mail-id)))
          (msg (plist-put msg :id id))
          (file (expand-file-name (format "%s.org" id)
@@ -212,11 +213,11 @@ The arrival watcher renders it when the workflow is active."
     id))
 
 (defun cc-butler-briefing-create (from-dir summary &optional via)
-  "Deliver a worker BRIEFING (a deliverable/result) UP to 정수님's inbox — the
-bidirectional bus's up-direction.  FROM-DIR is the worker (the ORIGIN, shown as
-`From', never a relayer); VIA is the relay-path (a hop list/string, shown as
-`Via').  Renders read-only in the inbox (r to acknowledge) with an OPTIONAL reply
-(c) routed back to the worker via the correlation.  Returns the id."
+  "Deliver a worker BRIEFING (a result) UP to 정수님's inbox (the bus's
+up-direction).  FROM-DIR is the worker (the ORIGIN, shown as `From', never a
+relayer); VIA is the relay-path (a hop list/string, shown as `Via').  Renders
+read-only (r to acknowledge) with an OPTIONAL reply (c) back to the worker.
+Returns the id."
   (let ((id (cc-butler--mail-id))
         (from (and from-dir (cc-butler--display-name from-dir))))
     (cc-butler--ch-deliver
@@ -523,9 +524,13 @@ org-edit-special pattern): edit freely — no command-key collisions — then
 
 (declare-function cc-butler-doc-reopen "cc-butler-doc-panel" ())
 
+;; NOTE: `defhydra' generates a docstring per -and-exit command from the hint;
+;; those can exceed 80 cols regardless of the hint text — the only remaining
+;; byte-compile warnings are this one cosmetic (a known hydra-macro artifact).
 (defhydra cc-butler-decision-hydra (:color blue :hint nil)
   "
- cc-butler decision (answer-only):  _r_ead   _c_ompose/answer   _u_ back to inbox   _g_ reload   _q_ close ⇄ _v_ reopen   _k_ remove
+ answer-only:  _r_ead  _c_ompose  _u_ inbox
+ _g_ reload  _q_ close  _v_ reopen  _k_ remove
 "
   ("r" cc-butler-decision-mark-read)
   ("c" cc-butler-decision-compose)
@@ -758,7 +763,7 @@ nothing into any input box."
 
 ;;;###autoload
 (defun cc-butler-decision-answer-next ()
-  "Open the oldest open decision document for answering (in `cc-butler-decision-mode').
+  "Open the oldest open decision for answering, in `cc-butler-decision-mode'.
 Renders any freshly-arrived decisions from the human inbox first."
   (interactive)
   (cc-butler-decision-refresh)
