@@ -42,6 +42,7 @@
 (require 'cc-butler-docs)
 (require 'cc-butler-persist)
 (require 'cc-butler-mail)
+(require 'cc-butler-decision)
 
 (provide 'cc-butler)
 ;;; cc-butler.el ends here
