@@ -237,10 +237,57 @@ moves the file to done/."
             (rename-file file dest t)
             (set-visited-file-name dest nil t)))
         (set-buffer-modified-p nil))
+      (cc-butler--decision-update-indicator)
       (run-hook-with-args 'cc-butler-decision-after-submit-functions
                           (list :to to :id id :answer answer))
       (message "cc-butler: answer sent to %s; decision archived to done/" to)
       answer)))
+
+(defun cc-butler--decision-footer ()
+  "Return (ID . TO) from the routing footer, or nil for a doc with no sender."
+  (save-excursion
+    (goto-char (point-min))
+    (when (re-search-forward "^# cc-butler decision id=\\(\\S-+\\) to=\\(\\S-+\\)" nil t)
+      (cons (match-string 1) (match-string 2)))))
+
+(defun cc-butler--decision-doc-title ()
+  (save-excursion
+    (goto-char (point-min))
+    (if (re-search-forward "^#\\+TITLE: \\(.*\\)$" nil t) (match-string 1) "document")))
+
+(defun cc-butler--decision-archive-current ()
+  "Move the current decision file open/ → done/ (audit trail)."
+  (let ((file (buffer-file-name)))
+    (when (and file (file-exists-p file))
+      (let ((dest (expand-file-name (file-name-nondirectory file)
+                                    (cc-butler--decision-done-dir))))
+        (ignore-errors (save-buffer))
+        (rename-file file dest t)
+        (set-visited-file-name dest nil t)))
+    (set-buffer-modified-p nil)))
+
+;;;###autoload
+(defun cc-butler-decision-mark-read ()
+  "Mark the current inbox document read: send a read-receipt to its sender.
+For a `note'/`relay' this also closes it (open/ → done/).  A `decision' stays
+open — only `C-c C-c' closes a decision (an unanswered decision is never lost).
+A plain document with no sender is marked read locally (no receipt)."
+  (interactive)
+  (let ((footer (cc-butler--decision-footer))
+        (decisionp (cc-butler--decision-answer-bounds)))
+    (if (not footer)
+        (progn (cc-butler--decision-update-indicator)
+               (message "cc-butler: read (local — no sender to receipt)."))
+      (let ((id (car footer)) (to (cdr footer)))
+        (unless (equal to "?")
+          (cc-butler--ch-deliver
+           to (list :kind 'read :from cc-butler-human-agent :in-reply-to id
+                    :body (format "read: %s" (cc-butler--decision-doc-title)))))
+        (if decisionp
+            (message "cc-butler: read-receipt sent to %s (decision stays open — answer with C-c C-c)." to)
+          (cc-butler--decision-archive-current)
+          (message "cc-butler: read — receipt sent to %s; archived." to))
+        (cc-butler--decision-update-indicator)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; The decision-document minor mode (read-only + C-c C-c)
@@ -249,6 +296,7 @@ moves the file to done/."
 (defvar cc-butler-decision-mode-map (make-sparse-keymap)
   "Keymap for `cc-butler-decision-mode'.")
 (define-key cc-butler-decision-mode-map (kbd "C-c C-c") #'cc-butler-decision-submit)
+(define-key cc-butler-decision-mode-map "r" #'cc-butler-decision-mark-read)
 
 (defun cc-butler--decision-protect ()
   "Make everything outside the answer region read-only (integrity)."
@@ -328,12 +376,10 @@ Arrival-driven: this runs on an inbox change, independent of any agent turn.
 render read-only straight to done/.  Returns the count of new decisions."
   (let ((msgs (cc-butler--ch-drain cc-butler-human-agent))
         (fresh '()))
+    ;; §③ (read-receipt): every inbox message renders to open/ as *unread* —
+    ;; decisions close by C-c C-c, notes/relays by the read-receipt `r'.
     (dolist (m msgs)
-      (let ((decision (eq (or (plist-get m :kind) 'decision) 'decision)))
-        (let ((file (cc-butler--decision-render
-                     m (if decision (cc-butler--decision-open-dir)
-                         (cc-butler--decision-done-dir)))))
-          (when decision (push file fresh)))))
+      (push (cc-butler--decision-render m) fresh))
     (cc-butler--decision-update-indicator)
     (when (and fresh cc-butler-decision-auto-display)
       (cc-butler--decision-display (car (last fresh))))

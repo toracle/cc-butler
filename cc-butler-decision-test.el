@@ -161,17 +161,17 @@ indicator — driven by arrival, with no agent turn involved."
       (should (= 0 (length (directory-files (cc-butler--decision-done-dir) nil "\\`[^.].*\\.org\\'"))))
       (should (equal " ⚖1" cc-butler--decision-indicator)))))
 
-(ert-deftest cc-butler-decision/arrival-note-not-queued ()
-  "A note arrival renders read-only to done/, never the answer queue, and leaves
-the indicator clear."
+(ert-deftest cc-butler-decision/arrival-note-to-open-unread ()
+  "§③ (read-receipt): a note arrival now renders to open/ as UNREAD (read-only),
+counted by the indicator — it stays visible until `r' closes it."
   (cc-butler-decision-test--with-arrival
     (cc-butler--mail-file-deliver
      "정수님" '(:id "n9" :kind note :from "steward" :summary "CI is green"))
     (let ((n (cc-butler--decision-on-arrival)))
-      (should (= 0 n))
-      (should (= 0 (length (directory-files (cc-butler--decision-open-dir) nil "\\`[^.].*\\.org\\'"))))
-      (should (= 1 (length (directory-files (cc-butler--decision-done-dir) nil "\\`[^.].*\\.org\\'"))))
-      (should (equal "" cc-butler--decision-indicator)))))
+      (should (= 1 n))
+      (should (= 1 (length (directory-files (cc-butler--decision-open-dir) nil "\\`[^.].*\\.org\\'"))))
+      (should (= 0 (length (directory-files (cc-butler--decision-done-dir) nil "\\`[^.].*\\.org\\'"))))
+      (should (equal " ⚖1" cc-butler--decision-indicator)))))
 
 ;;;; ---- create-path (escalate :options) + full flow -----------------
 
@@ -228,6 +228,62 @@ escalator via correlation."
           (should (string-match-p "yes" (plist-get r :body)))
           (should (string-match-p "asap" (plist-get r :body))))))))
 
+;;;; ---- read-receipt (`r') ------------------------------------------
+
+(defun cc-butler-decision-test--open-first ()
+  "Open the first open/ decision doc in a buffer (no lock files)."
+  (let* ((file (car (directory-files (cc-butler--decision-open-dir) t cc-butler--decision-org-re)))
+         (create-lockfiles nil))
+    (find-file-noselect file)))
+
+(ert-deftest cc-butler-decision/mark-read-note-closes-and-receipts ()
+  "`r' on a note: sends a `read' receipt to the sender (correlation) and closes
+it (open/ → done/); the indicator decrements."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cc-butler--mail-file-deliver "정수님"
+        '(:id "n1" :kind note :from "steward" :reply-to "steward" :summary "CI green"))
+      (cc-butler--decision-on-arrival)
+      (let ((buf (cc-butler-decision-test--open-first))
+            (kill-buffer-query-functions nil))
+        (unwind-protect (with-current-buffer buf (cc-butler-decision-mark-read))
+          (ignore-errors (kill-buffer buf))))
+      (let ((r (car (cc-butler--ch-drain "steward"))))
+        (should (eq 'read (plist-get r :kind)))
+        (should (equal "n1" (plist-get r :in-reply-to)))
+        (should (equal "정수님" (plist-get r :from))))
+      (should (= 0 (length (directory-files (cc-butler--decision-open-dir) nil cc-butler--decision-org-re))))
+      (should (= 1 (length (directory-files (cc-butler--decision-done-dir) nil cc-butler--decision-org-re))))
+      (should (equal "" cc-butler--decision-indicator)))))
+
+(ert-deftest cc-butler-decision/mark-read-decision-stays-open ()
+  "`r' on a decision: sends a read-receipt but KEEPS it in open/ — only C-c C-c
+closes a decision (correctness: an unanswered decision is never lost)."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cc-butler--mail-file-deliver "정수님"
+        '(:id "d1" :kind decision :from "worker-a" :reply-to "worker-a"
+              :summary "ship?" :options ("yes" "no")))
+      (cc-butler--decision-on-arrival)
+      (let ((buf (cc-butler-decision-test--open-first))
+            (kill-buffer-query-functions nil))
+        (unwind-protect (with-current-buffer buf (cc-butler-decision-mark-read))
+          (ignore-errors (kill-buffer buf))))
+      (let ((r (car (cc-butler--ch-drain "worker-a"))))
+        (should (eq 'read (plist-get r :kind)))
+        (should (equal "d1" (plist-get r :in-reply-to))))
+      (should (= 1 (length (directory-files (cc-butler--decision-open-dir) nil cc-butler--decision-org-re))))
+      (should (= 0 (length (directory-files (cc-butler--decision-done-dir) nil cc-butler--decision-org-re)))))))
+
+(ert-deftest cc-butler-decision/mark-read-plain-doc-local-only ()
+  "`r' on a document with no routing footer sends NO receipt (local read only)."
+  (cc-butler-decision-test--with-arrival
+    (with-temp-buffer
+      (insert "#+TITLE: Dashboard\n* Status\nall green\n")   ; no sender footer
+      (cc-butler-decision-mark-read)
+      (should (null (cc-butler--ch-drain "steward")))
+      (should (null (cc-butler--ch-drain "worker-a"))))))
+
 ;;;; ---- demo (staged, isolated, reversible) -------------------------
 
 (ert-deftest cc-butler-decision/demo-roundtrip ()
@@ -244,8 +300,10 @@ and auto-restores every setting (nothing leaks)."
         (progn
           (cc-butler-decision-demo)
           (should cc-butler--decision-demo-state)
-          (should (= 1 (length (directory-files (cc-butler--decision-open-dir) nil "\\`[^.].*\\.org\\'"))))
-          (should (string-match-p "⚖1" cc-butler--decision-indicator))
+          ;; §③: the demo delivers a decision AND a note — both land in open/.
+          (should (= 2 (length (directory-files (cc-butler--decision-open-dir) nil "\\`[^.].*\\.org\\'"))))
+          (should (string-match-p "⚖2" cc-butler--decision-indicator))
+          ;; the decision (demo-1) sorts before the note (demo-note); answer it
           (let* ((file (car (directory-files (cc-butler--decision-open-dir) t "\\`[^.].*\\.org\\'")))
                  (doc (with-temp-buffer (insert-file-contents file) (buffer-string))))
             (with-temp-file file
