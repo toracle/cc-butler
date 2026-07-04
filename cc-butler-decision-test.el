@@ -382,6 +382,25 @@ the butler (its box stays clean) and never a bad target."
   (should (eq (lookup-key cc-butler-decision-mode-map "?") #'cc-butler-decision-hydra/body))
   (should (fboundp 'cc-butler-decision-hydra/body)))
 
+;;;; ---- compose safety (data-loss guard) ----------------------------
+
+(ert-deftest cc-butler-decision/compose-region-types-command-letters ()
+  "In the answer region the bare command letters TYPE (self-insert), so an
+answer containing r/c/k/… is never eaten as a command (data-loss guard);
+outside, in the read-only decision text, they remain commands."
+  (with-temp-buffer
+    (insert (cc-butler--decision-doc-string cc-butler-decision-test--msg))
+    (cc-butler-decision-mode 1)
+    (let ((bounds (cc-butler--decision-answer-bounds)))
+      (should bounds)
+      (should (eq #'self-insert-command (key-binding "k" nil nil (car bounds))))
+      (should (eq #'self-insert-command (key-binding "r" nil nil (car bounds))))
+      (should (eq #'self-insert-command (key-binding "q" nil nil (car bounds))))
+      ;; C-c C-c still submits from inside the answer region
+      (should (eq #'cc-butler-decision-submit (key-binding (kbd "C-c C-c") nil nil (car bounds))))
+      ;; outside the region, the letters are commands
+      (should (eq #'cc-butler-decision-quit (key-binding "k" nil nil (point-min)))))))
+
 ;;;; ---- demo (staged, isolated, reversible) -------------------------
 
 (ert-deftest cc-butler-decision/demo-roundtrip ()

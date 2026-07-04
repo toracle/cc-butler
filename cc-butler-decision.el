@@ -398,15 +398,30 @@ notification into something you can comment on."
 (define-key cc-butler-decision-mode-map "q" #'cc-butler-decision-quit)
 (define-key cc-butler-decision-mode-map "?" #'cc-butler-decision-hydra/body)
 
+(defvar cc-butler--decision-compose-map
+  (let ((m (make-sparse-keymap)))
+    ;; Inside the answer region the bare command letters must TYPE, not fire —
+    ;; otherwise an answer containing r/c/k/n/p/g/q/? loses characters to a
+    ;; command (e.g. `k' quitting mid-word = a data-loss).  A `keymap' text
+    ;; property out-ranks the minor-mode map, so this wins only in the region.
+    (dolist (k '("r" "c" "k" "n" "p" "g" "q" "?"))
+      (define-key m k #'self-insert-command))
+    m)
+  "Keymap layered on the answer region so command letters type normally.")
+
 (defun cc-butler--decision-protect ()
-  "Make everything outside the answer region read-only (integrity)."
+  "Make everything outside the answer region read-only (integrity), and let the
+bare command letters TYPE inside it (compose safety — a data-loss guard)."
   (let ((bounds (cc-butler--decision-answer-bounds))
         (inhibit-read-only t))
-    (remove-text-properties (point-min) (point-max) '(read-only nil))
+    (remove-text-properties (point-min) (point-max) '(read-only nil keymap nil))
     (if bounds
         (progn
           (add-text-properties (point-min) (car bounds) '(read-only t))
-          (add-text-properties (cdr bounds) (point-max) '(read-only t)))
+          (add-text-properties (cdr bounds) (point-max) '(read-only t))
+          ;; compose region: letters self-insert (only C-c C-c submits)
+          (add-text-properties (car bounds) (cdr bounds)
+                               (list 'keymap cc-butler--decision-compose-map)))
       (add-text-properties (point-min) (point-max) '(read-only t)))))
 
 ;;;###autoload
