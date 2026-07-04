@@ -67,6 +67,16 @@ Each function is called with one plist argument (:to :id :answer).")
   "Label string for option O (a string, or a plist (:label :tradeoff))."
   (if (stringp o) o (plist-get o :label)))
 
+(defun cc-butler--decision-normalize (s)
+  (downcase (string-trim (replace-regexp-in-string "[ \t\n]+" " " (or s "")))))
+
+(defun cc-butler--decision-topic-key (msg)
+  "A stable single-token key identifying \"the same decision\" for dedup.
+From MSG's explicit :topic, else its normalized summary/body."
+  (md5 (or (plist-get msg :topic)
+           (cc-butler--decision-normalize
+            (or (plist-get msg :summary) (plist-get msg :body) "")))))
+
 (defun cc-butler--decision-doc-string (msg)
   "Return the org document text rendering decision MSG.
 MSG: (:id :kind :from :reply-to :summary :needs :options).  `decision' kind is
@@ -106,8 +116,8 @@ answerable; `note'/`relay' render a read-only notification."
         (insert (format "#+TITLE: Note — %s\n\n" first))
         (insert "* Notification (read-only)\n" summary "\n")
         (when from (insert (format "\n_(from %s)_\n" from))))
-      (insert (format "\n# cc-butler decision id=%s to=%s  (routing — do not edit)\n"
-                      id to))
+      (insert (format "\n# cc-butler decision id=%s to=%s topic=%s  (routing — do not edit)\n"
+                      id to (cc-butler--decision-topic-key msg)))
       (buffer-string))))
 
 (defun cc-butler--decision-render (msg &optional dir)
@@ -369,21 +379,64 @@ regardless."
     (with-current-buffer buf (cc-butler-decision-mode 1))
     (display-buffer buf '(display-buffer-in-side-window (side . right)))))
 
+;;;; dedup / supersede (item 2) — one open doc per topic ---------------
+
+(defun cc-butler--decision-scan-dir (dir topic-key state)
+  "Find a doc in DIR whose footer topic = TOPIC-KEY; return (FILE . STATE) or nil."
+  (seq-some
+   (lambda (f)
+     (with-temp-buffer
+       (insert-file-contents f)
+       (goto-char (point-min))
+       (when (re-search-forward (format "topic=%s\\b" (regexp-quote topic-key)) nil t)
+         (cons f state))))
+   (ignore-errors (directory-files dir t cc-butler--decision-org-re))))
+
+(defun cc-butler--decision-find-by-topic (topic-key)
+  "Return (FILE . STATE) for an existing doc of TOPIC-KEY (open takes precedence)."
+  (or (cc-butler--decision-scan-dir (cc-butler--decision-open-dir) topic-key 'open)
+      (cc-butler--decision-scan-dir (cc-butler--decision-done-dir) topic-key 'done)))
+
+(defun cc-butler--decision-file-answered-p (file)
+  "Non-nil if FILE's answer region already holds an in-progress answer."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (let ((p (ignore-errors (cc-butler--decision-parse))))
+      (and p (or (plist-get p :selected) (plist-get p :other))))))
+
+(defun cc-butler--decision-ingest (msg)
+  "Render MSG, deduplicating by topic.  Return (FILE . DISPOSITION):
+DISPOSITION is `new', `superseded', `kept' (an open doc 정수님 is answering —
+not clobbered), or `skipped' (already answered → not resurfaced)."
+  (let* ((topic (cc-butler--decision-topic-key msg))
+         (existing (cc-butler--decision-find-by-topic topic)))
+    (cond
+     ((and existing (eq (cdr existing) 'done))
+      (cons (car existing) 'skipped))
+     ((and existing (eq (cdr existing) 'open)
+           (cc-butler--decision-file-answered-p (car existing)))
+      (cons (car existing) 'kept))
+     ((and existing (eq (cdr existing) 'open))
+      (ignore-errors (delete-file (car existing)))
+      (cons (cc-butler--decision-render msg) 'superseded))
+     (t (cons (cc-butler--decision-render msg) 'new)))))
+
 (defun cc-butler--decision-on-arrival ()
-  "Render newly-arrived inbox messages and refresh the indicator.
-Arrival-driven: this runs on an inbox change, independent of any agent turn.
-`decision' messages render into open/ (the answer queue); `note'/`relay'
-render read-only straight to done/.  Returns the count of new decisions."
+  "Render newly-arrived inbox messages (dedup by topic) and refresh the indicator.
+Arrival-driven: runs on an inbox change, independent of any agent turn.  Every
+message renders to open/ as unread; a re-escalated topic supersedes its open doc
+(unless 정수님 is mid-answer) and an already-answered topic is not resurfaced.
+Returns the count of docs newly surfaced (new or superseded)."
   (let ((msgs (cc-butler--ch-drain cc-butler-human-agent))
-        (fresh '()))
-    ;; §③ (read-receipt): every inbox message renders to open/ as *unread* —
-    ;; decisions close by C-c C-c, notes/relays by the read-receipt `r'.
+        (surfaced '()))
     (dolist (m msgs)
-      (push (cc-butler--decision-render m) fresh))
+      (let ((r (cc-butler--decision-ingest m)))
+        (when (memq (cdr r) '(new superseded))
+          (push (car r) surfaced))))
     (cc-butler--decision-update-indicator)
-    (when (and fresh cc-butler-decision-auto-display)
-      (cc-butler--decision-display (car (last fresh))))
-    (length fresh)))
+    (when (and surfaced cc-butler-decision-auto-display)
+      (cc-butler--decision-display (car (last surfaced))))
+    (length surfaced)))
 
 (defun cc-butler-decision-watch-start ()
   "Watch 정수님's inbox and render on arrival (Emacs-native, no agent turn)."

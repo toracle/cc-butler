@@ -228,6 +228,70 @@ escalator via correlation."
           (should (string-match-p "yes" (plist-get r :body)))
           (should (string-match-p "asap" (plist-get r :body))))))))
 
+;;;; ---- dedup / supersede (item 2) ----------------------------------
+
+(ert-deftest cc-butler-decision/dedup-supersedes-open ()
+  "Re-escalating the same topic supersedes the open doc (no duplicate); the
+superseded doc reflects the new content."
+  (cc-butler-decision-test--with-arrival
+    (cc-butler--mail-file-deliver "정수님"
+      '(:id "a1" :kind decision :from "steward" :reply-to "steward"
+            :summary "Which auth?" :options ("Stripe")))
+    (should (= 1 (cc-butler--decision-on-arrival)))
+    (should (= 1 (length (directory-files (cc-butler--decision-open-dir) nil cc-butler--decision-org-re))))
+    (cc-butler--mail-file-deliver "정수님"
+      '(:id "a2" :kind decision :from "steward" :reply-to "steward"
+            :summary "Which auth?" :options ("Stripe" "Paddle")))
+    (should (= 1 (cc-butler--decision-on-arrival)))       ; superseded, still surfaced
+    (should (= 1 (length (directory-files (cc-butler--decision-open-dir) nil cc-butler--decision-org-re))))
+    (let ((file (car (directory-files (cc-butler--decision-open-dir) t cc-butler--decision-org-re))))
+      (should (string-match-p "Paddle" (with-temp-buffer (insert-file-contents file) (buffer-string)))))))
+
+(ert-deftest cc-butler-decision/dedup-keeps-in-progress-answer ()
+  "A re-escalation does NOT clobber an open doc 정수님 is already answering."
+  (cc-butler-decision-test--with-arrival
+    (cc-butler--mail-file-deliver "정수님"
+      '(:id "b1" :kind decision :from "steward" :reply-to "steward"
+            :summary "Ship?" :options ("yes" "no")))
+    (cc-butler--decision-on-arrival)
+    (let* ((file (car (directory-files (cc-butler--decision-open-dir) t cc-butler--decision-org-re)))
+           (doc (with-temp-buffer (insert-file-contents file) (buffer-string))))
+      (with-temp-file file (insert (cc-butler-decision-test--fill doc ?A))))
+    (cc-butler--mail-file-deliver "정수님"
+      '(:id "b2" :kind decision :from "steward" :reply-to "steward"
+            :summary "Ship?" :options ("yes" "no" "maybe")))
+    (should (= 0 (cc-butler--decision-on-arrival)))        ; kept, not surfaced anew
+    (should (= 1 (length (directory-files (cc-butler--decision-open-dir) nil cc-butler--decision-org-re))))
+    (let ((content (with-temp-buffer
+                     (insert-file-contents
+                      (car (directory-files (cc-butler--decision-open-dir) t cc-butler--decision-org-re)))
+                     (buffer-string))))
+      (should (string-match-p "\\[X\\] A" content))         ; 정수님's tick preserved
+      (should-not (string-match-p "maybe" content)))))       ; not superseded
+
+(ert-deftest cc-butler-decision/dedup-skips-answered ()
+  "An already-answered topic is not resurfaced by a re-escalation."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cc-butler--mail-file-deliver "정수님"
+        '(:id "c1" :kind decision :from "steward" :reply-to "steward"
+              :summary "Deploy?" :options ("yes" "no")))
+      (cc-butler--decision-on-arrival)
+      (let* ((file (car (directory-files (cc-butler--decision-open-dir) t cc-butler--decision-org-re)))
+             (doc (with-temp-buffer (insert-file-contents file) (buffer-string)))
+             (create-lockfiles nil) (kill-buffer-query-functions nil))
+        (with-temp-file file (insert (cc-butler-decision-test--fill doc ?A "go")))
+        (let ((buf (find-file-noselect file)))
+          (unwind-protect (with-current-buffer buf (cc-butler-decision-submit))
+            (ignore-errors (kill-buffer buf)))))
+      (should (= 0 (length (directory-files (cc-butler--decision-open-dir) nil cc-butler--decision-org-re))))
+      (should (= 1 (length (directory-files (cc-butler--decision-done-dir) nil cc-butler--decision-org-re))))
+      (cc-butler--mail-file-deliver "정수님"
+        '(:id "c2" :kind decision :from "steward" :reply-to "steward"
+              :summary "Deploy?" :options ("yes" "no")))
+      (should (= 0 (cc-butler--decision-on-arrival)))        ; skipped
+      (should (= 0 (length (directory-files (cc-butler--decision-open-dir) nil cc-butler--decision-org-re)))))))
+
 ;;;; ---- read-receipt (`r') ------------------------------------------
 
 (defun cc-butler-decision-test--open-first ()
