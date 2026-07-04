@@ -448,10 +448,12 @@ answer region is editable and parsed."
 
 (require 'filenotify)
 
-(defcustom cc-butler-decision-auto-display t
+(defcustom cc-butler-decision-auto-display nil
   "When non-nil, a freshly-arrived decision is shown in a side window.
-Uses `display-buffer' (no focus stealing); the mode-line indicator fires
-regardless."
+Default nil (guarantee 4): an arrival NEVER switches the view you are looking
+at — especially while you are composing an answer — it only bumps the ⚖ unread
+indicator (and the inbox list).  You navigate to new items yourself (`i' / n/p).
+Leaving this nil is what protects an answer-in-progress from being interrupted."
   :type 'boolean
   :group 'cc-butler)
 
@@ -662,7 +664,8 @@ touched; end early with `cc-butler-decision-demo-end'."
   (cc-butler--mail-file-deliver
    cc-butler-human-agent
    (list :id "demo-note" :kind 'note :from "steward" :summary "FYI: CI is green on main."))
-  (cc-butler--decision-on-arrival)             ; arrival-driven render + indicator + display
+  (let ((cc-butler-decision-auto-display t))   ; the demo explicitly shows the doc
+    (cc-butler--decision-on-arrival))
   (with-current-buffer (get-buffer-create "*cc-butler-decision-demo*")
     (erase-buffer)
     (insert "cc-butler decision workflow — DEMO  (isolated · reversible · nothing live)\n"

@@ -422,7 +422,10 @@ and auto-restores every setting (nothing leaks)."
           (should (string-match-p "⚖2" cc-butler--decision-indicator))
           ;; the decision (demo-1) sorts before the note (demo-note); answer it
           (let* ((file (car (directory-files (cc-butler--decision-open-dir) t "\\`[^.].*\\.org\\'")))
-                 (doc (with-temp-buffer (insert-file-contents file) (buffer-string))))
+                 (doc (with-temp-buffer (insert-file-contents file) (buffer-string)))
+                 (kill-buffer-query-functions nil))
+            ;; drop any buffer the demo's display opened (stale), then fill fresh
+            (when-let ((b (get-file-buffer file))) (kill-buffer b))
             (with-temp-file file
               (insert (cc-butler-decision-test--fill doc ?A "sandbox")))
             (let ((buf (find-file-noselect file)))
