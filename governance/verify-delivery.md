@@ -28,5 +28,13 @@ found **9 decision docs piled in 정수님's inbox, answered:0** — rendered to
 4. **Reconcile the two channels.** Chat-answers must close the corresponding decision docs, or they
    pile up unanswered and the system re-surfaces them forever. Answer-in-chat → close-the-doc.
 
+5. **Delivery/notification is the ALWAYS-ON daemon's job, not the conversation-paced agent.**
+   The butler AGENT sleeps when the human is away, so "the butler actively delivers in chat" only
+   works mid-conversation — a half-fix (the 2026-07-04 two-hours-of-zero-notifications root). The
+   moment a decision ARRIVES for the human, the always-on host (the Emacs daemon) must actively
+   PUSH to their real attention — an OS desktop notification and a phone push (e.g. Telegram) —
+   independent of any agent turn. Passive badges/inboxes are pull, not delivery. (Same principle as
+   "arrival is the daemon's job": the host handles arrival, not a paced agent.)
+
 Ties to [[butler-institutionalize-learning]], [[butler-relay-fidelity-provenance]],
 [[butler-state-desync]]. A standing butler/steward duty; runtime-neutral home owed.
