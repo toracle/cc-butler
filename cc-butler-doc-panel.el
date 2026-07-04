@@ -61,10 +61,27 @@ itself, so tearing the panel down never disturbs the terminal.")
          (idx (and state (plist-get state :current))))
     (and items (nth (min (max 0 (or idx 0)) (1- (length items))) items))))
 
+(defun cc-butler--doc-revive-buffer (dir doc)
+  "Return DOC's buffer, RE-CREATING it if it was killed; update DOC in place.
+The panel must not blank/close just because a document buffer died — guarantee
+1/6 (navigation onto a dead buffer once triggered a delete-window/close)."
+  (let ((buf (plist-get doc :buffer)))
+    (if (buffer-live-p buf) buf
+      (let ((new (if (eq (plist-get doc :kind) 'file)
+                     (cc-butler--doc-file-buffer dir (plist-get doc :ref))
+                   (cc-butler--doc-make-buffer (cc-butler--display-name dir)
+                                               (plist-get doc :kind)
+                                               (plist-get doc :ref)))))
+        (plist-put doc :buffer new)
+        (unless (eq (plist-get doc :kind) 'file) (cc-butler--doc-render doc dir))
+        new))))
+
 (defun cc-butler--current-doc-buffer (dir)
-  "Return the buffer of DIR's currently-selected document, or nil."
-  (let ((doc (cc-butler--current-doc dir)))
-    (and doc (buffer-live-p (plist-get doc :buffer)) (plist-get doc :buffer))))
+  "Return the current document's buffer, reviving it if the buffer was killed
+so the panel never blanks on a dead buffer."
+  (when-let ((doc (cc-butler--current-doc dir)))
+    (let ((buf (cc-butler--doc-revive-buffer dir doc)))
+      (and (buffer-live-p buf) buf))))
 
 (defun cc-butler--visible-dir ()
   "Return the session working-dir whose terminal occupies the main window."
@@ -226,6 +243,8 @@ on failure stderr is shown so the error is still visible."
 (define-key cc-butler-doc-view-mode-map "q" #'cc-butler-doc-hide)
 (define-key cc-butler-doc-view-mode-map "k" #'cc-butler-doc-remove)
 (define-key cc-butler-doc-view-mode-map "w" #'cc-butler-doc-browse)
+(define-key cc-butler-doc-view-mode-map (kbd "RET") #'cc-butler-doc-open-link)
+(define-key cc-butler-doc-view-mode-map (kbd "C-c C-o") #'cc-butler-doc-open-link)
 
 (define-minor-mode cc-butler-doc-view-mode
   "Read-only cc-butler viewer keys layered on a file's own major mode.
@@ -467,6 +486,35 @@ session (when invoked inside a document), else the visible session."
   "Show the previous document in the selected session's panel."
   (interactive)
   (when-let ((dir (cc-butler--doc-target-dir))) (cc-butler--doc-step dir -1)))
+
+(declare-function org-element-context "org-element" (&optional element))
+(declare-function org-element-property "org-element-ast" (property node))
+(declare-function org-element-type "org-element-ast" (node &optional anonymous))
+
+(defun cc-butler-doc-open-link ()
+  "Open the Org file-link at point as a new tab in this panel.
+Lets an index document (e.g. 00-index.org) act as a table of contents —
+RET or \\[cc-butler-doc-open-link] on a file link loads that file into the
+same doc-view surface, navigable with n/p alongside everything else."
+  (interactive)
+  (require 'org)
+  (let ((ctx (org-element-context)))
+    (unless (eq (org-element-type ctx) 'link)
+      (user-error "No link at point"))
+    (let ((ltype (org-element-property :type ctx))
+          (path (org-element-property :path ctx)))
+      (unless (member ltype '("file" "fuzzy" nil))
+        (user-error "Not a file link (%s)" ltype))
+      (let* ((base (if (buffer-file-name)
+                       (file-name-directory (buffer-file-name))
+                     default-directory))
+             (target (expand-file-name path base))
+             (dir (cc-butler--doc-target-dir)))
+        (unless (and dir (file-readable-p target))
+          (user-error "Cannot open %s" target))
+        (cc-butler--doc-add dir 'file target)
+        (cc-butler--doc-refresh-layout dir)
+        (message "cc-butler: opened %s" (file-name-nondirectory target))))))
 
 (defun cc-butler-doc-toggle ()
   "Toggle whether the selected session's document panel is shown."
