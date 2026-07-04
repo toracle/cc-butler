@@ -348,6 +348,25 @@ closes a decision (correctness: an unanswered decision is never lost)."
       (should (null (cc-butler--ch-drain "steward")))
       (should (null (cc-butler--ch-drain "worker-a"))))))
 
+;;;; ---- doc-view operations + hydra (item 3) ------------------------
+
+(ert-deftest cc-butler-decision/confirm-adds-answer-region-to-note ()
+  "`c' on a read-only note adds an answer region so it can be replied to."
+  (with-temp-buffer
+    (insert (cc-butler--decision-doc-string
+             '(:id "n1" :kind note :from "steward" :reply-to "steward" :summary "FYI")))
+    (should-not (cc-butler--decision-answer-bounds))
+    (cc-butler-decision-confirm)
+    (should (cc-butler--decision-answer-bounds))))
+
+(ert-deftest cc-butler-decision/keys-bound ()
+  "The unified scheme + hydra are bound in the decision keymap."
+  (dolist (k '("r" "c" "k" "n" "p" "g" "q" "?"))
+    (should (commandp (lookup-key cc-butler-decision-mode-map k))))
+  (should (eq (lookup-key cc-butler-decision-mode-map "r") #'cc-butler-decision-mark-read))
+  (should (eq (lookup-key cc-butler-decision-mode-map "?") #'cc-butler-decision-hydra/body))
+  (should (fboundp 'cc-butler-decision-hydra/body)))
+
 ;;;; ---- demo (staged, isolated, reversible) -------------------------
 
 (ert-deftest cc-butler-decision/demo-roundtrip ()

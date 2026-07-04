@@ -63,6 +63,9 @@ Each function is called with one plist argument (:to :id :answer).")
   (let ((d (expand-file-name "done/" cc-butler-decision-dir)))
     (make-directory d t) d))
 
+(defconst cc-butler--decision-org-re "\\`[^.].*\\.org\\'"
+  "Match decision .org files, excluding dotfiles like lock files (.#foo.org).")
+
 (defun cc-butler--decision-option-label (o)
   "Label string for option O (a string, or a plist (:label :tradeoff))."
   (if (stringp o) o (plist-get o :label)))
@@ -300,13 +303,89 @@ A plain document with no sender is marked read locally (no receipt)."
         (cc-butler--decision-update-indicator)))))
 
 ;;;; ------------------------------------------------------------------
+;;;; Doc-view operations (item 3) — confirm / navigate / quit
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-decision-confirm ()
+  "Move point to the answer region so you can reply, then C-c C-c to send.
+For a note/relay (no answer region) one is added, turning a read-only
+notification into something you can comment on."
+  (interactive)
+  (let ((bounds (cc-butler--decision-answer-bounds)))
+    (unless bounds
+      (let ((inhibit-read-only t))
+        (save-excursion
+          (goto-char (point-min))
+          (if (re-search-forward "^# cc-butler decision id=" nil t)
+              (goto-char (line-beginning-position))
+            (goto-char (point-max)))
+          (insert "\n" cc-butler--decision-answer-begin "\nOther: \n"
+                  cc-butler--decision-answer-end "\n"))
+        (when (bound-and-true-p cc-butler-decision-mode) (cc-butler--decision-protect)))
+      (setq bounds (cc-butler--decision-answer-bounds)))
+    (when bounds (goto-char (car bounds)))
+    (message "Edit your answer, then C-c C-c to send.")))
+
+(defun cc-butler-decision-quit ()
+  "Bury the decision view — the decision stays open in the queue (never deleted)."
+  (interactive)
+  (quit-window))
+
+(defun cc-butler-decision-revert ()
+  "Re-read the decision document from disk."
+  (interactive)
+  (when (buffer-file-name)
+    (revert-buffer 'ignore-auto 'noconfirm)
+    (cc-butler-decision-mode 1)))
+
+(defun cc-butler--decision-open-files ()
+  (sort (ignore-errors (directory-files (cc-butler--decision-open-dir) t cc-butler--decision-org-re))
+        #'string<))
+
+(defun cc-butler--decision-move (step)
+  (let* ((files (cc-butler--decision-open-files))
+         (cur (and (buffer-file-name) (expand-file-name (buffer-file-name))))
+         (idx (and cur (seq-position files cur #'equal))))
+    (cond
+     ((null files) (message "cc-butler: no open decisions."))
+     ((null idx) (cc-butler--decision-display (car files)))
+     (t (cc-butler--decision-display (nth (mod (+ idx step) (length files)) files))))))
+
+(defun cc-butler-decision-next () "Next open decision." (interactive) (cc-butler--decision-move 1))
+(defun cc-butler-decision-prev () "Previous open decision." (interactive) (cc-butler--decision-move -1))
+
+;;;; ------------------------------------------------------------------
 ;;;; The decision-document minor mode (read-only + C-c C-c)
 ;;;; ------------------------------------------------------------------
 
+(require 'hydra)
+
+(defhydra cc-butler-decision-hydra (:color blue :hint nil)
+  "
+ cc-butler decision:  _r_ead   _c_onfirm/answer   _k_ remove   _n_ext   _p_rev   _g_ reload   _q_ quit
+"
+  ("r" cc-butler-decision-mark-read)
+  ("c" cc-butler-decision-confirm)
+  ("k" cc-butler-decision-quit)
+  ("n" cc-butler-decision-next :color pink)
+  ("p" cc-butler-decision-prev :color pink)
+  ("g" cc-butler-decision-revert)
+  ("q" cc-butler-decision-quit)
+  ("RET" cc-butler-decision-submit "submit")
+  ("?" nil "cancel"))
+
 (defvar cc-butler-decision-mode-map (make-sparse-keymap)
   "Keymap for `cc-butler-decision-mode'.")
+;; Unified lowercase scheme; `?' opens the discoverable hydra of all of them.
 (define-key cc-butler-decision-mode-map (kbd "C-c C-c") #'cc-butler-decision-submit)
 (define-key cc-butler-decision-mode-map "r" #'cc-butler-decision-mark-read)
+(define-key cc-butler-decision-mode-map "c" #'cc-butler-decision-confirm)
+(define-key cc-butler-decision-mode-map "k" #'cc-butler-decision-quit)
+(define-key cc-butler-decision-mode-map "n" #'cc-butler-decision-next)
+(define-key cc-butler-decision-mode-map "p" #'cc-butler-decision-prev)
+(define-key cc-butler-decision-mode-map "g" #'cc-butler-decision-revert)
+(define-key cc-butler-decision-mode-map "q" #'cc-butler-decision-quit)
+(define-key cc-butler-decision-mode-map "?" #'cc-butler-decision-hydra/body)
 
 (defun cc-butler--decision-protect ()
   "Make everything outside the answer region read-only (integrity)."
@@ -356,9 +435,6 @@ regardless."
 
 (defvar cc-butler--decision-watch nil
   "The `file-notify' descriptor for 정수님's inbox, or nil.")
-
-(defconst cc-butler--decision-org-re "\\`[^.].*\\.org\\'"
-  "Match decision .org files, excluding dotfiles like lock files (.#foo.org).")
 
 (defun cc-butler--decision-open-count ()
   (length (ignore-errors
