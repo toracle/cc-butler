@@ -44,6 +44,7 @@
 (require 'cc-butler-mail)
 (require 'cc-butler-decision)
 (require 'cc-butler-inbox)
+(require 'cc-butler-governance)
 
 (provide 'cc-butler)
 ;;; cc-butler.el ends here
