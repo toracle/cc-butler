@@ -173,6 +173,61 @@ the indicator clear."
       (should (= 1 (length (directory-files (cc-butler--decision-done-dir) nil "\\`[^.].*\\.org\\'"))))
       (should (equal "" cc-butler--decision-indicator)))))
 
+;;;; ---- create-path (escalate :options) + full flow -----------------
+
+(ert-deftest cc-butler-decision/parse-options ()
+  "Options string parses into (:label :tradeoff), tradeoff optional, blanks dropped."
+  (let ((opts (cc-butler--decision-parse-options "Stripe — lower fees\nPaddle\n  \nother — misc")))
+    (should (= 3 (length opts)))
+    (should (equal "Stripe" (plist-get (nth 0 opts) :label)))
+    (should (equal "lower fees" (plist-get (nth 0 opts) :tradeoff)))
+    (should (equal "Paddle" (plist-get (nth 1 opts) :label)))
+    (should (null (plist-get (nth 1 opts) :tradeoff)))
+    (should (equal "other" (plist-get (nth 2 opts) :label)))))
+
+(ert-deftest cc-butler-decision/create-path-to-human-inbox ()
+  "The escalate create-path delivers a decision (parsed options + return path to
+the escalator) into 정수님's inbox."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name)
+               (lambda (d) (if (equal d "/worker/") "worker-a" d))))
+      (let ((id (cc-butler-decision-create
+                 "/worker/" "which auth?" "pick one"
+                 (cc-butler--decision-parse-options "Stripe — lower fees\nPaddle — handles VAT"))))
+        (let ((m (car (cc-butler--ch-drain cc-butler-human-agent))))
+          (should (eq 'decision (plist-get m :kind)))
+          (should (equal id (plist-get m :id)))
+          (should (equal "worker-a" (plist-get m :from)))
+          (should (equal "worker-a" (plist-get m :reply-to)))   ; answer returns to escalator
+          (should (equal "which auth?" (plist-get m :summary)))
+          (let ((opts (plist-get m :options)))
+            (should (= 2 (length opts)))
+            (should (equal "Stripe" (plist-get (car opts) :label)))
+            (should (equal "lower fees" (plist-get (car opts) :tradeoff)))))))))
+
+(ert-deftest cc-butler-decision/full-flow-create-to-route ()
+  "End to end: create → arrival render → answer + submit → routed back to the
+escalator via correlation."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name)
+               (lambda (d) (if (equal d "/worker/") "worker-a" d))))
+      (let ((id (cc-butler-decision-create
+                 "/worker/" "ship?" nil
+                 (cc-butler--decision-parse-options "yes — now\nno — wait"))))
+        (should (= 1 (cc-butler--decision-on-arrival)))
+        (let* ((file (car (directory-files (cc-butler--decision-open-dir) t
+                                           cc-butler--decision-org-re)))
+               (doc (with-temp-buffer (insert-file-contents file) (buffer-string))))
+          (with-temp-file file (insert (cc-butler-decision-test--fill doc ?A "asap")))
+          (let ((buf (find-file-noselect file)))
+            (unwind-protect (with-current-buffer buf (cc-butler-decision-submit))
+              (kill-buffer buf))))
+        (let ((r (car (cc-butler--ch-drain "worker-a"))))
+          (should (eq 'reply (plist-get r :kind)))
+          (should (equal id (plist-get r :in-reply-to)))
+          (should (string-match-p "yes" (plist-get r :body)))
+          (should (string-match-p "asap" (plist-get r :body))))))))
+
 ;;;; ---- demo (staged, isolated, reversible) -------------------------
 
 (ert-deftest cc-butler-decision/demo-roundtrip ()

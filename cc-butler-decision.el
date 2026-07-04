@@ -129,6 +129,34 @@ answerable; `note'/`relay' render a read-only notification."
       (setq rendered (1+ rendered)))
     rendered))
 
+(defun cc-butler--decision-parse-options (s)
+  "Parse an options STRING into a list of (:label :tradeoff) plists.
+One option per line, `Label — tradeoff' (the tradeoff, after - or —, optional)."
+  (when (and s (stringp s))
+    (delq nil
+          (mapcar
+           (lambda (line)
+             (let ((l (string-trim line)))
+               (unless (string-empty-p l)
+                 (if (string-match "\\`\\(.*?\\)[ \t]*[-—][ \t]+\\(.*\\)\\'" l)
+                     (list :label (string-trim (match-string 1 l))
+                           :tradeoff (string-trim (match-string 2 l)))
+                   (list :label l)))))
+           (split-string s "\n")))))
+
+(defun cc-butler-decision-create (from-dir summary needs options)
+  "Deliver a decision to 정수님's inbox (the human-adapter create-path).
+FROM-DIR is the escalating session; 정수님's answer returns to it via the
+correlation.  OPTIONS is a list of (:label :tradeoff).  Returns the id.
+The arrival watcher renders it when the workflow is active."
+  (let ((id (cc-butler--mail-id))
+        (from (and from-dir (cc-butler--display-name from-dir))))
+    (cc-butler--ch-deliver
+     cc-butler-human-agent
+     (list :id id :kind 'decision :from from :reply-to from
+           :summary summary :needs needs :options options))
+    id))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Parsing the answer region + routing the reply
 ;;;; ------------------------------------------------------------------

@@ -29,6 +29,9 @@
 (declare-function cc-butler-mail-up-report "cc-butler-mail" (from-dir body))
 (declare-function cc-butler-mail-up-decision "cc-butler-mail" (from-dir summary needs))
 (declare-function cc-butler-mail-up-drain "cc-butler-mail" (agent-dir))
+(declare-function cc-butler-decision-create "cc-butler-decision" (from-dir summary needs options))
+(declare-function cc-butler--decision-parse-options "cc-butler-decision" (s))
+(defvar cc-butler-decision-workflow)
 
 ;;;; ------------------------------------------------------------------
 ;;;; Addressing, reading, sending
@@ -469,29 +472,36 @@ butler only ever sees decisions, drained via `pending_decisions'.")
                  (format "  needs: %s\n" (string-trim needs))))
        nil file t 'silent))))
 
-(defun cc-butler-tool-escalate-to-butler (summary &optional needs)
-  "MCP tool (steward -> butler): raise a decision to the butler's quiet queue.
-Pushes onto the butler's decision inbox and appends to the shared
-`decisions.org'.  It types NOTHING into the butler's terminal — the butler
-pulls decisions with `pending_decisions', so the human's input box is never
-polluted and never needs a manual Return."
+(defun cc-butler-tool-escalate-to-butler (summary &optional needs options)
+  "MCP tool (steward -> butler): raise a decision for the human to answer.
+SUMMARY is the question, NEEDS what is needed, and OPTIONS an optional string
+of choices (one `Label — tradeoff' per line) for a pick-one answer.  Types
+NOTHING into any terminal.  When the decision workflow is active the decision
+is rendered as a document in 정수님's inbox; otherwise it queues for
+`pending_decisions'.  Either way it is appended to the shared `decisions.org'."
   (unless (and summary (stringp summary) (not (string-empty-p (string-trim summary))))
     (error "A decision summary is required"))
   (let* ((self (cc-butler--caller-dir))
          (s (string-trim summary))
          (n (and needs (stringp needs)
                  (not (string-empty-p (string-trim needs))) (string-trim needs))))
-    (if (eq cc-butler-message-transport 'maildir)
-        (cc-butler-mail-up-decision self s n)
-      (push (list :time (current-time) :dir self
-                  :name (and self (cc-butler--display-name self))
-                  :summary s :needs n)
-            cc-butler--butler-inbox))
-    (cc-butler--append-decision self s needs)   ; decisions.org audit doc, both transports
+    (cond
+     ;; human adapter create-path: decision → 정수님's inbox (the watcher renders it)
+     ((bound-and-true-p cc-butler-decision-workflow)
+      (cc-butler-decision-create self s n (cc-butler--decision-parse-options options)))
+     ;; durable agent path: butler's maildir inbox
+     ((eq cc-butler-message-transport 'maildir)
+      (cc-butler-mail-up-decision self s n))
+     ;; legacy in-memory queue
+     (t (push (list :time (current-time) :dir self
+                    :name (and self (cc-butler--display-name self))
+                    :summary s :needs n)
+              cc-butler--butler-inbox)))
+    (cc-butler--append-decision self s needs)   ; decisions.org audit doc, all paths
     (cc-butler--log "%s -> butler [decision] | %s"
                     (if self (cc-butler--who-dir self) "steward") s)
     (cc-butler--maybe-refresh)
-    "Escalated to the butler's decision queue (butler drains it with pending_decisions)."))
+    "Escalated the decision (rendered for 정수님 when the workflow is on, else queued for pending_decisions)."))
 
 (defun cc-butler-tool-pending-decisions ()
   "MCP tool (butler): drain the quiet decision queue (steward escalations)."
@@ -534,6 +544,10 @@ polluted and never needs a manual Return."
          (:name "needs"
                 :type string
                 :description "Exactly what you need from the human (a choice, an approval, missing info). Optional."
+                :optional t)
+         (:name "options"
+                :type string
+                :description "Optional choices for a pick-one answer, one per line as 'Label — tradeoff' (tradeoff optional), e.g. 'Stripe — lower fees\\nPaddle — handles VAT'. Rendered as selectable options in the decision document."
                 :optional t)))
 
 (claude-code-ide-make-tool
