@@ -22,12 +22,16 @@
         (string-trim (match-string 1))
       (file-name-base file))))
 
-(defun cc-butler-inbox-items ()
-  "Return the pending inbox queue — 정수님's OPEN decision/note documents, oldest
-first (filename = timestamp order).  Each item is a plist:
+(defun cc-butler--inbox-dir (folder)
+  "The directory backing inbox FOLDER: `unread' = open/, `archive' = done/."
+  (if (eq folder 'archive) (cc-butler--decision-done-dir) (cc-butler--decision-open-dir)))
+
+(defun cc-butler-inbox-items (&optional folder)
+  "Return the inbox items in FOLDER, oldest first (filename = timestamp order).
+FOLDER is `unread' (the open/ pending queue, default) or `archive' (done/, the
+handled items, re-referenceable — email-folder style).  Each item is a plist:
   (:file FILE :title TITLE :kind decision|note :answerable BOOL)
-`answerable' is non-nil for decisions (need a C-c C-c answer); notes are closed
-by the read-receipt `r'.  Reference documents are NOT queued here."
+`answerable' is non-nil for decisions; reference documents are NOT queued here."
   (mapcar
    (lambda (f)
      (let* ((title (cc-butler--inbox-title f))
@@ -36,12 +40,13 @@ by the read-receipt `r'.  Reference documents are NOT queued here."
              :kind (if decisionp 'decision 'note)
              :answerable decisionp)))
    (sort (ignore-errors
-           (directory-files (cc-butler--decision-open-dir) t cc-butler--decision-org-re))
+           (directory-files (cc-butler--inbox-dir (or folder 'unread))
+                            t cc-butler--decision-org-re))
          #'string<)))
 
 (defun cc-butler-inbox-count ()
-  "Number of pending inbox items (the unread badge count)."
-  (length (cc-butler-inbox-items)))
+  "Number of UNREAD inbox items (the badge count — open/ only)."
+  (length (cc-butler-inbox-items 'unread)))
 
 ;;;; ------------------------------------------------------------------
 ;;;; The inbox list surface (browse the pending queue)
@@ -52,22 +57,28 @@ by the read-receipt `r'.  Reference documents are NOT queued here."
     (define-key m (kbd "RET") #'cc-butler-inbox-open)
     (define-key m "n" #'next-line)
     (define-key m "p" #'previous-line)
+    (define-key m "f" #'cc-butler-inbox-cycle-folder)
     (define-key m "g" #'cc-butler-inbox-refresh)
     (define-key m "q" #'quit-window)
     m)
   "Keymap for `cc-butler-inbox-mode'.")
 
+(defvar-local cc-butler-inbox-folder 'unread
+  "Which folder the inbox list shows: `unread' (open/) or `archive' (done/).")
+
 (define-derived-mode cc-butler-inbox-mode special-mode "cc-Inbox"
   "정수님's inbox — the pending queue of decisions and notes to attend to.")
 
 (defun cc-butler--inbox-render ()
-  "Render the pending queue into the current buffer as a read-only list."
-  (let ((inhibit-read-only t) (items (cc-butler-inbox-items)))
+  "Render the current inbox folder into the buffer as a read-only list."
+  (let* ((inhibit-read-only t)
+         (folder (or cc-butler-inbox-folder 'unread))
+         (items (cc-butler-inbox-items folder)))
     (erase-buffer)
-    (insert (format "cc-butler inbox — %d pending   (RET open · n/p move · g refresh · q quit)\n\n"
-                    (length items)))
+    (insert (format "cc-butler inbox — [%s] %d   (RET open · n/p move · f folder · g refresh · q quit)\n\n"
+                    folder (length items)))
     (if (null items)
-        (insert "  (empty — nothing awaiting you)\n")
+        (insert (format "  (empty — no %s items)\n" folder))
       (dolist (it items)
         (insert (propertize
                  (format "  %s  %s\n"
@@ -78,9 +89,17 @@ by the read-receipt `r'.  Reference documents are NOT queued here."
     (forward-line (if items 2 0))))
 
 (defun cc-butler-inbox-refresh ()
-  "Re-read the pending queue into the inbox list."
+  "Re-read the current folder into the inbox list."
   (interactive)
   (when (derived-mode-p 'cc-butler-inbox-mode) (cc-butler--inbox-render)))
+
+(defun cc-butler-inbox-cycle-folder ()
+  "Switch the inbox between unread (open/) and archive (done/) — email-folder
+style; unread is the default and always one keystroke away."
+  (interactive)
+  (when (derived-mode-p 'cc-butler-inbox-mode)
+    (setq cc-butler-inbox-folder (if (eq cc-butler-inbox-folder 'archive) 'unread 'archive))
+    (cc-butler--inbox-render)))
 
 ;;;###autoload
 (defun cc-butler-inbox ()

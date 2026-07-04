@@ -53,7 +53,7 @@ Faithful: assert the rendered buffer state."
           (with-temp-buffer
             (cc-butler--inbox-render)
             (let ((s (buffer-string)))
-              (should (string-match-p "1 pending" s))
+              (should (string-match-p "\\[unread\\] 1" s))
               (should (string-match-p "Which auth?" s))
               (should (string-match-p "decide" s)))
             (goto-char (point-min))
@@ -67,7 +67,7 @@ Faithful: assert the rendered buffer state."
     (unwind-protect
         (with-temp-buffer
           (cc-butler--inbox-render)
-          (should (string-match-p "0 pending" (buffer-string)))
+          (should (string-match-p "\\[unread\\] 0" (buffer-string)))
           (should (string-match-p "empty" (buffer-string))))
       (delete-directory cc-butler-decision-dir t))))
 
@@ -101,6 +101,43 @@ LEAVES the queue (archived to done/) — the inbox reflects sign & next."
           (should (= 0 (cc-butler-inbox-count))))   ; signed → gone from the queue
       (delete-directory cc-butler-decision-dir t)
       (delete-directory cc-butler-mail-dir t))))
+
+(ert-deftest cc-butler-inbox/folders-unread-and-archive ()
+  "A (view scope): the inbox reads two folders — unread=open/, archive=done/ —
+and the badge count is unread-only."
+  (let ((cc-butler-decision-dir (make-temp-file "cc-fold" t)))
+    (unwind-protect
+        (progn
+          (make-directory (cc-butler--decision-open-dir) t)
+          (make-directory (cc-butler--decision-done-dir) t)
+          (with-temp-file (expand-file-name "a-0001.org" (cc-butler--decision-open-dir))
+            (insert "#+TITLE: Decision — open one\n"))
+          (with-temp-file (expand-file-name "b-0002.org" (cc-butler--decision-done-dir))
+            (insert "#+TITLE: Decision — done one\n"))
+          (should (= 1 (length (cc-butler-inbox-items 'unread))))
+          (should (= 1 (length (cc-butler-inbox-items 'archive))))
+          (should (= 1 (cc-butler-inbox-count)))           ; unread only
+          (should (string-match-p "open one"
+                                  (plist-get (car (cc-butler-inbox-items 'unread)) :title)))
+          (should (string-match-p "done one"
+                                  (plist-get (car (cc-butler-inbox-items 'archive)) :title))))
+      (delete-directory cc-butler-decision-dir t))))
+
+(ert-deftest cc-butler-inbox/render-shows-folder-and-cycles ()
+  "The render names the active folder; f cycles unread↔archive, default unread."
+  (let ((cc-butler-decision-dir (make-temp-file "cc-foldr" t)))
+    (unwind-protect
+        (with-temp-buffer
+          (cc-butler-inbox-mode)
+          (cc-butler--inbox-render)
+          (should (eq cc-butler-inbox-folder 'unread))
+          (should (string-match-p "\\[unread\\]" (buffer-string)))
+          (cc-butler-inbox-cycle-folder)
+          (should (eq cc-butler-inbox-folder 'archive))
+          (should (string-match-p "\\[archive\\]" (buffer-string)))
+          (cc-butler-inbox-cycle-folder)
+          (should (eq cc-butler-inbox-folder 'unread)))
+      (delete-directory cc-butler-decision-dir t))))
 
 (provide 'cc-butler-inbox-test)
 ;;; cc-butler-inbox-test.el ends here
