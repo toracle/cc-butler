@@ -259,7 +259,10 @@ major mode's)."
     (setq-local truncate-partial-width-windows nil)
     ;; A read-only Org buffer must not realign tables on TAB/nav.
     (when (derived-mode-p 'org-mode)
-      (setq-local org-table-automatic-realign nil))))
+      (setq-local org-table-automatic-realign nil))
+    ;; A viewer is never "modified": clear any modified flag set while rendering
+    ;; so the mode-line shows a clean read-only doc, not a stray `*' (bug ⑤).
+    (restore-buffer-modified-p nil)))
 
 (defun cc-butler--doc-file-buffer (dir ref)
   "Return a read-only buffer visiting file REF in its natural major mode.

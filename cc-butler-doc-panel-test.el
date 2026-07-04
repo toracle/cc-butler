@@ -69,5 +69,21 @@ state (a live buffer visiting the file), not on any call."
         (when (equal (buffer-file-name b) (expand-file-name tmp)) (kill-buffer b)))
       (delete-file tmp))))
 
+(ert-deftest cc-butler-doc/viewer-not-modified ()
+  "Guarantee 5 (bug ⑤): a read-only viewer buffer is not marked modified, so its
+mode-line shows a clean read-only doc, not a stray `*'."
+  (let ((tmp (make-temp-file "cc-docv" nil ".org"))
+        (kill-buffer-query-functions nil))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp (insert "* Doc\ncontent\n"))
+          (let ((buf (cc-butler--doc-file-buffer "/session/" tmp)))
+            (unwind-protect
+                (with-current-buffer buf
+                  (should buffer-read-only)
+                  (should-not (buffer-modified-p)))
+              (kill-buffer buf))))
+      (delete-file tmp))))
+
 (provide 'cc-butler-doc-panel-test)
 ;;; cc-butler-doc-panel-test.el ends here
