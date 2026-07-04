@@ -12,11 +12,11 @@ butler must judge whether the **ultimate goal (real Definition of Done)** is act
 whether it stopped at an **intermediate milestone** dressed as done. The proximate task is not
 the goal.
 
-Example the user gave: jarvice-assets-cdn — "put assets on the CDN" is NOT the DoD. The
-ultimate purpose is **"jarvice does not load heavy assets" (a light/fast app).** So the butler
+Example the user gave: an assets-offload task — "put assets on the CDN" is NOT the DoD. The
+ultimate purpose is **"the app does not load heavy assets" (a light/fast app).** So the butler
 must ask: is that achieved, or is "uploaded to CDN" just a step? (Answer there: the heavy bytes
-— pyodide/onnx — WERE offloaded = core met; the remaining `_app` chunk offload is an incremental
-bandwidth/edge gain, the tail, not the core.)
+— the large runtime/model blobs — WERE offloaded = core met; the remaining app-chunk offload is
+an incremental bandwidth/edge gain, the tail, not the core.)
 
 **Why:** Sessions naturally report the proximate step they finished. If the butler accepts that
 as "done," work false-completes and the real objective silently stalls — especially since the
@@ -35,7 +35,8 @@ can't cross alone.
   the ultimate signal, not the step) and the DoD-in-the-brief lever. Judge from observed facts,
   not the session's own success-narrative ([[butler-evaluation-independence]]).
 
-Recurring pattern (2026-07-03 scan): most parked sessions were intermediate — envelope-enc
-(T5 backfill + billing-key + T4-prod remain), server-side (flag not flipped), custom-mcp
-(backend skeleton only, not usable), jarvice#1130 (proposed fix unsound), safetysnap (model
-invalid + general-user access unbuilt), dealmatch (not merged). Only cli-rust had its core done.
+Recurring pattern (2026-07-03 scan): most parked sessions were intermediate — one encryption
+task (backfill + key-rotation + prod tier remain), a server-side one (flag not flipped), a
+custom-integration one (backend skeleton only, not usable), another (proposed fix unsound),
+another (model invalid + general-user access unbuilt), a further one (not merged). Only one
+session had its core done.

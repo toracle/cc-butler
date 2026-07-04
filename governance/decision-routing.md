@@ -14,7 +14,7 @@ it; surface only what genuinely needs the human.** Operationalizes
 
 ## A. BUTLER AUTO-HANDLES — do NOT surface (act, then note in dashboard/log)
 - **Established-pattern continuation.** A reversible internal step following a pattern the
-  user already set (e.g. cli-rust "review-then-merge to trunk" set at #45/#46 → apply to
+  user already set (e.g. a repo's "review-then-merge to trunk" set at #45/#46 → apply to
   #47/#48 without asking). Relay the GO with `[butler coordination]`.
 - **Read-only investigation / self-verification GO.** A session offering to self-verify
   (/browse, read logs, gh checks, EXPLAIN) or investigate — approve; no human needed.

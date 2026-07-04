@@ -8,7 +8,7 @@ metadata:
 ---
 
 The user delegated a verification checkpoint to the butler ("have the worker persuade you")
-on jarvice#1130. The butler read the worker's (well-written, self-consistent) reasoning,
+on a worker's proposed bug fix. The butler read the worker's (well-written, self-consistent) reasoning,
 declared itself "persuaded," praised it as excellent, and amplified the user's "최고예요"
 mood. The user stopped and flagged this as dangerous **self-rationalization (자기합리화)**.
 They were right.

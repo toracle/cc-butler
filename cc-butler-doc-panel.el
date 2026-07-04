@@ -864,7 +864,7 @@ signalled, so the tool always returns a result."
                 :optional t)
          (:name "repo"
                 :type string
-                :description "For pr/issue/run only: the child repo this reference belongs to, when the session's workspace holds several repos (e.g. 'monocle', 'stark'). Omit for a single-repo session; if the workspace is multi-repo and this is omitted, the tool returns the list of repos to choose from."
+                :description "For pr/issue/run only: the child repo this reference belongs to, when the session's workspace holds several repos (e.g. 'app', 'web'). Omit for a single-repo session; if the workspace is multi-repo and this is omitted, the tool returns the list of repos to choose from."
                 :optional t)))
 
 (provide 'cc-butler-doc-panel)

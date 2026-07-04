@@ -33,4 +33,4 @@ user state.
   worker's full current state; re-read/ask if its report seems to be on an old frame.
 - **Shrink the staleness window.** Relay promptly; when parking something, mark it "held,
   state may drift" and re-verify freshness on unpark. (E.g., the just-before-delete git
-  safety recheck when removing the stark-inlineadmin workspace.)
+  safety recheck when removing a stale workspace.)

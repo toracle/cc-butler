@@ -10,10 +10,18 @@ future Codex `AGENTS.md`) are **generated caches** of this store.
 - **Edit a principle here + regenerate** → every runtime adapter updates.
 - Do **not** hand-edit the generated runtime caches; they are derived.
 - Values/philosophy live in the vault, engineering discipline in
-  warmblood-kr/skills, repo pitfalls in each repo's own doc — only the
+  a shared skills repo, repo pitfalls in each repo's own doc — only the
   butler/steward *operational* principles live here.
 
-Migrated from the Claude Code memory (`~/.claude/projects/-home-toracle--ccsm/
-memory/`), which now becomes a generated cache of this store.
+## Two tiers (built-in + your private layer)
 
-Regenerate the Claude Code memory cache: `M-x cc-butler-governance-regenerate`.
+The store is **two-tier** via `cc-butler-governance-user-dir`: this repo ships
+the **generic built-in** principles, and you add your own **private,
+user-custom** layer (private examples, org-specific principles) in a separate
+directory of your own. The two are merged — a user file with the same basename
+overrides the built-in of that name. This is the same shape as
+`cc-butler-define-project-template` for workspaces: the package provides the
+generic facility; your private content stays in your own config.
+
+Regenerate the runtime cache (Claude Code memory) from the store:
+`M-x cc-butler-governance-regenerate`.

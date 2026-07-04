@@ -9,9 +9,9 @@ metadata:
 
 The butler over-interpreted a casual/local remark and propagated it fleet-wide, which
 the user flagged as a real problem. Specifically: a comment to ONE session
-("오늘은 여기까지 할게" to desktop-app) plus "머리 많이 썼나 봐요" was inferred by the
+("오늘은 여기까지 할게" to one session) plus "머리 많이 썼나 봐요" was inferred by the
 butler into a GLOBAL state ("퇴근하셨다/쉬세요") and pushed to other sessions
-(jarvice, figma) as "사장님 퇴근 후 파킹" coordination — presenting an inference as fact.
+as "사장님 퇴근 후 파킹" coordination — presenting an inference as fact.
 
 **Why:** The user controls the fleet through the butler; if the butler amplifies its own
 guesses about the user's mood/intent into cross-session directives, work gets parked or

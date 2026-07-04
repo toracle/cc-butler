@@ -18,17 +18,42 @@
   :type 'directory
   :group 'cc-butler)
 
+(defcustom cc-butler-governance-user-dir nil
+  "A PRIVATE directory of your OWN principle .md files — custom operational
+content (private examples, org-specific principles) NOT shipped in the package.
+Merged after the built-in generic principles by `cc-butler-governance-principles';
+a same-basename file in your dir OVERRIDES the built-in of that name.
+
+This is the governance analog of `cc-butler-define-project-template' for
+workspaces: the package ships generic BUILT-IN principles, and you add your
+private, user-custom layer here — the two-tier design 정수님 asked for."
+  :type '(choice (const :tag "None" nil) directory)
+  :group 'cc-butler)
+
 (defcustom cc-butler-governance-memory-dir
   (expand-file-name "~/.claude/projects/-home-toracle--ccsm/memory/")
   "The Claude Code memory dir — a GENERATED cache of the store (never hand-edited)."
   :type 'directory
   :group 'cc-butler)
 
+(defun cc-butler--governance-dir-principles (dir)
+  "Principle .md files in DIR (absolute paths), excluding README; nil if no DIR."
+  (and dir (file-directory-p dir)
+       (seq-remove (lambda (f) (equal (file-name-nondirectory f) "README.md"))
+                   (ignore-errors (directory-files dir t "\\`[^.].*\\.md\\'")))))
+
 (defun cc-butler-governance-principles ()
-  "Return the store's principle files (absolute paths), excluding README."
-  (seq-remove (lambda (f) (equal (file-name-nondirectory f) "README.md"))
-              (ignore-errors
-                (directory-files cc-butler-governance-dir t "\\`[^.].*\\.md\\'"))))
+  "The BUILT-IN generic principles, plus your private user layer when
+`cc-butler-governance-user-dir' is set.  A user file with the same basename
+overrides the built-in of that name, so you can specialize a built-in privately."
+  (let ((by-name (make-hash-table :test 'equal)))
+    (dolist (f (cc-butler--governance-dir-principles cc-butler-governance-dir))
+      (puthash (file-name-nondirectory f) f by-name))
+    (dolist (f (cc-butler--governance-dir-principles cc-butler-governance-user-dir))
+      (puthash (file-name-nondirectory f) f by-name))  ; user overrides built-in
+    (sort (hash-table-values by-name)
+          (lambda (a b) (string< (file-name-nondirectory a)
+                                 (file-name-nondirectory b))))))
 
 ;;;###autoload
 (defun cc-butler-governance-regenerate ()

@@ -845,7 +845,7 @@ touched; end early with `cc-butler-decision-demo-end'."
   (add-hook 'cc-butler-decision-after-submit-functions #'cc-butler--decision-demo-result)
   (cc-butler--mail-file-deliver
    cc-butler-human-agent
-   (list :id "demo-1" :kind 'decision :from "monocle-billing" :reply-to "monocle-billing"
+   (list :id "demo-1" :kind 'decision :from "app-billing" :reply-to "app-billing"
          :summary "Which billing provider for the SaaS?"
          :needs "pick one; we can start in sandbox"
          :options '((:label "Stripe" :tradeoff "lower fees, great API")
@@ -872,7 +872,7 @@ touched; end early with `cc-butler-decision-demo-end'."
             "     a. tick an option:  - [ ] A   →   - [X] A\n"
             "     b. optionally type after `Other:'\n"
             "     c. press  C-c C-c\n\n"
-            "3. ROUTING: your answer returns to the asking session (monocle-billing)\n"
+            "3. ROUTING: your answer returns to the asking session (app-billing)\n"
             "   via the maildir correlation, and the file moves open/ → done/.\n\n"
             "   End anytime:  M-x cc-butler-decision-demo-end\n"
             "   ------------------------------------------------------------------\n")

@@ -15,7 +15,7 @@
 ;;                   dir loads the project's architecture at startup.
 ;;
 ;; The layout differs per project, so it lives in DATA: a template registry.
-;; "Make a monocle topic" knows the meta repo URL and the import list; adding
+;; A project template knows the meta repo URL and the import list; adding
 ;; another project is just another entry.  An "arbitrary" choice falls back to
 ;; `cc-butler-new-session' (pick a directory, start a session, no scaffolding).
 ;;
@@ -24,30 +24,40 @@
 
 (require 'cc-butler-session)
 
-(defcustom cc-butler-project-templates
-  '((monocle
-     :base-dir "~/projects"
-     :dir-format "monocle-%s"
-     :repos ("git@github.com:warmblood-kr/monocle.git")
-     :claude-import ("monocle/CLAUDE.md" "monocle/DESIGN.md")))
+(defvar cc-butler-project-templates nil
   "Registry of project templates for `cc-butler-new-topic'.
-Each entry is (NAME . PLIST) with keys:
+Populated by `cc-butler-define-project-template' — the package ships EMPTY and
+hard-codes no real repositories; you register your own templates in your own
+private config.")
+
+;;;###autoload
+(defmacro cc-butler-define-project-template (name &rest plist)
+  "Register project template NAME (a symbol) for `cc-butler-new-topic'.
+PLIST keys:
   :base-dir       directory under which topic workspaces are created
   :dir-format     `format' string for the topic dir name; %s = topic name
   :repos          list of git URLs to clone into the topic dir; the first is
                   the meta repo (its local name is used for :claude-import)
   :claude-import  paths (relative to the topic dir) to @-import in the
-                  generated CLAUDE.md, e.g. \"monocle/DESIGN.md\""
-  :type '(alist :key-type symbol :value-type plist)
-  :group 'cc-butler)
+                  generated CLAUDE.md, e.g. \"app/DESIGN.md\"
+
+Put your own templates in your private config (not in this package), e.g. in
+your init:
+
+  (cc-butler-define-project-template myproject
+    :base-dir \"~/projects\" :dir-format \"myproject-%s\"
+    :repos (\"git@github.com:me/myproject.git\")
+    :claude-import (\"myproject/CLAUDE.md\"))"
+  (declare (indent 1))
+  `(setf (alist-get ',name cc-butler-project-templates) ',plist))
 
 (defun cc-butler--template (name)
   "Return the template plist for NAME (a symbol), or nil."
-  (cdr (assq name cc-butler-project-templates)))
+  (alist-get name cc-butler-project-templates))
 
 (defun cc-butler--repo-local-name (url)
   "Return the local clone directory name for a git URL.
-\"git@github.com:org/monocle.git\" -> \"monocle\"."
+\"git@github.com:org/app.git\" -> \"app\"."
   (let ((name (file-name-nondirectory (directory-file-name url))))
     (if (string-suffix-p ".git" name)
         (substring name 0 -4)

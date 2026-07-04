@@ -17,11 +17,11 @@ RECALL automatically, without remembering to look.
 - **Operating / coordination** (how butler & steward work) → butler/steward **memory** (loads
   every session). e.g. [[butler-no-overinterpret]], [[butler-state-desync]],
   [[butler-evaluation-independence]].
-- **Reusable engineering discipline** (a class of problem) → **warmblood-kr/skills** engineering
-  plugin (triggers on the situation). e.g. the `global-consistency` skill from the subdomain bug.
+- **Reusable engineering discipline** (a class of problem) → **the shared skills repo**'s
+  engineering plugin (triggers on the situation). e.g. a `global-consistency` skill from a subdomain bug.
 - **Repo / project-specific gotcha** → **that repo's CLAUDE.md** (loads when working there).
-  e.g. monocle: normalize a shared value via one function because it's stored in 3 places.
-- **Cross-repo project fact** → the warmble-jumble vault.
+  e.g. a repo pitfall: normalize a shared value via one function because it's stored in 3 places.
+- **Cross-repo project fact** → the team vault.
 
 **Trigger (the habit):** right after resolving a recurring/looping situation
 (reflection-on-action, cf. `reflective-learning` skill), ask: (1) will this recur? (2) what is
@@ -37,8 +37,8 @@ role CLAUDE.mds.
 
 **Runtime-neutral homes ONLY (the user's hard constraint).** Do NOT couple the knowledge to
 Claude Code's memory mechanism — if the runtime later changes (Codex, opencode, …) the
-principles would be lost. The *source of truth* must live runtime-neutral: the warmble-jumble
-**vault**, the **warmblood-kr/skills** repo, a repo's own project doc, or a **cc-butler-owned
+principles would be lost. The *source of truth* must live runtime-neutral: the team
+**vault**, the **shared skills** repo, a repo's own project doc, or a **cc-butler-owned
 store** (Emacs/file-based). The per-runtime context file (Claude Code memory/CLAUDE.md, Codex
 AGENTS.md) is a *generated adapter* from that neutral source — never the source. cc-butler (the
 runtime-neutral orchestration layer) owns the knowledge and injects it per runtime; Claude

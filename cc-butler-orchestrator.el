@@ -216,7 +216,7 @@ WHICH is `butler' or `steward'."
                      " (`%sMEMORY.md`\n  + the note it indexes) — the home you load"
                      " at startup, so it is actually recalled.\n")
              mem)
-     "- **reusable engineering discipline** → a warmblood-kr/skills skill (fires by\n"
+     "- **reusable engineering discipline** → a shared-skills-repo skill (fires by\n"
      "  trigger), e.g. global-consistency.\n"
      "- **repo-specific pitfall** → that repo's own `CLAUDE.md` (e.g. one\n"
      "  normalization point for a subdomain).\n"
@@ -736,7 +736,7 @@ without anything being typed into its input box."
  :description "Read the recent terminal screen of another Claude session by name, to see what it is doing or asking. The text is that session's live TUI screen (may include UI chrome)."
  :args '((:name "name"
                 :type string
-                :description "Session name from list_claude_sessions (e.g. 'monocle-billing').")
+                :description "Session name from list_claude_sessions (e.g. 'app-billing').")
          (:name "lines"
                 :type integer
                 :description "How many trailing lines to return (default 40)."
