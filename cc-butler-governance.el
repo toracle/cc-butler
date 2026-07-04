@@ -22,9 +22,10 @@
   :group 'cc-butler)
 
 (defun cc-butler-governance-principles ()
-  "Return the store's principle files (absolute paths)."
-  (ignore-errors
-    (directory-files cc-butler-governance-dir t "\\`[^.].*\\.md\\'")))
+  "Return the store's principle files (absolute paths), excluding README."
+  (seq-remove (lambda (f) (equal (file-name-nondirectory f) "README.md"))
+              (ignore-errors
+                (directory-files cc-butler-governance-dir t "\\`[^.].*\\.md\\'"))))
 
 ;;;###autoload
 (defun cc-butler-governance-regenerate ()
