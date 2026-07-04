@@ -45,6 +45,7 @@
 (require 'cc-butler-decision)
 (require 'cc-butler-inbox)
 (require 'cc-butler-governance)
+(require 'cc-butler-provenance)
 
 (provide 'cc-butler)
 ;;; cc-butler.el ends here
