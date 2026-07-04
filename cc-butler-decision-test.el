@@ -378,6 +378,8 @@ the butler (its box stays clean) and never a bad target."
   "The unified scheme + hydra are bound in the decision keymap."
   (dolist (k '("r" "c" "k" "n" "p" "g" "q" "?"))
     (should (commandp (lookup-key cc-butler-decision-mode-map k))))
+  ;; v = reopen (cross-module; assert the binding symbol, not commandp)
+  (should (eq (lookup-key cc-butler-decision-mode-map "v") #'cc-butler-doc-reopen))
   (should (eq (lookup-key cc-butler-decision-mode-map "r") #'cc-butler-decision-mark-read))
   (should (eq (lookup-key cc-butler-decision-mode-map "?") #'cc-butler-decision-hydra/body))
   (should (fboundp 'cc-butler-decision-hydra/body)))

@@ -371,9 +371,11 @@ notification into something you can comment on."
 
 (require 'hydra)
 
+(declare-function cc-butler-doc-reopen "cc-butler-doc-panel" ())
+
 (defhydra cc-butler-decision-hydra (:color blue :hint nil)
   "
- cc-butler decision:  _r_ead   _c_onfirm/answer   _k_ remove   _n_ext   _p_rev   _g_ reload   _q_ quit
+ cc-butler decision:  _r_ead   _c_onfirm/answer   _k_ remove   _n_ext   _p_rev   _g_ reload   _q_ close ⇄ _v_ reopen
 "
   ("r" cc-butler-decision-mark-read)
   ("c" cc-butler-decision-confirm)
@@ -382,6 +384,7 @@ notification into something you can comment on."
   ("p" cc-butler-decision-prev :color pink)
   ("g" cc-butler-decision-revert)
   ("q" cc-butler-decision-quit)
+  ("v" cc-butler-doc-reopen)        ; the close (q) ⇄ reopen (v) pair, discoverable
   ("RET" cc-butler-decision-submit "submit")
   ("?" nil "cancel"))
 
@@ -396,6 +399,7 @@ notification into something you can comment on."
 (define-key cc-butler-decision-mode-map "p" #'cc-butler-decision-prev)
 (define-key cc-butler-decision-mode-map "g" #'cc-butler-decision-revert)
 (define-key cc-butler-decision-mode-map "q" #'cc-butler-decision-quit)
+(define-key cc-butler-decision-mode-map "v" #'cc-butler-doc-reopen)
 (define-key cc-butler-decision-mode-map "?" #'cc-butler-decision-hydra/body)
 
 (defvar cc-butler--decision-compose-map
