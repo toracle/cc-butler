@@ -63,6 +63,9 @@ handled items, re-referenceable — email-folder style).  Each item is a plist:
     m)
   "Keymap for `cc-butler-inbox-mode'.")
 
+;; Top-level so a hot-load (which won't re-init the defvar keymap) still binds it.
+(define-key cc-butler-inbox-mode-map "f" #'cc-butler-inbox-cycle-folder)
+
 (defvar-local cc-butler-inbox-folder 'unread
   "Which folder the inbox list shows: `unread' (open/) or `archive' (done/).")
 
