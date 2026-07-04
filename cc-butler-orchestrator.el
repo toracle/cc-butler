@@ -170,9 +170,15 @@ Locations are derived from the butler home (the shared operational home)."
      (when mem
        (format (concat "- shared memory: `%sMEMORY.md` and the notes it indexes"
                        " (decision-routing,\n  DoD-vs-goal, evaluation-independence,"
-                       " decision-proposal-format,\n  warmblood-talent-philosophy, …)"
-                       " — load these to keep operating discipline.\n")
+                       " decision-proposal-format, verify-delivery,\n"
+                       "  institutionalize-learning, …) — load these to keep operating"
+                       " discipline.\n")
                (abbreviate-file-name mem)))
+     (concat "- **operating-principle source of truth:** the cc-butler repo store"
+             " `governance/`\n  (one `.md` per principle, runtime-neutral). The"
+             " shared memory above is a\n  *generated cache* of it — route a new"
+             " operational learning by editing the\n  store + `M-x"
+             " cc-butler-governance-regenerate`, not by hand-editing memory.\n")
      "\n")))
 
 (defun cc-butler--roles-metaphor (which)
