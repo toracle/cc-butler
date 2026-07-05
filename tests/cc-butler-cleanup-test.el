@@ -400,5 +400,98 @@ the in-dir copy exists, and passes once the record has been promoted outside."
         (should (= 0 (cc-butler-cleanup-surface-candidates))))  ; already surfaced
       (should (= 1 calls)))))
 
+;;;; ---- MCP tool: close_topic (the butler's teardown hand) ----------
+
+(ert-deftest cc-butler-cleanup/close-topic-tool-refuses-unknown-name ()
+  "close_topic on an unknown session name refuses and touches nothing."
+  (let (torn)
+    (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) nil))
+              ((symbol-function 'cc-butler--teardown-workspace)
+               (lambda (&rest _) (setq torn t) '(:deleted t))))
+      (let ((out (cc-butler-tool-close-topic "ghost")))
+        (should (string-match-p "No session named" out))
+        (should-not torn)))))
+
+(ert-deftest cc-butler-cleanup/close-topic-tool-refuses-butler-steward ()
+  "close_topic refuses the butler/steward (role-rank 0/1); nothing is torn down."
+  (let (torn)
+    (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/b/"))
+              ((symbol-function 'cc-butler--role-rank) (lambda (_d) 0))
+              ((symbol-function 'cc-butler--teardown-workspace)
+               (lambda (&rest _) (setq torn t) '(:deleted t))))
+      (let ((cc-butler--butler "/b/"))
+        (let ((out (cc-butler-tool-close-topic "Butler")))
+          (should (string-match-p "not a worker" out))
+          (should-not torn))))))
+
+(ert-deftest cc-butler-cleanup/close-topic-tool-refuses-unsafe-git ()
+  "close_topic refuses a worker with unsafe git state; teardown is never called."
+  (let (torn)
+    (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/w/"))
+              ((symbol-function 'cc-butler--role-rank) (lambda (_d) 2))
+              ((symbol-function 'cc-butler--close-topic-dir) (lambda (_d) "/w/"))
+              ((symbol-function 'cc-butler--close-topic-audit)
+               (lambda (_d) '(("repo" "uncommitted changes"))))
+              ((symbol-function 'cc-butler--teardown-workspace)
+               (lambda (&rest _) (setq torn t) '(:deleted t))))
+      (let ((cc-butler--butler nil) (cc-butler--steward nil))
+        (let ((out (cc-butler-tool-close-topic "w")))
+          (should (string-match-p "unsafe git state" out))
+          (should (string-match-p "uncommitted changes" out))
+          (should-not torn))))))
+
+(ert-deftest cc-butler-cleanup/close-topic-tool-deletes-clean-worker ()
+  "A clean worker: close_topic routes through the shared teardown WITHOUT force
+\(so the tail's pre-delete re-check stays live) and reports the deleted dir."
+  (let (tear-args)
+    (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/w/"))
+              ((symbol-function 'cc-butler--role-rank) (lambda (_d) 2))
+              ((symbol-function 'cc-butler--close-topic-dir) (lambda (_d) "/w/topic/"))
+              ((symbol-function 'cc-butler--close-topic-audit) (lambda (_d) nil))
+              ((symbol-function 'cc-butler--log) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler--maybe-refresh) (lambda () nil))
+              ((symbol-function 'cc-butler--teardown-workspace)
+               (lambda (&rest args) (setq tear-args args)
+                 '(:killed ("*buf*") :deleted t :note nil))))
+      (let ((cc-butler--butler nil) (cc-butler--steward nil))
+        (let ((out (cc-butler-tool-close-topic "w")))
+          (should (string-match-p "Deleted" out))
+          (should (string-match-p "/w/topic/" out))
+          ;; called as (dir topic) with NO force argument -> re-check stays on
+          (should (equal tear-args '("/w/" "/w/topic/"))))))))
+
+;;;; ---- permission gate: destructive tool kept OUT of auto-allow -----
+
+(ert-deftest cc-butler-cleanup/nondestructive-allow-list-excludes-close-topic ()
+  "The carve-out omits every destructive tool and keeps the reversible ones."
+  (let ((cc-butler-destructive-tools '("close_topic")))
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-server-get-tool-names)
+               (lambda (&optional prefix)
+                 (mapcar (lambda (n) (concat (or prefix "") n))
+                         '("send_to_session" "close_topic" "butler_dashboard")))))
+      (let ((allowed (cc-butler--nondestructive-allowed-tools)))
+        (should (member "mcp__emacs-tools__send_to_session" allowed))
+        (should (member "mcp__emacs-tools__butler_dashboard" allowed))
+        (should-not (member "mcp__emacs-tools__close_topic" allowed))))))
+
+(ert-deftest cc-butler-cleanup/install-permissions-carves-out-of-auto ()
+  "Installing over the default `auto' replaces it with the reversible-only list
+\(so the harness prompts for the destructive tool); a custom value is untouched."
+  (cl-letf (((symbol-function 'claude-code-ide-mcp-server-get-tool-names)
+             (lambda (&optional prefix)
+               (mapcar (lambda (n) (concat (or prefix "") n))
+                       '("send_to_session" "close_topic")))))
+    ;; default `auto' -> carved-out explicit list, close_topic omitted
+    (let ((claude-code-ide-mcp-allowed-tools 'auto)
+          (cc-butler-destructive-tools '("close_topic")))
+      (cc-butler-install-tool-permissions)
+      (should (listp claude-code-ide-mcp-allowed-tools))
+      (should-not (member "mcp__emacs-tools__close_topic"
+                          claude-code-ide-mcp-allowed-tools)))
+    ;; a deliberately-customised value is left exactly as the user set it
+    (let ((claude-code-ide-mcp-allowed-tools "mcp__emacs-tools__*"))
+      (cc-butler-install-tool-permissions)
+      (should (equal "mcp__emacs-tools__*" claude-code-ide-mcp-allowed-tools)))))
+
 (provide 'cc-butler-cleanup-test)
 ;;; cc-butler-cleanup-test.el ends here

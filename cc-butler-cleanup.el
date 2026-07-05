@@ -710,6 +710,139 @@ select any, choose a tier, and runs `cc-butler-session-cleanup' on each."
                (length dirs) tier))))
 
 ;;;; ------------------------------------------------------------------
+;;;; MCP tool: close_topic (the butler's IRREVERSIBLE teardown hand)
+;;;; ------------------------------------------------------------------
+;;
+;; Lets the user-facing butler CALL the same teardown the operator would run by
+;; hand with `M-x cc-butler-close-topic', turning "type M-x" into "the butler
+;; calls the tool -> the operator approves the harness permission prompt".  The
+;; human stays in the loop for the irreversible delete; only the friction moves.
+;;
+;; It reuses (never reimplements) the shared teardown machinery, applying the
+;; same guards as the interactive command, in the same order:
+;;   1. worker-only        -- `cc-butler-cleanup--worker-p' (never butler/steward)
+;;   2. git-safety audit    -- `cc-butler--close-topic-audit' (refuse if unsafe)
+;;   3. shared teardown tail -- `cc-butler--teardown-workspace' (kill + delete,
+;;                              with its own pre-delete safety RE-CHECK).
+;; It never passes FORCE, so both the audit and the teardown re-check are live.
+
+(defun cc-butler-tool-close-topic (name)
+  "MCP tool: IRREVERSIBLY tear down worker session NAME and delete its workspace.
+Resolve NAME to a live session dir, then apply the interactive command's guards:
+the target MUST be an ordinary worker (never the butler or steward); the
+git-safety audit MUST pass (no local-only commits, uncommitted changes, or
+stashes); only then kill the session and delete the workspace via the shared
+`cc-butler--teardown-workspace' (which re-checks safety just before removal).
+Returns a human-readable line: deleted (which dir), or refused (why)."
+  (let ((dir (cc-butler--dir-by-name name)))
+    (cond
+     ((not dir)
+      (format "No session named %S.  Call list_claude_sessions for names." name))
+     ;; Guard 1: worker only — refuse the butler/steward (role-rank 0/1).
+     ((not (cc-butler-cleanup--worker-p dir))
+      (format "Refused: %S is the butler or steward, not a worker.  \
+close_topic only tears down ordinary workers." name))
+     (t
+      (let* ((topic (cc-butler--close-topic-dir dir))
+             ;; Guard 2: git-safety audit — refuse a workspace with local work.
+             (bad (cc-butler--close-topic-audit topic)))
+        (if bad
+            (format "Refused: %s has unsafe git state, NOT deleted —\n%s"
+                    name
+                    (mapconcat
+                     (lambda (cell)
+                       (format "  %s: %s"
+                               (file-name-nondirectory
+                                (directory-file-name (car cell)))
+                               (string-join (cdr cell) ", ")))
+                     bad "\n"))
+          ;; Guard 3: kill + delete via the shared irreversible tail (no FORCE,
+          ;; so it re-checks git safety immediately before removing the dir).
+          (let* ((res (cc-butler--teardown-workspace dir topic))
+                 (killed (plist-get res :killed))
+                 (deleted (plist-get res :deleted))
+                 (note (plist-get res :note))
+                 (bufs (if killed (string-join killed ", ") "(no buffers)")))
+            (cc-butler--log "close_topic: %s │ %s" name
+                            (if deleted (format "deleted %s" topic)
+                              (or note "not deleted")))
+            (cc-butler--maybe-refresh)
+            (cond
+             (deleted (format "Deleted: closed %s — killed %s; removed workspace %s."
+                              name bufs topic))
+             (note (format "Refused after kill: closed %s (killed %s); \
+workspace NOT deleted — %s." name bufs note))
+             (t (format "Refused: killed %s's session (%s) but workspace %s \
+was NOT deleted." name bufs topic))))))))))
+
+;; Idempotent (re)registration: drop a prior copy before adding.
+(setq claude-code-ide-mcp-server-tools
+      (seq-remove
+       (lambda (spec)
+         (equal "close_topic"
+                (plist-get (claude-code-ide--normalize-tool-spec spec) :name)))
+       claude-code-ide-mcp-server-tools))
+
+(claude-code-ide-make-tool
+ :function #'cc-butler-tool-close-topic
+ :name "close_topic"
+ :description "DESTRUCTIVE, IRREVERSIBLE: kill a finished worker's Claude session and permanently DELETE its topic workspace directory — its git clone(s) and every local file — from disk.  This cannot be undone.  Use it to tear a worker down once its work is safely committed/pushed and you no longer need its workspace.  Safety gates enforced by the tool, in order: (1) refuses unless the target is an ordinary WORKER — it can NEVER close the butler or the steward; (2) runs a git-safety audit and REFUSES, deleting nothing, if any repo in the workspace has local-only commits, uncommitted changes, or stashes; (3) only then kills the session and deletes the directory, re-checking git safety one last time immediately before removal.  Identify the target by its session NAME (from list_claude_sessions).  Returns whether the workspace was deleted, or the reason it was refused.  Because it is irreversible, the operator is asked to approve each call."
+ :args '((:name "name"
+                :type string
+                :description "Session name of the WORKER to close, from list_claude_sessions (e.g. 'app-billing').  Must be a worker — never the butler or steward.")))
+
+;;;; ------------------------------------------------------------------
+;;;; Permission gate: keep the destructive tool OUT of the auto-allow list
+;;;; ------------------------------------------------------------------
+;;
+;; The human-approval gate for `close_topic' is the HARNESS permission prompt in
+;; the calling Claude session — NOT anything inside Emacs.  But upstream
+;; `claude-code-ide-mcp-allowed-tools' defaults to `auto', which passes EVERY
+;; registered emacs-tools tool to `--allowedTools' at launch (see
+;; `claude-code-ide' launch).  Left at `auto', `close_topic' would be
+;; pre-approved and the delete would run UNATTENDED — exactly the bypass we must
+;; not allow.  So when the setting is still that default, we replace it with an
+;; explicit allow-list of only the NON-destructive tools; the destructive ones
+;; are then omitted from `--allowedTools' and fall through to the operator's
+;; approval prompt on every call.  Reversible tools stay freely agent-callable.
+;; A user who has deliberately customised the setting is left untouched.
+
+(defcustom cc-butler-destructive-tools '("close_topic")
+  "Names of emacs-tools MCP tools that IRREVERSIBLY destroy state.
+These must never be silently auto-allowed: cc-butler carves them out of the
+auto-generated `--allowedTools' list (see `cc-butler-install-tool-permissions')
+so the harness prompts the operator for approval on every call.  Names are the
+bare tool names (e.g. \"close_topic\"), without the mcp__emacs-tools__ prefix."
+  :type '(repeat string)
+  :group 'cc-butler)
+
+(defun cc-butler--nondestructive-allowed-tools ()
+  "Return the emacs-tools MCP tool names to auto-allow.
+Every currently-registered tool EXCEPT those in `cc-butler-destructive-tools',
+each fully prefixed as mcp__emacs-tools__NAME for `--allowedTools'."
+  (let ((deny (mapcar (lambda (n) (concat "mcp__emacs-tools__" n))
+                      cc-butler-destructive-tools)))
+    (seq-remove (lambda (full) (member full deny))
+                (claude-code-ide-mcp-server-get-tool-names "mcp__emacs-tools__"))))
+
+(defun cc-butler-install-tool-permissions ()
+  "Ensure destructive MCP tools require operator approval by default.
+When `claude-code-ide-mcp-allowed-tools' is still the upstream default `auto'
+\(which would auto-allow every tool, including the irreversible ones), replace it
+with an explicit allow-list of only the non-destructive tools, so the
+destructive ones fall through to the harness permission prompt.  A user who has
+deliberately set the variable to a string or list is left untouched.  Safe to
+call again; recomputes from the current tool set."
+  (when (and (boundp 'claude-code-ide-mcp-allowed-tools)
+             (eq claude-code-ide-mcp-allowed-tools 'auto))
+    (setq claude-code-ide-mcp-allowed-tools
+          (cc-butler--nondestructive-allowed-tools))))
+
+;; Install once, after every cc-butler tool has registered (this file loads
+;; last), so the carve-out sees the full tool set.
+(cc-butler-install-tool-permissions)
+
+;;;; ------------------------------------------------------------------
 ;;;; statusLine helper: ship it + wire it onto new workers
 ;;;; ------------------------------------------------------------------
 
