@@ -141,7 +141,7 @@ processed."
 ;; operation for a fresh install.
 
 (defcustom cc-butler-home
-  (expand-file-name "cc-butler" user-emacs-directory)
+  (expand-file-name "cc-butler/butler" user-emacs-directory)
   "Working directory the butler session runs in (its home).
 `cc-butler-start-butler' creates it on demand, scaffolding a `.projectile'
 marker and a role `CLAUDE.md'.  Point this at an existing directory (e.g.
@@ -399,7 +399,7 @@ if a butler session is already running there, it is just focused."
     (cc-butler)))
 
 (defcustom cc-butler-steward-home
-  (expand-file-name "cc-butler-steward" user-emacs-directory)
+  (expand-file-name "cc-butler/steward" user-emacs-directory)
   "Working directory the steward (operations) session runs in.
 `cc-butler-start-steward' creates it on demand with a role `CLAUDE.md'.
 Must differ from `cc-butler-home' (two sessions cannot share a directory)."
