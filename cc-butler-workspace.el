@@ -283,16 +283,42 @@ Returns the list of buffer names killed."
     (nreverse killed)))
 
 (defun cc-butler--close-topic-deletable-p (dir)
-  "Return non-nil when DIR is a plausible workspace dir to delete.
-A backstop against obviously-wrong targets (home, root, .emacs.d, and
-paths shallower than three components); the commit-safety gate is the
-real guarantee."
-  (let ((d (directory-file-name (expand-file-name dir))))
+  "Return non-nil only when DIR is a cc-butler-SCAFFOLDED topic workspace.
+Teardown deletes a directory only when this returns non-nil, and it is
+deliberately built to REFUSE anything cc-butler did not itself scaffold.
+The guarantee: teardown never deletes a directory cc-butler did not create
+— most importantly an EXISTING project the user merely opened as a session
+\(a real repo whose own root is a git working tree, full of the user's work),
+which deleting would destroy.
+
+DIR qualifies as a scaffolded topic only when ALL of these hold:
+  - it exists and is not an obviously-wrong target — home, root, .emacs.d,
+    or any path shallower than three components (the long-standing backstop);
+  - it is NOT itself a git working-tree root: no `.git' entry (dir OR file)
+    directly inside it.  `cc-butler--scaffold' always clones repos into
+    SUBDIRS of a topic, so a scaffold root never carries its own `.git';
+    a `.git' at the root is the signature of an existing project and is
+    REFUSED unconditionally — the decisive data-loss backstop, effective
+    even if a stray marker is present; and
+  - it carries cc-butler's scaffold marker `cc-butler-project-marker'
+    (the `.projectile' file `cc-butler--scaffold' writes at the topic root)
+    — a POSITIVE \"cc-butler laid this directory out\" signal, so teardown
+    only ever removes dirs cc-butler is known to have scaffolded (allowlist),
+    not arbitrary directories a session happened to run in.
+The git-clean commit-safety gate remains a separate, independent guarantee."
+  (let* ((d (directory-file-name (expand-file-name dir)))
+         (dslash (file-name-as-directory d)))
     (and (file-directory-p d)
          (> (length (split-string d "/" t)) 2)
          (not (member d (list (directory-file-name (expand-file-name "~"))
                               (directory-file-name (expand-file-name "~/.emacs.d"))
-                              "/" "/home" "/root" "/tmp"))))))
+                              "/" "/home" "/root" "/tmp")))
+         ;; Blocklist: an existing project's root is a git working tree.
+         ;; `.git' may be a directory (normal repo) or a file (worktree /
+         ;; submodule gitlink); refuse either.  A scaffold root never has one.
+         (not (file-exists-p (expand-file-name ".git" dslash)))
+         ;; Allowlist: only a cc-butler-scaffolded topic carries this marker.
+         (file-exists-p (expand-file-name cc-butler-project-marker dslash)))))
 
 (defun cc-butler--teardown-workspace (dir topic-dir &optional force)
   "Kill DIR's Claude session and delete TOPIC-DIR — the shared teardown tail.
@@ -310,7 +336,8 @@ operation cannot diverge (mirrors the single-launch-path discipline)."
          deleted note)
     (cond
      ((not (cc-butler--close-topic-deletable-p topic-dir))
-      (setq note (format "refused unusual path %s" topic-dir)))
+      (setq note (format "refusing to delete %s: not a cc-butler-scaffolded \
+topic (existing project or unrecognized path)" topic-dir)))
      (recheck
       (setq note
             (format "became unsafe just before deletion (%s) — NOT deleted"
