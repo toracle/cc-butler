@@ -49,12 +49,13 @@
 (require 'cc-butler-inbox)
 (require 'cc-butler-governance)
 (require 'cc-butler-provenance)
+(require 'cc-butler-cleanup)
 
 (defconst cc-butler--modules
   '(cc-butler-session cc-butler-notifications cc-butler-workspace
     cc-butler-orchestrator cc-butler-doc-panel cc-butler-docs cc-butler-persist
     cc-butler-mail cc-butler-decision cc-butler-inbox cc-butler-governance
-    cc-butler-provenance)
+    cc-butler-provenance cc-butler-cleanup)
   "cc-butler modules, in dependency order.")
 
 (defconst cc-butler--dir

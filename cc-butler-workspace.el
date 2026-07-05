@@ -70,9 +70,17 @@ your init:
     (format (plist-get template :dir-format) topic)
     (expand-file-name (plist-get template :base-dir)))))
 
+(defvar cc-butler-scaffold-functions nil
+  "Abnormal hook run after a topic workspace is scaffolded.
+Each function receives (TOPIC-DIR TEMPLATE).  A generic seam for site or
+optional-feature setup that must ride new-worker creation without core knowing
+about it — e.g. the session cleaner installs its context-reporting statusLine
+here.  Run with `run-hook-with-args'.")
+
 (defun cc-butler--scaffold (topic-dir template)
   "Write `.projectile' and `CLAUDE.md' markers into TOPIC-DIR (idempotent).
-Existing files are never clobbered."
+Existing files are never clobbered.
+Runs `cc-butler-scaffold-functions' with (TOPIC-DIR TEMPLATE) at the end."
   (let ((proj (expand-file-name ".projectile" topic-dir))
         (cmd  (expand-file-name "CLAUDE.md" topic-dir)))
     (unless (file-exists-p proj)
@@ -91,7 +99,21 @@ Existing files are never clobbered."
           (insert "call the `report_to_butler` tool with real content — `summary` (what you\n")
           (insert "did / what happened), `status` (current state), and `needs` (what you need\n")
           (insert "from the human, or omit if just informing). Keep it concise; the butler\n")
-          (insert "relays it to the human.\n"))))
+          (insert "relays it to the human.\n")
+          (insert "\n## Delegating to sub-agents\n\n")
+          (insert "Treat delegation as your default working mode, not the exception. When a\n")
+          (insert "task means more than skimming a file — reading long session output or logs,\n")
+          (insert "searching across many files, carrying out a multi-step investigation,\n")
+          (insert "analysis, or review, or running a self-contained job where only the result\n")
+          (insert "matters — hand it to a sub-agent and keep only the distilled conclusion in\n")
+          (insert "this window. Working directly here is reserved for the cases that genuinely\n")
+          (insert "need it: when you need the content itself for your very next action (a `Read`\n")
+          (insert "before an `Edit`, or scoping a change), when the work is small and fast, or\n")
+          (insert "when a tight loop would lose more to round-trips than it saves. The reason\n")
+          (insert "is simple — re-reading accumulated context is the single largest cost\n")
+          (insert "driver, so this window stays a thin coordination layer while the raw\n")
+          (insert "material lives in the sub-agents you dispatch.\n"))))
+    (run-hook-with-args 'cc-butler-scaffold-functions topic-dir template)
     topic-dir))
 
 (defun cc-butler--start-session-in (dir)
@@ -272,6 +294,34 @@ real guarantee."
                               (directory-file-name (expand-file-name "~/.emacs.d"))
                               "/" "/home" "/root" "/tmp"))))))
 
+(defun cc-butler--teardown-workspace (dir topic-dir &optional force)
+  "Kill DIR's Claude session and delete TOPIC-DIR — the shared teardown tail.
+Callers MUST run the pre-audit gate (`cc-butler--close-topic-audit') and the
+human confirmation first; this only performs the irreversible tail with a
+pre-delete safety RE-CHECK, so state that drifted between the gate and now (a
+background write, a new stash) still blocks removal (skipped under FORCE).
+Returns a plist (:killed BUFFER-NAMES :deleted BOOL :note STRING-OR-NIL).
+
+This is the single delete-dir path; both `cc-butler-close-topic' and the
+session cleaner (`cc-butler-cleanup') route through it, so the irreversible
+operation cannot diverge (mirrors the single-launch-path discipline)."
+  (let* ((killed (cc-butler--close-topic-kill-session dir))
+         (recheck (unless force (cc-butler--close-topic-audit topic-dir)))
+         deleted note)
+    (cond
+     ((not (cc-butler--close-topic-deletable-p topic-dir))
+      (setq note (format "refused unusual path %s" topic-dir)))
+     (recheck
+      (setq note
+            (format "became unsafe just before deletion (%s) — NOT deleted"
+                    (mapconcat (lambda (c)
+                                 (file-name-nondirectory
+                                  (directory-file-name (car c))))
+                               recheck ", "))))
+     (t (ignore-errors (delete-directory topic-dir t))
+        (setq deleted (not (file-exists-p topic-dir)))))
+    (list :killed killed :deleted deleted :note note)))
+
 ;;;###autoload
 (defun cc-butler-close-topic (&optional force)
   "Close a topic: vet its repos, kill the session, delete the workspace.
@@ -313,32 +363,18 @@ state is out of scope."
              (format "Kill session %s and DELETE %s%s? "
                      name topic-dir (if force " [FORCE: safety skipped]" "")))
       (user-error "Aborted"))
-    ;; 2) kill session.
-    (let* ((killed (cc-butler--close-topic-kill-session dir))
-           ;; Re-run the safety audit immediately before deletion, so state
-           ;; that drifted between the gate and now (a background write, a new
-           ;; stash) still blocks removal.  Skipped under FORCE.
-           (recheck (unless force (cc-butler--close-topic-audit topic-dir)))
-           deleted skipped)
-      ;; 3) delete workspace (only if still deletable and still safe).
-      (cond
-       ((not (cc-butler--close-topic-deletable-p topic-dir))
-        (setq skipped (format "refused unusual path %s" topic-dir)))
-       (recheck
-        (setq skipped
-              (format "became unsafe just before deletion (%s) — NOT deleted"
-                      (mapconcat (lambda (c)
-                                   (file-name-nondirectory
-                                    (directory-file-name (car c))))
-                                 recheck ", "))))
-       (t (ignore-errors (delete-directory topic-dir t))
-          (setq deleted (not (file-exists-p topic-dir)))))
-      ;; 4) report.
+    ;; 2) kill session + delete workspace via the shared teardown tail (which
+    ;;    re-checks safety immediately before the irreversible delete).
+    (let* ((res (cc-butler--teardown-workspace dir topic-dir force))
+           (killed (plist-get res :killed))
+           (deleted (plist-get res :deleted))
+           (note (plist-get res :note)))
+      ;; 3) report.
       (message "cc-butler: closed %s — killed %s%s"
                name
                (if killed (string-join killed ", ") "(no buffers)")
                (cond (deleted (format "; deleted %s" topic-dir))
-                     (skipped (format "; %s" skipped))
+                     (note (format "; %s" note))
                      (t (format "; workspace NOT deleted (%s)" topic-dir)))))))
 
 ;; Reachable from the session manager and the LLM hydra.
