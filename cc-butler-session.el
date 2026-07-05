@@ -422,15 +422,30 @@ and the rest keep their natural order (the sort is stable)."
             (insert "   " (propertize osc 'face 'italic) "\n"))
           (unless (string-empty-p status)
             (insert "   " (propertize status 'face 'font-lock-string-face) "\n"))
-          (let ((meta (mapconcat
-                       #'identity
-                       (delq nil
-                             (list (unless (string-empty-p branch)
-                                     (concat "⎇ " branch))
-                                   (unless (string-empty-p forge) forge)))
-                       "   ")))
-            (unless (string-empty-p meta)
-              (insert "   " (propertize meta 'face 'font-lock-comment-face) "\n")))
+          (let* ((sd (plist-get s :dir))
+                 (meta (mapconcat
+                        #'identity
+                        (delq nil
+                              (list (unless (string-empty-p branch)
+                                      (concat "⎇ " branch))
+                                    (unless (string-empty-p forge) forge)))
+                        "   "))
+                 ;; Context-length feedback tag (e.g. "ctx 187k"), provided by
+                 ;; the cleaner module when loaded; highlighted once it crosses
+                 ;; the cleanup threshold so 200k candidates stand out.
+                 (ctx (and (fboundp 'cc-butler-cleanup-context-tag)
+                           (cc-butler-cleanup-context-tag sd)))
+                 (ctx-hot (and ctx (fboundp 'cc-butler-cleanup-context-over-threshold-p)
+                               (cc-butler-cleanup-context-over-threshold-p sd))))
+            (when (or (not (string-empty-p meta)) ctx)
+              (insert "   ")
+              (unless (string-empty-p meta)
+                (insert (propertize meta 'face 'font-lock-comment-face)))
+              (when ctx
+                (insert (if (string-empty-p meta) "" "   ")
+                        (propertize ctx 'face (if ctx-hot 'warning
+                                                'font-lock-comment-face))))
+              (insert "\n")))
           (insert "\n")
           (put-text-property start (point) 'cc-butler-dir (plist-get s :dir)))))
     (setq cc-butler--entries (nreverse entries))

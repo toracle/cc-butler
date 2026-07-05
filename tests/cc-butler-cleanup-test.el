@@ -26,6 +26,9 @@ no real terminal is touched.  Sent text is collected in the dynamic var `sent'."
          (cc-butler--butler nil)
          (cc-butler-cleanup--inhibit-timers t)
          (cc-butler-cleanup--state (make-hash-table :test 'equal))
+         ;; durable store -> a throwaway temp dir, never the real default
+         (cc-butler-cleanup-handoff-dir
+          (file-name-as-directory (make-temp-file "cc-durable" t)))
          (term-buf (get-buffer-create " *cc-butler-test-term*")))
      (unwind-protect
          (cl-letf (((symbol-function 'cc-butler--display-name)
@@ -239,12 +242,122 @@ teardown (which carries the git audit + confirmation)."
       (should-error (cc-butler-session-cleanup dir 'clear) :type 'user-error))))
 
 (ert-deftest cc-butler-cleanup/refuses-butler ()
-  "Cleaning the butler session is refused outright."
+  "Cleaning the butler session is refused outright by the CORE guard."
   (let ((cc-butler--butler "/b/")
         (cc-butler-cleanup--state (make-hash-table :test 'equal)))
     (cl-letf (((symbol-function 'cc-butler--role-rank) (lambda (_d) 0))
               ((symbol-function 'cc-butler--display-name) (lambda (_d) "Butler")))
       (should-error (cc-butler-session-cleanup "/b/" 'clear) :type 'user-error))))
+
+(ert-deftest cc-butler-cleanup/refuses-steward ()
+  "Cleaning the steward session is refused outright by the CORE guard."
+  (let ((cc-butler--butler nil)
+        (cc-butler--steward "/s/")
+        (cc-butler-cleanup--state (make-hash-table :test 'equal)))
+    (cl-letf (((symbol-function 'cc-butler--role-rank) (lambda (_d) 1))
+              ((symbol-function 'cc-butler--display-name) (lambda (_d) "Steward")))
+      (should-error (cc-butler-session-cleanup "/s/" 'clear) :type 'user-error))))
+
+;;;; ---- target resolution: butler/steward never targetable ----------
+
+(ert-deftest cc-butler-cleanup/eligible-excludes-butler-steward ()
+  "The eligible-worker set (what the picker offers) never includes the butler or
+steward, so they can never be confirmed as a target."
+  (let ((cc-butler--butler "/b/") (cc-butler--steward "/s/"))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () (list (list :dir "/b/") (list :dir "/s/")
+                                (list :dir "/w1/") (list :dir "/w2/"))))
+              ((symbol-function 'cc-butler--role-rank)
+               (lambda (d) (cond ((equal d "/b/") 0) ((equal d "/s/") 1) (t 2)))))
+      (let ((dirs (cc-butler-cleanup--eligible-worker-dirs)))
+        (should (equal dirs '("/w1/" "/w2/")))
+        (should-not (member "/b/" dirs))
+        (should-not (member "/s/" dirs))))))
+
+(ert-deftest cc-butler-cleanup/read-target-confirms-by-name ()
+  "Target resolution confirms by NAME over eligible workers and returns that dir;
+a resolved-at-point BUTLER never leaks through as the target."
+  (let ((cc-butler--butler "/b/") (cc-butler--steward nil))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () (list (list :dir "/b/") (list :dir "/w1/"))))
+              ((symbol-function 'cc-butler--role-rank)
+               (lambda (d) (if (equal d "/b/") 0 2)))
+              ((symbol-function 'cc-butler--display-name)
+               (lambda (d) (file-name-nondirectory (directory-file-name d))))
+              ;; point is on the butler, but confirmation must resolve a worker
+              ((symbol-function 'cc-butler-cleanup--context-target) (lambda () "/b/"))
+              ((symbol-function 'completing-read)
+               (lambda (_p coll &rest _)
+                 ;; the butler must not even be offered
+                 (should-not (member "b" coll))
+                 "w1")))
+      (should (equal "/w1/" (cc-butler-cleanup--read-target))))))
+
+;;;; ---- durable record lives OUTSIDE the topic dir ------------------
+
+(ert-deftest cc-butler-cleanup/durable-file-is-outside-topic-dir ()
+  "The durable record path is in the handoff-dir, never under the topic dir."
+  (let ((cc-butler-cleanup-handoff-dir "/var/durable/")
+        (session (list :name "proj-x" :topic-dir "/tmp/ws/proj-x/")))
+    (let ((durable (cc-butler-cleanup--durable-file session)))
+      (should (equal durable "/var/durable/proj-x.md"))
+      (should-not (string-prefix-p (expand-file-name "/tmp/ws/proj-x/")
+                                   (expand-file-name durable))))))
+
+(ert-deftest cc-butler-cleanup/promote-copies-record-outside ()
+  "Promote copies the in-dir re-hydration record to the durable OUTSIDE store."
+  (let* ((topic (file-name-as-directory (make-temp-file "cc-topic" t)))
+         (durable (file-name-as-directory (make-temp-file "cc-dur" t)))
+         (cc-butler-cleanup-handoff-dir durable)
+         (session (list :name "sess" :topic-dir topic))
+         (body (mapconcat (lambda (i) (format "l%d durable detail" i))
+                          (number-sequence 1 20) "\n")))
+    (write-region body nil (expand-file-name cc-butler-cleanup-handoff-file topic)
+                  nil 'silent)
+    (should (eq t (cc-butler-cleanup--default-promote session)))
+    (should (file-exists-p (expand-file-name "sess.md" durable)))))
+
+(ert-deftest cc-butler-cleanup/delete-dir-verify-checks-outside-record ()
+  "For delete-dir, verify checks the OUTSIDE durable record: it fails when only
+the in-dir copy exists, and passes once the record has been promoted outside."
+  (let* ((topic (file-name-as-directory (make-temp-file "cc-topic" t)))
+         (durable (file-name-as-directory (make-temp-file "cc-dur" t)))
+         (cc-butler-cleanup-handoff-dir durable)
+         (session (list :name "sess" :topic-dir topic :tier 'delete-dir))
+         (body (mapconcat (lambda (i) (format "l%d durable detail" i))
+                          (number-sequence 1 20) "\n")))
+    (write-region body nil (expand-file-name cc-butler-cleanup-handoff-file topic)
+                  nil 'silent)
+    ;; in-dir exists but nothing promoted yet -> delete-dir verify fails
+    (should (stringp (cc-butler-cleanup--default-verify session)))
+    ;; promote outside, then delete-dir verify passes
+    (cc-butler-cleanup--default-promote session)
+    (should (eq t (cc-butler-cleanup--default-verify session)))))
+
+;;;; ---- context feedback tag formatting -----------------------------
+
+(ert-deftest cc-butler-cleanup/context-tag-formats-k ()
+  "The sessions-list context tag renders compactly as \"ctx <n>k\"."
+  (let ((cc-butler-cleanup--context-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-context-function (lambda (_s) 187342)))
+    (should (equal "ctx 187k" (cc-butler-cleanup-context-tag "/w/")))))
+
+(ert-deftest cc-butler-cleanup/context-tag-nil-when-unknown ()
+  "No CTX marker -> no tag (nil), not \"ctx 0k\"."
+  (let ((cc-butler-cleanup--context-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-context-function (lambda (_s) nil)))
+    (should (null (cc-butler-cleanup-context-tag "/w/")))))
+
+(ert-deftest cc-butler-cleanup/context-over-threshold-flag ()
+  "The over-threshold flag drives the sessions-list highlight."
+  (let ((cc-butler-cleanup--context-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-context-threshold 200000)
+        (cc-butler-cleanup-context-function (lambda (_s) 210000)))
+    (should (cc-butler-cleanup-context-over-threshold-p "/w/")))
+  (let ((cc-butler-cleanup--context-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-context-threshold 200000)
+        (cc-butler-cleanup-context-function (lambda (_s) 150000)))
+    (should-not (cc-butler-cleanup-context-over-threshold-p "/w/"))))
 
 ;;;; ---- timeout ------------------------------------------------------
 

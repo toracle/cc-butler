@@ -40,11 +40,30 @@
 
 ;;;; --- externalization -----------------------------------------------
 
+;; The record has TWO distinct roles; keep them separate:
+;;   - the RE-HYDRATION record lives INSIDE the topic dir; it survives `/clear'
+;;     (context only, dir stays), which is all the `clear' tier needs.
+;;   - the DURABLE ACCOUNTABILITY record must survive `delete-dir' (the dir is
+;;     gone), so it must live OUTSIDE the topic dir, in a durable store.
+;; The generic default writes the re-hydration record in-dir, then PROMOTES a
+;; copy to the durable store before a delete-dir teardown; the delete-dir verify
+;; checks the OUTSIDE copy.
+
 (defcustom cc-butler-cleanup-handoff-file "HANDOFF.md"
-  "Relative path (within the topic workspace) of the generic handoff document.
-Shared by the default externalize instruction and the default verifier so they
-agree on where the record lives."
+  "Relative path (within the topic workspace) of the in-dir RE-HYDRATION record.
+This copy survives `/clear' (the `clear' tier) but NOT `delete-dir'; for
+delete-dir it is promoted to `cc-butler-cleanup-handoff-dir' first.  Shared by
+the default externalize instruction and the default verifier."
   :type 'string
+  :group 'cc-butler)
+
+(defcustom cc-butler-cleanup-handoff-dir
+  (expand-file-name "cc-butler/handoffs/" user-emacs-directory)
+  "Durable directory, OUTSIDE any topic workspace, for accountability records.
+A delete-dir teardown promotes the in-dir re-hydration record here (named
+`<session-name>.md') BEFORE deleting the workspace, so the record — the recall/
+audit anchor — survives the dir's removal.  Must not live under any topic dir."
+  :type 'directory
   :group 'cc-butler)
 
 (defcustom cc-butler-cleanup-externalize-preamble
@@ -85,9 +104,22 @@ site overrides this to externalize its own way and place (e.g. a vault)."
 (defcustom cc-butler-cleanup-verify-function
   #'cc-butler-cleanup--default-verify
   "Function judging whether externalization sufficed.
-Called with the session plist; returns t when sufficient, or a REASON STRING
-explaining why not (teardown is then refused).  A site overrides this to check
-its own record (e.g. hub note + GitHub cross-ref present)."
+Called with the session plist (its :tier key says which tier is running);
+returns t when sufficient, or a REASON STRING explaining why not (teardown is
+then refused).  For the `delete-dir' tier it MUST check the OUTSIDE durable
+record, not an in-dir file that the delete would destroy.  A site overrides this
+to check its own record (e.g. a hub note + GitHub cross-ref present)."
+  :type 'function
+  :group 'cc-butler)
+
+(defcustom cc-butler-cleanup-promote-function
+  #'cc-butler-cleanup--default-promote
+  "Function that establishes the DURABLE record OUTSIDE the topic dir.
+Called with the session plist before a `delete-dir' teardown; returns t on
+success or a REASON STRING (teardown is then refused, unless FORCE).  The
+generic default copies the in-dir re-hydration record to
+`cc-butler-cleanup-handoff-dir'.  A site whose externalize already writes
+OUTSIDE the dir (e.g. into a vault) sets this to a no-op that returns t."
   :type 'function
   :group 'cc-butler)
 
@@ -126,6 +158,13 @@ Nil disables the idle rule."
 Called with the session plist.  The default scrapes a `CTX:<n>' marker emitted
 by the shipped statusLine helper from the session terminal."
   :type 'function
+  :group 'cc-butler)
+
+(defcustom cc-butler-cleanup-context-ttl 3
+  "Seconds to cache a session's scraped context size.
+The sessions-list feedback tag reads this cache, so a redraw does not re-scrape
+every terminal on every refresh."
+  :type 'number
   :group 'cc-butler)
 
 (defcustom cc-butler-cleanup-trigger-predicate
@@ -192,26 +231,42 @@ i.e. it RECOMMENDS, it does not act."
 ;;;; The session model the seams receive
 ;;;; ------------------------------------------------------------------
 
-(defun cc-butler-cleanup--session (dir)
+(defun cc-butler-cleanup--session (dir &optional tier)
   "Return the session plist the cleaner seams operate on for DIR.
-Keys: :dir :name :session-id :topic-dir :waiting :context."
+TIER (when a cleanup is in flight) is carried so tier-aware seams (verify,
+externalize) can branch on it.  Keys: :dir :name :session-id :topic-dir :tier
+:waiting :context."
   (let ((base (list :dir dir
                     :name (cc-butler--display-name dir)
                     :session-id (cc-butler--session-id dir)
                     :topic-dir (cc-butler--close-topic-dir dir)
+                    :tier tier
                     :waiting (cc-butler--waiting-p dir))))
     (plist-put base :context
                (ignore-errors (funcall cc-butler-cleanup-context-function base)))
     base))
+
+(defun cc-butler-cleanup--rehydration-file (session)
+  "Absolute path of SESSION's in-dir re-hydration record (survives `/clear')."
+  (expand-file-name cc-butler-cleanup-handoff-file (plist-get session :topic-dir)))
+
+(defun cc-butler-cleanup--durable-file (session)
+  "Absolute path of SESSION's durable OUTSIDE record (survives `delete-dir').
+Lives in `cc-butler-cleanup-handoff-dir', named after the session — never inside
+the topic dir."
+  (expand-file-name (concat (plist-get session :name) ".md")
+                    (file-name-as-directory
+                     (expand-file-name cc-butler-cleanup-handoff-dir))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Default seam implementations (generic, site-agnostic)
 ;;;; ------------------------------------------------------------------
 
 (defun cc-butler-cleanup--default-externalize-instruction (session)
-  "Default: instruct the worker to write a generic handoff document."
-  (let ((file (expand-file-name cc-butler-cleanup-handoff-file
-                                (plist-get session :topic-dir))))
+  "Default: instruct the worker to write the in-dir re-hydration record.
+On a delete-dir teardown cc-butler promotes this file to a durable store outside
+the dir, so it is also the accountability record — write it to stand alone."
+  (let ((file (cc-butler-cleanup--rehydration-file session)))
     (concat
      cc-butler-cleanup-externalize-preamble "\n\n"
      (format "Write (or update) a handoff document at `%s`.  Capture, concisely \
@@ -222,25 +277,44 @@ session could resume this work from THIS FILE ALONE.\n\n" file)
      (format "When you are finished writing it, print a final line containing \
 exactly:\n\n%s\n" cc-butler-cleanup-sentinel))))
 
+(defun cc-butler-cleanup--record-sufficient-p (file)
+  "Return t when FILE is a non-trivial record, else a reason string."
+  (cond
+   ((not (file-exists-p file)) (format "record missing: %s" file))
+   (t (let ((size (or (file-attribute-size (file-attributes file)) 0))
+            (lines (with-temp-buffer
+                     (insert-file-contents file)
+                     (count-lines (point-min) (point-max)))))
+        (cond
+         ((< size cc-butler-cleanup-verify-min-bytes)
+          (format "record too small (%d < %d bytes): %s"
+                  size cc-butler-cleanup-verify-min-bytes file))
+         ((< lines cc-butler-cleanup-verify-min-lines)
+          (format "record too thin (%d < %d lines): %s"
+                  lines cc-butler-cleanup-verify-min-lines file))
+         (t t))))))
+
 (defun cc-butler-cleanup--default-verify (session)
-  "Default: the handoff doc exists and is non-trivial.  t or a reason string."
-  (let ((file (expand-file-name cc-butler-cleanup-handoff-file
-                                (plist-get session :topic-dir))))
+  "Default verify: the operative record exists and is non-trivial.
+For the `delete-dir' tier this checks the OUTSIDE durable record (it must
+survive the dir's removal); otherwise the in-dir re-hydration record."
+  (cc-butler-cleanup--record-sufficient-p
+   (if (eq (plist-get session :tier) 'delete-dir)
+       (cc-butler-cleanup--durable-file session)
+     (cc-butler-cleanup--rehydration-file session))))
+
+(defun cc-butler-cleanup--default-promote (session)
+  "Default promote: copy the in-dir re-hydration record to the durable store.
+Returns t on success or a reason string.  Establishes the OUTSIDE record so it
+survives `delete-dir'."
+  (let ((src (cc-butler-cleanup--rehydration-file session))
+        (dst (cc-butler-cleanup--durable-file session)))
     (cond
-     ((not (file-exists-p file))
-      (format "handoff doc missing: %s" file))
-     (t (let ((size (or (file-attribute-size (file-attributes file)) 0))
-              (lines (with-temp-buffer
-                       (insert-file-contents file)
-                       (count-lines (point-min) (point-max)))))
-          (cond
-           ((< size cc-butler-cleanup-verify-min-bytes)
-            (format "handoff doc too small (%d < %d bytes): %s"
-                    size cc-butler-cleanup-verify-min-bytes file))
-           ((< lines cc-butler-cleanup-verify-min-lines)
-            (format "handoff doc too thin (%d < %d lines): %s"
-                    lines cc-butler-cleanup-verify-min-lines file))
-           (t t)))))))
+     ((not (file-exists-p src)) (format "no in-dir record to promote: %s" src))
+     (t (make-directory (file-name-directory dst) t)
+        (copy-file src dst t)
+        (if (file-exists-p dst) t
+          (format "failed to write durable record: %s" dst))))))
 
 (defun cc-butler-cleanup--default-context (session)
   "Default: scrape a `CTX:<n>' marker (from the statusLine helper) for SESSION."
@@ -248,6 +322,38 @@ exactly:\n\n%s\n" cc-butler-cleanup-sentinel))))
                                      cc-butler-cleanup-read-lines)))
     (when (and out (string-match "CTX:\\([0-9]+\\)" out))
       (string-to-number (match-string 1 out)))))
+
+;;;; --- context feedback for the sessions list (cached) ---------------
+
+(defvar cc-butler-cleanup--context-cache (make-hash-table :test 'equal)
+  "Map a session dir -> (TIMESTAMP . TOKENS); a short TTL keeps the sessions-list
+tag cheap so a redraw does not re-scrape every terminal.")
+
+(defun cc-butler-cleanup-context-for (dir)
+  "Return DIR's context size in input tokens, cached for a short TTL.
+The TTL is `cc-butler-cleanup-context-ttl'; the value comes from
+`cc-butler-cleanup-context-function'.  Nil when unknown."
+  (let ((cached (gethash dir cc-butler-cleanup--context-cache))
+        (now (float-time)))
+    (if (and cached (< (- now (car cached)) cc-butler-cleanup-context-ttl))
+        (cdr cached)
+      (let ((tok (ignore-errors
+                   (funcall cc-butler-cleanup-context-function (list :dir dir)))))
+        (puthash dir (cons now tok) cc-butler-cleanup--context-cache)
+        tok))))
+
+(defun cc-butler-cleanup-context-tag (dir)
+  "Return a compact context tag like \"ctx 187k\" for DIR, or nil when unknown.
+This is the sessions-list feedback device; `cc-butler--render' calls it."
+  (let ((tok (cc-butler-cleanup-context-for dir)))
+    (and (integerp tok) (format "ctx %dk" (max 0 (/ tok 1000))))))
+
+(defun cc-butler-cleanup-context-over-threshold-p (dir)
+  "Non-nil when DIR's cached context is at/above the cleanup context threshold.
+The threshold is `cc-butler-cleanup-context-threshold'."
+  (let ((tok (cc-butler-cleanup-context-for dir)))
+    (and cc-butler-cleanup-context-threshold (integerp tok)
+         (>= tok cc-butler-cleanup-context-threshold))))
 
 (defun cc-butler-cleanup--default-completion-p (session _sent-time)
   "Default: the session terminal shows the externalize sentinel."
@@ -304,6 +410,50 @@ an ordinary worker, currently WAITING/idle (not mid-work), not on the keep list.
                    (not (cc-butler-cleanup--active-p dir)))
           (push (cc-butler-cleanup--session dir) out))))
     (nreverse out)))
+
+;;;; ------------------------------------------------------------------
+;;;; Target resolution: EXPLICIT + CONFIRMED, never a transient point
+;;;; ------------------------------------------------------------------
+;;
+;; The sessions-list cursor can reset to the top (the butler), so a point-based
+;; target could silently hit the butler and /clear it.  Targets must therefore
+;; be resolved AND confirmed by NAME before any action, and the butler/steward
+;; can never be chosen (they are not ordinary workers).
+
+(defun cc-butler-cleanup--eligible-worker-dirs ()
+  "All live ordinary-worker session dirs (butler/steward excluded)."
+  (let (out)
+    (dolist (s (cc-butler--sessions))
+      (let ((dir (plist-get s :dir)))
+        (when (cc-butler-cleanup--worker-p dir) (push dir out))))
+    (nreverse out)))
+
+(defun cc-butler-cleanup--context-target ()
+  "Best-effort target dir from context, WITHOUT acting: the session terminal we
+are visiting, else the session at point in the list, else nil."
+  (or (and (fboundp 'cc-butler--dir-for-buffer)
+           (cc-butler--dir-for-buffer (current-buffer)))
+      (and (derived-mode-p 'cc-butler-mode)
+           (fboundp 'cc-butler--dir-at-point)
+           (cc-butler--dir-at-point))))
+
+(defun cc-butler-cleanup--read-target ()
+  "Resolve and CONFIRM a worker cleanup target BY NAME; return its dir.
+Offers only eligible workers (butler/steward can never appear), defaulting to
+the context-resolved session when it is itself an eligible worker.  Signals if
+there are no eligible workers or the confirmed name resolves to none."
+  (let* ((dirs (cc-butler-cleanup--eligible-worker-dirs)))
+    (unless dirs (user-error "No eligible worker sessions to clean"))
+    (let* ((names (mapcar #'cc-butler--display-name dirs))
+           (cand (cc-butler-cleanup--context-target))
+           (default (and cand (cc-butler-cleanup--worker-p cand)
+                         (cc-butler--display-name cand)))
+           (name (completing-read
+                  (if default (format "Clean up worker (default %s): " default)
+                    "Clean up worker: ")
+                  names nil t nil nil default)))
+      (or (seq-find (lambda (d) (equal (cc-butler--display-name d) name)) dirs)
+          (user-error "No eligible worker session named %S" name)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Soft trigger: surface over-threshold idle sessions as candidates
@@ -395,21 +545,25 @@ TIER defaults to `cc-butler-cleanup-teardown-tier'.  With FORCE, the verify gate
 is skipped (an explicit operator escape).  Asynchronous: the externalize
 instruction is typed into the worker, then the terminal is polled for the
 completion sentinel; on completion the record is verified and, only then, the
-session is torn down.  Never tears down before verification passes."
+session is torn down.  Never tears down before verification passes.
+
+The target is resolved and CONFIRMED BY NAME (see
+`cc-butler-cleanup--read-target'); the butler/steward can never be a target —
+enforced in the core here, not only in the picker."
   (interactive
-   (list (or (and (derived-mode-p 'cc-butler-mode) (cc-butler--dir-at-point))
-             (user-error "No session at point"))
+   (list (cc-butler-cleanup--read-target)
          (and current-prefix-arg
               (intern (completing-read "Tier: " '("clear" "delete-dir") nil t)))
          nil))
+  ;; HARD core guard (defense in depth): the butler/steward and any non-worker
+  ;; are never a valid target, however DIR was obtained.
+  (unless (cc-butler-cleanup--worker-p dir)
+    (user-error "Refusing to clean the butler/steward, or a non-worker: %s"
+                (cc-butler--display-name dir)))
   (let ((tier (or tier cc-butler-cleanup-teardown-tier)))
-    (cond
-     ((cc-butler-cleanup--active-p dir)
+    (when (cc-butler-cleanup--active-p dir)
       (user-error "Cleanup already in flight for %s" (cc-butler--display-name dir)))
-     ((not (cc-butler-cleanup--worker-p dir))
-      (user-error "Refusing to clean the butler/steward, or a non-worker: %s"
-                  (cc-butler--display-name dir))))
-    (let* ((session (cc-butler-cleanup--session dir))
+    (let* ((session (cc-butler-cleanup--session dir tier))
            (instruction (funcall cc-butler-cleanup-externalize-function session)))
       (cc-butler-cleanup--set-state dir :phase 'externalizing :tier tier
                                     :force force :sent-time (float-time))
@@ -431,7 +585,7 @@ session is torn down.  Never tears down before verification passes."
 (defun cc-butler-cleanup--poll (dir)
   "One poll tick: advance to verify when done, abort on timeout, else re-poll."
   (when-let ((st (gethash dir cc-butler-cleanup--state)))
-    (let* ((session (cc-butler-cleanup--session dir))
+    (let* ((session (cc-butler-cleanup--session dir (plist-get st :tier)))
            (sent (plist-get st :sent-time)))
       (cond
        ((not (get-buffer (claude-code-ide--get-buffer-name dir)))
@@ -445,26 +599,42 @@ session is torn down.  Never tears down before verification passes."
 
 (defun cc-butler-cleanup--verify-and-teardown (dir)
   "Verify externalization for DIR; on success run hooks, then tear down.
-Never tears down when verification fails (unless FORCE was set at start)."
+For `delete-dir', first PROMOTE the record to the durable OUTSIDE store (so it
+survives the dir) and verify THAT copy.  Never tears down when the durable
+record cannot be established or verification fails (unless FORCE was set)."
   (let* ((st (gethash dir cc-butler-cleanup--state))
          (force (plist-get st :force))
-         (session (cc-butler-cleanup--session dir)))
+         (tier (plist-get st :tier))
+         (session (cc-butler-cleanup--session dir tier))
+         (name (cc-butler--display-name dir)))
     (cc-butler-cleanup--set-state dir :phase 'verifying)
-    (let ((res (funcall cc-butler-cleanup-verify-function session)))
+    ;; delete-dir: establish the durable OUTSIDE record before verify/delete.
+    (let ((promote (if (eq tier 'delete-dir)
+                       (funcall cc-butler-cleanup-promote-function session)
+                     t)))
       (cond
-       ((and (not force) (not (eq res t)))
+       ((and (not (eq promote t)) (not force))
         (cc-butler-cleanup--finish
-         dir "verification FAILED (%s) — NOT torn down"
-         (if (stringp res) res "insufficient externalization")))
+         dir "durable record not established (%s) — NOT torn down"
+         (if (stringp promote) promote "promotion failed")))
        (t
-        (when (and force (not (eq res t)))
-          (cc-butler--log "cleanup: %s │ verify skipped (FORCE)"
-                          (cc-butler--display-name dir)))
-        ;; Outward/gated site side-effects recommend decisions; they do not act.
-        (ignore-errors
-          (run-hook-with-args 'cc-butler-cleanup-after-externalize-functions session))
-        (cc-butler-cleanup--set-state dir :phase 'teardown)
-        (cc-butler-cleanup--teardown dir (plist-get st :tier) force session))))))
+        (when (and (not (eq promote t)) force)
+          (cc-butler--log "cleanup: %s │ promote failed, continuing (FORCE)" name))
+        (let ((res (funcall cc-butler-cleanup-verify-function session)))
+          (cond
+           ((and (not force) (not (eq res t)))
+            (cc-butler-cleanup--finish
+             dir "verification FAILED (%s) — NOT torn down"
+             (if (stringp res) res "insufficient externalization")))
+           (t
+            (when (and force (not (eq res t)))
+              (cc-butler--log "cleanup: %s │ verify skipped (FORCE)" name))
+            ;; Outward/gated site side-effects recommend decisions; never act.
+            (ignore-errors
+              (run-hook-with-args 'cc-butler-cleanup-after-externalize-functions
+                                  session))
+            (cc-butler-cleanup--set-state dir :phase 'teardown)
+            (cc-butler-cleanup--teardown dir tier force session)))))))))
 
 (defun cc-butler-cleanup--teardown (dir tier force session)
   "Perform the TIER teardown of DIR after verification.
