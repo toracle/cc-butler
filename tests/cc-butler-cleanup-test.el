@@ -92,6 +92,62 @@ no real terminal is touched.  Sent text is collected in the dynamic var `sent'."
   (cl-letf (((symbol-function 'cc-butler--read-output) (lambda (&rest _) "nope")))
     (should (null (cc-butler-cleanup--default-context (list :dir "/d"))))))
 
+(ert-deftest cc-butler-cleanup/context-parses-clear-hint-k ()
+  "The default parse reads the idle \"/clear to save <N>k tokens\" hint."
+  (cl-letf (((symbol-function 'cc-butler--read-output)
+             (lambda (&rest _) "  Context left until auto-compact\n\
+  /clear to save 152k tokens\n")))
+    (should (= 152000 (cc-butler-cleanup--default-context (list :dir "/d"))))))
+
+(ert-deftest cc-butler-cleanup/context-parses-clear-hint-m ()
+  "The default parse also handles the M (millions) form of the save hint."
+  (cl-letf (((symbol-function 'cc-butler--read-output)
+             (lambda (&rest _) "/clear to save 1.2M tokens")))
+    (should (= 1200000 (cc-butler-cleanup--default-context (list :dir "/d"))))))
+
+(ert-deftest cc-butler-cleanup/context-parses-percent-used ()
+  "The default parse estimates tokens from \"<N>% context used\" against the
+configured context window."
+  (let ((cc-butler-cleanup-context-window 200000))
+    (cl-letf (((symbol-function 'cc-butler--read-output)
+               (lambda (&rest _) "45% context used")))
+      (should (= 90000 (cc-butler-cleanup--default-context (list :dir "/d")))))))
+
+(ert-deftest cc-butler-cleanup/context-marker-wins-over-tui-hints ()
+  "The reliable CTX: marker takes precedence over the default-TUI hints when
+both are present in the scrape."
+  (cl-letf (((symbol-function 'cc-butler--read-output)
+             (lambda (&rest _) "CTX:187342 57%\n/clear to save 152k tokens")))
+    (should (= 187342 (cc-butler-cleanup--default-context (list :dir "/d"))))))
+
+;;;; ---- last-known-value persistence (no flicker) -------------------
+
+(ert-deftest cc-butler-cleanup/context-keeps-last-known-on-nil-read ()
+  "A fresh read of nil (indicator gone mid-task) must KEEP the last-known size,
+so the sessions-list tag persists instead of flickering out; a new real reading
+replaces it."
+  (let ((cc-butler-cleanup--context-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-context-ttl 0)   ; force a fresh scrape on every call
+        (reading 187342))
+    (let ((cc-butler-cleanup-context-function (lambda (_s) reading)))
+      ;; first read sees a real value -> cached and shown
+      (should (equal "ctx 187k" (cc-butler-cleanup-context-tag "/w/")))
+      ;; indicator disappears: read returns nil -> tag STILL shows last-known
+      (setq reading nil)
+      (should (equal "ctx 187k" (cc-butler-cleanup-context-tag "/w/")))
+      (should (= 187342 (cc-butler-cleanup-context-for "/w/")))
+      ;; a new real reading replaces the kept value
+      (setq reading 150000)
+      (should (equal "ctx 150k" (cc-butler-cleanup-context-tag "/w/"))))))
+
+(ert-deftest cc-butler-cleanup/context-nil-with-no-prior-value-is-nil ()
+  "With no value ever read, a nil read yields nil (no phantom tag)."
+  (let ((cc-butler-cleanup--context-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-context-ttl 0)
+        (cc-butler-cleanup-context-function (lambda (_s) nil)))
+    (should (null (cc-butler-cleanup-context-for "/w/")))
+    (should (null (cc-butler-cleanup-context-tag "/w/")))))
+
 ;;;; ---- trigger gating ----------------------------------------------
 
 (ert-deftest cc-butler-cleanup/trigger-fires-over-200k ()
@@ -492,6 +548,40 @@ the in-dir copy exists, and passes once the record has been promoted outside."
     (let ((claude-code-ide-mcp-allowed-tools "mcp__emacs-tools__*"))
       (cc-butler-install-tool-permissions)
       (should (equal "mcp__emacs-tools__*" claude-code-ide-mcp-allowed-tools)))))
+
+;;;; ---- statusLine retrofit: workers only ---------------------------
+
+(ert-deftest cc-butler-cleanup/install-statusline-all-targets-workers-only ()
+  "Retrofitting the statusLine installs into every eligible WORKER workspace and
+NEVER the butler or steward, returning the dirs actually written."
+  (let ((cc-butler--butler "/b/") (cc-butler--steward "/s/")
+        (installed nil))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () (list (list :dir "/b/") (list :dir "/s/")
+                                (list :dir "/w1/") (list :dir "/w2/"))))
+              ((symbol-function 'cc-butler--role-rank)
+               (lambda (d) (cond ((equal d "/b/") 0) ((equal d "/s/") 1) (t 2))))
+              ;; stub the writer: record targets, report a fresh write for each
+              ((symbol-function 'cc-butler-cleanup-install-statusline)
+               (lambda (dir &optional _template) (push dir installed) dir)))
+      (let ((written (cc-butler-cleanup-install-statusline-all)))
+        (should (equal '("/w1/" "/w2/") written))
+        (should (equal '("/w1/" "/w2/") (sort (copy-sequence installed) #'string<)))
+        (should-not (member "/b/" installed))
+        (should-not (member "/s/" installed))))))
+
+(ert-deftest cc-butler-cleanup/install-statusline-all-skips-already-configured ()
+  "Workers that already have a settings file (writer returns nil) are not counted
+as freshly written."
+  (let ((cc-butler--butler nil) (cc-butler--steward nil))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () (list (list :dir "/w1/") (list :dir "/w2/"))))
+              ((symbol-function 'cc-butler--role-rank) (lambda (_d) 2))
+              ((symbol-function 'cc-butler-cleanup-install-statusline)
+               (lambda (dir &optional _template)
+                 ;; /w1 already configured -> nil; /w2 freshly written -> path
+                 (unless (equal dir "/w1/") dir))))
+      (should (equal '("/w2/") (cc-butler-cleanup-install-statusline-all))))))
 
 (provide 'cc-butler-cleanup-test)
 ;;; cc-butler-cleanup-test.el ends here

@@ -347,20 +347,38 @@ nil when the terminal shows no context indicator (e.g. mid-task)."
 
 (defvar cc-butler-cleanup--context-cache (make-hash-table :test 'equal)
   "Map a session dir -> (TIMESTAMP . TOKENS); a short TTL keeps the sessions-list
-tag cheap so a redraw does not re-scrape every terminal.")
+tag cheap so a redraw does not re-scrape every terminal.  TOKENS is the
+LAST-KNOWN size: a later read of nil (no indicator on screen right now) does not
+erase it, so the tag persists instead of flickering out.")
 
 (defun cc-butler-cleanup-context-for (dir)
   "Return DIR's context size in input tokens, cached for a short TTL.
 The TTL is `cc-butler-cleanup-context-ttl'; the value comes from
-`cc-butler-cleanup-context-function'.  Nil when unknown."
+`cc-butler-cleanup-context-function'.
+
+RELIABILITY: the context indicator is not shown at every moment (the default
+Claude Code terminal only shows a size hint when idle or near the limit), so a
+fresh read often returns nil while a session works.  A nil read must NOT clear a
+previously-known size — otherwise the sessions-list `ctx' tag would flicker in
+and out as sessions change state.  So a real reading refreshes the cached value,
+but a nil reading KEEPS the last-known value (only its timestamp is refreshed,
+so we retry after the TTL rather than on every redraw).  Nil is returned only
+when no size has ever been read for DIR."
   (let ((cached (gethash dir cc-butler-cleanup--context-cache))
         (now (float-time)))
     (if (and cached (< (- now (car cached)) cc-butler-cleanup-context-ttl))
         (cdr cached)
       (let ((tok (ignore-errors
                    (funcall cc-butler-cleanup-context-function (list :dir dir)))))
-        (puthash dir (cons now tok) cc-butler-cleanup--context-cache)
-        tok))))
+        (if (integerp tok)
+            ;; A real reading: refresh both the value and its timestamp.
+            (progn (puthash dir (cons now tok) cc-butler-cleanup--context-cache)
+                   tok)
+          ;; No reading now: keep the last-known value (nil if we never had one),
+          ;; refreshing only the timestamp so we retry after the TTL.
+          (let ((last (and cached (cdr cached))))
+            (puthash dir (cons now last) cc-butler-cleanup--context-cache)
+            last))))))
 
 (defun cc-butler-cleanup-context-tag (dir)
   "Return a compact context tag like \"ctx 187k\" for DIR, or nil when unknown.
@@ -907,6 +925,42 @@ Never clobbers an existing settings file (idempotent, non-destructive)."
           file)))))
 
 (add-hook 'cc-butler-scaffold-functions #'cc-butler-cleanup-install-statusline)
+
+;;;###autoload
+(defun cc-butler-cleanup-install-statusline-all ()
+  "Retrofit the context-reporting statusLine onto every current WORKER session.
+Runs `cc-butler-cleanup-install-statusline' in each eligible worker's workspace
+\(the butler and steward are NEVER touched — see
+`cc-butler-cleanup--eligible-worker-dirs'), writing a `.claude/settings.json'
+that wires the `CTX:<n>' marker.  It never clobbers an existing settings file,
+so a worker that already has one is left untouched.
+
+STATUSLINE TAKES EFFECT LIVE (no restart needed): Claude Code watches its
+settings files and hot-reloads them when they change; only `model' and
+`outputStyle' require a restart, and `statusLine' is not among them.  So a
+worker that is already running picks up the new `.claude/settings.json' and
+starts emitting the `CTX:<n>' marker on its refresh interval, without being
+restarted.  As a belt-and-braces fallback for the brief reload window (and any
+session where the statusLine is unavailable), the default-terminal parse in
+`cc-butler-cleanup--default-context' plus the last-known-value cache in
+`cc-butler-cleanup-context-for' keep the `ctx' tag populated.
+
+Returns the list of worker dirs a fresh settings file was written into."
+  (interactive)
+  (let (written)
+    (dolist (dir (cc-butler-cleanup--eligible-worker-dirs))
+      (when (cc-butler-cleanup-install-statusline dir)
+        (push dir written)))
+    (setq written (nreverse written))
+    (when (called-interactively-p 'interactive)
+      (message
+       "cc-butler: statusLine written into %d worker workspace(s)%s"
+       (length written)
+       (if written
+           (format " — RESTART those sessions to activate: %s"
+                   (mapconcat #'cc-butler--display-name written ", "))
+         " (all workers already had settings, or none eligible)")))
+    written))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Keybinding
