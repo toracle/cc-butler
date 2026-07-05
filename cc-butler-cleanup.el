@@ -316,12 +316,32 @@ survives `delete-dir'."
         (if (file-exists-p dst) t
           (format "failed to write durable record: %s" dst))))))
 
+(defcustom cc-butler-cleanup-context-window 200000
+  "Assumed context-window size (input tokens) for converting a bare
+\"<N>% context used\" terminal indicator into a token estimate.  Used only when
+no explicit token count is shown."
+  :type 'integer
+  :group 'cc-butler)
+
 (defun cc-butler-cleanup--default-context (session)
-  "Default: scrape a `CTX:<n>' marker (from the statusLine helper) for SESSION."
+  "Default: read SESSION's current context size (input tokens) from its terminal.
+Tries, in order: a `CTX:<n>' marker (from the optional statusLine helper); the
+default Claude Code hint \"/clear to save <N>k tokens\" (also M); or \"<N>%
+context used\" (estimated against `cc-butler-cleanup-context-window').  Returns
+nil when the terminal shows no context indicator (e.g. mid-task)."
   (let ((out (cc-butler--read-output (plist-get session :dir)
                                      cc-butler-cleanup-read-lines)))
-    (when (and out (string-match "CTX:\\([0-9]+\\)" out))
-      (string-to-number (match-string 1 out)))))
+    (when out
+      (cond
+       ((string-match "CTX:\\([0-9]+\\)" out)
+        (string-to-number (match-string 1 out)))
+       ((string-match "save \\([0-9.]+\\)[kK] tokens" out)
+        (round (* 1000 (string-to-number (match-string 1 out)))))
+       ((string-match "save \\([0-9.]+\\)[mM] tokens" out)
+        (round (* 1000000 (string-to-number (match-string 1 out)))))
+       ((string-match "\\([0-9]+\\)% context used" out)
+        (round (* (/ (string-to-number (match-string 1 out)) 100.0)
+                  cc-butler-cleanup-context-window)))))))
 
 ;;;; --- context feedback for the sessions list (cached) ---------------
 
