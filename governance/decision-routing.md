@@ -18,6 +18,23 @@ it; surface only what genuinely needs the human.** Operationalizes
   #47/#48 without asking). Relay the GO with `[butler coordination]`.
 - **Read-only investigation / self-verification GO.** A session offering to self-verify
   (/browse, read logs, gh checks, EXPLAIN) or investigate — approve; no human needed.
+- **PR open (not merge), and its lightweight adjacent prep.** Pulling/updating, rebasing,
+  re-running tests, pushing, opening a PR, and posting an overdue status comment on an
+  issue — proceed without asking, every time. A PR is a review request, not an irreversible
+  act. This does **not** extend to GitHub **issue creation** — that's a separate, still-
+  unconfirmed track (§B); don't conflate opening a PR with opening an issue.
+- **PR merge — conditional auto-handle.** Merge without asking only when BOTH are
+  independently verified (not taken from the worker's self-report):
+  1. **CI green + code review passed** — re-check directly (`gh pr checks` etc.); a worker
+     saying "tests passed" is not enough (custom-mcp PR #1133: self-report claimed tests
+     passed while the actual CI status was FAILURE).
+  2. **E2E/BDD scenario verification** — the PR actually does what it originally set out to
+     do, driven end-to-end (the `/verify` skill's bar). Unit/integration test counts alone
+     don't clear this: "코드 리뷰는 사실 덜 중요한 것들도 많아요... 진짜 문제되는 부분은
+     유저 사용관점에서 기능이 제대로 동작하는가... e2e 테스트를 하면서 BDD 시나리오를
+     충족하는 게 진짜 중요한 것 같습니다" (정수님).
+  If either is missing or ambiguous, merge still must escalate to the human — this bar
+  also governs the "low-risk devel merges" mentioned in §C.
 - **Re-surfaced already-answered decision.** If a worker re-shows a menu the user already
   answered, re-relay the user's prior answer (anchor in time) — don't re-ask.
 - **Safe non-gated prep while a gated decision is parked** (draft, tee-up, doc) — direct it.
@@ -29,8 +46,9 @@ it; surface only what genuinely needs the human.** Operationalizes
 
 ## B. BUTLER SURFACES — must-ask (with a recommendation + terse-answer format)
 - **Outward / irreversible:** prod deploy, tag/release, force-push, data migration,
-  deleting a dir/session, creating public GitHub issues/PRs on product repos, sending
-  external messages (Teams). Confirm even if a pattern exists.
+  deleting a dir/session, creating public GitHub **issues** on product repos (unlike PR
+  open, which §A now auto-handles — issue creation is a separate, still-unconfirmed
+  track), sending external messages (Teams). Confirm even if a pattern exists.
 - **Credential / security-sensitive:** secrets, auth policy, permission scopes.
 - **Genuine forks with user taste / product-strategy weight:** which of two real designs,
   MVP-vs-full scope, pricing, architecture ownership (bucket/platform extraction).
@@ -40,6 +58,9 @@ it; surface only what genuinely needs the human.** Operationalizes
 
 ## C. Reversible staging deploys / low-risk devel merges
 Surface, but as a **one-line recommendation + one-tap answer** (not an essay). Low friction.
+A devel merge that clears §A's conditional-merge bar (CI+review re-verified, E2E/BDD
+re-verified) skips this and auto-handles instead; this tier is for the merges that don't
+clear that bar yet, or for staging deploys, which are always surfaced.
 
 ## Delivery rules (make must-ask fast)
 - Lead with a recommendation; ask for a terse answer ("1 / B / go"), not prose.
