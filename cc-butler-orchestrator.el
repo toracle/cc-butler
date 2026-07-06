@@ -332,6 +332,33 @@ WHICH is `butler' or `steward'."
    "Keep workers moving, and never let the state of the fleet live only in the\n"
    "chat scrollback.\n"))
 
+(defun cc-butler--haiku-summarizer-agent-md ()
+  "Return the `.claude/agents/haiku-summarizer.md' sub-agent definition —
+the reusable device for `haiku-summarization-delegation': a single tool call
+for \"read this long file/output, answer this one question, return only the
+distilled answer,\" priced and speeded for haiku since it takes no judgment."
+  (concat
+   "---\n"
+   "name: haiku-summarizer\n"
+   "description: Summarize or extract a specific answer from a long document, "
+   "log, or tool/session output. Use this BEFORE reading any long file "
+   "directly — hand it the exact file/output and the question the summary "
+   "must answer; it returns only the distilled answer, never a copy of the "
+   "source. Only for pure extraction with no judgment call; if the task "
+   "requires weighing options or verifying a claim, use the default model "
+   "instead.\n"
+   "model: haiku\n"
+   "tools: Read, Grep, Glob\n"
+   "---\n\n"
+   "Read the file or output you were given and answer the exact question you "
+   "were asked — nothing else.\n\n"
+   "Return only the distilled answer: the facts, quotes, or conclusions "
+   "needed, with file:line references where useful. Never return a copy or "
+   "paraphrase of the full source, and never pad the answer with "
+   "commentary about what you did.\n\n"
+   "If the question can't be answered from what you were given, say so "
+   "plainly instead of guessing.\n"))
+
 (defun cc-butler--user-profile-template ()
   "Return the initial (empty) user-profile file the interview fills."
   (concat
@@ -366,8 +393,10 @@ fills it), and an `interview-inventory.org' (the questions to ask)."
                    `((".projectile" . ,(lambda () ""))
                      ("CLAUDE.md" . cc-butler--butler-claude-md)
                      ("user-profile.org" . cc-butler--user-profile-template)
-                     ("interview-inventory.org" . cc-butler--interview-inventory-template)))
+                     ("interview-inventory.org" . cc-butler--interview-inventory-template)
+                     (".claude/agents/haiku-summarizer.md" . cc-butler--haiku-summarizer-agent-md)))
       (let ((file (expand-file-name name home)))
+        (make-directory (file-name-directory file) t)
         (unless (file-exists-p file)
           (write-region (funcall gen) nil file nil 'silent))))
     home))
@@ -411,10 +440,14 @@ Must differ from `cc-butler-home' (two sessions cannot share a directory)."
   (let ((home (file-name-as-directory (expand-file-name cc-butler-steward-home))))
     (make-directory home t)
     (let ((proj (expand-file-name ".projectile" home))
-          (cmd  (expand-file-name "CLAUDE.md" home)))
+          (cmd  (expand-file-name "CLAUDE.md" home))
+          (agent (expand-file-name ".claude/agents/haiku-summarizer.md" home)))
       (unless (file-exists-p proj) (write-region "" nil proj nil 'silent))
       (unless (file-exists-p cmd)
-        (write-region (cc-butler--steward-claude-md) nil cmd nil 'silent)))
+        (write-region (cc-butler--steward-claude-md) nil cmd nil 'silent))
+      (make-directory (file-name-directory agent) t)
+      (unless (file-exists-p agent)
+        (write-region (cc-butler--haiku-summarizer-agent-md) nil agent nil 'silent)))
     home))
 
 ;;;###autoload

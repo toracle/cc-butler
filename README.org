@@ -80,7 +80,7 @@ tools listed above.
 ** The butler
 
 ~M-x cc-butler-start-butler~ (~B~) launches a dedicated *butler* session in
-~cc-butler-home~ (default =~/.emacs.d/cc-butler=), scaffolding a =.projectile=
+~cc-butler-home~ (default =~/.emacs.d/cc-butler/butler=), scaffolding a =.projectile=
 marker and a role =CLAUDE.md= there on first run, and designating it the butler.
 Point ~cc-butler-home~ at an existing directory to reuse it. (~b~ still lets you
 mark any session the butler by hand.)
