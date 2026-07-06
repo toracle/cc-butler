@@ -295,6 +295,52 @@ superseded doc reflects the new content."
       (should (= 0 (cc-butler--decision-on-arrival)))        ; skipped
       (should (= 0 (length (directory-files (cc-butler--decision-open-dir) nil cc-butler--decision-org-re)))))))
 
+;;;; ---- manual refresh (`cc-butler-decision-answer-next' path) ------
+
+(ert-deftest cc-butler-decision/refresh-dedups-by-topic ()
+  "`cc-butler-decision-refresh' (the manual answer-next path) dedups by topic
+the same way arrival does.  Regression: this path used to call
+`cc-butler--decision-render' directly with no dedup, so two same-topic
+messages queued before a single refresh left duplicate open docs behind."
+  (cc-butler-decision-test--with-arrival
+    (cc-butler--mail-file-deliver "정수님"
+      '(:id "r1" :kind decision :from "steward" :reply-to "steward"
+            :summary "Which auth?" :options ("Stripe")))
+    (cc-butler--mail-file-deliver "정수님"
+      '(:id "r2" :kind decision :from "steward" :reply-to "steward"
+            :summary "Which auth?" :options ("Stripe" "Paddle")))
+    ;; Both drain in one pass: r1 surfaces new, r2 supersedes it — 2 surfacing
+    ;; events (same counting convention as `cc-butler--decision-on-arrival'),
+    ;; but the point of this test is the invariant below: only ONE file
+    ;; survives in open/, not two.
+    (should (= 2 (cc-butler-decision-refresh)))
+    (should (= 1 (length (directory-files (cc-butler--decision-open-dir) nil cc-butler--decision-org-re))))
+    (let ((file (car (directory-files (cc-butler--decision-open-dir) t cc-butler--decision-org-re))))
+      (should (string-match-p "Paddle" (with-temp-buffer (insert-file-contents file) (buffer-string)))))))
+
+(ert-deftest cc-butler-decision/refresh-skips-already-answered-topic ()
+  "A topic already answered and archived is not resurrected by refresh.
+Regression: without dedup, an answered decision that got re-escalated would
+reappear in open/ looking like it never cleared."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cc-butler--mail-file-deliver "정수님"
+        '(:id "s1" :kind decision :from "steward" :reply-to "steward"
+              :summary "Deploy?" :options ("yes" "no")))
+      (cc-butler-decision-refresh)
+      (let* ((file (car (directory-files (cc-butler--decision-open-dir) t cc-butler--decision-org-re)))
+             (doc (with-temp-buffer (insert-file-contents file) (buffer-string)))
+             (create-lockfiles nil) (kill-buffer-query-functions nil))
+        (with-temp-file file (insert (cc-butler-decision-test--fill doc ?A "go")))
+        (let ((buf (find-file-noselect file)))
+          (unwind-protect (with-current-buffer buf (cc-butler-decision-submit))
+            (ignore-errors (kill-buffer buf)))))
+      (cc-butler--mail-file-deliver "정수님"
+        '(:id "s2" :kind decision :from "steward" :reply-to "steward"
+              :summary "Deploy?" :options ("yes" "no")))
+      (should (= 0 (cc-butler-decision-refresh)))
+      (should (= 0 (length (directory-files (cc-butler--decision-open-dir) nil cc-butler--decision-org-re)))))))
+
 ;;;; ---- read-receipt (`r') ------------------------------------------
 
 (defun cc-butler-decision-test--open-first ()

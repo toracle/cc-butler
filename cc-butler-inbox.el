@@ -55,11 +55,25 @@ handled items, re-referenceable — email-folder style).  Each item is a plist:
 ;;;; The inbox list surface (browse the pending queue)
 ;;;; ------------------------------------------------------------------
 
+(defun cc-butler-inbox-next ()
+  "Move to the next inbox entry.
+Each entry is exactly one logical buffer line (see `cc-butler--inbox-render'),
+so this moves by `forward-line' rather than `next-line' — a long title that
+soft-wraps across several screen rows still takes exactly one press to clear,
+instead of one press per wrapped row."
+  (interactive)
+  (forward-line 1))
+
+(defun cc-butler-inbox-prev ()
+  "Move to the previous inbox entry (see `cc-butler-inbox-next')."
+  (interactive)
+  (forward-line -1))
+
 (defvar cc-butler-inbox-mode-map
   (let ((m (make-sparse-keymap)))
     (define-key m (kbd "RET") #'cc-butler-inbox-open)
-    (define-key m "n" #'next-line)
-    (define-key m "p" #'previous-line)
+    (define-key m "n" #'cc-butler-inbox-next)
+    (define-key m "p" #'cc-butler-inbox-prev)
     (define-key m "f" #'cc-butler-inbox-cycle-folder)
     (define-key m "g" #'cc-butler-inbox-refresh)
     (define-key m "q" #'quit-window)

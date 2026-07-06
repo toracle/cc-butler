@@ -175,13 +175,19 @@ DIR defaults to open/."
     file))
 
 (defun cc-butler-decision-refresh ()
-  "Drain the human node's inbox and render each decision as an open/ document.
-`note'/`relay' messages render read-only; nothing is typed anywhere."
+  "Drain the human node's inbox and render each decision as an open/ document,
+deduplicating by topic (`cc-butler--decision-ingest') the same way arrival-driven
+rendering does: a re-escalated topic supersedes its open doc (unless 정수님 is
+mid-answer) and an already-answered topic is not resurfaced — so a topic that
+arrives twice before this is called doesn't leave a stray duplicate behind, and
+one already answered and archived doesn't reappear.  `note'/`relay' messages
+render read-only; nothing is typed anywhere.  Returns the count of docs newly
+surfaced (new or superseded)."
   (let ((msgs (cc-butler--ch-drain cc-butler-human-agent))
         (rendered 0))
     (dolist (m msgs)
-      (cc-butler--decision-render m)
-      (setq rendered (1+ rendered)))
+      (when (memq (cdr (cc-butler--decision-ingest m)) '(new superseded))
+        (setq rendered (1+ rendered))))
     rendered))
 
 (defun cc-butler--decision-parse-options (s)

@@ -142,5 +142,40 @@ and the badge count is unread-only."
           (should (eq cc-butler-inbox-folder 'unread)))
       (delete-directory cc-butler-decision-dir t))))
 
+(ert-deftest cc-butler-inbox/next-prev-bound-to-entry-movers ()
+  "n/p are bound to the entry-boundary movers, not raw `next-line'/`previous-line'
+(regression: those move by wrapped screen line, so a long title spanning
+several rows used to take one press per row instead of one press per entry)."
+  (should (eq (lookup-key cc-butler-inbox-mode-map "n") #'cc-butler-inbox-next))
+  (should (eq (lookup-key cc-butler-inbox-mode-map "p") #'cc-butler-inbox-prev)))
+
+(ert-deftest cc-butler-inbox/next-prev-move-by-entry ()
+  "cc-butler-inbox-next/-prev land on the next/previous entry's file, one
+press each, regardless of how many buffer lines a title's content spans."
+  (let ((cc-butler-decision-dir (make-temp-file "cc-inbox-nav" t)))
+    (unwind-protect
+        (progn
+          (cc-butler--decision-render
+           '(:id "d1" :kind decision :from "s" :reply-to "s"
+                 :summary "First decision" :options ("a")))
+          (cc-butler--decision-render
+           '(:id "d2" :kind decision :from "s" :reply-to "s"
+                 :summary "Second decision" :options ("a")))
+          (with-temp-buffer
+            (cc-butler-inbox-mode)
+            (cc-butler--inbox-render)
+            (goto-char (point-min))
+            (should (re-search-forward "First decision" nil t))
+            (goto-char (line-beginning-position))
+            (let ((file1 (get-text-property (point) 'cc-butler-inbox-file)))
+              (should file1)
+              (cc-butler-inbox-next)
+              (let ((file2 (get-text-property (point) 'cc-butler-inbox-file)))
+                (should file2)
+                (should-not (equal file1 file2))
+                (cc-butler-inbox-prev)
+                (should (equal file1 (get-text-property (point) 'cc-butler-inbox-file)))))))
+      (delete-directory cc-butler-decision-dir t))))
+
 (provide 'cc-butler-inbox-test)
 ;;; cc-butler-inbox-test.el ends here

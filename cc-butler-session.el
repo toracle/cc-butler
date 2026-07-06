@@ -320,22 +320,18 @@ DEFAULT (its title / topic name)."
 
 (defun cc-butler--ordered (sessions)
   "Sort SESSIONS for display.
-The butler is pinned to slot 1 and the steward to slot 2.  Below them,
-sessions awaiting user input form a FIFO approval queue (oldest first),
-and the rest keep their natural order (the sort is stable)."
+The butler is pinned to slot 1 and the steward to slot 2.  Below them, workers
+keep a FIXED order (alphabetical by working directory) regardless of state —
+a session awaiting input is marked visually (⏳, `warning' face) rather than
+reordered, so a row's position while you are navigating never shifts out from
+under the cursor just because some session's wait-state flipped mid-move."
   (sort (copy-sequence sessions)
         (lambda (a b)
           (let ((ra (cc-butler--role-rank (plist-get a :dir)))
                 (rb (cc-butler--role-rank (plist-get b :dir))))
             (cond
              ((/= ra rb) (< ra rb))
-             ((= ra 2)
-              (let ((wa (cc-butler--waiting-p (plist-get a :dir)))
-                    (wb (cc-butler--waiting-p (plist-get b :dir))))
-                (cond ((and wa wb) (< wa wb))
-                      (wa t)
-                      (wb nil)
-                      (t nil))))
+             ((= ra 2) (string< (plist-get a :dir) (plist-get b :dir)))
              (t nil))))))
 
 ;;;; ------------------------------------------------------------------
@@ -382,8 +378,11 @@ and the rest keep their natural order (the sort is stable)."
 ;;;; Rendering
 
 (defun cc-butler--render ()
-  "Render all live sessions as multi-line blocks in the current buffer."
+  "Render all live sessions as multi-line blocks in the current buffer,
+preserving the cursor's current session across the redraw when possible
+(falls back to point-min only if that session is no longer present)."
   (let ((inhibit-read-only t)
+        (dir (cc-butler--dir-at-point))
         (sessions (cc-butler--ordered (cc-butler--sessions)))
         entries)
     (erase-buffer)
@@ -449,7 +448,9 @@ and the rest keep their natural order (the sort is stable)."
           (insert "\n")
           (put-text-property start (point) 'cc-butler-dir (plist-get s :dir)))))
     (setq cc-butler--entries (nreverse entries))
-    (goto-char (point-min))
+    (if-let ((e (and dir (assoc dir cc-butler--entries))))
+        (goto-char (cdr e))
+      (goto-char (point-min)))
     (cc-butler--highlight)))
 
 (defun cc-butler--list-buffer ()
@@ -491,14 +492,11 @@ and the rest keep their natural order (the sort is stable)."
     (overlay-put cc-butler--hl-overlay 'face 'highlight)))
 
 (defun cc-butler--reprint ()
-  "Re-render the list in place, keeping the selected session if possible."
+  "Re-render the list in place; `cc-butler--render' itself keeps the cursor on
+the selected session when possible."
   (when-let ((buf (get-buffer cc-butler--list-buffer-name)))
     (with-current-buffer buf
-      (let ((dir (cc-butler--dir-at-point)))
-        (cc-butler--render)
-        (when-let ((e (and dir (assoc dir cc-butler--entries))))
-          (goto-char (cdr e))
-          (cc-butler--highlight))))))
+      (cc-butler--render))))
 
 (defun cc-butler--maybe-refresh ()
   "Re-render the list if its buffer exists (safe to call from anywhere)."
