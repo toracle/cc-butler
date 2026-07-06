@@ -41,8 +41,8 @@ rigid line.** Rough triggers — delegate by default when the task is:
 When in doubt between these, prefer delegating — the default is flipped for a
 reason, and the exceptions are narrow.
 
-**Critical caveat — guidance ALONE does not change behavior.** The monocle
-worker `CLAUDE.md` already carried near-identical advice ("act as orchestrator;
+**Critical caveat — guidance ALONE does not change behavior.** A real worker's
+`CLAUDE.md` already carried near-identical advice ("act as orchestrator;
 utilize subagents to save context") and it was *not* followed. Willpower and a
 written reminder are not a control system. So this rule is written down here as
 the source of truth AND it must be **backed by a feedback device that makes

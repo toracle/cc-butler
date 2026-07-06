@@ -26,7 +26,7 @@ it; surface only what genuinely needs the human.** Operationalizes
 - **PR merge — conditional auto-handle.** Merge without asking only when BOTH are
   independently verified (not taken from the worker's self-report):
   1. **CI green + code review passed** — re-check directly (`gh pr checks` etc.); a worker
-     saying "tests passed" is not enough (custom-mcp PR #1133: self-report claimed tests
+     saying "tests passed" is not enough (past incident: a worker self-reported tests
      passed while the actual CI status was FAILURE).
   2. **E2E/BDD scenario verification** — the PR actually does what it originally set out to
      do, driven end-to-end (the `/verify` skill's bar). Unit/integration test counts alone
