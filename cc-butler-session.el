@@ -368,6 +368,7 @@ under the cursor just because some session's wait-state flipped mid-move."
   "g"        #'cc-butler-refresh
   "c"        #'cc-butler-new-session
   "l"        #'cc-butler-show-log
+  "?"        #'cc-butler-doctor
   "q"        #'cc-butler-quit)
 
 (define-derived-mode cc-butler-mode special-mode "CC-Sessions"
@@ -618,10 +619,74 @@ since the launch is async)."
      (cc-butler--configure-session-buffer
       (get-buffer (claude-code-ide--get-buffer-name dir))))))
 
+(defun cc-butler--launch-preflight-diagnostics ()
+  "Return a list of (SEVERITY . MESSAGE) launch-environment problems.
+Checked BEFORE `claude-code-ide' is invoked so a fresh-install gap surfaces
+as a clear `user-error' instead of a silent no-op or the cryptic bare
+\"Invalid buffer\" error ghostel raises when its exec path is wrong — the
+exact failure mode that made a first `B'/`S' press look like \"the shortcut
+doesn't work\" on a freshly-installed machine (2026-07-06).  SEVERITY is
+`error' (the launch will almost certainly fail) or `warn' (cc-butler's
+ghostel-specific UI features — OSC-title tracking, terminal resize, screen
+refresh — degrade, but the session still launches under another backend).
+None of this is configured by `cc-butler' itself or declared in its
+Package-Requires; it lives in the user's own Emacs init."
+  (let ((backend (and (boundp 'claude-code-ide-terminal-backend)
+                       claude-code-ide-terminal-backend))
+        (cli (and (boundp 'claude-code-ide-cli-path) claude-code-ide-cli-path))
+        problems)
+    (unless (executable-find (or cli "claude"))
+      (push (cons 'error
+                   (format "claude CLI %S is not executable/found on PATH — set `claude-code-ide-cli-path' to an absolute path to the `claude' binary"
+                           (or cli "claude")))
+            problems))
+    (if (eq backend 'ghostel)
+        (progn
+          (unless (featurep 'ghostel)
+            (push (cons 'error
+                         "`claude-code-ide-terminal-backend' is `ghostel' but the `ghostel' package is not installed/loaded — launches will fail. Install ghostel, or switch the backend to `vterm' or `eat'.")
+                  problems))
+          (when (and (stringp cli) (string-prefix-p "~" cli))
+            (push (cons 'error
+                         "`claude-code-ide-cli-path' starts with `~' — the ghostel backend spawns it via execvp with no shell, so `~' is never expanded and the process dies instantly (surfaces as a bare \"Invalid buffer\" error). Set it to an absolute path, e.g. via `executable-find'.")
+                  problems)))
+      (push (cons 'warn
+                   (format "`claude-code-ide-terminal-backend' is `%s', not `ghostel' — cc-butler's OSC-title tracking, terminal resize, and screen-refresh features are ghostel-specific and will silently no-op under this backend."
+                           (or backend "unset")))
+            problems))
+    (nreverse problems)))
+
+;;;###autoload
+(defun cc-butler-doctor ()
+  "Check for fresh-install gaps that make a cc-butler session launch fail
+silently or misbehave (missing ghostel, an unexpanded `~' in
+`claude-code-ide-cli-path', a non-ghostel terminal backend, or no `claude'
+CLI on PATH) and report them in `*cc-butler-doctor*'.  None of these are
+cc-butler bugs — they are Emacs-init/environment setup this package
+depends on but cannot install or verify for you."
+  (interactive)
+  (let ((problems (cc-butler--launch-preflight-diagnostics)))
+    (with-current-buffer (get-buffer-create "*cc-butler-doctor*")
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (if (null problems)
+            (insert "cc-butler: no known fresh-install gaps detected.\n")
+          (dolist (p problems)
+            (insert (format "[%s] %s\n\n" (upcase (symbol-name (car p))) (cdr p))))))
+      (goto-char (point-min))
+      (special-mode)
+      (display-buffer (current-buffer)))))
+
 (defun cc-butler--launch-session (dir)
   "The ONE path every role launches through — butler, steward, and workers —
 so their ghostel config cannot diverge (global-consistency).  Launches a
-channel-joined Claude session in DIR and applies the uniform config."
+channel-joined Claude session in DIR and applies the uniform config.
+Runs `cc-butler--launch-preflight-diagnostics' first so a fresh-install
+misconfiguration is a loud, actionable `user-error', not a silent no-op."
+  (dolist (p (cc-butler--launch-preflight-diagnostics))
+    (if (eq (car p) 'error)
+        (user-error "cc-butler: %s" (cdr p))
+      (message "cc-butler: %s" (cdr p))))
   (let ((default-directory (file-name-as-directory (expand-file-name dir))))
     (cc-butler--with-channel (claude-code-ide))
     (cc-butler--configure-session dir)))

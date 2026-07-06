@@ -88,5 +88,80 @@ of `cc-butler--render' silently reset to the top)."
         (cc-butler--reprint)
         (should (equal "/c/" (cc-butler--dir-at-point)))))))
 
+;;;; ---- launch preflight diagnostics (fresh-install gaps) -------------
+;;
+;; Regression coverage for the fresh-install gap that made a first `B'/`S'
+;; press on a newly-installed machine look like "the shortcut doesn't
+;; work": `claude-code-ide' defaults to the `vterm' backend, but cc-butler's
+;; UI is built on ghostel internals, and the required
+;; `(setq claude-code-ide-terminal-backend 'ghostel)' + an absolute
+;; `claude-code-ide-cli-path' live only in the user's own Emacs init, never
+;; verified by `(require 'cc-butler)' itself. 2026-07-06.
+
+(ert-deftest cc-butler-session/preflight-clean-when-well-configured ()
+  "No problems reported when ghostel + an absolute cli-path + a real
+executable are all in place."
+  (let ((orig-featurep (symbol-function 'featurep)))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/claude"))
+              ((symbol-function 'featurep)
+               (lambda (f) (or (eq f 'ghostel) (funcall orig-featurep f)))))
+      (let ((claude-code-ide-terminal-backend 'ghostel)
+            (claude-code-ide-cli-path "/usr/bin/claude"))
+        (should (null (cc-butler--launch-preflight-diagnostics)))))))
+
+(ert-deftest cc-butler-session/preflight-warns-on-non-ghostel-backend ()
+  "A non-ghostel backend is a WARN (cc-butler's UI features degrade), not an
+ERROR (the session still launches fine under vterm/eat)."
+  (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/claude")))
+    (let ((claude-code-ide-terminal-backend 'vterm)
+          (claude-code-ide-cli-path "/usr/bin/claude"))
+      (let ((problems (cc-butler--launch-preflight-diagnostics)))
+        (should (= 1 (length problems)))
+        (should (eq 'warn (car (car problems))))))))
+
+(ert-deftest cc-butler-session/preflight-errors-when-ghostel-not-installed ()
+  "ghostel backend selected but the package itself is not loaded: an ERROR,
+since the launch will fail outright."
+  (let ((orig-featurep (symbol-function 'featurep)))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/claude"))
+              ((symbol-function 'featurep)
+               (lambda (f) (if (eq f 'ghostel) nil (funcall orig-featurep f)))))
+      (let ((claude-code-ide-terminal-backend 'ghostel)
+            (claude-code-ide-cli-path "/usr/bin/claude"))
+        (should (memq 'error (mapcar #'car (cc-butler--launch-preflight-diagnostics))))))))
+
+(ert-deftest cc-butler-session/preflight-errors-on-unexpanded-tilde-cli-path ()
+  "A `~'-prefixed `claude-code-ide-cli-path' under the ghostel backend is a
+known-broken combination — ghostel spawns it via execvp with no shell, so
+`~' is never expanded and the process dies instantly with a bare \"Invalid
+buffer\" error. Must be flagged explicitly, not left to the generic
+not-executable check."
+  (let ((orig-featurep (symbol-function 'featurep)))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) nil))
+              ((symbol-function 'featurep)
+               (lambda (f) (or (eq f 'ghostel) (funcall orig-featurep f)))))
+      (let* ((claude-code-ide-terminal-backend 'ghostel)
+             (claude-code-ide-cli-path "~/.claude/local/claude")
+             (problems (cc-butler--launch-preflight-diagnostics)))
+        (should (seq-find (lambda (p) (string-match-p "execvp" (cdr p))) problems))))))
+
+(ert-deftest cc-butler-session/preflight-errors-when-cli-not-executable ()
+  "No usable `claude' binary at all is an ERROR regardless of backend."
+  (cl-letf (((symbol-function 'executable-find) (lambda (_) nil)))
+    (let ((claude-code-ide-terminal-backend 'vterm)
+          (claude-code-ide-cli-path "claude"))
+      (should (memq 'error (mapcar #'car (cc-butler--launch-preflight-diagnostics)))))))
+
+(ert-deftest cc-butler-session/launch-session-refuses-on-preflight-error ()
+  "`cc-butler--launch-session' raises a loud `user-error' — and never reaches
+`claude-code-ide' — when the preflight reports an ERROR, so a fresh-install
+misconfiguration is impossible to miss (regression: it used to fail silently
+or with a cryptic downstream error)."
+  (cl-letf (((symbol-function 'executable-find) (lambda (_) nil))
+            ((symbol-function 'claude-code-ide)
+             (lambda (&rest _) (error "claude-code-ide should not have been called"))))
+    (let ((claude-code-ide-cli-path "/nonexistent/claude"))
+      (should-error (cc-butler--launch-session "/tmp") :type 'user-error))))
+
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here

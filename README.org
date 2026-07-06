@@ -47,9 +47,28 @@ session (which you can drive from your phone) coordinate the rest.
   backend and MCP bridge this package builds on).
 - *ghostel* — the terminal backend that claude-code-ide drives; cc-butler reads
   its live terminal state (OSC titles, screen capture) and rides its
-  notification callback.
+  notification callback. *Not* a formal dependency of either package (neither
+  declares it in ~Package-Requires~), so on a fresh install it is easy to skip
+  — but without it, sessions still launch under claude-code-ide's default
+  ~vterm~ backend, just with cc-butler's OSC-title tracking, terminal resize,
+  and screen-refresh features silently disabled. Install it separately, then:
+  #+begin_src emacs-lisp
+  (setq claude-code-ide-terminal-backend 'ghostel)
+  #+end_src
 
-The [[https://claude.com/claude-code][Claude Code]] CLI itself must be installed and on ~claude-code-ide-cli-path~.
+The [[https://claude.com/claude-code][Claude Code]] CLI itself must be installed and on ~claude-code-ide-cli-path~
+(default ~"claude"~, resolved via ~PATH~). *If you use the ghostel backend*,
+set this to an *absolute, tilde-free* path instead of relying on the default —
+ghostel spawns the process directly via ~execvp~ with no shell, so a literal
+~"~/..."~ is never expanded and the process dies instantly, surfacing as a
+bare "Invalid buffer" error with no indication why:
+#+begin_src emacs-lisp
+(setq claude-code-ide-cli-path (executable-find "claude"))
+#+end_src
+
+Run ~M-x cc-butler-doctor~ (~?~ in the session list) any time to check these —
+useful right after a fresh install, since none of the above is verified or
+installed by ~(require 'cc-butler)~ itself.
 
 * Installation
 
@@ -69,10 +88,12 @@ Not on a package archive yet. Clone and put it on your ~load-path~:
 | ~n~/~p~   | move + preview a session                            |
 | ~RET~   | select the session's terminal                       |
 | ~B~     | start (or focus) the dedicated butler session       |
+| ~S~     | start (or focus) the dedicated steward session      |
 | ~N~     | create a topic workspace                            |
 | ~K~     | close a topic safely (vet → kill → delete)          |
 | ~b~     | designate the session at point as the butler        |
 | ~g~     | refresh                                             |
+| ~?~     | ~cc-butler-doctor~ — check for fresh-install gaps   |
 
 A running Claude drives its own panel and reports to the butler through the MCP
 tools listed above.
@@ -84,6 +105,15 @@ tools listed above.
 marker and a role =CLAUDE.md= there on first run, and designating it the butler.
 Point ~cc-butler-home~ at an existing directory to reuse it. (~b~ still lets you
 mark any session the butler by hand.)
+
+** The steward
+
+~M-x cc-butler-start-steward~ (~S~) launches a dedicated *steward* session in
+~cc-butler-steward-home~ (default =~/.emacs.d/cc-butler/steward=), the same way.
+Once running, the worker firehose (nudges + ~report_to_butler~) routes to the
+steward instead of the butler (split mode) — the butler then only ever sees
+decisions the steward escalates to it (~escalate_to_butler~ /
+~pending_decisions~), never the raw worker chatter.
 
 * License
 
