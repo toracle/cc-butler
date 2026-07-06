@@ -25,6 +25,7 @@
 (require 'cc-butler-session)
 (require 'cc-butler-notifications)
 (require 'claude-code-ide)
+(require 'json)
 
 ;; The up-direction tools optionally route through the durable maildir inbox
 ;; (`cc-butler-mail', loaded after this file); declared so the byte-compiler is
@@ -359,6 +360,130 @@ distilled answer,\" priced and speeded for haiku since it takes no judgment."
    "If the question can't be answered from what you were given, say so "
    "plainly instead of guessing.\n"))
 
+(defun cc-butler--pending-decisions-hook-sh ()
+  "Return the butler's `check-pending-decisions.sh' UserPromptSubmit hook.
+Mechanically drains `cc-butler-tool-pending-decisions' via `emacsclient'
+on every turn and injects the result as context, so the butler is never
+relying on remembering to call `pending_decisions' itself.
+
+KNOWN FRAGILITY (baked into the script's own comment too): this call is
+caller-independent and safe only while `cc-butler-message-transport' is
+`in-memory' (the default). If switched to `maildir', the tool's maildir
+branch calls `cc-butler--caller-dir', which resolves the invoking MCP
+tool call's session context; a bare `emacsclient --eval' is not one, so
+it returns nil there and the hook silently breaks (empty queue, or the
+wrong mailbox drained). Revisit both hooks if you migrate transports."
+  "#!/usr/bin/env bash
+# UserPromptSubmit hook: mechanically drains cc-butler's pending_decisions
+# queue on every turn and injects it as context, so the butler never has to
+# remember to call mcp__emacs-tools__pending_decisions itself. Written
+# 2026-07-06 after that exact manual step got skipped for an entire long
+# conversation and a real worker escalation went unnoticed.
+#
+# Uses write-region (not --eval's own quoted return value) so newlines,
+# quotes, and backslashes in decision text survive byte-exact into the
+# JSON payload via `jq -Rs`.
+#
+# KNOWN FRAGILITY: cc-butler-tool-pending-decisions is caller-independent
+# and safe to call from a bare `emacsclient --eval' (as this hook does)
+# only while `cc-butler-message-transport' is `in-memory' (the current
+# default) — in that mode it drains a plain global queue with no notion
+# of \"caller\". If that transport is ever switched to `maildir', its
+# maildir branch calls `cc-butler--caller-dir', which resolves the
+# *invoking MCP tool call's* session context — a bare emacsclient --eval
+# from this hook is not an MCP tool call, so `cc-butler--caller-dir'
+# returns nil there and the drain silently breaks (empty queue, or the
+# wrong mailbox drained). Revisit this hook if you migrate transports.
+# See check-pending-events.sh (steward) for the identical fragility.
+set -euo pipefail
+
+tmpfile=\"$(mktemp)\"
+trap 'rm -f \"$tmpfile\"' EXIT
+
+emacsclient --eval \"(write-region (cc-butler-tool-pending-decisions) nil \\\"$tmpfile\\\")\" >/dev/null 2>&1 || exit 0
+
+content=\"$(cat \"$tmpfile\" 2>/dev/null || true)\"
+
+if [ -z \"$content\" ] || [ \"$content\" = \"No pending decisions.\" ]; then
+  exit 0
+fi
+
+jq -n --arg ctx \"$content\" \\
+  '{hookSpecificOutput: {hookEventName: \"UserPromptSubmit\", additionalContext: (\"[cc-butler] pending_decisions queue was just auto-drained by hook — present these to 정수님 now:\\n\" + $ctx)}}'
+")
+
+(defun cc-butler--pending-events-hook-sh ()
+  "Return the steward's `check-pending-events.sh' UserPromptSubmit hook.
+Mirrors `cc-butler--pending-decisions-hook-sh' (butler) but drains
+`cc-butler-tool-inbox' — the steward's worker-firehose queue registered
+as MCP tool `pending_events' — instead of the decision queue. Same
+`cc-butler-message-transport' fragility applies identically; see that
+function's docstring."
+  "#!/usr/bin/env bash
+# UserPromptSubmit hook: mechanically drains cc-butler's pending_events
+# (worker firehose) queue on every turn and injects it as context, so the
+# steward never has to remember to call mcp__emacs-tools__pending_events
+# itself. Mirrors the butler's check-pending-decisions.sh, written
+# 2026-07-06 after a manual pending_decisions check got skipped for an
+# entire long conversation and a real escalation went unnoticed.
+#
+# Uses write-region (not --eval's own quoted return value) so newlines,
+# quotes, and backslashes in event text survive byte-exact into the JSON
+# payload via `jq -Rs`.
+#
+# KNOWN FRAGILITY: cc-butler-tool-inbox is caller-independent and safe to
+# call from a bare `emacsclient --eval' (as this hook does) only while
+# `cc-butler-message-transport' is `in-memory' (the current default) — in
+# that mode it drains a plain global queue with no notion of \"caller\".
+# If that transport is ever switched to `maildir', cc-butler-tool-inbox's
+# maildir branch calls `cc-butler--caller-dir', which resolves the
+# *invoking MCP tool call's* session context — a bare emacsclient --eval
+# from this hook is not an MCP tool call, so `cc-butler--caller-dir'
+# returns nil there and the drain silently breaks (empty queue, or the
+# wrong mailbox drained). Revisit this hook if you migrate transports.
+set -euo pipefail
+
+tmpfile=\"$(mktemp)\"
+trap 'rm -f \"$tmpfile\"' EXIT
+
+emacsclient --eval \"(write-region (cc-butler-tool-inbox) nil \\\"$tmpfile\\\")\" >/dev/null 2>&1 || exit 0
+
+content=\"$(cat \"$tmpfile\" 2>/dev/null || true)\"
+
+if [ -z \"$content\" ] || [ \"$content\" = \"No pending worker events.\" ]; then
+  exit 0
+fi
+
+jq -n --arg ctx \"$content\" \\
+  '{hookSpecificOutput: {hookEventName: \"UserPromptSubmit\", additionalContext: (\"[cc-butler] pending_events queue was just auto-drained by hook — act on these now:\\n\" + $ctx)}}'
+")
+
+(defun cc-butler--hook-settings-json (hook-file status-message)
+  "Return a `.claude/settings.json' JSON string wiring HOOK-FILE as a
+UserPromptSubmit hook, shown as STATUS-MESSAGE while it runs."
+  (json-encode
+   (list :hooks
+         (list :UserPromptSubmit
+               (vector
+                (list :hooks
+                      (vector
+                       (list :type "command"
+                             :command hook-file
+                             :timeout 10
+                             :statusMessage status-message))))))))
+
+(defun cc-butler--ensure-hook-settings-json (home hook-relpath status-message)
+  "Scaffold HOME's `.claude/settings.json' wiring HOOK-RELPATH as a
+UserPromptSubmit hook, unless a settings file already exists there —
+never clobbers a hand-edited one, the same convention as the worker
+statusLine scaffold in `cc-butler-cleanup-install-statusline'."
+  (let ((file (expand-file-name ".claude/settings.json" home)))
+    (unless (file-exists-p file)
+      (make-directory (file-name-directory file) t)
+      (write-region
+       (cc-butler--hook-settings-json (expand-file-name hook-relpath home) status-message)
+       nil file nil 'silent))))
+
 (defun cc-butler--user-profile-template ()
   "Return the initial (empty) user-profile file the interview fills."
   (concat
@@ -394,11 +519,16 @@ fills it), and an `interview-inventory.org' (the questions to ask)."
                      ("CLAUDE.md" . cc-butler--butler-claude-md)
                      ("user-profile.org" . cc-butler--user-profile-template)
                      ("interview-inventory.org" . cc-butler--interview-inventory-template)
-                     (".claude/agents/haiku-summarizer.md" . cc-butler--haiku-summarizer-agent-md)))
+                     (".claude/agents/haiku-summarizer.md" . cc-butler--haiku-summarizer-agent-md)
+                     (".claude/hooks/check-pending-decisions.sh" . cc-butler--pending-decisions-hook-sh)))
       (let ((file (expand-file-name name home)))
         (make-directory (file-name-directory file) t)
         (unless (file-exists-p file)
-          (write-region (funcall gen) nil file nil 'silent))))
+          (write-region (funcall gen) nil file nil 'silent))
+        (when (string-suffix-p ".sh" name)
+          (set-file-modes file #o755))))
+    (cc-butler--ensure-hook-settings-json
+     home ".claude/hooks/check-pending-decisions.sh" "Checking pending decisions...")
     home))
 
 (defun cc-butler--live-dir-p (dir)
@@ -439,15 +569,19 @@ Must differ from `cc-butler-home' (two sessions cannot share a directory)."
   "Create `cc-butler-steward-home' with its markers if missing; return it."
   (let ((home (file-name-as-directory (expand-file-name cc-butler-steward-home))))
     (make-directory home t)
-    (let ((proj (expand-file-name ".projectile" home))
-          (cmd  (expand-file-name "CLAUDE.md" home))
-          (agent (expand-file-name ".claude/agents/haiku-summarizer.md" home)))
-      (unless (file-exists-p proj) (write-region "" nil proj nil 'silent))
-      (unless (file-exists-p cmd)
-        (write-region (cc-butler--steward-claude-md) nil cmd nil 'silent))
-      (make-directory (file-name-directory agent) t)
-      (unless (file-exists-p agent)
-        (write-region (cc-butler--haiku-summarizer-agent-md) nil agent nil 'silent)))
+    (pcase-dolist (`(,name . ,gen)
+                   `((".projectile" . ,(lambda () ""))
+                     ("CLAUDE.md" . cc-butler--steward-claude-md)
+                     (".claude/agents/haiku-summarizer.md" . cc-butler--haiku-summarizer-agent-md)
+                     (".claude/hooks/check-pending-events.sh" . cc-butler--pending-events-hook-sh)))
+      (let ((file (expand-file-name name home)))
+        (make-directory (file-name-directory file) t)
+        (unless (file-exists-p file)
+          (write-region (funcall gen) nil file nil 'silent))
+        (when (string-suffix-p ".sh" name)
+          (set-file-modes file #o755))))
+    (cc-butler--ensure-hook-settings-json
+     home ".claude/hooks/check-pending-events.sh" "Checking pending worker events...")
     home))
 
 ;;;###autoload
