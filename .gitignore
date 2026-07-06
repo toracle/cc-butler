@@ -1,3 +1,8 @@
 *.elc
 *.eln
 /eln-cache/
+
+# Per-checkout Claude Code state: machine-specific absolute paths
+# (statusLine command) and live process locks (PID/session-id/timestamp) —
+# never meaningful outside the machine that created them.
+/.claude/

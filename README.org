@@ -15,6 +15,19 @@ output scrolls away and the overall state of the work becomes impossible to
 hold in your head. cc-butler makes the fleet legible — and lets one *butler*
 session (which you can drive from your phone) coordinate the rest.
 
+* Screenshots
+
+(Mocked content — no real project or session data.)
+
+[[file:docs/images/full-frame.png]]
+
+The session list (left) beside a worker's terminal (right). ~household.png~
+below is the roles diagram; the rest illustrate individual features.
+
+| [[file:docs/images/session-list.png]] | [[file:docs/images/household.png]]  |
+| [[file:docs/images/decision.png]]     | [[file:docs/images/inbox-list.png]] |
+| [[file:docs/images/doc-view.png]]     | [[file:docs/images/terminal.png]]   |
+
 * Features
 
 - *Session list* (~M-x cc-butler~) — a sticky left side window listing every
