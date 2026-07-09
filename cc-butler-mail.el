@@ -182,7 +182,7 @@ Return the recipient agent."
 ;;;; Up-direction transport (B): report / escalate / drain over the channel
 ;;;; ------------------------------------------------------------------
 ;;
-;; These back the existing report_to_butler / escalate_to_butler /
+;; These back the existing report_to_steward / escalate_to_butler /
 ;; pending_events / pending_decisions tools when `cc-butler-message-transport'
 ;; is `maildir': the message is delivered to the recipient's durable file
 ;; inbox, and draining archives it (the audit trail).  No poke — up-direction
@@ -229,6 +229,23 @@ Return the recipient agent."
       (format "Asked %s (id %s).  The reply will arrive in YOUR inbox — call check_inbox to read it."
               name id))))
 
+(defun cc-butler--format-inbox-messages (msgs)
+  "Format MSGS (a list from `cc-butler--ch-drain') the way `check_inbox' does."
+  (mapconcat
+   (lambda (m)
+     (let ((kind (plist-get m :kind)))
+       (concat
+        (format "- from %s" (plist-get m :from))
+        (pcase kind
+          ('ask (format " asks (reply with reply_message reply_handle=\"%s\")"
+                        (cc-butler--mail-reply-handle m)))
+          ('reply (if (plist-get m :in-reply-to)
+                      (format " replied to your query %s" (plist-get m :in-reply-to))
+                    " replied"))
+          (_ (format " (%s)" kind)))
+        "\n    " (string-trim (or (plist-get m :body) "")))))
+   msgs "\n"))
+
 (defun cc-butler-tool-check-inbox ()
   "MCP tool: drain YOUR inbox (queries, replies, notes)."
   (let ((self (cc-butler--mail-self)))
@@ -236,20 +253,17 @@ Return the recipient agent."
     (let ((msgs (cc-butler--ch-drain self)))
       (if (null msgs)
           "No new inbox messages."
-        (mapconcat
-         (lambda (m)
-           (let ((kind (plist-get m :kind)))
-             (concat
-              (format "- from %s" (plist-get m :from))
-              (pcase kind
-                ('ask (format " asks (reply with reply_message reply_handle=\"%s\")"
-                              (cc-butler--mail-reply-handle m)))
-                ('reply (if (plist-get m :in-reply-to)
-                            (format " replied to your query %s" (plist-get m :in-reply-to))
-                          " replied"))
-                (_ (format " (%s)" kind)))
-              "\n    " (string-trim (or (plist-get m :body) "")))))
-         msgs "\n")))))
+        (cc-butler--format-inbox-messages msgs)))))
+
+(defun cc-butler--check-inbox-drain-as (agent-name)
+  "Drain AGENT-NAME's inbox directly, no MCP caller context needed.
+Returns (COUNT . FORMATTED-STRING-OR-NIL). For the check-inbox
+UserPromptSubmit hook, which bakes in a static, known-at-scaffold-time
+AGENT-NAME instead of resolving \"self\" via `cc-butler--mail-self' /
+`cc-butler--caller-dir' (nil from a bare `emacsclient --eval', since
+that is not an MCP tool call context)."
+  (let ((msgs (cc-butler--ch-drain agent-name)))
+    (cons (length msgs) (and msgs (cc-butler--format-inbox-messages msgs)))))
 
 (defun cc-butler-tool-reply-message (reply_handle body)
   "MCP tool: answer a query using its REPLY_HANDLE from check_inbox."

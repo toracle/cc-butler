@@ -1,6 +1,6 @@
 ---
 name: butler-relay-safe-worker-decisions
-description: "AskUserQuestion assumes a human is at the terminal typing directly; it does not compose with fleet orchestration, where the steward drives workers via send_to_session (text + one Enter at the end). Workers under fleet orchestration should prefer report_to_butler/escalate_to_butler over AskUserQuestion for human-decision requests."
+description: "AskUserQuestion assumes a human is at the terminal typing directly; it does not compose with fleet orchestration, where the steward drives workers via send_to_session (text + one Enter at the end). Workers under fleet orchestration should prefer report_to_steward/escalate_to_butler over AskUserQuestion for human-decision requests."
 metadata:
   node_type: memory
   type: feedback
@@ -25,7 +25,7 @@ requests, not interactive ones.** A worker is "under fleet orchestration"
 when it was spawned/dispatched by the steward (or, in single mode, the
 butler) rather than being driven directly by a human at the keyboard. Such a
 worker should prefer:
-- `report_to_butler` with a clear `needs` — when it has a status to share and
+- `report_to_steward` with a clear `needs` — when it has a status to share and
   something specific it needs from the human, or
 - `escalate_to_butler` — when it needs a decision and nothing else is
   blocking it.

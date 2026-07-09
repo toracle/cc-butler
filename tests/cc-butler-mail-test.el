@@ -102,6 +102,22 @@ signal only (never the body); and the butler is never poked."
     (cc-butler--route-reply "worker-a" "butler#abc" "answer")
     (should-not (member "butler" cc-butler-mail-test--pokes))))
 
+(ert-deftest cc-butler-mail/check-inbox-drain-as-static-identity ()
+  "Given messages waiting for a KNOWN agent name, When drained via
+`cc-butler--check-inbox-drain-as' (no MCP caller context, as a
+UserPromptSubmit hook would call it), Then the count and formatted text
+match, and an empty inbox yields (0 . nil)."
+  (cc-butler-mail-test--with-mock
+    (should (equal '(0 . nil) (cc-butler--check-inbox-drain-as "steward")))
+    (cc-butler--ch-deliver "steward" (list :kind 'note :from "worker-a" :body "done: PR #42"))
+    (cc-butler--ch-deliver "steward" (list :kind 'note :from "worker-b" :body "blocked"))
+    (pcase-let ((`(,n . ,formatted) (cc-butler--check-inbox-drain-as "steward")))
+      (should (= 2 n))
+      (should (string-match-p "worker-a" formatted))
+      (should (string-match-p "worker-b" formatted)))
+    ;; drained — a second call sees nothing left
+    (should (equal '(0 . nil) (cc-butler--check-inbox-drain-as "steward")))))
+
 ;;;; ---- transport guarantees (file adapter) -------------------------
 
 (defmacro cc-butler-mail-test--with-file (&rest body)
@@ -194,7 +210,7 @@ never read (only complete, renamed messages appear in new/)."
       (should (null remaining)))))
 
 (ert-deftest cc-butler-mail/transport-rollback ()
-  "The transport flag switches report_to_butler between the legacy in-memory
+  "The transport flag switches report_to_steward between the legacy in-memory
 queue and the durable maildir inbox — proving rollback."
   (require 'cc-butler-orchestrator)
   (let ((cc-butler-mail-test--inboxes nil)
@@ -212,14 +228,37 @@ queue and the durable maildir inbox — proving rollback."
               ((symbol-function 'cc-butler--log) (lambda (&rest _) nil)))
       ;; maildir: report goes to the channel (steward inbox); legacy queue empty
       (let ((cc-butler-message-transport 'maildir))
-        (cc-butler-tool-report-to-butler "hello")
+        (cc-butler-tool-report-to-steward "hello")
         (should (cc-butler--ch-drain "steward"))
         (should (null cc-butler--inbox)))
       ;; in-memory (rollback): report goes to the legacy queue; channel untouched
       (let ((cc-butler-message-transport 'in-memory))
-        (cc-butler-tool-report-to-butler "hello2")
+        (cc-butler-tool-report-to-steward "hello2")
         (should cc-butler--inbox)
         (should (null (cc-butler--ch-drain "steward")))))))
+
+(ert-deftest cc-butler-mail/report-to-steward-logs-under-maildir-transport ()
+  "Given maildir transport (where `cc-butler--inbox-push' — and its
+auto-log advice — is never called), Then `report_to_steward' still logs
+directly, so \"report -> logged\" holds under either transport, not just
+the in-memory default it used to silently depend on."
+  (require 'cc-butler-orchestrator)
+  (let ((cc-butler-message-transport 'maildir)
+        (cc-butler--channel (cc-butler-mail-test--mock-channel))
+        (logged nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () "/worker/"))
+              ((symbol-function 'cc-butler--ops-dir) (lambda () "/steward/"))
+              ((symbol-function 'cc-butler--display-name)
+               (lambda (d) (pcase d ("/steward/" "steward") ("/worker/" "worker-a") (_ d))))
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "worker-a"))
+              ((symbol-function 'cc-butler--maybe-refresh) (lambda () nil))
+              ((symbol-function 'cc-butler-docs--auto-log)
+               (lambda (dir body) (push (cons dir body) logged))))
+      (should (fboundp 'cc-butler-docs--auto-log)) ; the report path only logs when this is bound
+      (cc-butler-tool-report-to-steward "hello")
+      (should (= 1 (length logged)))
+      (should (equal "/worker/" (car (car logged))))
+      (should (string-match-p "hello" (cdr (car logged)))))))
 
 (ert-deftest cc-butler-mail/dismiss-mcp-all-targets ()
   "cc-butler-dismiss-mcp-all sends ESC to WORKER sessions, skipping the butler

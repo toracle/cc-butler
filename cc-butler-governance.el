@@ -31,8 +31,15 @@ private, user-custom layer here — the two-tier design 정수님 asked for."
   :group 'cc-butler)
 
 (defcustom cc-butler-governance-memory-dir
-  (expand-file-name "~/.claude/projects/-home-toracle--ccsm/memory/")
-  "The Claude Code memory dir — a GENERATED cache of the store (never hand-edited)."
+  (or (and (fboundp 'cc-butler--claude-memory-dir) (boundp 'cc-butler-home)
+           (cc-butler--claude-memory-dir cc-butler-home))
+      (expand-file-name "~/.claude/projects/-home-toracle--ccsm/memory/"))
+  "The Claude Code memory dir — a GENERATED cache of the store (never
+hand-edited). Derived from the butler home the same way
+`cc-butler--shared-state-note' computes it, so it tracks
+`cc-butler-home' instead of drifting to a stale hardcoded path if the
+home ever moves; falls back to the historical ~/.ccsm path only if
+`cc-butler--claude-memory-dir'/`cc-butler-home' aren't loaded yet."
   :type 'directory
   :group 'cc-butler)
 

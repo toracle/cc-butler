@@ -41,7 +41,7 @@ below is the roles diagram; the rest illustrate individual features.
   commits, a clean tree, and no stashes — checked with real =git=).
 - *Butler / worker control plane* — a designated /butler/ session drives the
   /workers/ through MCP tools (~list_claude_sessions~, ~read_session_output~,
-  ~send_to_session~) and receives their events (~report_to_butler~ →
+  ~send_to_session~) and receives their events (~report_to_steward~ →
   ~pending_events~). You remote-control one session; it becomes the situation
   room for the rest.
 - *Document panel* — a running Claude opens a PR, issue, CI run, or file into a
@@ -123,7 +123,7 @@ mark any session the butler by hand.)
 
 ~M-x cc-butler-start-steward~ (~S~) launches a dedicated *steward* session in
 ~cc-butler-steward-home~ (default =~/.emacs.d/cc-butler/steward=), the same way.
-Once running, the worker firehose (nudges + ~report_to_butler~) routes to the
+Once running, the worker firehose (nudges + ~report_to_steward~) routes to the
 steward instead of the butler (split mode) — the butler then only ever sees
 decisions the steward escalates to it (~escalate_to_butler~ /
 ~pending_decisions~), never the raw worker chatter.

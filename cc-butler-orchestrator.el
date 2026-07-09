@@ -33,8 +33,10 @@
 (declare-function cc-butler-mail-up-report "cc-butler-mail" (from-dir body))
 (declare-function cc-butler-mail-up-decision "cc-butler-mail" (from-dir summary needs))
 (declare-function cc-butler-mail-up-drain "cc-butler-mail" (agent-dir))
+(declare-function cc-butler--check-inbox-drain-as "cc-butler-mail" (agent-name))
 (declare-function cc-butler-decision-create "cc-butler-decision" (from-dir summary needs options))
 (declare-function cc-butler--decision-parse-options "cc-butler-decision" (s))
+(declare-function cc-butler-docs--auto-log "cc-butler-docs" (dir body))
 (defvar cc-butler-decision-workflow)
 
 ;;;; ------------------------------------------------------------------
@@ -278,7 +280,7 @@ WHICH is `butler' or `steward'."
    "Carry the steward's context-hygiene duty too while you do: tell every\n"
    "worker you dispatch to delegate to subagents, and clear any worker whose\n"
    "context has grown unbounded (`subagent-first`, `worker-context-hygiene`).\n"
-   "Also carry relay safety: tell every worker to prefer `report_to_butler`/\n"
+   "Also carry relay safety: tell every worker to prefer `report_to_steward`/\n"
    "`escalate_to_butler` over `AskUserQuestion`, and check a worker's screen\n"
    "with `read_session_output` before texting it free-form — your single\n"
    "submit-Enter can otherwise land on an open wizard's highlighted default\n"
@@ -305,7 +307,7 @@ WHICH is `butler' or `steward'."
    "4. THEN act. Do not re-dispatch or duplicate in-flight work.\n\n"
    (cc-butler--shared-state-note)
    "## Each turn\n\n"
-   "1. Call `pending_events` first — worker reports (`report_to_butler`) and\n"
+   "1. Call `pending_events` first — worker reports (`report_to_steward`) and\n"
    "   notifications land here; nudges are also typed at you. This is your inbox.\n"
    "2. Dispatch and unblock: `read_session_output` to see a worker's screen,\n"
    "   `send_to_session` to answer, task, or unblock it. Track each toward its DoD.\n"
@@ -316,7 +318,7 @@ WHICH is `butler' or `steward'."
    "   Every dispatch or check-in tells the worker to delegate substantial reads,\n"
    "   searches, and investigations to its own subagents and keep its own main\n"
    "   thread thin — a standing habit, not a one-time reminder — and to prefer\n"
-   "   `report_to_butler`/`escalate_to_butler` over `AskUserQuestion` for any\n"
+   "   `report_to_steward`/`escalate_to_butler` over `AskUserQuestion` for any\n"
    "   human-decision request, since it is under fleet orchestration, not a human\n"
    "   at its keyboard.\n"
    "3. Keep the picture current: `butler_dashboard` (the sessions table is built\n"
@@ -343,7 +345,7 @@ WHICH is `butler' or `steward'."
    "when your text lands, that Enter hits the wizard's highlighted default, not\n"
    "your message — silently swallowed on both ends. So, as a standing duty (not\n"
    "a one-time reminder, same failure mode as context hygiene above):\n"
-   "1. Tell every worker you dispatch to prefer `report_to_butler`/\n"
+   "1. Tell every worker you dispatch to prefer `report_to_steward`/\n"
    "   `escalate_to_butler` over `AskUserQuestion` for human-decision requests —\n"
    "   both are pull-based (drained via `pending_events`/`pending_decisions`),\n"
    "   so there is no live wizard to collide with.\n"
@@ -388,102 +390,178 @@ distilled answer,\" priced and speeded for haiku since it takes no judgment."
    "If the question can't be answered from what you were given, say so "
    "plainly instead of guessing.\n"))
 
+(defun cc-butler--inbox-urgent-block (agent-name)
+  "Return AGENT-NAME's check_inbox content (ask_worker replies/queries),
+front-loaded with an unread count so it can't get lost among other
+notifications — or nil when empty. Written 2026-07-09 after a real
+ask_worker reply sat unread for a long stretch while the reader was
+absorbed in an unrelated task. Uses `cc-butler--check-inbox-drain-as',
+not `cc-butler-tool-check-inbox' — see that function's docstring for
+why (caller-dir resolves to nil from a bare `emacsclient --eval')."
+  (pcase-let ((`(,n . ,formatted) (cc-butler--check-inbox-drain-as agent-name)))
+    (when (> n 0)
+      (format "📥 %d unread inbox message(s) — handle before anything else this turn:\n%s"
+              n formatted))))
+
+(defcustom cc-butler-fleet-stale-waiting-seconds 120
+  "Seconds a worker session must sit WAITING-FOR-INPUT before the
+steward's pending_events hook flags it as possibly stuck (e.g. an
+unnoticed AskUserQuestion dialog) rather than routinely idle.
+See `cc-butler--fleet-stale-waiting-summary'."
+  :type 'number
+  :group 'cc-butler)
+
+(defun cc-butler--fleet-stale-waiting-summary ()
+  "Return a string flagging workers WAITING-FOR-INPUT longer than
+`cc-butler-fleet-stale-waiting-seconds', or nil when none. Excludes the
+butler/steward roles themselves — this is about fleet members going
+quiet, not the reader's own state. A structural, every-turn version of
+what a busy steward would otherwise have to remember to go check."
+  (let ((now (float-time)) rows)
+    (dolist (s (cc-butler--sessions))
+      (let* ((dir (plist-get s :dir))
+             (since (cc-butler--waiting-p dir)))
+        (when (and since
+                   (>= (- now since) cc-butler-fleet-stale-waiting-seconds)
+                   (not (equal dir cc-butler--butler))
+                   (not (equal dir cc-butler--steward)))
+          (push (format "- %s (waiting %ds)" (cc-butler--display-name dir)
+                        (round (- now since)))
+                rows))))
+    (when rows
+      (format "🔍 Fleet check: %d worker(s) waiting a while with no report — could be a stuck dialog (e.g. AskUserQuestion) rather than routine idle; read_session_output to check:\n%s"
+              (length rows) (mapconcat #'identity (nreverse rows) "\n")))))
+
+(defun cc-butler--pending-decisions-hook-payload ()
+  "Combined payload for the butler's pending_decisions hook: an urgent
+check_inbox block (ask_worker replies) followed by the drained decision
+queue. Either half may be absent; returns \"\" when both are empty."
+  (let* ((inbox (cc-butler--inbox-urgent-block "butler"))
+         (decisions (cc-butler-tool-pending-decisions))
+         (has-decisions (not (equal decisions "No pending decisions."))))
+    (mapconcat #'identity (delq nil (list inbox (and has-decisions decisions))) "\n\n")))
+
+(defun cc-butler--pending-events-hook-payload ()
+  "Combined payload for the steward's pending_events hook: an urgent
+check_inbox block, the drained worker-event queue, and a fleet
+stale-waiting nudge. Any subset may be absent; returns \"\" when all
+three are empty."
+  (let* ((inbox (cc-butler--inbox-urgent-block "steward"))
+         (events (cc-butler-tool-inbox))
+         (has-events (not (equal events "No pending worker events.")))
+         (stale (cc-butler--fleet-stale-waiting-summary)))
+    (mapconcat #'identity
+               (delq nil (list inbox (and has-events events) stale))
+               "\n\n")))
+
 (defun cc-butler--pending-decisions-hook-sh ()
   "Return the butler's `check-pending-decisions.sh' UserPromptSubmit hook.
-Mechanically drains `cc-butler-tool-pending-decisions' via `emacsclient'
-on every turn and injects the result as context, so the butler is never
-relying on remembering to call `pending_decisions' itself.
+Mechanically drains `cc-butler--pending-decisions-hook-payload' (check_inbox
++ pending_decisions) via `emacsclient' on every turn and injects the
+result as context, so the butler is never relying on remembering to
+check either itself.
 
-KNOWN FRAGILITY (baked into the script's own comment too): this call is
-caller-independent and safe only while `cc-butler-message-transport' is
-`in-memory' (the default). If switched to `maildir', the tool's maildir
-branch calls `cc-butler--caller-dir', which resolves the invoking MCP
-tool call's session context; a bare `emacsclient --eval' is not one, so
-it returns nil there and the hook silently breaks (empty queue, or the
-wrong mailbox drained). Revisit both hooks if you migrate transports."
+KNOWN FRAGILITY (baked into the script's own comment too): the
+pending_decisions half of the payload is caller-independent and safe
+only while `cc-butler-message-transport' is `in-memory' (the default).
+If switched to `maildir', the tool's maildir branch calls
+`cc-butler--caller-dir', which resolves the invoking MCP tool call's
+session context; a bare `emacsclient --eval' is not one, so it returns
+nil there and that half silently breaks (empty, or the wrong mailbox
+drained). The check_inbox half is NOT affected — it drains
+`cc-butler--ch-drain' directly with the static \"butler\" identity, which
+doesn't depend on caller-dir at all. Revisit the decisions half if you
+migrate transports."
   "#!/usr/bin/env bash
 # UserPromptSubmit hook: mechanically drains cc-butler's pending_decisions
-# queue on every turn and injects it as context, so the butler never has to
-# remember to call mcp__emacs-tools__pending_decisions itself. Written
-# 2026-07-06 after that exact manual step got skipped for an entire long
-# conversation and a real worker escalation went unnoticed.
+# queue AND check_inbox (ask_worker replies) on every turn and injects them
+# as context, so the butler never has to remember to check either itself.
+# Written 2026-07-06 (decisions) / extended 2026-07-09 (inbox) after each
+# manual check got skipped for a stretch and something real went unnoticed.
 #
 # Uses write-region (not --eval's own quoted return value) so newlines,
-# quotes, and backslashes in decision text survive byte-exact into the
-# JSON payload via `jq -Rs`.
+# quotes, and backslashes survive byte-exact into the JSON payload via
+# `jq -Rs`.
 #
-# KNOWN FRAGILITY: cc-butler-tool-pending-decisions is caller-independent
-# and safe to call from a bare `emacsclient --eval' (as this hook does)
-# only while `cc-butler-message-transport' is `in-memory' (the current
-# default) — in that mode it drains a plain global queue with no notion
-# of \"caller\". If that transport is ever switched to `maildir', its
-# maildir branch calls `cc-butler--caller-dir', which resolves the
-# *invoking MCP tool call's* session context — a bare emacsclient --eval
-# from this hook is not an MCP tool call, so `cc-butler--caller-dir'
-# returns nil there and the drain silently breaks (empty queue, or the
-# wrong mailbox drained). Revisit this hook if you migrate transports.
-# See check-pending-events.sh (steward) for the identical fragility.
+# KNOWN FRAGILITY (pending_decisions half only): cc-butler-tool-pending-decisions
+# is caller-independent and safe to call from a bare `emacsclient --eval'
+# (as this hook does) only while `cc-butler-message-transport' is
+# `in-memory' (the current default) — in that mode it drains a plain
+# global queue with no notion of \"caller\". If that transport is ever
+# switched to `maildir', its maildir branch calls `cc-butler--caller-dir',
+# which resolves the *invoking MCP tool call's* session context — a bare
+# emacsclient --eval from this hook is not an MCP tool call, so
+# `cc-butler--caller-dir' returns nil there and that half silently breaks
+# (empty, or the wrong mailbox drained). The check_inbox half drains
+# directly by the static \"butler\" identity and is unaffected. Revisit the
+# decisions half if you migrate transports. See check-pending-events.sh
+# (steward) for the identical decisions-side fragility.
 set -euo pipefail
 
 tmpfile=\"$(mktemp)\"
 trap 'rm -f \"$tmpfile\"' EXIT
 
-emacsclient --eval \"(write-region (cc-butler-tool-pending-decisions) nil \\\"$tmpfile\\\")\" >/dev/null 2>&1 || exit 0
+emacsclient --eval \"(write-region (cc-butler--pending-decisions-hook-payload) nil \\\"$tmpfile\\\")\" >/dev/null 2>&1 || exit 0
 
 content=\"$(cat \"$tmpfile\" 2>/dev/null || true)\"
 
-if [ -z \"$content\" ] || [ \"$content\" = \"No pending decisions.\" ]; then
+if [ -z \"$content\" ]; then
   exit 0
 fi
 
 jq -n --arg ctx \"$content\" \\
-  '{hookSpecificOutput: {hookEventName: \"UserPromptSubmit\", additionalContext: (\"[cc-butler] pending_decisions queue was just auto-drained by hook — present these to 정수님 now:\\n\" + $ctx)}}'
+  '{hookSpecificOutput: {hookEventName: \"UserPromptSubmit\", additionalContext: (\"[cc-butler] auto-drained by hook — present these to 정수님 now:\\n\" + $ctx)}}'
 ")
 
 (defun cc-butler--pending-events-hook-sh ()
   "Return the steward's `check-pending-events.sh' UserPromptSubmit hook.
-Mirrors `cc-butler--pending-decisions-hook-sh' (butler) but drains
-`cc-butler-tool-inbox' — the steward's worker-firehose queue registered
-as MCP tool `pending_events' — instead of the decision queue. Same
-`cc-butler-message-transport' fragility applies identically; see that
-function's docstring."
+Mirrors `cc-butler--pending-decisions-hook-sh' (butler): drains
+`cc-butler--pending-events-hook-payload' — check_inbox, the worker-event
+queue (MCP tool `pending_events'), and a fleet stale-waiting nudge — on
+every turn. Same `cc-butler-message-transport' fragility applies to the
+pending_events half identically; see that function's docstring."
   "#!/usr/bin/env bash
 # UserPromptSubmit hook: mechanically drains cc-butler's pending_events
-# (worker firehose) queue on every turn and injects it as context, so the
-# steward never has to remember to call mcp__emacs-tools__pending_events
-# itself. Mirrors the butler's check-pending-decisions.sh, written
-# 2026-07-06 after a manual pending_decisions check got skipped for an
-# entire long conversation and a real escalation went unnoticed.
+# (worker firehose) queue, check_inbox (ask_worker replies), and a fleet
+# stale-waiting scan on every turn and injects them as context, so the
+# steward never has to remember to check any of them itself. Mirrors the
+# butler's check-pending-decisions.sh, written 2026-07-06 after a manual
+# pending_decisions check got skipped for an entire long conversation and
+# a real escalation went unnoticed; extended 2026-07-09 (inbox + fleet
+# check) after a busy steward missed a worker stuck at an unnoticed
+# dialog while absorbed in another task.
 #
 # Uses write-region (not --eval's own quoted return value) so newlines,
 # quotes, and backslashes in event text survive byte-exact into the JSON
 # payload via `jq -Rs`.
 #
-# KNOWN FRAGILITY: cc-butler-tool-inbox is caller-independent and safe to
-# call from a bare `emacsclient --eval' (as this hook does) only while
-# `cc-butler-message-transport' is `in-memory' (the current default) — in
-# that mode it drains a plain global queue with no notion of \"caller\".
-# If that transport is ever switched to `maildir', cc-butler-tool-inbox's
-# maildir branch calls `cc-butler--caller-dir', which resolves the
-# *invoking MCP tool call's* session context — a bare emacsclient --eval
-# from this hook is not an MCP tool call, so `cc-butler--caller-dir'
-# returns nil there and the drain silently breaks (empty queue, or the
-# wrong mailbox drained). Revisit this hook if you migrate transports.
+# KNOWN FRAGILITY (pending_events half only): cc-butler-tool-inbox is
+# caller-independent and safe to call from a bare `emacsclient --eval'
+# (as this hook does) only while `cc-butler-message-transport' is
+# `in-memory' (the current default) — in that mode it drains a plain
+# global queue with no notion of \"caller\". If that transport is ever
+# switched to `maildir', cc-butler-tool-inbox's maildir branch calls
+# `cc-butler--caller-dir', which resolves the *invoking MCP tool call's*
+# session context — a bare emacsclient --eval from this hook is not an
+# MCP tool call, so `cc-butler--caller-dir' returns nil there and that
+# half silently breaks (empty queue, or the wrong mailbox drained). The
+# check_inbox and fleet-check halves are unaffected. Revisit the events
+# half if you migrate transports.
 set -euo pipefail
 
 tmpfile=\"$(mktemp)\"
 trap 'rm -f \"$tmpfile\"' EXIT
 
-emacsclient --eval \"(write-region (cc-butler-tool-inbox) nil \\\"$tmpfile\\\")\" >/dev/null 2>&1 || exit 0
+emacsclient --eval \"(write-region (cc-butler--pending-events-hook-payload) nil \\\"$tmpfile\\\")\" >/dev/null 2>&1 || exit 0
 
 content=\"$(cat \"$tmpfile\" 2>/dev/null || true)\"
 
-if [ -z \"$content\" ] || [ \"$content\" = \"No pending worker events.\" ]; then
+if [ -z \"$content\" ]; then
   exit 0
 fi
 
 jq -n --arg ctx \"$content\" \\
-  '{hookSpecificOutput: {hookEventName: \"UserPromptSubmit\", additionalContext: (\"[cc-butler] pending_events queue was just auto-drained by hook — act on these now:\\n\" + $ctx)}}'
+  '{hookSpecificOutput: {hookEventName: \"UserPromptSubmit\", additionalContext: (\"[cc-butler] auto-drained by hook — act on these now:\\n\" + $ctx)}}'
 ")
 
 (defun cc-butler--hook-settings-json (hook-file status-message)
@@ -612,12 +690,57 @@ Must differ from `cc-butler-home' (two sessions cannot share a directory)."
      home ".claude/hooks/check-pending-events.sh" "Checking pending worker events...")
     home))
 
+(defun cc-butler--regenerate-role-home (home claude-md-fn hook-relname hook-fn status-message)
+  "Force-rewrite HOME's generated-cache files (CLAUDE.md + its
+UserPromptSubmit hook script) from the current template functions.
+Unlike `cc-butler--ensure-butler-home'/`cc-butler--ensure-steward-home',
+this OVERWRITES even when the files already exist — the whole point is to
+propagate template edits into an already-scaffolded, already-running home.
+Never touches user-authored files (user-profile.org,
+interview-inventory.org) or a hand-edited settings.json. No-ops (returns
+nil) if HOME doesn't exist yet — this is a refresh, not initial scaffold."
+  (let ((home (file-name-as-directory (expand-file-name home))))
+    (when (file-directory-p home)
+      (write-region (funcall claude-md-fn) nil (expand-file-name "CLAUDE.md" home) nil 'silent)
+      (let ((file (expand-file-name (concat ".claude/hooks/" hook-relname) home)))
+        (make-directory (file-name-directory file) t)
+        (write-region (funcall hook-fn) nil file nil 'silent)
+        (set-file-modes file #o755))
+      (cc-butler--ensure-hook-settings-json
+       home (concat ".claude/hooks/" hook-relname) status-message)
+      t)))
+
+;;;###autoload
+(defun cc-butler-home-regenerate ()
+  "Regenerate the butler's and steward's CLAUDE.md + UserPromptSubmit hook
+from the current template functions — a generated cache of them, the same
+relationship `cc-butler-governance-regenerate' has to the governance
+store. `cc-butler--ensure-butler-home'/`cc-butler--ensure-steward-home'
+only ever write these once (`unless file-exists-p'), so template edits
+never reach an already-scaffolded home without calling this. Returns the
+count of homes refreshed."
+  (interactive)
+  (let ((n 0))
+    (when (cc-butler--regenerate-role-home
+           cc-butler-home #'cc-butler--butler-claude-md
+           "check-pending-decisions.sh" #'cc-butler--pending-decisions-hook-sh
+           "Checking pending decisions...")
+      (setq n (1+ n)))
+    (when (cc-butler--regenerate-role-home
+           cc-butler-steward-home #'cc-butler--steward-claude-md
+           "check-pending-events.sh" #'cc-butler--pending-events-hook-sh
+           "Checking pending worker events...")
+      (setq n (1+ n)))
+    (when (called-interactively-p 'interactive)
+      (message "cc-butler: regenerated %d home(s)" n))
+    n))
+
 ;;;###autoload
 (defun cc-butler-start-steward ()
   "Launch (or focus) the steward session in `cc-butler-steward-home'.
 Scaffolds the home (`.projectile' + steward role `CLAUDE.md') on first run,
 designates it the steward, and opens the manager.  Once the steward runs,
-the worker firehose (nudges + `report_to_butler') routes to it instead of
+the worker firehose (nudges + `report_to_steward') routes to it instead of
 the butler (split mode).  Idempotent."
   (interactive)
   (let ((home (cc-butler--ensure-steward-home)))
@@ -668,7 +791,7 @@ submit  -> type the summary and submit it, so the butler reacts at once"
 (defvar cc-butler--steward nil
   "Working-dir of the designated steward session, or nil.
 The steward is the internal-orchestration role: it receives the worker
-firehose (nudges + `report_to_butler') and escalates only decisions to the
+firehose (nudges + `report_to_steward') and escalates only decisions to the
 butler.  When nil, cc-butler runs in single mode and the butler plays both
 roles (backward compatible).")
 
@@ -860,11 +983,21 @@ is rendered as a document in 정수님's inbox; otherwise it queues for
       (cc-butler--maybe-refresh)
       (format "Sent to %s and submitted." name)))))
 
-(defun cc-butler-tool-report-to-butler (summary &optional status needs)
-  "MCP tool: a worker reports to the butler with real content.
+(defun cc-butler-tool-report-to-steward (summary &optional status needs)
+  "MCP tool: a worker reports to the steward with real content.
 SUMMARY is what happened / what was done, STATUS the current state, and
 NEEDS what the worker needs from the human (all teed to the inbox and
-log).  The caller's session name and id are attached automatically."
+log).  The caller's session name and id are attached automatically.
+
+NOTE: despite the name, this does NOT reach the butler — it lands in the
+steward's worker-firehose queue (`cc-butler--inbox' / `pending_events').
+Only the steward can put something in front of the human, via
+`escalate_to_butler'. This function was named/documented as reporting
+\"to the butler\" until 2026-07-09; that was a bug (worker reports were
+silently landing with the steward instead, and the butler had no
+auto-hook onto this queue at all), not the intended two-tier design —
+see `cc-butler-tool-report-to-butler' below, kept only as a deprecated
+alias for already-connected callers."
   (let ((self (cc-butler--caller-dir)))
     (unless self
       (error "No calling session context for this report"))
@@ -876,15 +1009,28 @@ log).  The caller's session name and id are attached automatically."
                                    (concat "needs: " needs)))))
            (msg (if parts (string-join parts " · ") "(empty report)")))
       (if (eq cc-butler-message-transport 'maildir)
-          (cc-butler-mail-up-report self msg)
+          ;; The maildir path doesn't route through `cc-butler--inbox-push',
+          ;; so it misses that function's advice-based auto-log — log
+          ;; directly here instead, so "report -> logged" holds under
+          ;; either transport, not just the in-memory default.
+          (progn
+            (cc-butler-mail-up-report self msg)
+            (when (fboundp 'cc-butler-docs--auto-log)
+              (cc-butler-docs--auto-log self msg)))
         (cc-butler--inbox-push self msg))
       (cc-butler--maybe-refresh)
-      (format "Reported to the butler as %s." (cc-butler--who-dir self)))))
+      (format "Reported to the steward as %s." (cc-butler--who-dir self)))))
+
+(defalias 'cc-butler-tool-report-to-butler 'cc-butler-tool-report-to-steward
+  "Deprecated alias — see `cc-butler-tool-report-to-steward'.
+Kept only so an already-connected session that still has the old MCP
+tool name `report_to_butler' cached doesn't hit a hard tool-not-found
+error mid-task. New callers should use `report_to_steward'.")
 
 (defun cc-butler-tool-inbox ()
-  "MCP tool: return and clear the butler's pending worker events.
+  "MCP tool: return and clear the steward's pending worker events.
 This is the pull side of the bus: worker notifications (needs input /
-done) are queued in Emacs and drained here, so the butler gets them
+done) are queued in Emacs and drained here, so the steward gets them
 without anything being typed into its input box."
   (if (eq cc-butler-message-transport 'maildir)
       (let ((msgs (cc-butler-mail-up-drain (cc-butler--caller-dir))))
@@ -910,19 +1056,20 @@ without anything being typed into its input box."
        (lambda (spec)
          (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                  '("list_claude_sessions" "read_session_output"
-                   "send_to_session" "pending_events" "report_to_butler")))
+                   "send_to_session" "pending_events"
+                   "report_to_steward" "report_to_butler")))
        claude-code-ide-mcp-server-tools))
 
 (claude-code-ide-make-tool
  :function #'cc-butler-tool-inbox
  :name "pending_events"
- :description "Drain the butler's inbox: pending events from worker sessions that need attention (a worker asked a question, finished, reported, or hit a prompt), newest last. Each line is a timestamped worker name (with its session id) and message. Call this at the start of each turn (and whenever you are nudged) to learn what changed without anything being typed into your input box. Returns the events and clears them."
+ :description "Steward only: drain your inbox of pending events from worker sessions that need attention (a worker asked a question, finished, reported via report_to_steward, or hit a prompt), newest last. Each line is a timestamped worker name (with its session id) and message. Call this at the start of each turn (and whenever you are nudged) to learn what changed without anything being typed into your input box. Returns the events and clears them."
  :args nil)
 
 (claude-code-ide-make-tool
- :function #'cc-butler-tool-report-to-butler
- :name "report_to_butler"
- :description "Report up to the butler/orchestrator with real content — not just 'I need attention'. State WHAT happened / what you did, the current STATE, and exactly what you NEED from the human (a decision, input, or nothing). Your session name and id are attached automatically; the butler reads it from its inbox and relays a summary to the human. Call it when you finish, get blocked, or need a decision."
+ :function #'cc-butler-tool-report-to-steward
+ :name "report_to_steward"
+ :description "Report up to the steward with real content — not just 'I need attention'. State WHAT happened / what you did, the current STATE, and exactly what you NEED (a decision, input, or nothing). Your session name and id are attached automatically; the steward drains this via pending_events and tracks/dispatches you from there. This does NOT reach the human/butler directly — the steward escalates to the butler only when something genuinely needs a human decision. Call it when you finish, get blocked, or have a status update."
  :args '((:name "summary"
                 :type string
                 :description "What happened or what you did — the substance of the report (e.g. 'implemented invoice PDF rendering, all tests pass').")
@@ -932,7 +1079,23 @@ without anything being typed into its input box."
                 :optional t)
          (:name "needs"
                 :type string
-                :description "What you need from the human/butler to proceed, e.g. 'approve the merge' or 'which auth method to use'. Omit (or 'nothing') if you are only informing. Optional."
+                :description "What you need to proceed, e.g. 'review this PR' or 'which auth method to use'. Omit (or 'nothing') if you are only informing. Optional."
+                :optional t)))
+
+(claude-code-ide-make-tool
+ :function #'cc-butler-tool-report-to-butler
+ :name "report_to_butler"
+ :description "DEPRECATED — renamed to `report_to_steward' on 2026-07-09 (this tool never actually reached the butler; it always landed with the steward). Kept only so already-connected sessions don't hit a tool-not-found error. Use report_to_steward instead."
+ :args '((:name "summary"
+                :type string
+                :description "What happened or what you did — the substance of the report (e.g. 'implemented invoice PDF rendering, all tests pass').")
+         (:name "status"
+                :type string
+                :description "Current state, e.g. 'PR #42 open, CI green' or 'blocked on the DB migration'. Optional."
+                :optional t)
+         (:name "needs"
+                :type string
+                :description "What you need to proceed. Omit (or 'nothing') if you are only informing. Optional."
                 :optional t)))
 
 (claude-code-ide-make-tool
@@ -956,7 +1119,7 @@ without anything being typed into its input box."
 (claude-code-ide-make-tool
  :function #'cc-butler-tool-send-session
  :name "send_to_session"
- :description "Type a prompt/answer into another Claude session by name and submit it (press Enter), to direct that worker. Use to answer a worker's question, give it a task, or unblock it. You cannot send to yourself. Multi-line is supported: include newlines in text — they are delivered as a paste and stay literal, and Enter is pressed only once, at the end, to submit. CAUTION when sending free-form text (not answering a question you just asked): if the target has an open interactive prompt or menu (e.g. from AskUserQuestion), your one submit-Enter lands on whatever is highlighted there, not on your text — it is silently swallowed on both ends. Check with read_session_output first when unsure, and tell dispatched workers to prefer report_to_butler/escalate_to_butler over AskUserQuestion so this cannot happen."
+ :description "Type a prompt/answer into another Claude session by name and submit it (press Enter), to direct that worker. Use to answer a worker's question, give it a task, or unblock it. You cannot send to yourself. Multi-line is supported: include newlines in text — they are delivered as a paste and stay literal, and Enter is pressed only once, at the end, to submit. CAUTION when sending free-form text (not answering a question you just asked): if the target has an open interactive prompt or menu (e.g. from AskUserQuestion), your one submit-Enter lands on whatever is highlighted there, not on your text — it is silently swallowed on both ends. Check with read_session_output first when unsure, and tell dispatched workers to prefer report_to_steward/escalate_to_butler over AskUserQuestion so this cannot happen."
  :args '((:name "name"
                 :type string
                 :description "Target session name from list_claude_sessions.")
