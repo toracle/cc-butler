@@ -947,7 +947,7 @@ is rendered as a document in 정수님's inbox; otherwise it queues for
         (rows '()))
     (dolist (s (cc-butler--sessions))
       (let ((dir (plist-get s :dir)))
-        (push (format "- %s%s | %s | branch:%s%s | %s"
+        (push (format "- %s%s | %s | branch:%s%s | %s%s"
                       (cc-butler--display-name dir)
                       (cond ((equal dir self) " (you)")
                             ((equal dir cc-butler--butler) " (butler)")
@@ -955,7 +955,10 @@ is rendered as a document in 정수님's inbox; otherwise it queues for
                       (if (cc-butler--waiting-p dir) "WAITING-FOR-INPUT" "running")
                       (let ((b (plist-get s :branch))) (if (string-empty-p b) "-" b))
                       (let ((f (plist-get s :forge))) (if (string-empty-p f) "" (concat " " f)))
-                      (let ((o (plist-get s :osc))) (if (string-empty-p o) "" o)))
+                      (let ((o (plist-get s :osc))) (if (string-empty-p o) "" o))
+                      (let ((m (and (fboundp 'cc-butler-cleanup-model-tag)
+                                    (cc-butler-cleanup-model-tag dir))))
+                        (if m (concat " | " m) "")))
               rows)))
     (if rows (mapconcat #'identity (nreverse rows) "\n") "No active Claude sessions")))
 
@@ -1101,7 +1104,7 @@ without anything being typed into its input box."
 (claude-code-ide-make-tool
  :function #'cc-butler-tool-list-sessions
  :name "list_claude_sessions"
- :description "List the other live Claude Code sessions running in this Emacs (the workers you orchestrate): their stable name, whether each is WAITING-FOR-INPUT, its git branch, and its current activity title. Call this first to learn the names used by read_session_output and send_to_session."
+ :description "List the other live Claude Code sessions running in this Emacs (the workers you orchestrate): their stable name, whether each is WAITING-FOR-INPUT, its git branch, its current activity title, and (when known) the model it's running. Call this first to learn the names used by read_session_output and send_to_session."
  :args nil)
 
 (claude-code-ide-make-tool

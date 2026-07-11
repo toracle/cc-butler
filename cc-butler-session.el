@@ -436,16 +436,21 @@ preserving the cursor's current session across the redraw when possible
                  (ctx (and (fboundp 'cc-butler-cleanup-context-tag)
                            (cc-butler-cleanup-context-tag sd)))
                  (ctx-hot (and ctx (fboundp 'cc-butler-cleanup-context-over-threshold-p)
-                               (cc-butler-cleanup-context-over-threshold-p sd))))
-            (when (or (not (string-empty-p meta)) ctx)
-              (insert "   ")
-              (unless (string-empty-p meta)
-                (insert (propertize meta 'face 'font-lock-comment-face)))
-              (when ctx
-                (insert (if (string-empty-p meta) "" "   ")
-                        (propertize ctx 'face (if ctx-hot 'warning
-                                                'font-lock-comment-face))))
-              (insert "\n")))
+                               (cc-butler-cleanup-context-over-threshold-p sd)))
+                 ;; Which model the session is running (e.g. "Sonnet-5"),
+                 ;; scraped from the same statusLine feed as `ctx'.
+                 (model (and (fboundp 'cc-butler-cleanup-model-tag)
+                             (cc-butler-cleanup-model-tag sd)))
+                 (segments (delq nil
+                                 (list (unless (string-empty-p meta)
+                                         (propertize meta 'face 'font-lock-comment-face))
+                                       (and model
+                                            (propertize model 'face 'font-lock-type-face))
+                                       (and ctx
+                                            (propertize ctx 'face (if ctx-hot 'warning
+                                                                    'font-lock-comment-face)))))))
+            (when segments
+              (insert "   " (mapconcat #'identity segments "   ") "\n")))
           (insert "\n")
           (put-text-property start (point) 'cc-butler-dir (plist-get s :dir)))))
     (setq cc-butler--entries (nreverse entries))

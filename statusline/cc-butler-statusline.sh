@@ -2,11 +2,13 @@
 # cc-butler-statusline.sh --- context-size reporter for the cc-butler cleaner
 #
 # Claude Code invokes a custom `statusLine` command with a JSON blob on stdin
-# describing the session, including a `context_window` object.  This helper
-# parses it and prints ONE line that is both human-readable AND machine-
-# readable: a marker `CTX:<total_input_tokens>` that cc-butler's cleaner scrapes
-# from the session terminal (see `cc-butler-cleanup-context-function'), followed
-# by a short percentage / over-200k hint.
+# describing the session, including a `context_window` object and a `model`
+# object.  This helper parses it and prints ONE line that is both human-
+# readable AND machine-readable: a marker `CTX:<total_input_tokens>` that
+# cc-butler's cleaner scrapes from the session terminal (see
+# `cc-butler-cleanup-context-function'), followed by a short percentage /
+# over-200k hint, followed by a `MODEL:<name>` marker (scraped by
+# `cc-butler-cleanup-model-function') identifying the model in use.
 #
 # It is intentionally generic and site-agnostic — it ships with the open-source
 # core and hard-codes no policy (the 200k threshold lives in Emacs).  Wire it as
@@ -22,11 +24,11 @@ input=$(cat)
 
 if command -v python3 >/dev/null 2>&1; then
   printf '%s' "$input" | python3 -c '
-import sys, json
+import sys, json, re
 try:
     d = json.load(sys.stdin)
 except Exception:
-    print("CTX:?"); sys.exit(0)
+    print("CTX:? MODEL:?"); sys.exit(0)
 cw = d.get("context_window") or {}
 tot = cw.get("total_input_tokens")
 if tot is None:
@@ -43,14 +45,18 @@ if isinstance(pct, (int, float)):
     extra += " %d%%" % int(pct)
 if over:
     extra += " >200k"
-print(mark + extra)
+model = d.get("model") or {}
+mname = model.get("display_name") or model.get("id") or "?"
+mtag = re.sub(r"[^A-Za-z0-9_.-]+", "-", mname).strip("-") or "?"
+print(mark + extra + " MODEL:" + mtag)
 '
 elif command -v jq >/dev/null 2>&1; then
   printf '%s' "$input" | jq -r '
     "CTX:\(.context_window.total_input_tokens // 0)"
     + (if .context_window.used_percentage
          then " \(.context_window.used_percentage | floor)%" else "" end)
-    + (if .exceeds_200k_tokens then " >200k" else "" end)'
+    + (if .exceeds_200k_tokens then " >200k" else "" end)
+    + " MODEL:" + ((.model.display_name // .model.id // "?") | gsub("[^A-Za-z0-9_.-]+"; "-"))'
 else
-  printf 'CTX:?\n'
+  printf 'CTX:? MODEL:?\n'
 fi

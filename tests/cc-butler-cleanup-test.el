@@ -148,6 +148,48 @@ replaces it."
     (should (null (cc-butler-cleanup-context-for "/w/")))
     (should (null (cc-butler-cleanup-context-tag "/w/")))))
 
+;;;; ---- default model scrape ------------------------------------------
+
+(ert-deftest cc-butler-cleanup/model-scrapes-marker ()
+  "The default model function reads the MODEL:<name> marker off the terminal."
+  (cl-letf (((symbol-function 'cc-butler--read-output)
+             (lambda (&rest _) "CTX:187342 57% MODEL:claude-sonnet-5\n")))
+    (should (equal "claude-sonnet-5" (cc-butler-cleanup--default-model (list :dir "/d"))))))
+
+(ert-deftest cc-butler-cleanup/model-absent-is-nil ()
+  "No marker -> nil model (not an error, not an empty string)."
+  (cl-letf (((symbol-function 'cc-butler--read-output)
+             (lambda (&rest _) "CTX:187342 57%\n")))
+    (should (null (cc-butler-cleanup--default-model (list :dir "/d"))))))
+
+;;;; ---- model feedback tag & last-known-value persistence -------------
+
+(ert-deftest cc-butler-cleanup/model-tag-strips-claude-prefix ()
+  "The sessions-list model tag strips the \"claude-\" prefix for compactness."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-function (lambda (_s) "claude-sonnet-5")))
+    (should (equal "sonnet-5" (cc-butler-cleanup-model-tag "/w/")))))
+
+(ert-deftest cc-butler-cleanup/model-tag-nil-when-unknown ()
+  "No MODEL marker -> no tag (nil)."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-function (lambda (_s) nil)))
+    (should (null (cc-butler-cleanup-model-tag "/w/")))))
+
+(ert-deftest cc-butler-cleanup/model-keeps-last-known-on-nil-read ()
+  "A fresh read of nil (indicator gone mid-task) must KEEP the last-known
+model name, mirroring the context tag's no-flicker behavior."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 0)
+        (reading "claude-sonnet-5"))
+    (let ((cc-butler-cleanup-model-function (lambda (_s) reading)))
+      (should (equal "sonnet-5" (cc-butler-cleanup-model-tag "/w/")))
+      (setq reading nil)
+      (should (equal "sonnet-5" (cc-butler-cleanup-model-tag "/w/")))
+      (should (equal "claude-sonnet-5" (cc-butler-cleanup-model-for "/w/")))
+      (setq reading "claude-opus-4-8")
+      (should (equal "opus-4-8" (cc-butler-cleanup-model-tag "/w/"))))))
+
 ;;;; ---- trigger gating ----------------------------------------------
 
 (ert-deftest cc-butler-cleanup/trigger-fires-over-200k ()
