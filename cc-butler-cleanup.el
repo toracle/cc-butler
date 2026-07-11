@@ -167,6 +167,21 @@ every terminal on every refresh."
   :type 'number
   :group 'cc-butler)
 
+(defcustom cc-butler-cleanup-model-function
+  #'cc-butler-cleanup--default-model
+  "Function returning a session's current model name, or nil.  Called with the
+session plist.  The default scrapes a `MODEL:<name>' marker emitted by the
+shipped statusLine helper from the session terminal."
+  :type 'function
+  :group 'cc-butler)
+
+(defcustom cc-butler-cleanup-model-ttl 3
+  "Seconds to cache a session's scraped model name.
+The sessions-list feedback tag reads this cache, so a redraw does not re-scrape
+every terminal on every refresh."
+  :type 'number
+  :group 'cc-butler)
+
 (defcustom cc-butler-cleanup-trigger-predicate
   #'cc-butler-cleanup--default-trigger-p
   "Predicate deciding whether a session should be RECOMMENDED for cleanup now.
@@ -379,6 +394,49 @@ when no size has ever been read for DIR."
           (let ((last (and cached (cdr cached))))
             (puthash dir (cons now last) cc-butler-cleanup--context-cache)
             last))))))
+
+(defun cc-butler-cleanup--default-model (session)
+  "Default: read SESSION's current model name from its terminal.
+Reads the `MODEL:<name>' marker emitted by the optional statusLine helper.
+Returns nil when the terminal shows no model indicator."
+  (let ((out (cc-butler--read-output (plist-get session :dir)
+                                     cc-butler-cleanup-read-lines)))
+    (when (and out (string-match "MODEL:\\([A-Za-z0-9_.-]+\\)" out))
+      (match-string 1 out))))
+
+;;;; --- model feedback for the sessions list (cached) -------------------
+
+(defvar cc-butler-cleanup--model-cache (make-hash-table :test 'equal)
+  "Map a session dir -> (TIMESTAMP . NAME).  Mirrors
+`cc-butler-cleanup--context-cache': a short TTL keeps the sessions-list tag
+cheap, and a nil read does not erase a previously-known name (same
+no-flicker reasoning as `cc-butler-cleanup-context-for').")
+
+(defun cc-butler-cleanup-model-for (dir)
+  "Return DIR's current model name, cached for a short TTL.
+The TTL is `cc-butler-cleanup-model-ttl'; the value comes from
+`cc-butler-cleanup-model-function'.  A nil read keeps the last-known name
+instead of clearing it — see `cc-butler-cleanup-context-for' for why."
+  (let ((cached (gethash dir cc-butler-cleanup--model-cache))
+        (now (float-time)))
+    (if (and cached (< (- now (car cached)) cc-butler-cleanup-model-ttl))
+        (cdr cached)
+      (let ((name (ignore-errors
+                    (funcall cc-butler-cleanup-model-function (list :dir dir)))))
+        (if (stringp name)
+            (progn (puthash dir (cons now name) cc-butler-cleanup--model-cache)
+                   name)
+          (let ((last (and cached (cdr cached))))
+            (puthash dir (cons now last) cc-butler-cleanup--model-cache)
+            last))))))
+
+(defun cc-butler-cleanup-model-tag (dir)
+  "Return a compact model tag for DIR (its \"claude-\" prefix stripped, e.g.
+\"Sonnet-5\"), or nil when unknown.  This is the sessions-list feedback
+device; `cc-butler--render' calls it."
+  (let ((name (cc-butler-cleanup-model-for dir)))
+    (and (stringp name)
+         (replace-regexp-in-string "\\`claude-" "" name))))
 
 (defun cc-butler-cleanup-context-tag (dir)
   "Return a compact context tag like \"ctx 187k\" for DIR, or nil when unknown.

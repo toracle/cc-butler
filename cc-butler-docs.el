@@ -124,12 +124,16 @@
              (state (if (cc-butler--waiting-p dir) "WAITING" "running"))
              (branch (let ((b (plist-get s :branch))) (if (string-empty-p b) "-" b)))
              (pr (let ((f (plist-get s :forge))) (if (string-empty-p f) "-" f)))
-             (act (let ((o (plist-get s :osc))) (if (string-empty-p o) "-" o))))
-        (push (format "| %s%s | %s | %s | %s | %s |"
+             (act (let ((o (plist-get s :osc))) (if (string-empty-p o) "-" o)))
+             (model (or (and (fboundp 'cc-butler-cleanup-model-tag)
+                              (cc-butler-cleanup-model-tag dir))
+                        "-")))
+        (push (format "| %s%s | %s | %s | %s | %s | %s |"
                       (cc-butler-docs--cell (cc-butler--display-name dir))
                       tag state
                       (cc-butler-docs--cell branch)
                       (cc-butler-docs--cell pr)
+                      (cc-butler-docs--cell model)
                       (cc-butler-docs--cell act))
               rows)))
     (nreverse rows)))
@@ -146,9 +150,9 @@
      "#+TITLE: Butler dashboard\n#+STARTUP: overview\n"
      (format "Last updated: %s\n\n" (format-time-string "[%Y-%m-%d %a %H:%M]"))
      "* Sessions\n"
-     "| Session | State | Branch | PR | Activity |\n"
-     "|---------+-------+--------+----+----------|\n"
-     (if rows (concat (string-join rows "\n") "\n") "| (none) | - | - | - | - |\n")
+     "| Session | State | Branch | PR | Model | Activity |\n"
+     "|---------+-------+--------+----+-------+----------|\n"
+     (if rows (concat (string-join rows "\n") "\n") "| (none) | - | - | - | - | - |\n")
      "\n* Overview\n"
      (if (and cc-butler-docs--overview
               (not (string-empty-p (string-trim cc-butler-docs--overview))))
