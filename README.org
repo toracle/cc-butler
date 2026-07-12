@@ -85,12 +85,75 @@ installed by ~(require 'cc-butler)~ itself.
 
 * Installation
 
-Not on a package archive yet. Clone and put it on your ~load-path~:
+cc-butler is not on a package archive yet, so it installs straight from Git.
+One wrinkle to know first: its ~claude-code-ide~ dependency is *also* GitHub-only
+(not on MELPA/GNU ELPA), so a package manager that tries to satisfy it from an
+archive will fail. *Install ~claude-code-ide~ first, then cc-butler* — the
+recipes below do this in order. (The other dependency, ~hydra~, is on MELPA and
+resolves automatically.)
+
+** Built-in use-package + ~:vc~ (Emacs 30+)
+
+Emacs 30 ships a ~:vc~ keyword in ~use-package~, so no third-party package
+manager is needed. Make sure MELPA is registered (for ~hydra~):
 
 #+begin_src emacs-lisp
+(require 'package)
+(add-to-list 'package-archives '("melpa" . "https://melpa.org/packages/") t)
+(package-initialize)
+
+;; 1. GitHub-only dependency first
+(use-package claude-code-ide
+  :vc (:url "https://github.com/manzaltu/claude-code-ide.el" :rev :newest))
+
+;; 2. then cc-butler
+(use-package cc-butler
+  :vc (:url "https://github.com/toracle/cc-butler" :rev :newest)
+  :after claude-code-ide)
+#+end_src
+
+Upgrade later with ~M-x package-vc-upgrade RET cc-butler RET~.
+
+*** Emacs 29
+
+The ~:vc~ keyword is Emacs 30+. On 29.x, install with ~package-vc-install~ (run
+once), then configure with plain ~use-package~:
+
+#+begin_src emacs-lisp
+(unless (package-installed-p 'claude-code-ide)
+  (package-vc-install "https://github.com/manzaltu/claude-code-ide.el"))
+(unless (package-installed-p 'cc-butler)
+  (package-vc-install "https://github.com/toracle/cc-butler"))
+
+(use-package cc-butler
+  :after claude-code-ide)
+#+end_src
+
+** straight.el + use-package
+
+straight reads ~Package-Requires~ and pulls ~hydra~ from MELPA for you:
+
+#+begin_src emacs-lisp
+(use-package claude-code-ide
+  :straight (:host github :repo "manzaltu/claude-code-ide.el"))
+
+(use-package cc-butler
+  :straight (:host github :repo "toracle/cc-butler")
+  :after claude-code-ide)
+#+end_src
+
+** Manual clone
+
+Or clone both repos and put them on your ~load-path~:
+
+#+begin_src emacs-lisp
+(add-to-list 'load-path "/path/to/claude-code-ide.el")
 (add-to-list 'load-path "/path/to/cc-butler")
 (require 'cc-butler)
 #+end_src
+
+After any of these, run ~M-x cc-butler-doctor~ to check for fresh-install gaps
+(CLI path, ghostel backend, etc.) — see [[*Requirements][Requirements]] above.
 
 * Usage
 
