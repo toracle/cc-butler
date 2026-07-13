@@ -368,7 +368,7 @@ under the cursor just because some session's wait-state flipped mid-move."
   "g"        #'cc-butler-refresh
   "c"        #'cc-butler-new-session
   "l"        #'cc-butler-show-log
-  "?"        #'cc-butler-doctor
+  "h"        #'cc-butler-doctor
   "q"        #'cc-butler-quit)
 
 (define-derived-mode cc-butler-mode special-mode "CC-Sessions"

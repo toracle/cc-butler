@@ -51,6 +51,47 @@
 (require 'cc-butler-provenance)
 (require 'cc-butler-cleanup)
 
+(require 'hydra)
+
+;; A discoverable menu of the `*claude-sessions*' buffer's own commands,
+;; mirroring the `?' -> hydra pattern already used by
+;; `cc-butler-decision-mode-map' (see cc-butler-decision.el).  Lives here
+;; (after every module is required) rather than in `cc-butler-session.el'
+;; itself, because it references commands owned by other modules
+;; (`cc-butler-new-topic', `cc-butler-inbox', `cc-butler-start-butler', the
+;; doc-panel commands, ...) that are not yet defined while
+;; `cc-butler-session.el' loads.  The individual keys it lists keep working
+;; standalone; this only adds a cheat-sheet on `?'.
+(defhydra cc-butler-session-hydra (:color blue :hint nil)
+  "
+ _n_ext  _p_rev  _RET_ open  _SPC_ preview  _g_ refresh  _q_ quit
+ _c_ new session   _N_ew topic   _K_ close topic   _h_ doctor   _l_og
+ _B_utler   _S_teward   _b_ set butler   _i_nbox
+ doc panel:  _d_ toggle  _o_pen  _v_ reopen  _D_ remove
+"
+  ("n" cc-butler-next)
+  ("p" cc-butler-prev)
+  ("RET" cc-butler-visit)
+  ("SPC" cc-butler-preview)
+  ("g" cc-butler-refresh)
+  ("c" cc-butler-new-session)
+  ("N" cc-butler-new-topic)
+  ("K" cc-butler-close-topic)
+  ("h" cc-butler-doctor)
+  ("l" cc-butler-show-log)
+  ("B" cc-butler-start-butler)
+  ("S" cc-butler-start-steward)
+  ("b" cc-butler-set-butler)
+  ("i" cc-butler-inbox)
+  ("d" cc-butler-doc-toggle)
+  ("o" cc-butler-doc-open)
+  ("v" cc-butler-doc-reopen)
+  ("D" cc-butler-doc-remove)
+  ("q" cc-butler-quit)
+  ("?" nil "cancel"))
+
+(define-key cc-butler-mode-map "?" #'cc-butler-session-hydra/body)
+
 (defconst cc-butler--modules
   '(cc-butler-session cc-butler-notifications cc-butler-workspace
     cc-butler-orchestrator cc-butler-doc-panel cc-butler-docs cc-butler-persist

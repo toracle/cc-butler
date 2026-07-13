@@ -35,10 +35,15 @@ below is the roles diagram; the rest illustrate individual features.
   status / branch + PR). Navigating previews the session's terminal.
 - *Per-session metadata* — a running Claude sets its own title/status via the
   ~set_session_info~ MCP tool, so you can track many sessions at a glance.
-- *Topic workspaces* — ~cc-butler-new-topic~ scaffolds a workspace (clones +
-  markers) and launches a session; ~cc-butler-close-topic~ (~K~) tears one down
-  *safely* (it refuses to delete unless every git clone has no local-only
-  commits, a clean tree, and no stashes — checked with real =git=).
+- *Topic workspaces* — ~cc-butler-new-topic~ (~N~) scaffolds a workspace
+  (clones + markers) and launches a session; ~cc-butler-close-topic~ (~K~)
+  tears one down *safely* (it refuses to delete unless every git clone has no
+  local-only commits, a clean tree, and no stashes — checked with real
+  =git=). The package ships one built-in template, ~default~ (a repo-free
+  scaffold — no cloning, just a workspace dir), plus an ~arbitrary~ escape
+  hatch (pick any directory, no scaffolding); register your own real-repo
+  templates with ~cc-butler-define-project-template~ in your own config (see
+  its docstring).
 - *Butler / worker control plane* — a designated /butler/ session drives the
   /workers/ through MCP tools (~list_claude_sessions~, ~read_session_output~,
   ~send_to_session~) and receives their events (~report_to_steward~ →
@@ -47,7 +52,13 @@ below is the roles diagram; the rest illustrate individual features.
 - *Document panel* — a running Claude opens a PR, issue, CI run, or file into a
   right-hand panel beside its terminal (~show_document~), shown as a tab line;
   the set is remembered per session. Read-only with explicit actions
-  (comment / browse).
+  (comment / browse). You can also open one yourself with ~o~ (or ~C-c d o~
+  from anywhere) — see [[*The document panel][The document panel]] below; the panel stays
+  invisible until at least one document has been opened for that session, so
+  don't mistake an empty panel for a missing feature.
+- *Inbox* — decisions/notes the butler or steward escalates land in a
+  reviewable list (~M-x cc-butler-inbox~, ~i~ in the session list); see
+  [[*The inbox][The inbox]] below for what populates it.
 - *Butler document repository* — the butler keeps a regenerated =dashboard.org=
   (sessions table auto-built from live state + overview + open decisions) and
   an append-only daily log, updated via ~butler_log~ / ~butler_dashboard~ and
@@ -79,7 +90,7 @@ bare "Invalid buffer" error with no indication why:
 (setq claude-code-ide-cli-path (executable-find "claude"))
 #+end_src
 
-Run ~M-x cc-butler-doctor~ (~?~ in the session list) any time to check these —
+Run ~M-x cc-butler-doctor~ (~h~ in the session list) any time to check these —
 useful right after a fresh install, since none of the above is verified or
 installed by ~(require 'cc-butler)~ itself.
 
@@ -157,22 +168,59 @@ After any of these, run ~M-x cc-butler-doctor~ to check for fresh-install gaps
 
 * Usage
 
-~M-x cc-butler~ opens the session manager. In the list buffer:
+~M-x cc-butler~ opens the session manager. In the list buffer, ~?~ opens a
+discoverable Hydra menu of everything below (mirroring the same ~?~ → menu
+pattern used by the decision reader) — press it any time you forget a key:
 
-| Key   | Action                                              |
-|-------+-----------------------------------------------------|
-| ~n~/~p~   | move + preview a session                            |
-| ~RET~   | select the session's terminal                       |
-| ~B~     | start (or focus) the dedicated butler session       |
-| ~S~     | start (or focus) the dedicated steward session      |
-| ~N~     | create a topic workspace                            |
-| ~K~     | close a topic safely (vet → kill → delete)          |
-| ~b~     | designate the session at point as the butler        |
-| ~g~     | refresh                                             |
-| ~?~     | ~cc-butler-doctor~ — check for fresh-install gaps   |
+| Key     | Action                                              |
+|---------+------------------------------------------------------|
+| ~n~/~p~     | move + preview a session                            |
+| ~RET~     | select the session's terminal                       |
+| ~SPC~     | preview without switching                            |
+| ~B~       | start (or focus) the dedicated butler session       |
+| ~S~       | start (or focus) the dedicated steward session      |
+| ~N~       | create a topic workspace                            |
+| ~K~       | close a topic safely (vet → kill → delete)          |
+| ~b~       | designate the session at point as the butler        |
+| ~i~       | open the inbox (see [[*The inbox][The inbox]])                       |
+| ~d~/~o~/~v~/~D~ | doc-panel toggle / open / reopen / remove (see below) |
+| ~c~       | start a plain session (no scaffolding)               |
+| ~l~       | show the cc-butler log                               |
+| ~g~       | refresh                                             |
+| ~h~       | ~cc-butler-doctor~ — check for fresh-install gaps   |
+| ~?~       | open this Hydra menu                                |
+| ~q~       | quit the session manager                             |
 
 A running Claude drives its own panel and reports to the butler through the MCP
 tools listed above.
+
+** The document panel
+
+A per-session right-hand panel for PRs, issues, CI runs, and files. It stays
+*invisible* until at least one document has been opened for that session —
+there is no persistent empty-state placeholder, so a session with nothing
+opened yet looks identical to the panel not existing at all. Two ways to
+populate it:
+
+- *Automatically*: a running Claude calls the ~show_document~ MCP tool.
+- *Manually*: press ~o~ in the session list (or ~C-c d o~ from anywhere in
+  Emacs) to open a document into the session at point.
+
+Once at least one document is open, further keys apply: ~d~ toggles the panel
+visible/hidden, ~]~/~[~ move between open documents, ~v~ reopens the
+last-closed one, and ~D~ removes the current one from the set.
+
+** The inbox
+
+~M-x cc-butler-inbox~ (~i~ in the session list) lists decision/note documents
+the butler or steward has escalated for a human to review and answer — *not*
+the agent-to-agent messaging worker sessions use internally (~ask_worker~ /
+~check_inbox~ / ~report_to_steward~, which self-initialize and need no setup).
+The human inbox only starts filling once you have actually launched a butler
+and/or steward session at least once (~B~ / ~S~) — those launches write the
+hooks that auto-drain escalated decisions into it. An empty inbox on a fresh
+install usually just means neither has been started yet, not that anything is
+broken.
 
 ** The butler
 

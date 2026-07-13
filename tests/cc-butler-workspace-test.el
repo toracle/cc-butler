@@ -8,11 +8,12 @@
 (require 'cc-butler-workspace)
 
 (ert-deftest cc-butler-workspace/define-template-registers ()
-  "The package ships NO templates; cc-butler-define-project-template registers
-one into the registry, retrievable by name (users add their own in private
-config — no real repos are hard-coded in the package)."
+  "cc-butler-define-project-template registers a template into the registry,
+retrievable by name (users add their own in private config — no real
+org-specific repos are hard-coded in the package; see the built-in-default
+tests below for the one exception, which is itself repo-free)."
   (let ((cc-butler-project-templates nil))
-    (should (null (cc-butler--template 'anything)))   ; empty by default
+    (should (null (cc-butler--template 'anything)))   ; empty when isolated
     (cc-butler-define-project-template testproj
       :base-dir "~/x" :dir-format "testproj-%s"
       :repos ("git@github.com:me/testproj.git")
@@ -21,6 +22,71 @@ config — no real repos are hard-coded in the package)."
       (should tpl)
       (should (equal (plist-get tpl :dir-format) "testproj-%s"))
       (should (equal (plist-get tpl :repos) '("git@github.com:me/testproj.git"))))))
+
+;;;; ------------------------------------------------------------------
+;;;; The built-in `default' template: repo-free, ships with the package
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-workspace/built-in-default-template-is-repo-free ()
+  "The package ships exactly one built-in template, `default' — repo-free
+(:repos nil), so no org-specific repository is hard-coded in the package
+itself, while still giving a fresh install a real template besides
+`arbitrary'.  Checks the REAL global registry (not isolated), since this is
+about what ships, not what a test defines."
+  (let ((tpl (cc-butler--template 'default)))
+    (should tpl)
+    (should (null (plist-get tpl :repos)))
+    (should (stringp (plist-get tpl :base-dir)))
+    (should (stringp (plist-get tpl :dir-format)))))
+
+(ert-deftest cc-butler-workspace/new-topic-repo-free-template-does-not-error ()
+  "A repo-free template (like the built-in `default') must not crash computing
+the prior-clone check — `(car nil)' into `cc-butler--repo-local-name' errored
+before this fix.  It should scaffold directly, no clone attempted."
+  (let ((cc-butler-project-templates nil)
+        (base (make-temp-file "cc-newtopic" t))
+        finished-dir)
+    (setf (alist-get 'blanktest cc-butler-project-templates)
+          (list :base-dir base :dir-format "%s" :repos nil :claude-import nil))
+    (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) "blanktest"))
+              ((symbol-function 'read-string) (lambda (&rest _) "mytopic"))
+              ((symbol-function 'cc-butler--finish-topic)
+               (lambda (topic-dir _template) (setq finished-dir topic-dir))))
+      (cc-butler-new-topic))
+    (should finished-dir)
+    (should (file-directory-p finished-dir))))
+
+;;;; ------------------------------------------------------------------
+;;;; Scaffold: CLAUDE.md must not carry a dangling import blurb when the
+;;;; template has nothing to import (the repo-free case)
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-workspace-test--claude-md (topic-dir)
+  "Return the freshly scaffolded CLAUDE.md contents under TOPIC-DIR."
+  (with-temp-buffer
+    (insert-file-contents (expand-file-name "CLAUDE.md" topic-dir))
+    (buffer-string)))
+
+(ert-deftest cc-butler-workspace/scaffold-skips-import-blurb-when-no-imports ()
+  "A repo-free template (:claude-import nil) must not leave a dangling
+\"imported from the meta repo\" sentence with nothing listed under it."
+  (let* ((topic-dir (file-name-as-directory (make-temp-file "cc-scaffold-blank" t)))
+         (template (list :claude-import nil)))
+    (cc-butler--scaffold topic-dir template)
+    (should (file-exists-p (expand-file-name ".projectile" topic-dir)))
+    (should-not (string-match-p
+                 "imported from the meta repo"
+                 (cc-butler-workspace-test--claude-md topic-dir)))))
+
+(ert-deftest cc-butler-workspace/scaffold-includes-import-blurb-when-imports-present ()
+  "A template WITH :claude-import still emits the import blurb and @-imports
+(no regression from the repo-free fix)."
+  (let* ((topic-dir (file-name-as-directory (make-temp-file "cc-scaffold-imp" t)))
+         (template (list :claude-import '("app/CLAUDE.md"))))
+    (cc-butler--scaffold topic-dir template)
+    (let ((claude-md (cc-butler-workspace-test--claude-md topic-dir)))
+      (should (string-match-p "imported from the meta repo" claude-md))
+      (should (string-match-p "@app/CLAUDE.md" claude-md)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Teardown safety: never delete a dir cc-butler did not scaffold

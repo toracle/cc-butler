@@ -26,9 +26,11 @@
 
 (defvar cc-butler-project-templates nil
   "Registry of project templates for `cc-butler-new-topic'.
-Populated by `cc-butler-define-project-template' — the package ships EMPTY and
-hard-codes no real repositories; you register your own templates in your own
-private config.")
+Populated by `cc-butler-define-project-template'.  The package hard-codes no
+real repositories — it ships exactly one built-in entry, `default' (a
+repo-free scaffold-only workspace, see below), so a fresh install offers a
+real template besides the `arbitrary' escape hatch.  Register your own
+real-repo templates in your own private config.")
 
 ;;;###autoload
 (defmacro cc-butler-define-project-template (name &rest plist)
@@ -54,6 +56,17 @@ your init:
 (defun cc-butler--template (name)
   "Return the template plist for NAME (a symbol), or nil."
   (alist-get name cc-butler-project-templates))
+
+;; The one built-in template: no repos to clone, just a scaffolded topic dir
+;; under a package-owned home (mirrors `cc-butler-home'/`cc-butler-steward-home').
+;; Keeps the "no hard-coded real repositories" rule (there is nothing
+;; org-specific here) while giving a fresh install a real, immediately-usable
+;; template instead of only the `arbitrary' escape hatch.
+(cc-butler-define-project-template default
+  :base-dir "~/.emacs.d/cc-butler/topics"
+  :dir-format "%s"
+  :repos nil
+  :claude-import nil)
 
 (defun cc-butler--repo-local-name (url)
   "Return the local clone directory name for a git URL.
@@ -90,9 +103,10 @@ Runs `cc-butler-scaffold-functions' with (TOPIC-DIR TEMPLATE) at the end."
             (topic (file-name-nondirectory (directory-file-name topic-dir))))
         (with-temp-file cmd
           (insert (format "# %s workspace\n\n" topic))
-          (insert "Shared architecture and conventions, imported from the meta repo:\n\n")
-          (dolist (imp imports)
-            (insert (format "@%s\n" imp)))
+          (when imports
+            (insert "Shared architecture and conventions, imported from the meta repo:\n\n")
+            (dolist (imp imports)
+              (insert (format "@%s\n" imp))))
           (insert "\n## Reporting up (cc-butler)\n\n")
           (insert "This session may run as a *worker* under cc-butler orchestration. When you\n")
           (insert "finish a task, get blocked, or need a human decision, call the\n")
@@ -181,10 +195,12 @@ needed, scaffolds the markers, and launches Claude at the topic dir."
           (user-error "Topic name must not contain spaces or slashes: %S" topic))
         (let* ((topic-dir (cc-butler--topic-dir template topic))
                (repos (plist-get template :repos))
-               (meta-dir (expand-file-name
-                          (cc-butler--repo-local-name (car repos)) topic-dir)))
+               ;; A repo-free template (e.g. the built-in `default') has
+               ;; nothing to check for a prior clone of.
+               (meta-dir (and repos (expand-file-name
+                                     (cc-butler--repo-local-name (car repos)) topic-dir))))
           (make-directory topic-dir t)
-          (if (file-directory-p meta-dir)
+          (if (and meta-dir (file-directory-p meta-dir))
               ;; Already cloned — just scaffold (idempotent) and start.
               (cc-butler--finish-topic topic-dir template)
             (cc-butler--clone-repos
