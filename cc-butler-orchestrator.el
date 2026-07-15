@@ -69,19 +69,37 @@ without needing a window."
       (let ((inhibit-read-only t))
         (ignore-errors (ghostel--redraw ghostel--term t))))))
 
+(defcustom cc-butler-session-io-timeout 8
+  "Seconds before reading or writing a session's terminal buffer gives up.
+Bounds `cc-butler--read-output'/`cc-butler--send-input' — without this, a
+stuck redraw or wedged terminal in ONE session hangs the calling MCP
+request indefinitely (observed: callers were left waiting the full 300s
+client-side timeout with no Emacs-side bound at all).  Because
+`cc-butler--read-output' is also the fallback path for every session
+list row's model/context tag on a cache miss, a single wedged session can
+otherwise freeze `cc-butler--maybe-refresh' — and with it every tool that
+triggers a refresh (report_to_steward, escalate_to_butler, ...), not just
+direct read_session_output/send_to_session calls."
+  :type 'number
+  :group 'cc-butler)
+
 (defun cc-butler--read-output (dir &optional lines)
   "Return the last LINES (default 40) of session DIR's terminal screen.
 The terminal text is force-refreshed first so the capture is always the
-current frame, even for a background (non-displayed) buffer."
-  (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
-    (when (buffer-live-p buf)
-      (cc-butler--refresh-terminal-text buf)
-      (with-current-buffer buf
-        (let* ((n (max 1 (or lines 40)))
-               (start (save-excursion (goto-char (point-max))
-                                      (forward-line (- n))
-                                      (line-beginning-position))))
-          (string-trim (buffer-substring-no-properties start (point-max))))))))
+current frame, even for a background (non-displayed) buffer.  Bounded by
+`cc-butler-session-io-timeout' so a stuck redraw cannot hang the caller."
+  (with-timeout (cc-butler-session-io-timeout
+                 (error "Timed out reading session %s's output after %ss (redraw or buffer access may be stuck)"
+                        (cc-butler--display-name dir) cc-butler-session-io-timeout))
+    (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
+      (when (buffer-live-p buf)
+        (cc-butler--refresh-terminal-text buf)
+        (with-current-buffer buf
+          (let* ((n (max 1 (or lines 40)))
+                 (start (save-excursion (goto-char (point-max))
+                                        (forward-line (- n))
+                                        (line-beginning-position))))
+            (string-trim (buffer-substring-no-properties start (point-max)))))))))
 
 (defcustom cc-butler-submit-delay 0.1
   "Seconds to wait after sending text before the submitting Return.
@@ -99,20 +117,23 @@ Carriage returns are normalized to LF and stray ESC bytes are stripped so
 the body cannot break out of the paste or submit mid-prompt.  A short
 settle delay precedes the Return so it is not dropped before the input is
 processed."
-  (let* ((buf (get-buffer (claude-code-ide--get-buffer-name dir)))
-         (body (replace-regexp-in-string
-                "\e" ""
-                (replace-regexp-in-string "\r\n?" "\n" (or text "")))))
-    (unless (buffer-live-p buf)
-      (error "No live terminal for session %s" dir))
-    (with-current-buffer buf
-      (if (string-search "\n" body)
-          (claude-code-ide--terminal-send-string (concat "\e[200~" body "\e[201~"))
-        (claude-code-ide--terminal-send-string body))
-      (when submit
-        (sleep-for cc-butler-submit-delay)
-        (claude-code-ide--terminal-send-return)))
-    t))
+  (with-timeout (cc-butler-session-io-timeout
+                 (error "Timed out sending input to session %s after %ss (terminal may be stuck; text may be partially delivered)"
+                        (cc-butler--display-name dir) cc-butler-session-io-timeout))
+    (let* ((buf (get-buffer (claude-code-ide--get-buffer-name dir)))
+           (body (replace-regexp-in-string
+                  "\e" ""
+                  (replace-regexp-in-string "\r\n?" "\n" (or text "")))))
+      (unless (buffer-live-p buf)
+        (error "No live terminal for session %s" dir))
+      (with-current-buffer buf
+        (if (string-search "\n" body)
+            (claude-code-ide--terminal-send-string (concat "\e[200~" body "\e[201~"))
+          (claude-code-ide--terminal-send-string body))
+        (when submit
+          (sleep-for cc-butler-submit-delay)
+          (claude-code-ide--terminal-send-return)))
+      t)))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Butler designation

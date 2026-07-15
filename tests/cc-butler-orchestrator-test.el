@@ -108,5 +108,62 @@ exactly the events text, with no stray separators."
       "- [12:00] worker-a: done: PR #42" nil
     (should (equal "- [12:00] worker-a: done: PR #42" (cc-butler--pending-events-hook-payload)))))
 
+;;;; ---- session I/O timeout guard ---------------------------------------
+;;;; 2026-07-15: a stuck ghostel redraw or wedged terminal write used to hang
+;;;; the calling MCP request for the full 300s client-side timeout, with no
+;;;; Emacs-side bound at all — and since `cc-butler--read-output' is also the
+;;;; fallback path for every session-list row's model/context tag on a cache
+;;;; miss, ONE wedged session could freeze `cc-butler--maybe-refresh' and
+;;;; with it every tool that triggers a refresh, not just direct
+;;;; read_session_output/send_to_session calls. `cc-butler-session-io-timeout'
+;;;; bounds both primitives.
+
+(ert-deftest cc-butler-orchestrator/read-output-times-out-on-stuck-redraw ()
+  "Given a session whose terminal redraw hangs, Then `cc-butler--read-output'
+gives up after `cc-butler-session-io-timeout' instead of blocking forever."
+  (let ((cc-butler-session-io-timeout 0.2)
+        (term-buf (get-buffer-create " *cc-butler-test-term*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                   (lambda (_d) (buffer-name term-buf)))
+                  ((symbol-function 'cc-butler--display-name) (lambda (d) d))
+                  ((symbol-function 'cc-butler--refresh-terminal-text)
+                   (lambda (_buf) (sleep-for 5))))
+          (let ((start (float-time)))
+            (should-error (cc-butler--read-output "/worker/"))
+            (should (< (- (float-time) start) 2))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-orchestrator/send-input-times-out-on-stuck-terminal ()
+  "Given a session whose terminal write hangs, Then `cc-butler--send-input'
+gives up after `cc-butler-session-io-timeout' instead of blocking forever."
+  (let ((cc-butler-session-io-timeout 0.2)
+        (term-buf (get-buffer-create " *cc-butler-test-term*")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                   (lambda (_d) (buffer-name term-buf)))
+                  ((symbol-function 'cc-butler--display-name) (lambda (d) d))
+                  ((symbol-function 'claude-code-ide--terminal-send-string)
+                   (lambda (_s) (sleep-for 5))))
+          (let ((start (float-time)))
+            (should-error (cc-butler--send-input "/worker/" "hi"))
+            (should (< (- (float-time) start) 2))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-orchestrator/read-output-still-works-within-timeout ()
+  "Given a session that responds promptly, Then `cc-butler--read-output'
+returns its content normally — the timeout guard must not disturb the
+non-hung path."
+  (let ((cc-butler-session-io-timeout 5)
+        (term-buf (get-buffer-create " *cc-butler-test-term*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (insert "hello from the terminal\n"))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+            (should (equal "hello from the terminal" (cc-butler--read-output "/worker/")))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here
