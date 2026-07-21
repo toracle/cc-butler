@@ -180,9 +180,12 @@ below the live input row."
 (defun cc-butler-orchestrator-test--insert-ghost-line (text)
   "Insert TEXT as the input row — sandwiched between two border-rule
 lines, matching how Claude Code actually renders the live input area —
-with TEXT painted in the ghost/autocomplete face signature."
+with TEXT painted in the ghost/autocomplete face signature. The prompt is
+followed by U+00A0 NO-BREAK SPACE, not an ordinary space — that is what
+Claude Code actually renders (confirmed 2026-07-21, cc-butler#6 second
+miss); using an ordinary space here is what let that miss ship green."
   (cc-butler-orchestrator-test--insert-border-line)
-  (insert "❯ ")
+  (insert "❯ ")
   (let ((start (point)))
     (insert text)
     (put-text-property start (point) 'face
@@ -218,7 +221,7 @@ fail-safe treats anything that isn't confirmed-ghost as real."
         (progn
           (with-current-buffer term-buf
             (cc-butler-orchestrator-test--insert-border-line)
-            (insert "❯ ")
+            (insert "❯ ")
             (let ((start (point)))
               (insert "merge PR #72 please")
               (put-text-property start (point) 'face
@@ -303,7 +306,7 @@ correctly — the border check is framing, not purity."
             (insert " plugin-gateway-routing-audit ")
             (insert (make-string 4 cc-butler--border-rule-char))
             (insert "\n")
-            (insert "❯ ")
+            (insert "❯ ")
             (let ((start (point)))
               (insert "PR #72 머지 진행해주세요")
               (put-text-property start (point) 'face
@@ -318,6 +321,62 @@ correctly — the border check is framing, not purity."
               (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
               (should-not (string-match-p "PR #72" out)))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-orchestrator/read-output-redacted-hides-ghost-with-nbsp-prompt-pad ()
+  "Regression for the SECOND cc-butler#6 miss (2026-07-21): a real live
+phantom (\"move to #7\", the correct next-step guess) passed through
+`cc-butler--read-output-redacted' completely unredacted. Root cause:
+Claude Code pads the prompt with U+00A0 NO-BREAK SPACE after \"❯\", not
+an ordinary space, so the old fixed-offset check (`looking-at-p \"❯ \"'
+with an ordinary space) failed to match, fell back to sampling the
+unfaced \"❯\" glyph itself, and the fail-safe correctly-but-wrongly
+called an unreadable sample \"real\". Built from the ACTUAL captured row
+— \"❯\" + U+00A0 + ghost-faced text — not a synthetic fixture with an
+ordinary space; that is exactly the gap that let the bug ship at
+157/157 green. `cc-butler--line-ghost-p' fixes this by scanning every
+cell in the row instead of trusting one offset to hold it."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (cc-butler-orchestrator-test--insert-border-line)
+            (insert "❯ ")
+            (let ((start (point)))
+              (insert "move to #7")
+              (put-text-property start (point) 'face
+                                  (list :foreground cc-butler--ghost-face-fg
+                                        :background cc-butler--ghost-face-bg)))
+            (insert "\n")
+            (cc-butler-orchestrator-test--insert-border-line))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+            (let ((out (cc-butler--read-output-redacted "/worker/")))
+              (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
+              (should-not (string-match-p "move to #7" out)))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-orchestrator/line-ghost-p-skips-unfaced-prompt-glyph ()
+  "`cc-butler--line-ghost-p' judges on a faced cell, not on offset 0 (the
+prompt glyph, which carries no face at all whether padded with an
+ordinary space or U+00A0) — direct unit coverage of the scan itself,
+independent of the border/redaction machinery around it."
+  (with-temp-buffer
+    (insert "❯ ")
+    (let ((start (point)))
+      (insert "phantom text")
+      (put-text-property start (point) 'face
+                          (list :foreground cc-butler--ghost-face-fg
+                                :background cc-butler--ghost-face-bg)))
+    (should (cc-butler--line-ghost-p (point-min) (point-max)))))
+
+(ert-deftest cc-butler-orchestrator/line-ghost-p-nil-when-nothing-faced ()
+  "`cc-butler--line-ghost-p' returns nil (fail-safe: treat as real) when no
+cell in the row carries any face at all — the genuinely-empty live input
+row case, not a detection failure."
+  (with-temp-buffer
+    (insert "❯ ")
+    (should-not (cc-butler--line-ghost-p (point-min) (point-max)))))
 
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here

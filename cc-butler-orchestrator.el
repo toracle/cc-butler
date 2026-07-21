@@ -135,6 +135,23 @@ root-caused.")
     (setq cc-butler--ghost-redaction-debug
           (seq-take cc-butler--ghost-redaction-debug cc-butler--ghost-redaction-debug-max))))
 
+(defun cc-butler--line-ghost-p (line-beg line-end)
+  "Return non-nil if any character in [LINE-BEG,LINE-END) carries the
+ghost/autocomplete face signature (`cc-butler--ghost-face-p'). Scans
+every cell in the row rather than sampling a single fixed offset — the
+prompt glyph and any padding after it carry no face at all (confirmed
+2026-07-21: Claude Code pads \"❯\" with U+00A0 NO-BREAK SPACE on some
+builds, not an ordinary space, so a fixed offset can land on an unfaced
+cell and wrongly read as real). An entirely unfaced row still yields
+nil — fail-safe: nothing readable to call ghost."
+  (let ((pos line-beg))
+    (catch 'found
+      (while (< pos line-end)
+        (when (cc-butler--ghost-face-p (get-text-property pos 'face))
+          (throw 'found t))
+        (setq pos (1+ pos)))
+      nil)))
+
 (defun cc-butler--redact-ghost-input-line (start end)
   "In the current buffer, return the text between START and END as a
 plain string, with one exception: if the input row — the line
@@ -160,40 +177,45 @@ holds regardless of theme, and regardless of whether the row itself is
 empty, ghost, or real. Do not \"simplify\" this back to a color check on
 the border; that was tried and found fragile before this landed.
 
-Fail-safe: if no such sandwich is found in range, or the row's face
-cannot be read, the text is returned unchanged — an unreadable signal is
-always treated as real, never optimistically assumed to be ghost. See
-governance principle butler-ghost-text-not-a-blocker-authorization-or-data."
+Judging ghost-vs-real used to sample ONE fixed offset into the row (just
+past a literal \"❯ \" prefix). That was abandoned 2026-07-21 (cc-butler#6,
+second miss on the same day): a live phantom (\"move to #7\") passed
+through unredacted because Claude Code pads the prompt with U+00A0
+NO-BREAK SPACE after \"❯\", not an ordinary space — the literal prefix
+match failed, the fallback landed on the unfaced \"❯\" glyph itself, and
+the fail-safe correctly-but-wrongly treated an unreadable single sample
+as real. `cc-butler--line-ghost-p' scans every cell in the row instead
+of trusting one offset to be the right one — robust to NBSP padding, to
+a changed prompt glyph, and to the single-point-sample risk at once,
+not just the specific character that broke this time.
+
+Fail-safe: if no such sandwich is found in range, or no cell in the row
+carries any face at all, the text is returned unchanged — an unreadable
+signal is always treated as real, never optimistically assumed to be
+ghost. See governance principle
+butler-ghost-text-not-a-blocker-authorization-or-data."
   (save-excursion
     (let* ((line-beg (cc-butler--find-input-line start end))
-           (line-text-beg
-            (and line-beg
-                 (save-excursion
-                   (goto-char line-beg)
-                   (if (looking-at-p "❯ ") (+ line-beg 3) line-beg)))))
+           (line-end (and line-beg (save-excursion (goto-char line-beg) (line-end-position)))))
       ;; TEMPORARY diagnostic capture — see the defvar above. Kept in
       ;; place until this redesign is confirmed against a real live
       ;; phantom, not just synthetic input (cc-butler#6).
       (if (not line-beg)
           (cc-butler--ghost-redaction-debug-record
            (list :time (format-time-string "%H:%M:%S") :found nil))
-        (let* ((l-end (save-excursion (goto-char line-beg) (line-end-position)))
-               (l-len (- l-end line-beg))
+        (let* ((l-len (- line-end line-beg))
                (offsets (seq-filter (lambda (o) (< o l-len))
                                     '(0 1 2 3 4 5 6 8 10 15 20 30 40)))
                (faces (mapcar (lambda (o) (cons o (get-text-property (+ line-beg o) 'face)))
                              offsets)))
           (cc-butler--ghost-redaction-debug-record
            (list :time (format-time-string "%H:%M:%S") :found t
-                 :line-text (buffer-substring-no-properties line-beg l-end)
+                 :line-text (buffer-substring-no-properties line-beg line-end)
                  :faces faces))))
-      (if (and line-beg (<= line-text-beg end)
-               (cc-butler--ghost-face-p (get-text-property line-text-beg 'face)))
+      (if (and line-beg (cc-butler--line-ghost-p line-beg line-end))
           (concat (buffer-substring-no-properties start line-beg)
                   "❯ [ghost suggestion, not user input]"
-                  (buffer-substring-no-properties
-                   (save-excursion (goto-char line-beg) (line-end-position))
-                   end))
+                  (buffer-substring-no-properties line-end end))
         (buffer-substring-no-properties start end)))))
 
 (defun cc-butler--read-output-redacted (dir &optional lines)
