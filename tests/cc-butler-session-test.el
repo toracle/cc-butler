@@ -163,5 +163,60 @@ or with a cryptic downstream error)."
     (let ((claude-code-ide-cli-path "/nonexistent/claude"))
       (should-error (cc-butler--launch-session "/tmp") :type 'user-error))))
 
+;;;; ---- launch readiness (cc-butler#8, 2026-07-21) -------------------
+
+(ert-deftest cc-butler-session/wait-for-ready-returns-once-input-line-appears ()
+  "`cc-butler--wait-for-session-ready' returns (no error) as soon as the
+session buffer shows a live input row — it does not wait out the full
+timeout when the row is already there."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-ready-term*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (insert (make-string 24 cc-butler--border-rule-char))
+            (insert "\n❯ \n")
+            (insert (make-string 24 cc-butler--border-rule-char)))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil))
+                    (cc-butler-launch-ready-timeout 2))
+            (should (progn (cc-butler--wait-for-session-ready "/worker/") t))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/wait-for-ready-errors-on-timeout ()
+  "`cc-butler--wait-for-session-ready' signals a loud error — rather than
+returning as if launch succeeded — when no input row ever appears within
+`cc-butler-launch-ready-timeout'. Silently returning here would hand a
+caller a false-ready session (cc-butler#8)."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-ready-term-2*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (insert "still starting up...\n"))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil))
+                    (cc-butler-launch-ready-timeout 0.3))
+            (should-error (cc-butler--wait-for-session-ready "/worker/"))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/launch-session-waits-for-readiness ()
+  "`cc-butler--launch-session' calls `cc-butler--wait-for-session-ready'
+after spawning and configuring, so a caller can never be handed a
+false-ready session into which a `send_to_session' silently vanishes
+(cc-butler#8)."
+  (let ((orig-featurep (symbol-function 'featurep))
+        waited-for)
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/claude"))
+              ((symbol-function 'featurep)
+               (lambda (f) (or (eq f 'ghostel) (funcall orig-featurep f))))
+              ((symbol-function 'claude-code-ide) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler--configure-session) (lambda (_dir) nil))
+              ((symbol-function 'cc-butler--wait-for-session-ready)
+               (lambda (dir) (setq waited-for dir))))
+      (let ((claude-code-ide-terminal-backend 'ghostel)
+            (claude-code-ide-cli-path "/usr/bin/claude"))
+        (cc-butler--launch-session "/tmp/some-worker/")))
+    (should (equal waited-for (file-name-as-directory (expand-file-name "/tmp/some-worker/"))))))
+
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here

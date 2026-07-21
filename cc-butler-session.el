@@ -682,19 +682,135 @@ depends on but cannot install or verify for you."
       (special-mode)
       (display-buffer (current-buffer)))))
 
+;;;; ------------------------------------------------------------------
+;;;; Terminal-text access (moved here from cc-butler-orchestrator.el
+;;;; 2026-07-21, cc-butler#8 — both `cc-butler--launch-session' below and
+;;;; `cc-butler--resume-in' need these to detect launch readiness, and
+;;;; session.el sits below orchestrator.el in the require graph, so this
+;;;; is the shared layer both can reach without a circular require)
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler--refresh-terminal-text (buffer)
+  "Force BUFFER's text to be re-synced from the live ghostel grid.
+ghostel only repaints a buffer that is displayed in a window; a
+background session buffer is never redisplayed, so its text can be a
+stale frame.  Drive a full `ghostel--redraw' directly (the same call
+ghostel makes on config changes) so the text reflects the current frame
+without needing a window."
+  (with-current-buffer buffer
+    (when (and (boundp 'ghostel--term) ghostel--term (fboundp 'ghostel--redraw))
+      (let ((inhibit-read-only t))
+        (ignore-errors (ghostel--redraw ghostel--term t))))))
+
+(defconst cc-butler--border-rule-char ?─
+  "The box-drawing horizontal-rule character Claude Code draws immediately
+above and below the live input row. Anchor on this CONTENT, not color —
+measured foreground varies by session/theme (#0891b2 on one session,
+#888888 on five others sampled 2026-07-21), the same theme-dependency
+already known to affect the ghost/autocomplete color signature (see
+cc-butler#6). The character itself was stable across every session
+sampled.")
+
+(defun cc-butler--border-line-p ()
+  "Return non-nil if the line at point is a border rule: a run of
+`cc-butler--border-rule-char' framing both ends of the line, regardless
+of color. Not required to be PURELY the rule character — Claude Code
+sometimes draws a short title (a branch/topic name) embedded in the
+middle of the top border (confirmed 2026-07-21, e.g. \"───── some-topic
+──\"), so this checks framing, not purity."
+  (let ((text (string-trim (buffer-substring-no-properties
+                             (line-beginning-position) (line-end-position))))
+        (rule3 (make-string 3 cc-butler--border-rule-char))
+        (rule2 (make-string 2 cc-butler--border-rule-char)))
+    (and (> (length text) 3)
+         (string-prefix-p rule3 text)
+         (string-suffix-p rule2 text))))
+
+(defun cc-butler--find-input-line (start end)
+  "Search START..END for the input row: the single line sandwiched
+between two consecutive border-rule lines (`cc-butler--border-line-p') —
+the box Claude Code draws around the live input area, present whether
+that area is empty, holds a ghost suggestion, or holds real typed text.
+Return the buffer position of the row's start, preferring the LAST such
+sandwich (closest to END), or nil if none is found."
+  (save-excursion
+    (goto-char start)
+    (let (result)
+      (while (< (point) end)
+        (if (cc-butler--border-line-p)
+            (progn
+              (forward-line 1)
+              (when (< (point) end)
+                (let ((candidate (point)))
+                  (forward-line 1)
+                  (when (and (< (point) end) (cc-butler--border-line-p))
+                    (setq result candidate))
+                  (goto-char candidate))))
+          (forward-line 1)))
+      result)))
+
+;;;; ------------------------------------------------------------------
+;;;; Launch readiness (cc-butler#8, 2026-07-21) — a freshly spawned
+;;;; `claude' CLI process is not immediately ready to read stdin.  A send
+;;;; landing in that window is silently dropped, with no error and no
+;;;; sign in `list_claude_sessions' that anything was wrong.  Gate ONCE,
+;;;; right after spawn, rather than on every `send_to_session' call — a
+;;;; busy session legitimately shows no input row too (mid permission
+;;;; prompt, mid a "switch model?" confirmation, mid tool-call rendering,
+;;;; all confirmed live 2026-07-21), so a per-send gate would add latency
+;;;; or hang on ordinary sends that have nothing wrong with them.
+;;;; ------------------------------------------------------------------
+
+(defcustom cc-butler-launch-ready-timeout 5
+  "Seconds to wait, right after a session's process is spawned, for its
+input box to actually render before giving up. See
+`cc-butler--wait-for-session-ready'."
+  :type 'number
+  :group 'cc-butler)
+
+(defun cc-butler--wait-for-session-ready (dir)
+  "Block until DIR's session buffer shows a live input row (see
+`cc-butler--find-input-line'), or `cc-butler-launch-ready-timeout'
+elapses.  Called once, right after a session's process is spawned, by
+both `cc-butler--launch-session' and `cc-butler--resume-in' — the two
+places a `claude' process is started — so neither can return a false
+\"launched\" into which a caller's first `send_to_session' silently
+vanishes (cc-butler#8).
+
+Signals an error on timeout rather than returning silently: a caller
+that believes launch succeeded when the session never became reachable
+is worse off than one told plainly that it didn't."
+  (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
+    (unless (buffer-live-p buf)
+      (error "cc-butler: no terminal buffer for %s right after launch" dir))
+    (with-timeout (cc-butler-launch-ready-timeout
+                   (error "cc-butler: session %s did not show a live input row within %ss of launch (cc-butler#8)"
+                          (cc-butler--display-name dir) cc-butler-launch-ready-timeout))
+      (while (not (with-current-buffer buf
+                    (cc-butler--refresh-terminal-text buf)
+                    (let ((start (save-excursion (goto-char (point-max))
+                                                  (forward-line -40)
+                                                  (point))))
+                      (cc-butler--find-input-line start (point-max)))))
+        (sleep-for 0.1)))))
+
 (defun cc-butler--launch-session (dir)
   "The ONE path every role launches through — butler, steward, and workers —
 so their ghostel config cannot diverge (global-consistency).  Launches a
 channel-joined Claude session in DIR and applies the uniform config.
 Runs `cc-butler--launch-preflight-diagnostics' first so a fresh-install
-misconfiguration is a loud, actionable `user-error', not a silent no-op."
+misconfiguration is a loud, actionable `user-error', not a silent no-op.
+Blocks until the session is actually ready to receive input (see
+`cc-butler--wait-for-session-ready') before returning, so a caller can
+never be handed a false-ready session (cc-butler#8)."
   (dolist (p (cc-butler--launch-preflight-diagnostics))
     (if (eq (car p) 'error)
         (user-error "cc-butler: %s" (cdr p))
       (message "cc-butler: %s" (cdr p))))
   (let ((default-directory (file-name-as-directory (expand-file-name dir))))
     (cc-butler--with-channel (claude-code-ide))
-    (cc-butler--configure-session dir)))
+    (cc-butler--configure-session dir))
+  (cc-butler--wait-for-session-ready dir))
 
 (defvar cc-butler-after-preview-functions nil
   "Abnormal hook run after a session terminal is shown in the main window.

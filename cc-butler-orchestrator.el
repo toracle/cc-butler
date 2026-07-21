@@ -57,18 +57,6 @@
   "Return the working-dir of the session that invoked the current MCP tool."
   (plist-get (claude-code-ide-mcp-server-get-session-context) :project-dir))
 
-(defun cc-butler--refresh-terminal-text (buffer)
-  "Force BUFFER's text to be re-synced from the live ghostel grid.
-ghostel only repaints a buffer that is displayed in a window; a
-background session buffer is never redisplayed, so its text can be a
-stale frame.  Drive a full `ghostel--redraw' directly (the same call
-ghostel makes on config changes) so the text reflects the current frame
-without needing a window."
-  (with-current-buffer buffer
-    (when (and (boundp 'ghostel--term) ghostel--term (fboundp 'ghostel--redraw))
-      (let ((inhibit-read-only t))
-        (ignore-errors (ghostel--redraw ghostel--term t))))))
-
 (defcustom cc-butler-session-io-timeout 8
   "Seconds before reading or writing a session's terminal buffer gives up.
 Bounds `cc-butler--read-output'/`cc-butler--send-input' — without this, a
@@ -126,52 +114,6 @@ with."
   (and (consp face)
        (equal (plist-get face :foreground) cc-butler--ghost-face-fg)
        (equal (plist-get face :background) cc-butler--ghost-face-bg)))
-
-(defconst cc-butler--border-rule-char ?─
-  "The box-drawing horizontal-rule character Claude Code draws immediately
-above and below the live input row. Anchor on this CONTENT, not color —
-measured foreground varies by session/theme (#0891b2 on one session,
-#888888 on five others sampled 2026-07-21), the same theme-dependency
-already known to affect `cc-butler--ghost-face-p' (see cc-butler#6). The
-character itself was stable across every session sampled.")
-
-(defun cc-butler--border-line-p ()
-  "Return non-nil if the line at point is a border rule: a run of
-`cc-butler--border-rule-char' framing both ends of the line, regardless
-of color. Not required to be PURELY the rule character — Claude Code
-sometimes draws a short title (a branch/topic name) embedded in the
-middle of the top border (confirmed 2026-07-21, e.g. \"───── some-topic
-──\"), so this checks framing, not purity."
-  (let ((text (string-trim (buffer-substring-no-properties
-                             (line-beginning-position) (line-end-position))))
-        (rule3 (make-string 3 cc-butler--border-rule-char))
-        (rule2 (make-string 2 cc-butler--border-rule-char)))
-    (and (> (length text) 3)
-         (string-prefix-p rule3 text)
-         (string-suffix-p rule2 text))))
-
-(defun cc-butler--find-input-line (start end)
-  "Search START..END for the input row: the single line sandwiched
-between two consecutive border-rule lines (`cc-butler--border-line-p') —
-the box Claude Code draws around the live input area, present whether
-that area is empty, holds a ghost suggestion, or holds real typed text.
-Return the buffer position of the row's start, preferring the LAST such
-sandwich (closest to END), or nil if none is found."
-  (save-excursion
-    (goto-char start)
-    (let (result)
-      (while (< (point) end)
-        (if (cc-butler--border-line-p)
-            (progn
-              (forward-line 1)
-              (when (< (point) end)
-                (let ((candidate (point)))
-                  (forward-line 1)
-                  (when (and (< (point) end) (cc-butler--border-line-p))
-                    (setq result candidate))
-                  (goto-char candidate))))
-          (forward-line 1)))
-      result)))
 
 ;; --- TEMPORARY diagnostics for cc-butler#6 (silent redaction miss,
 ;; 2026-07-21) — remove once the miss is root-caused.  Pure observability:

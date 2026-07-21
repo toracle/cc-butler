@@ -143,12 +143,18 @@ explicit forget is the only correct signal for a session whose directory
               (cc-butler--load-roster)))
 
 (defun cc-butler--resume-in (dir)
-  "Launch a Claude session in DIR resuming its previous conversation."
+  "Launch a Claude session in DIR resuming its previous conversation.
+Blocks until the session is actually ready to receive input (see
+`cc-butler--wait-for-session-ready') before returning, same as
+`cc-butler--launch-session' — this is the OTHER place a `claude' process
+gets spawned, and the startup race that can drop a caller's first
+`send_to_session' (cc-butler#8) applies here too."
   (let ((claude-code-ide-cli-extra-flags
          (string-trim (concat (or claude-code-ide-cli-extra-flags "")
                               " " (mapconcat #'identity cc-butler-resume-args " "))))
         (default-directory (file-name-as-directory (expand-file-name dir))))
-    (cc-butler--with-channel (claude-code-ide))))
+    (cc-butler--with-channel (claude-code-ide)))
+  (cc-butler--wait-for-session-ready dir))
 
 ;;;###autoload
 (defun cc-butler-restore-sessions (&optional force)

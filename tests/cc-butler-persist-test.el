@@ -147,5 +147,20 @@ stale record used to signal an error that `cc-butler--save-roster's
             (should (equal dir (plist-get (car saved) :dir)))))
       (delete-directory tmpdir t))))
 
+;;;; ---- resume path waits for launch readiness (cc-butler#8, 2026-07-21) --
+
+(ert-deftest cc-butler-persist/resume-in-waits-for-readiness ()
+  "`cc-butler--resume-in' calls `cc-butler--wait-for-session-ready' after
+spawning, same as `cc-butler--launch-session' — this is the OTHER place a
+`claude' process is spawned, and it is exactly the path this morning's
+resumed-fleet incident went through, so it needs the same guard against
+handing back a false-ready session (cc-butler#8)."
+  (let (waited-for)
+    (cl-letf (((symbol-function 'claude-code-ide) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler--wait-for-session-ready)
+               (lambda (dir) (setq waited-for dir))))
+      (cc-butler--resume-in "/tmp/some-resumed-worker/"))
+    (should (equal waited-for (file-name-as-directory (expand-file-name "/tmp/some-resumed-worker/"))))))
+
 (provide 'cc-butler-persist-test)
 ;;; cc-butler-persist-test.el ends here
