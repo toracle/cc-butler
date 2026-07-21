@@ -378,5 +378,42 @@ row case, not a detection failure."
     (insert "❯ ")
     (should-not (cc-butler--line-ghost-p (point-min) (point-max)))))
 
+(ert-deftest cc-butler-orchestrator/line-ghost-p-detects-ghost-even-when-glyph-is-faced ()
+  "The prompt glyph's own face is NOT constant — sometimes nil (the
+original captured phantom), sometimes a dim #999999/#262626 status style
+(observed live 2026-07-21 on a genuinely-empty row). `cc-butler--line-ghost-p'
+must not resolve on whichever cell comes first in the row; it must find
+the ghost signature wherever it actually is, even when a non-ghost face
+(the glyph's dim style) comes before it. This is the case a
+\"first-faced-cell\" reading of the function would fail — direct
+verification that the actual scan does not have that failure mode."
+  (with-temp-buffer
+    (insert "❯")
+    (put-text-property (1- (point)) (point) 'face
+                        (list :foreground "#999999" :background "#262626"))
+    (insert " ")
+    (put-text-property (1- (point)) (point) 'face
+                        (list :foreground "#999999" :background "#262626"))
+    (let ((start (point)))
+      (insert "some ghost suggestion")
+      (put-text-property start (point) 'face
+                          (list :foreground cc-butler--ghost-face-fg
+                                :background cc-butler--ghost-face-bg)))
+    (should (cc-butler--line-ghost-p (point-min) (point-max)))))
+
+(ert-deftest cc-butler-orchestrator/line-ghost-p-nil-when-glyph-faced-but-row-otherwise-empty ()
+  "A dim-faced prompt glyph (#999999/#262626, not the ghost signature) on
+an otherwise-empty row must still read as real/empty, not ghost —
+confirms the dim status style near the prompt does not itself trigger a
+false positive."
+  (with-temp-buffer
+    (insert "❯")
+    (put-text-property (1- (point)) (point) 'face
+                        (list :foreground "#999999" :background "#262626"))
+    (insert " ")
+    (put-text-property (1- (point)) (point) 'face
+                        (list :foreground "#999999" :background "#262626"))
+    (should-not (cc-butler--line-ghost-p (point-min) (point-max)))))
+
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here
