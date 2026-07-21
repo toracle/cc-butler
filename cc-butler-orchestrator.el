@@ -83,11 +83,13 @@ direct read_session_output/send_to_session calls."
   :type 'number
   :group 'cc-butler)
 
-(defun cc-butler--read-output (dir &optional lines)
-  "Return the last LINES (default 40) of session DIR's terminal screen.
-The terminal text is force-refreshed first so the capture is always the
-current frame, even for a background (non-displayed) buffer.  Bounded by
-`cc-butler-session-io-timeout' so a stuck redraw cannot hang the caller."
+(defun cc-butler--output-buffer-and-bounds (dir &optional lines)
+  "Return (BUF START . END) for the last LINES (default 40) of DIR's
+terminal screen, after a force-refresh, or nil if the buffer isn't live.
+Bounded by `cc-butler-session-io-timeout' so a stuck redraw cannot hang
+the caller.  Shared by `cc-butler--read-output' (plain text, properties
+stripped) and `cc-butler--read-output-redacted' (ghost-input-line-aware,
+still needs the live `face' properties BUF carries before they're gone)."
   (with-timeout (cc-butler-session-io-timeout
                  (error "Timed out reading session %s's output after %ss (redraw or buffer access may be stuck)"
                         (cc-butler--display-name dir) cc-butler-session-io-timeout))
@@ -99,7 +101,71 @@ current frame, even for a background (non-displayed) buffer.  Bounded by
                  (start (save-excursion (goto-char (point-max))
                                         (forward-line (- n))
                                         (line-beginning-position))))
-            (string-trim (buffer-substring-no-properties start (point-max)))))))))
+            (cons buf (cons start (point-max)))))))))
+
+(defun cc-butler--read-output (dir &optional lines)
+  "Return the last LINES (default 40) of session DIR's terminal screen, as
+plain text.  See `cc-butler--output-buffer-and-bounds'."
+  (when-let ((bb (cc-butler--output-buffer-and-bounds dir lines)))
+    (with-current-buffer (car bb)
+      (string-trim (buffer-substring-no-properties (cadr bb) (cddr bb))))))
+
+(defconst cc-butler--ghost-face-fg "#a7a7a7"
+  "Foreground color Claude Code renders ghost/autocomplete input-line text
+with (measured 2026-07-21) — see governance principle
+butler-ghost-text-not-a-blocker-authorization-or-data.")
+
+(defconst cc-butler--ghost-face-bg "#262626"
+  "Background color Claude Code renders ghost/autocomplete input-line text
+with (measured 2026-07-21) — pairs with `cc-butler--ghost-face-fg'.")
+
+(defun cc-butler--ghost-face-p (face)
+  "Return non-nil if FACE (a plist, as ghostel paints terminal cells)
+matches the color signature Claude Code renders ghost/autocomplete text
+with."
+  (and (consp face)
+       (equal (plist-get face :foreground) cc-butler--ghost-face-fg)
+       (equal (plist-get face :background) cc-butler--ghost-face-bg)))
+
+(defun cc-butler--redact-ghost-input-line (start end)
+  "In the current buffer, return the text between START and END as a
+plain string, with one exception: if the LAST \"❯ \"-prefixed line in
+that range is rendered in the ghost/autocomplete color signature (not
+real input), its content is replaced with a plain marker instead of
+being returned as if it were real.
+
+Fail-safe: if no \"❯ \"-prefixed line is found in range, or its face
+cannot be read, the text is returned unchanged — an unreadable signal is
+always treated as real, never optimistically assumed to be ghost. See
+governance principle butler-ghost-text-not-a-blocker-authorization-or-data."
+  (save-excursion
+    (goto-char end)
+    (let (line-beg line-text-beg)
+      (catch 'found
+        (while (> (point) start)
+          (forward-line -1)
+          (when (and (>= (point) start) (looking-at-p "❯ "))
+            (setq line-beg (point) line-text-beg (+ (point) 3))
+            (throw 'found nil))))
+      (if (and line-beg (<= line-text-beg end)
+               (cc-butler--ghost-face-p (get-text-property line-text-beg 'face)))
+          (concat (buffer-substring-no-properties start line-beg)
+                  "❯ [ghost suggestion, not user input]"
+                  (buffer-substring-no-properties
+                   (save-excursion (goto-char line-beg) (line-end-position))
+                   end))
+        (buffer-substring-no-properties start end)))))
+
+(defun cc-butler--read-output-redacted (dir &optional lines)
+  "Like `cc-butler--read-output', but a ghost/autocomplete input line is
+replaced with a plain marker instead of being returned as real text —
+used by the `read_session_output' MCP tool so a caller can never mistake
+a phantom for a blocker, an authorization, or data.  See
+`cc-butler--redact-ghost-input-line' and governance principle
+butler-ghost-text-not-a-blocker-authorization-or-data."
+  (when-let ((bb (cc-butler--output-buffer-and-bounds dir lines)))
+    (with-current-buffer (car bb)
+      (string-trim (cc-butler--redact-ghost-input-line (cadr bb) (cddr bb))))))
 
 (defcustom cc-butler-submit-delay 0.1
   "Seconds to wait after sending text before the submitting Return.
@@ -984,11 +1050,14 @@ is rendered as a document in 정수님's inbox; otherwise it queues for
     (if rows (mapconcat #'identity (nreverse rows) "\n") "No active Claude sessions")))
 
 (defun cc-butler-tool-read-session (name &optional lines)
-  "MCP tool: return the recent terminal output of session NAME."
+  "MCP tool: return the recent terminal output of session NAME.
+A ghost/autocomplete input-line suggestion is redacted to a plain marker
+rather than returned as if it were real input — see
+`cc-butler--read-output-redacted'."
   (let ((dir (cc-butler--dir-by-name name)))
     (if (not dir)
         (format "No session named %S.  Call list_claude_sessions for names." name)
-      (or (cc-butler--read-output dir (and lines (truncate lines)))
+      (or (cc-butler--read-output-redacted dir (and lines (truncate lines)))
           "(no output)"))))
 
 (defun cc-butler-tool-send-session (name text)
@@ -1131,7 +1200,7 @@ without anything being typed into its input box."
 (claude-code-ide-make-tool
  :function #'cc-butler-tool-read-session
  :name "read_session_output"
- :description "Read the recent terminal screen of another Claude session by name, to see what it is doing or asking. The text is that session's live TUI screen (may include UI chrome)."
+ :description "Read the recent terminal screen of another Claude session by name, to see what it is doing or asking. The text is that session's live TUI screen (may include UI chrome). A detected ghost/autocomplete input-line suggestion is replaced with a plain marker rather than returned as real text — it is never the session's actual input."
  :args '((:name "name"
                 :type string
                 :description "Session name from list_claude_sessions (e.g. 'app-billing').")

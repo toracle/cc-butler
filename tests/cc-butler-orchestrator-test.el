@@ -165,5 +165,91 @@ non-hung path."
             (should (equal "hello from the terminal" (cc-butler--read-output "/worker/")))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
+;;;; ---- ghost/autocomplete input-line redaction (2026-07-21, cc-butler#6) --
+;;;; read_session_output used to return ghost-faced input-line text
+;;;; byte-identical to real typed input (buffer-substring-no-properties
+;;;; strips the one signal that tells them apart). See governance principle
+;;;; butler-ghost-text-not-a-blocker-authorization-or-data.
+
+(defun cc-butler-orchestrator-test--insert-ghost-line (text)
+  "Insert TEXT into the current buffer as a \"❯ \"-prefixed line, painted
+with the ghost/autocomplete face signature."
+  (insert "❯ ")
+  (let ((start (point)))
+    (insert text)
+    (put-text-property start (point) 'face
+                        (list :foreground cc-butler--ghost-face-fg
+                              :background cc-butler--ghost-face-bg)))
+  (insert "\n"))
+
+(ert-deftest cc-butler-orchestrator/read-output-redacted-hides-ghost-input-line ()
+  "Given a session whose input line is ghost/autocomplete text (the
+measured color signature), Then `cc-butler--read-output-redacted' replaces
+it with a plain marker rather than returning it as real text."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (insert "some earlier transcript line\n")
+            (cc-butler-orchestrator-test--insert-ghost-line "PR #72 머지 진행해주세요"))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+            (let ((out (cc-butler--read-output-redacted "/worker/")))
+              (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
+              (should-not (string-match-p "PR #72" out)))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-orchestrator/read-output-redacted-keeps-real-input-line ()
+  "Given a session whose input line is real (not the ghost color
+signature), Then `cc-butler--read-output-redacted' returns it unchanged —
+fail-safe treats anything that isn't confirmed-ghost as real."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (insert "❯ ")
+            (let ((start (point)))
+              (insert "merge PR #72 please")
+              (put-text-property start (point) 'face
+                                  (list :foreground "#eeeeee" :background "#373737"))))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+            (let ((out (cc-butler--read-output-redacted "/worker/")))
+              (should (string-match-p "merge PR #72 please" out))
+              (should-not (string-match-p "ghost suggestion" out)))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-orchestrator/read-output-redacted-passthrough-when-no-input-line ()
+  "Given a session with no \"❯ \"-prefixed line at all (fail-safe case:
+nothing to detect), Then `cc-butler--read-output-redacted' returns the
+plain text unchanged, same as `cc-butler--read-output'."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (insert "plain transcript output\n"))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+            (should (equal "plain transcript output" (cc-butler--read-output-redacted "/worker/")))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-orchestrator/read-output-unfiltered-unaffected-by-redaction ()
+  "Given the same ghost-faced input line, Then the ORIGINAL
+`cc-butler--read-output' (still used by cc-butler-cleanup.el's model/context
+detectors) is completely unaffected by the new redaction path — it keeps
+returning the raw text, properties stripped, exactly as before."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (cc-butler-orchestrator-test--insert-ghost-line "PR #72 머지 진행해주세요"))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+            (should (string-match-p "PR #72" (cc-butler--read-output "/worker/")))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here
