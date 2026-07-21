@@ -912,14 +912,9 @@ input-waiting queue."
       (cc-butler--forge-fetch (plist-get s :dir))))
   (cc-butler--reprint))
 
-(defun cc-butler-new-session ()
-  "Start a new Claude session in a chosen directory, then re-open the manager."
-  (interactive)
-  (let ((default-directory
-         (read-directory-name "Start Claude session in: "
-                              (or (cc-butler--dir-at-point) default-directory))))
-    (claude-code-ide))
-  (cc-butler))
+;; `cc-butler-new-session' moved to cc-butler-workspace.el 2026-07-21
+;; (cc-butler#7) — it needs `cc-butler--scaffold'/`cc-butler--start-session-in',
+;; which live there, and workspace.el requires session.el, not the reverse.
 
 (defun cc-butler-quit ()
   "Close the session-list side window."

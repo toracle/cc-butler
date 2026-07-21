@@ -17,7 +17,8 @@
 ;; The layout differs per project, so it lives in DATA: a template registry.
 ;; A project template knows the meta repo URL and the import list; adding
 ;; another project is just another entry.  An "arbitrary" choice falls back to
-;; `cc-butler-new-session' (pick a directory, start a session, no scaffolding).
+;; `cc-butler-new-session' (pick a directory, scaffold it the same idempotent
+;; way, start a session — no template/repo-clone step, cc-butler#7).
 ;;
 ;; Entry point: M-x cc-butler-new-topic  (also `t' in the cc-butler hydra,
 ;; `N' in the session-manager buffer).
@@ -173,6 +174,33 @@ with t (all succeeded) or nil (a clone failed)."
   (cc-butler--scaffold topic-dir template)
   (cc-butler--start-session-in topic-dir)
   (cc-butler))
+
+;;;###autoload
+(defun cc-butler-new-session ()
+  "Start a new Claude session in a chosen directory, then re-open the manager.
+Moved here from cc-butler-session.el 2026-07-21 (cc-butler#7): this used to
+call `claude-code-ide' directly, so a session started this way — the
+\"arbitrary\" choice `cc-butler-new-topic' itself delegates to — never got
+`.claude/settings.json's statusLine entry (only written by
+`cc-butler-scaffold-functions', which only ran on the template/topic path),
+and also skipped preflight diagnostics, ghostel window-fit config, and the
+input-readiness/trust-dialog gate (cc-butler#8) that every other role-launch
+gets.
+
+Routes through `cc-butler--finish-topic' — the SAME function
+`cc-butler-new-topic' uses — rather than re-inlining its
+scaffold+launch+reopen sequence here. Two call sites independently doing
+the same three steps is exactly how this gap was created in the first
+place (one remembered to scaffold, one didn't); a future fourth step
+only needs to be added once, in `cc-butler--finish-topic', for both
+paths to get it. `cc-butler--scaffold' is idempotent — it never clobbers
+an existing `.projectile'/`CLAUDE.md' — so scaffolding an arbitrary,
+possibly already-set-up directory here is safe; a nil template just
+skips the optional `:claude-import' blurb."
+  (interactive)
+  (let ((dir (read-directory-name "Start Claude session in: "
+                                  (or (cc-butler--dir-at-point) default-directory))))
+    (cc-butler--finish-topic dir nil)))
 
 ;;;###autoload
 (defun cc-butler-new-topic ()

@@ -57,6 +57,60 @@ before this fix.  It should scaffold directly, no clone attempted."
     (should (file-directory-p finished-dir))))
 
 ;;;; ------------------------------------------------------------------
+;;;; cc-butler-new-session: routes through the SAME choke point as
+;;;; cc-butler-new-topic (cc-butler--finish-topic), not a re-inlined copy
+;;;; of its scaffold+launch+reopen sequence (cc-butler#7 — moved here
+;;;; 2026-07-21 from cc-butler-session.el). Two independent call sites
+;;;; doing the same three steps is how this gap was created in the first
+;;;; place; a shared choke point means a future step is added once.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-workspace/new-session-delegates-to-finish-topic ()
+  "`cc-butler-new-session' calls `cc-butler--finish-topic' — the same
+function `cc-butler-new-topic' uses to provision a session — rather than
+re-inlining scaffold+start+reopen itself. This is the structural
+guarantee that a future addition to session provisioning only needs to
+land in ONE place for both entry points to get it (cc-butler#7)."
+  (let ((dir (file-name-as-directory (make-temp-file "cc-new-session-3" t)))
+        finished-with)
+    (cl-letf (((symbol-function 'read-directory-name) (lambda (&rest _) dir))
+              ((symbol-function 'cc-butler--finish-topic)
+               (lambda (d template) (setq finished-with (cons d template)))))
+      (cc-butler-new-session))
+    (should (equal finished-with (cons dir nil)))))
+
+(ert-deftest cc-butler-workspace/new-session-scaffolds-chosen-directory ()
+  "End-to-end (through `cc-butler--finish-topic', not mocked): the chosen
+directory gets scaffolded for real — this is what gives it statusLine
+coverage (cc-butler#7), unlike before when it called `claude-code-ide'
+directly and skipped scaffolding entirely."
+  (let ((dir (file-name-as-directory (make-temp-file "cc-new-session" t))))
+    (cl-letf (((symbol-function 'read-directory-name) (lambda (&rest _) dir))
+              ((symbol-function 'cc-butler--start-session-in) (lambda (_dir) nil))
+              ((symbol-function 'cc-butler) (lambda () nil)))
+      (cc-butler-new-session))
+    (should (file-exists-p (expand-file-name ".projectile" dir)))
+    (should (file-exists-p (expand-file-name "CLAUDE.md" dir)))))
+
+(ert-deftest cc-butler-workspace/new-session-routes-through-launch-session ()
+  "End-to-end (through `cc-butler--finish-topic', not mocked): the session
+starts via `cc-butler--start-session-in' (which routes through
+`cc-butler--launch-session') rather than calling `claude-code-ide'
+directly — this is what gives it preflight diagnostics, ghostel
+window-fit config, and the input-readiness/trust-dialog gate
+(cc-butler#8), which every other role-launch already gets."
+  (let ((dir (file-name-as-directory (make-temp-file "cc-new-session-2" t)))
+        started-with)
+    (cl-letf (((symbol-function 'read-directory-name) (lambda (&rest _) dir))
+              ((symbol-function 'claude-code-ide)
+               (lambda (&rest _) (error "claude-code-ide should not be called directly")))
+              ((symbol-function 'cc-butler--start-session-in)
+               (lambda (d) (setq started-with d)))
+              ((symbol-function 'cc-butler) (lambda () nil)))
+      (cc-butler-new-session))
+    (should (equal started-with dir))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Scaffold: CLAUDE.md must not carry a dangling import blurb when the
 ;;;; template has nothing to import (the repo-free case)
 ;;;; ------------------------------------------------------------------
