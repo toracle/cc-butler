@@ -127,6 +127,26 @@ with."
        (equal (plist-get face :foreground) cc-butler--ghost-face-fg)
        (equal (plist-get face :background) cc-butler--ghost-face-bg)))
 
+;; --- TEMPORARY diagnostics for cc-butler#6 (silent redaction miss,
+;; 2026-07-21) — remove once the miss is root-caused.  Pure observability:
+;; does not alter `cc-butler--redact-ghost-input-line's return value at all.
+(defvar cc-butler--ghost-redaction-debug nil
+  "TEMPORARY ring of the last few redaction attempts, newest first. Each
+entry: (:time STR :found BOOL :line-text STR :faces ((OFFSET . FACE) ...)).
+Remove along with `cc-butler--ghost-redaction-debug-record' and its call
+site in `cc-butler--redact-ghost-input-line' once cc-butler#6 is
+root-caused.")
+
+(defconst cc-butler--ghost-redaction-debug-max 30
+  "TEMPORARY cap on `cc-butler--ghost-redaction-debug' entries.")
+
+(defun cc-butler--ghost-redaction-debug-record (entry)
+  "TEMPORARY: push ENTRY onto `cc-butler--ghost-redaction-debug', capped."
+  (push entry cc-butler--ghost-redaction-debug)
+  (when (> (length cc-butler--ghost-redaction-debug) cc-butler--ghost-redaction-debug-max)
+    (setq cc-butler--ghost-redaction-debug
+          (seq-take cc-butler--ghost-redaction-debug cc-butler--ghost-redaction-debug-max))))
+
 (defun cc-butler--redact-ghost-input-line (start end)
   "In the current buffer, return the text between START and END as a
 plain string, with one exception: if the LAST \"❯ \"-prefixed line in
@@ -147,6 +167,20 @@ governance principle butler-ghost-text-not-a-blocker-authorization-or-data."
           (when (and (>= (point) start) (looking-at-p "❯ "))
             (setq line-beg (point) line-text-beg (+ (point) 3))
             (throw 'found nil))))
+      ;; TEMPORARY diagnostic capture — see the defvar above.
+      (if (not line-beg)
+          (cc-butler--ghost-redaction-debug-record
+           (list :time (format-time-string "%H:%M:%S") :found nil))
+        (let* ((l-end (save-excursion (goto-char line-beg) (line-end-position)))
+               (l-len (- l-end line-beg))
+               (offsets (seq-filter (lambda (o) (< o l-len))
+                                    '(0 1 2 3 4 5 6 8 10 15 20 30 40)))
+               (faces (mapcar (lambda (o) (cons o (get-text-property (+ line-beg o) 'face)))
+                             offsets)))
+          (cc-butler--ghost-redaction-debug-record
+           (list :time (format-time-string "%H:%M:%S") :found t
+                 :line-text (buffer-substring-no-properties line-beg l-end)
+                 :faces faces))))
       (if (and line-beg (<= line-text-beg end)
                (cc-butler--ghost-face-p (get-text-property line-text-beg 'face)))
           (concat (buffer-substring-no-properties start line-beg)
