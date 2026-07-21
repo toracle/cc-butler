@@ -768,6 +768,31 @@ input box to actually render before giving up. See
   :type 'number
   :group 'cc-butler)
 
+(defconst cc-butler--trust-dialog-marker "Quick safety check:"
+  "Literal text unique to Claude Code's one-time \"trust this folder?\"
+screen, shown the first time a directory is opened (confirmed 2026-07-21
+on two never-before-launched directories). Anchor detection on this
+exact phrase, not on the numbered-option layout alone or on color —
+another first-run dialog could share that shape, and this codebase has
+already been burned twice today by a color assumption that varied by
+theme (`cc-butler--border-rule-char', `cc-butler--ghost-face-p')."
+  )
+
+(defun cc-butler--trust-dialog-showing-p (buf)
+  "Return non-nil if BUF's terminal currently shows the folder-trust
+screen (`cc-butler--trust-dialog-marker') with \"Yes, I trust this
+folder\" as the highlighted/default option. Both the marker phrase AND
+the exact option wording are required — a dialog that merely mentions
+trust, or shares the numbered-option shape for an unrelated first-run
+warning (e.g. an MCP permission prompt), must not be mistaken for this
+one and auto-accepted (cc-butler#8)."
+  (with-current-buffer buf
+    (save-excursion
+      (goto-char (point-min))
+      (and (search-forward cc-butler--trust-dialog-marker nil t)
+           (progn (goto-char (point-min))
+                  (search-forward "❯ 1. Yes, I trust this folder" nil t))))))
+
 (defun cc-butler--wait-for-session-ready (dir)
   "Block until DIR's session buffer shows a live input row (see
 `cc-butler--find-input-line'), or `cc-butler-launch-ready-timeout'
@@ -777,10 +802,26 @@ places a `claude' process is started — so neither can return a false
 \"launched\" into which a caller's first `send_to_session' silently
 vanishes (cc-butler#8).
 
+Along the way, if the one-time folder-trust screen is showing (always
+true on a directory Claude Code has never opened before — the exact
+scenario 정수님's original report was about, a fresh environment full of
+new directories), accept it once (a bare Return; \"Yes, trust\" is the
+pre-highlighted default) and keep polling for the real input row
+afterward, rather than timing out on a session that is actually alive
+and just waiting for a yes/no answer. Accepted at most once per call —
+never re-sent if the screen is still transitioning — so a slow render
+can't cause a second Return to land on whatever comes next.
+
+Claude Code itself eventually auto-accepts this screen if left alone
+(confirmed: it does NOT hang forever, but takes 15-65s, unbounded and
+far past this function's timeout) — waiting it out is not an
+alternative to answering it directly.
+
 Signals an error on timeout rather than returning silently: a caller
 that believes launch succeeded when the session never became reachable
 is worse off than one told plainly that it didn't."
-  (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
+  (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir)))
+        (trust-accepted nil))
     (unless (buffer-live-p buf)
       (error "cc-butler: no terminal buffer for %s right after launch" dir))
     (with-timeout (cc-butler-launch-ready-timeout
@@ -792,7 +833,11 @@ is worse off than one told plainly that it didn't."
                                                   (forward-line -40)
                                                   (point))))
                       (cc-butler--find-input-line start (point-max)))))
-        (sleep-for 0.1)))))
+        (if (and (not trust-accepted) (cc-butler--trust-dialog-showing-p buf))
+            (progn
+              (with-current-buffer buf (claude-code-ide--terminal-send-return))
+              (setq trust-accepted t))
+          (sleep-for 0.1))))))
 
 (defun cc-butler--launch-session (dir)
   "The ONE path every role launches through — butler, steward, and workers —

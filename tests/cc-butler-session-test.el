@@ -199,6 +199,89 @@ caller a false-ready session (cc-butler#8)."
             (should-error (cc-butler--wait-for-session-ready "/worker/"))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
+;;;; ---- folder-trust dialog (cc-butler#8, 2026-07-21) ----------------
+;;;; A directory Claude Code has never opened before shows a one-time
+;;;; "trust this folder?" screen instead of the normal input row. This is
+;;;; the exact case a NEW ENVIRONMENT hits (정수님's original report) —
+;;;; the readiness gate must recognize and answer it, not just time out.
+
+(defun cc-butler-session-test--insert-trust-dialog ()
+  "Insert the verbatim folder-trust screen (captured live 2026-07-21 on
+two never-before-launched directories)."
+  (insert (make-string 24 cc-butler--border-rule-char) "\n")
+  (insert " Accessing workspace:\n\n /tmp/some-new-dir/\n\n")
+  (insert " Quick safety check: Is this a project you created or one you trust?\n\n")
+  (insert " Claude Code'll be able to read, edit, and execute files here.\n\n")
+  (let ((start (point)))
+    (insert "❯ 1. Yes, I trust this folder")
+    (put-text-property start (point) 'face
+                        (list :foreground "#b1b9f9" :background "#262626")))
+  (insert "\n   2. No, exit\n"))
+
+(ert-deftest cc-butler-session/trust-dialog-showing-p-detects-real-screen ()
+  "`cc-butler--trust-dialog-showing-p' recognizes the actual captured
+folder-trust screen."
+  (let ((buf (get-buffer-create " *cc-butler-test-trust*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (cc-butler-session-test--insert-trust-dialog))
+          (should (cc-butler--trust-dialog-showing-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/trust-dialog-showing-p-nil-on-normal-input-row ()
+  "`cc-butler--trust-dialog-showing-p' does not fire on an ordinary
+border-sandwiched input row — it is specific to the trust screen."
+  (let ((buf (get-buffer-create " *cc-butler-test-trust-2*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert (make-string 24 cc-butler--border-rule-char))
+            (insert "\n❯ \n")
+            (insert (make-string 24 cc-butler--border-rule-char)))
+          (should-not (cc-butler--trust-dialog-showing-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/trust-dialog-showing-p-nil-on-lookalike-dialog ()
+  "A DIFFERENT first-run confirmation that happens to share the
+numbered-option shape (and even mentions \"trust\" in passing) must NOT
+be auto-accepted — only the exact folder-trust wording qualifies
+(cc-butler#8: a wrong auto-accept here is worse than a slow timeout)."
+  (let ((buf (get-buffer-create " *cc-butler-test-trust-3*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert (make-string 24 cc-butler--border-rule-char) "\n")
+            (insert " This MCP server requests filesystem access. Only allow it if you trust the source.\n\n")
+            (insert "❯ 1. Allow always\n   2. Allow once\n   3. Deny\n"))
+          (should-not (cc-butler--trust-dialog-showing-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/wait-for-ready-accepts-trust-dialog-then-proceeds ()
+  "`cc-butler--wait-for-session-ready' recognizes the folder-trust screen,
+sends a bare Return to accept it (\"Yes, trust\" is pre-highlighted), and
+keeps polling for the real input row afterward instead of timing out —
+this is the exact case a genuinely new directory hits."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-trust-wait*"))
+        (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (cc-butler-session-test--insert-trust-dialog))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda ()
+                       (cl-incf return-count)
+                       (with-current-buffer term-buf
+                         (erase-buffer)
+                         (insert (make-string 24 cc-butler--border-rule-char))
+                         (insert "\n❯ \n")
+                         (insert (make-string 24 cc-butler--border-rule-char)))))
+                    (cc-butler-launch-ready-timeout 2))
+            (should (progn (cc-butler--wait-for-session-ready "/worker/") t))
+            (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
 (ert-deftest cc-butler-session/launch-session-waits-for-readiness ()
   "`cc-butler--launch-session' calls `cc-butler--wait-for-session-ready'
 after spawning and configuring, so a caller can never be handed a
