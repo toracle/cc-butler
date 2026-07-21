@@ -38,27 +38,77 @@ session's working directory (restore last state, non-interactive)."
 ;;;; Saving the roster
 ;;;; ------------------------------------------------------------------
 
+(defun cc-butler--dir-key (dir)
+  "Normalize DIR for identity comparisons across roster records."
+  (file-name-as-directory (expand-file-name dir)))
+
+(defun cc-butler--roster-write (records)
+  "Write RECORDS to `cc-butler-roster-file' as the whole persisted roster."
+  (ignore-errors
+    (with-temp-file cc-butler-roster-file
+      (let ((print-length nil) (print-level nil))
+        (prin1 (list :saved (current-time) :sessions records) (current-buffer))
+        (insert "\n")))))
+
 (defun cc-butler--roster-records ()
-  "Return a serializable snapshot of the current live sessions."
-  (mapcar (lambda (s)
-            (let ((dir (plist-get s :dir)))
-              (list :dir dir
-                    :name (cc-butler--display-name dir)
-                    :title (plist-get s :title)
-                    :status (plist-get s :status)
-                    :branch (plist-get s :branch)
-                    :butler (equal dir cc-butler--butler))))
-          (cc-butler--sessions)))
+  "Return a serializable snapshot of the roster: every live session, plus any
+previously-persisted record not currently live whose directory still exists.
+Sessions die one at a time (a mass teardown, e.g. an OS shutdown, is never
+atomic), and the save is debounced — so merging in the last-known roster
+instead of overwriting it outright keeps a transient dip in the live set
+(e.g. only butler+steward up) from clobbering the durable record of every
+other session.
+
+A stale record is kept only while its directory still exists AND it has not
+been explicitly forgotten (`cc-butler--roster-forget', called when a topic is
+retired on purpose) — directory existence alone only reliably signals
+retirement for a cc-butler-SCAFFOLDED topic (deleted by `cc-butler-close-topic');
+a session opened on an existing project repo is never deleted that way, so
+its retirement must be signaled explicitly instead.
+
+`:butler' is forced to nil on every stale record: it is a liveness-derived
+field, so letting it survive as stale truth would let a dead record outrank
+the actual current butler on the next restore (last-write-wins there)."
+  (let* ((live (mapcar (lambda (s)
+                          (let ((dir (plist-get s :dir)))
+                            (list :dir dir
+                                  :name (cc-butler--display-name dir)
+                                  :title (plist-get s :title)
+                                  :status (plist-get s :status)
+                                  :branch (plist-get s :branch)
+                                  :butler (equal dir cc-butler--butler))))
+                        (cc-butler--sessions)))
+         (live-keys (mapcar (lambda (r) (cc-butler--dir-key (plist-get r :dir))) live))
+         (stale (mapcar (lambda (r) (list :dir (plist-get r :dir)
+                                          :name (plist-get r :name)
+                                          :title (plist-get r :title)
+                                          :status (plist-get r :status)
+                                          :branch (plist-get r :branch)
+                                          :butler nil))
+                        (seq-filter
+                         (lambda (r)
+                           (and (consp r) (stringp (plist-get r :dir))
+                                (not (member (cc-butler--dir-key (plist-get r :dir)) live-keys))
+                                (file-directory-p (plist-get r :dir))))
+                         (cc-butler--load-roster)))))
+    (append live stale)))
 
 (defun cc-butler--save-roster (&rest _)
   "Write the current roster to `cc-butler-roster-file'."
-  (ignore-errors
-    (let ((records (cc-butler--roster-records)))
-      (with-temp-file cc-butler-roster-file
-        (let ((print-length nil) (print-level nil))
-          (prin1 (list :saved (current-time) :sessions records)
-                 (current-buffer))
-          (insert "\n"))))))
+  (cc-butler--roster-write (cc-butler--roster-records)))
+
+(defun cc-butler--roster-forget (dir)
+  "Remove any persisted record for DIR from the roster file.
+Call this when a session is retired ON PURPOSE — directory existence alone
+cannot tell \"intentionally retired\" apart from \"died mid-shutdown\", so an
+explicit forget is the only correct signal for a session whose directory
+`cc-butler-close-topic' will never delete (an existing project repo)."
+  (let ((key (cc-butler--dir-key dir)))
+    (cc-butler--roster-write
+     (seq-remove (lambda (r)
+                   (and (consp r) (stringp (plist-get r :dir))
+                        (equal (cc-butler--dir-key (plist-get r :dir)) key)))
+                 (cc-butler--load-roster)))))
 
 (defvar cc-butler--roster-timer nil
   "Idle timer debouncing roster saves.")

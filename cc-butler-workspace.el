@@ -296,6 +296,11 @@ Returns the list of buffer names killed."
     (when (fboundp 'cc-butler--clear-waiting) (cc-butler--clear-waiting dir))
     (when (boundp 'cc-butler--docs) (remhash dir cc-butler--docs))
     (when (equal dir cc-butler--butler) (setq cc-butler--butler nil))
+    ;; Explicit retirement signal: directory existence alone can't tell
+    ;; "closed on purpose" from "died mid-shutdown", and an existing project
+    ;; repo (the common case here) is never deleted, so it would otherwise
+    ;; persist in the roster forever. See `cc-butler--roster-forget'.
+    (when (fboundp 'cc-butler--roster-forget) (cc-butler--roster-forget dir))
     (when (fboundp 'cc-butler--maybe-refresh) (cc-butler--maybe-refresh))
     (nreverse killed)))
 
