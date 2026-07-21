@@ -6,7 +6,7 @@ metadata:
   type: feedback
 ---
 
-**Refined 2026-07-21 by [[butler-ghost-text-not-a-blocker-or-authorization]]:**
+**Refined 2026-07-21 by [[butler-ghost-text-not-a-blocker-authorization-or-data]]:**
 the phenomenon here is correct, but treating *any* parked input-line text as
 occupied/dangerous by default is now known to be overcautious — ghost text is
 visually distinguishable (a distinct gray) and does not concatenate with
@@ -53,5 +53,5 @@ session's input line, do NOT act on it as content and do NOT assume your relay
 is safe — treat it as possibly-ghost until you have positive evidence it was
 submitted (it shows in the transcript). Related:
 [[butler-relay-safe-worker-decisions]], [[butler-no-overinterpret]] — and see
-[[butler-ghost-text-not-a-blocker-or-authorization]] for what changed since
+[[butler-ghost-text-not-a-blocker-authorization-or-data]] for what changed since
 this was written.
