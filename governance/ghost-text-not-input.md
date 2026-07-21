@@ -6,6 +6,16 @@ metadata:
   type: feedback
 ---
 
+**Refined 2026-07-21 by [[butler-ghost-text-not-a-blocker-or-authorization]]:**
+the phenomenon here is correct, but treating *any* parked input-line text as
+occupied/dangerous by default is now known to be overcautious — ghost text is
+visually distinguishable (a distinct gray) and does not concatenate with
+what's sent over it. The refinement changes the reasoning (a tooling gap in
+`read_session_output`, not an inherent property of parked text) and, once the
+color is actually readable, the outcome (confirmed-ghost text should not
+block a dispatch). This file's "confirm before acting on it" duty still
+stands; read the refinement for the full picture.
+
 Recurring issue (2026-07-13): Claude Code renders prompt auto-suggestions /
 ghost (autocomplete) text directly in a session's input line. It *looks* like
 typed input sitting there ready — but it was never submitted. Twice this
@@ -18,10 +28,10 @@ sending over that occupied-looking input line, and (b) it did **NOT** treat the
 ghost text as a command to act on. Both halves matter — the danger is
 symmetric.
 
-This is the same family as [[butler-relay-safe-worker-decisions]] and
-[[butler-worker-relay-prompt-safety]] (an occupied input line is dangerous to
-send Enter into) crossed with [[butler-no-overinterpret]] (do not read intent
-into a surface that was never asserted).
+This is the same family as [[butler-relay-safe-worker-decisions]] (an
+occupied input line is dangerous to send Enter into) crossed with
+[[butler-no-overinterpret]] (do not read intent into a surface that was
+never asserted).
 
 **Lessons (durable):**
 1. **A visible input-line string is not a message.** It may be a ghost /
@@ -42,5 +52,6 @@ into a surface that was never asserted).
 session's input line, do NOT act on it as content and do NOT assume your relay
 is safe — treat it as possibly-ghost until you have positive evidence it was
 submitted (it shows in the transcript). Related:
-[[butler-relay-safe-worker-decisions]], [[butler-worker-relay-prompt-safety]],
-[[butler-no-overinterpret]].
+[[butler-relay-safe-worker-decisions]], [[butler-no-overinterpret]] — and see
+[[butler-ghost-text-not-a-blocker-or-authorization]] for what changed since
+this was written.
