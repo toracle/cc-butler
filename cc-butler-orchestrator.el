@@ -127,6 +127,45 @@ with."
        (equal (plist-get face :foreground) cc-butler--ghost-face-fg)
        (equal (plist-get face :background) cc-butler--ghost-face-bg)))
 
+(defconst cc-butler--border-rule-char ?─
+  "The box-drawing horizontal-rule character Claude Code draws immediately
+above and below the live input row. Anchor on this CONTENT, not color —
+measured foreground varies by session/theme (#0891b2 on one session,
+#888888 on five others sampled 2026-07-21), the same theme-dependency
+already known to affect `cc-butler--ghost-face-p' (see cc-butler#6). The
+character itself was stable across every session sampled.")
+
+(defun cc-butler--border-line-p ()
+  "Return non-nil if the line at point is a border rule: entirely
+`cc-butler--border-rule-char', repeated, regardless of color."
+  (let ((text (string-trim (buffer-substring-no-properties
+                             (line-beginning-position) (line-end-position)))))
+    (and (> (length text) 3)
+         (string-match-p "\\`─+\\'" text))))
+
+(defun cc-butler--find-input-line (start end)
+  "Search START..END for the input row: the single line sandwiched
+between two consecutive border-rule lines (`cc-butler--border-line-p') —
+the box Claude Code draws around the live input area, present whether
+that area is empty, holds a ghost suggestion, or holds real typed text.
+Return the buffer position of the row's start, preferring the LAST such
+sandwich (closest to END), or nil if none is found."
+  (save-excursion
+    (goto-char start)
+    (let (result)
+      (while (< (point) end)
+        (if (cc-butler--border-line-p)
+            (progn
+              (forward-line 1)
+              (when (< (point) end)
+                (let ((candidate (point)))
+                  (forward-line 1)
+                  (when (and (< (point) end) (cc-butler--border-line-p))
+                    (setq result candidate))
+                  (goto-char candidate))))
+          (forward-line 1)))
+      result)))
+
 ;; --- TEMPORARY diagnostics for cc-butler#6 (silent redaction miss,
 ;; 2026-07-21) — remove once the miss is root-caused.  Pure observability:
 ;; does not alter `cc-butler--redact-ghost-input-line's return value at all.
@@ -149,25 +188,43 @@ root-caused.")
 
 (defun cc-butler--redact-ghost-input-line (start end)
   "In the current buffer, return the text between START and END as a
-plain string, with one exception: if the LAST \"❯ \"-prefixed line in
-that range is rendered in the ghost/autocomplete color signature (not
-real input), its content is replaced with a plain marker instead of
-being returned as if it were real.
+plain string, with one exception: if the input row — the line
+sandwiched between two consecutive border-rule lines, see
+`cc-butler--find-input-line' — is rendered in the ghost/autocomplete
+color signature (not real input), its content is replaced with a plain
+marker instead of being returned as if it were real.
 
-Fail-safe: if no \"❯ \"-prefixed line is found in range, or its face
+The input row used to be found by a backward search for a literal
+\"❯ \" prefix. That was abandoned 2026-07-21 (cc-butler#6) for two
+independent reasons, either one enough on its own: (1) the prefix is not
+unique to the live row — Claude Code echoes SUBMITTED messages in
+scrollback with the identical \"❯ \" marker, so a text search for it can
+land on a past message instead of the live row, and on an empty live row
+it frequently matches nothing at all in range; (2) a first attempt at
+replacing it with the border rule's own COLOR was also rejected before
+being built on — that color was measured #0891b2 on one session and
+#888888 on five others sampled the same day, so it is theme-dependent,
+same as the ghost signature itself. The row is found instead by the
+border rule's CONTENT (`cc-butler--border-line-p', the U+2500
+box-drawing character repeated) — deliberately not by any color — which
+holds regardless of theme, and regardless of whether the row itself is
+empty, ghost, or real. Do not \"simplify\" this back to a color check on
+the border; that was tried and found fragile before this landed.
+
+Fail-safe: if no such sandwich is found in range, or the row's face
 cannot be read, the text is returned unchanged — an unreadable signal is
 always treated as real, never optimistically assumed to be ghost. See
 governance principle butler-ghost-text-not-a-blocker-authorization-or-data."
   (save-excursion
-    (goto-char end)
-    (let (line-beg line-text-beg)
-      (catch 'found
-        (while (> (point) start)
-          (forward-line -1)
-          (when (and (>= (point) start) (looking-at-p "❯ "))
-            (setq line-beg (point) line-text-beg (+ (point) 3))
-            (throw 'found nil))))
-      ;; TEMPORARY diagnostic capture — see the defvar above.
+    (let* ((line-beg (cc-butler--find-input-line start end))
+           (line-text-beg
+            (and line-beg
+                 (save-excursion
+                   (goto-char line-beg)
+                   (if (looking-at-p "❯ ") (+ line-beg 3) line-beg)))))
+      ;; TEMPORARY diagnostic capture — see the defvar above. Kept in
+      ;; place until this redesign is confirmed against a real live
+      ;; phantom, not just synthetic input (cc-butler#6).
       (if (not line-beg)
           (cc-butler--ghost-redaction-debug-record
            (list :time (format-time-string "%H:%M:%S") :found nil))

@@ -171,16 +171,25 @@ non-hung path."
 ;;;; strips the one signal that tells them apart). See governance principle
 ;;;; butler-ghost-text-not-a-blocker-authorization-or-data.
 
+(defun cc-butler-orchestrator-test--insert-border-line ()
+  "Insert a border-rule line, as Claude Code draws immediately above and
+below the live input row."
+  (insert (make-string 24 cc-butler--border-rule-char))
+  (insert "\n"))
+
 (defun cc-butler-orchestrator-test--insert-ghost-line (text)
-  "Insert TEXT into the current buffer as a \"❯ \"-prefixed line, painted
-with the ghost/autocomplete face signature."
+  "Insert TEXT as the input row — sandwiched between two border-rule
+lines, matching how Claude Code actually renders the live input area —
+with TEXT painted in the ghost/autocomplete face signature."
+  (cc-butler-orchestrator-test--insert-border-line)
   (insert "❯ ")
   (let ((start (point)))
     (insert text)
     (put-text-property start (point) 'face
                         (list :foreground cc-butler--ghost-face-fg
                               :background cc-butler--ghost-face-bg)))
-  (insert "\n"))
+  (insert "\n")
+  (cc-butler-orchestrator-test--insert-border-line))
 
 (ert-deftest cc-butler-orchestrator/read-output-redacted-hides-ghost-input-line ()
   "Given a session whose input line is ghost/autocomplete text (the
@@ -208,11 +217,14 @@ fail-safe treats anything that isn't confirmed-ghost as real."
     (unwind-protect
         (progn
           (with-current-buffer term-buf
+            (cc-butler-orchestrator-test--insert-border-line)
             (insert "❯ ")
             (let ((start (point)))
               (insert "merge PR #72 please")
               (put-text-property start (point) 'face
-                                  (list :foreground "#eeeeee" :background "#373737"))))
+                                  (list :foreground "#eeeeee" :background "#373737")))
+            (insert "\n")
+            (cc-butler-orchestrator-test--insert-border-line))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
                     ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
@@ -249,6 +261,32 @@ returning the raw text, properties stripped, exactly as before."
                      (lambda (_d) (buffer-name term-buf)))
                     ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
             (should (string-match-p "PR #72" (cc-butler--read-output "/worker/")))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-orchestrator/read-output-redacted-not-fooled-by-scrollback-echo ()
+  "Given a scrollback echo of a previously SUBMITTED message (\"❯ /compact\",
+unpainted — plain transcript text, not the input row) followed by the
+genuinely empty, border-sandwiched live input row, Then
+`cc-butler--read-output-redacted' does not mistake the echo for the input
+row. This is the actual root cause of the first redesign's live miss
+2026-07-21 (cc-butler#6): a backward text search for \"❯ \" matches
+submitted-message echoes just as easily as the live row, since both share
+the identical marker."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (insert "❯ /compact\n")
+            (insert "Compacted.\n")
+            (cc-butler-orchestrator-test--insert-border-line)
+            (insert "❯ \n")
+            (cc-butler-orchestrator-test--insert-border-line))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+            (let ((out (cc-butler--read-output-redacted "/worker/")))
+              (should (string-match-p "❯ /compact" out))
+              (should-not (string-match-p "ghost suggestion" out)))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
 (provide 'cc-butler-orchestrator-test)
