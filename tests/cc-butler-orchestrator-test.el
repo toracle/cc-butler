@@ -289,5 +289,35 @@ the identical marker."
               (should-not (string-match-p "ghost suggestion" out)))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
+(ert-deftest cc-butler-orchestrator/border-line-with-embedded-title-still-detected ()
+  "Given a top border line with a title embedded in the middle (Claude
+Code sometimes draws the topic/branch name there, e.g. \"───── some-topic
+──\" — confirmed 2026-07-21 on a real live session), Then the input row
+between it and a plain border below is still found and redacted
+correctly — the border check is framing, not purity."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (insert (make-string 10 cc-butler--border-rule-char))
+            (insert " plugin-gateway-routing-audit ")
+            (insert (make-string 4 cc-butler--border-rule-char))
+            (insert "\n")
+            (insert "❯ ")
+            (let ((start (point)))
+              (insert "PR #72 머지 진행해주세요")
+              (put-text-property start (point) 'face
+                                  (list :foreground cc-butler--ghost-face-fg
+                                        :background cc-butler--ghost-face-bg)))
+            (insert "\n")
+            (cc-butler-orchestrator-test--insert-border-line))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+            (let ((out (cc-butler--read-output-redacted "/worker/")))
+              (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
+              (should-not (string-match-p "PR #72" out)))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here

@@ -136,12 +136,19 @@ already known to affect `cc-butler--ghost-face-p' (see cc-butler#6). The
 character itself was stable across every session sampled.")
 
 (defun cc-butler--border-line-p ()
-  "Return non-nil if the line at point is a border rule: entirely
-`cc-butler--border-rule-char', repeated, regardless of color."
+  "Return non-nil if the line at point is a border rule: a run of
+`cc-butler--border-rule-char' framing both ends of the line, regardless
+of color. Not required to be PURELY the rule character — Claude Code
+sometimes draws a short title (a branch/topic name) embedded in the
+middle of the top border (confirmed 2026-07-21, e.g. \"───── some-topic
+──\"), so this checks framing, not purity."
   (let ((text (string-trim (buffer-substring-no-properties
-                             (line-beginning-position) (line-end-position)))))
+                             (line-beginning-position) (line-end-position))))
+        (rule3 (make-string 3 cc-butler--border-rule-char))
+        (rule2 (make-string 2 cc-butler--border-rule-char)))
     (and (> (length text) 3)
-         (string-match-p "\\`─+\\'" text))))
+         (string-prefix-p rule3 text)
+         (string-suffix-p rule2 text))))
 
 (defun cc-butler--find-input-line (start end)
   "Search START..END for the input row: the single line sandwiched
