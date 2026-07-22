@@ -169,11 +169,22 @@ with t (all succeeded) or nil (a clone failed)."
                           url (buffer-name buf))
                  (funcall done-fn nil))))))))))
 
-(defun cc-butler--finish-topic (topic-dir template)
-  "Scaffold TOPIC-DIR, start a session there, and open the manager."
+(defun cc-butler--finish-topic (topic-dir template &optional no-reopen)
+  "Scaffold TOPIC-DIR, start a session there, and open the manager.
+With NO-REOPEN, skip the final `cc-butler' manager re-open and return
+TOPIC-DIR.
+
+Re-opening the manager is a UI courtesy for a human who just typed
+\\[cc-butler-new-topic]; it is not part of launching.  It also cannot run
+from every caller: `cc-butler' calls `delete-other-windows', which signals
+\"Cannot make side window the only window\" when the selected window is a
+Claude side window — exactly where an MCP tool call originates.  So the
+non-interactive entry points pass NO-REOPEN and the launch path itself
+stays shared, rather than each caller re-inlining scaffold+start (the
+duplication that caused cc-butler#7)."
   (cc-butler--scaffold topic-dir template)
   (cc-butler--start-session-in topic-dir)
-  (cc-butler))
+  (if no-reopen topic-dir (cc-butler)))
 
 ;;;###autoload
 (defun cc-butler-new-session ()
@@ -202,42 +213,87 @@ skips the optional `:claude-import' blurb."
                                   (or (cc-butler--dir-at-point) default-directory))))
     (cc-butler--finish-topic dir nil)))
 
+(defun cc-butler-topic-names ()
+  "Return the selectable workspace template names, plus \"arbitrary\"."
+  (append (mapcar (lambda (e) (symbol-name (car e))) cc-butler-project-templates)
+          '("arbitrary")))
+
+(defun cc-butler--validate-topic-name (topic)
+  "Signal unless TOPIC is usable as a directory name; return it trimmed."
+  (let ((topic (string-trim (or topic ""))))
+    (when (string-empty-p topic)
+      (user-error "Topic name must not be empty"))
+    (when (string-match-p "[/ \t]" topic)
+      (user-error "Topic name must not contain spaces or slashes: %S" topic))
+    topic))
+
+(defun cc-butler-create-topic (template-name topic &optional no-reopen)
+  "Create a topic workspace from TEMPLATE-NAME called TOPIC and launch it.
+
+The non-interactive core of `cc-butler-new-topic': same work, no prompts.
+TEMPLATE-NAME is a string or symbol naming a registered template, or
+\"arbitrary\", in which case TOPIC is taken as the directory to start in
+rather than a name to build one from.  Returns the workspace directory.
+
+Split out 2026-07-22 because the butler could not create sessions at all
+over MCP: driving `cc-butler-new-topic' meant stubbing its `completing-read'
+and `read-string' with `cl-letf' from outside, and when the elisp MCP server
+died the fleet could not be grown by any route.  Prompting is a UI concern;
+it does not belong between the butler and the work.  The prompts live in
+`cc-butler-new-topic', the work lives here, and neither reimplements the
+other.
+
+NO-REOPEN is passed through to `cc-butler--finish-topic' — set it from any
+caller that is not a human at the manager buffer."
+  (let ((choice (if (symbolp template-name) (symbol-name template-name)
+                  (string-trim (or template-name "")))))
+    (if (equal choice "arbitrary")
+        ;; No template: TOPIC is a directory. Scaffolding is idempotent, so
+        ;; pointing this at an existing project is safe.
+        (let ((dir (expand-file-name (string-trim (or topic "")))))
+          (when (string-empty-p (string-trim (or topic "")))
+            (user-error "The `arbitrary' template needs a directory"))
+          (make-directory dir t)
+          (cc-butler--finish-topic dir nil no-reopen)
+          dir)
+      (let* ((template (or (cc-butler--template (intern choice))
+                           (user-error "No such workspace template: %s (have: %s)"
+                                       choice
+                                       (string-join (cc-butler-topic-names) ", "))))
+             (topic (cc-butler--validate-topic-name topic))
+             (topic-dir (cc-butler--topic-dir template topic))
+             (repos (plist-get template :repos))
+             ;; A repo-free template (e.g. the built-in `default') has
+             ;; nothing to check for a prior clone of.
+             (meta-dir (and repos (expand-file-name
+                                   (cc-butler--repo-local-name (car repos)) topic-dir))))
+        (make-directory topic-dir t)
+        (if (or (null repos) (and meta-dir (file-directory-p meta-dir)))
+            ;; Already cloned (or nothing to clone) — scaffold and start now.
+            (cc-butler--finish-topic topic-dir template no-reopen)
+          ;; Cloning is asynchronous, so the session starts from the sentinel
+          ;; and this returns before the workspace is live.
+          (cc-butler--clone-repos
+           topic-dir repos
+           (lambda (ok)
+             (if ok
+                 (cc-butler--finish-topic topic-dir template no-reopen)
+               (message "cc-butler: workspace %s not started (clone failed)"
+                        topic-dir)))))
+        topic-dir))))
+
 ;;;###autoload
 (defun cc-butler-new-topic ()
   "Create a topic workspace from a template and start a Claude session in it.
 Prompts for a template (or `arbitrary', which delegates to
-`cc-butler-new-session') and a topic name, clones the template's repos if
-needed, scaffolds the markers, and launches Claude at the topic dir."
+`cc-butler-new-session') and a topic name, then hands off to
+`cc-butler-create-topic', which does the work."
   (interactive)
-  (let* ((names (append (mapcar (lambda (e) (symbol-name (car e)))
-                                cc-butler-project-templates)
-                        '("arbitrary")))
-         (choice (completing-read "Workspace template: " names nil t)))
+  (let ((choice (completing-read "Workspace template: " (cc-butler-topic-names) nil t)))
     (if (equal choice "arbitrary")
         (call-interactively #'cc-butler-new-session)
-      (let* ((template (cc-butler--template (intern choice)))
-             (topic (string-trim (read-string (format "%s topic name: " choice)))))
-        (when (string-empty-p topic)
-          (user-error "Topic name must not be empty"))
-        (when (string-match-p "[/ \t]" topic)
-          (user-error "Topic name must not contain spaces or slashes: %S" topic))
-        (let* ((topic-dir (cc-butler--topic-dir template topic))
-               (repos (plist-get template :repos))
-               ;; A repo-free template (e.g. the built-in `default') has
-               ;; nothing to check for a prior clone of.
-               (meta-dir (and repos (expand-file-name
-                                     (cc-butler--repo-local-name (car repos)) topic-dir))))
-          (make-directory topic-dir t)
-          (if (and meta-dir (file-directory-p meta-dir))
-              ;; Already cloned — just scaffold (idempotent) and start.
-              (cc-butler--finish-topic topic-dir template)
-            (cc-butler--clone-repos
-             topic-dir repos
-             (lambda (ok)
-               (if ok
-                   (cc-butler--finish-topic topic-dir template)
-                 (message "cc-butler: workspace %s not started (clone failed)"
-                          topic-dir))))))))))
+      (cc-butler-create-topic
+       choice (read-string (format "%s topic name: " choice))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Close a topic: safety-gated session teardown + workspace removal
@@ -459,6 +515,38 @@ state is out of scope."
   (when (boundp 'cc-butler-mode-map)
     (define-key cc-butler-mode-map "N" #'cc-butler-new-topic)
     (define-key cc-butler-mode-map "K" #'cc-butler-close-topic)))
+
+;;;; ------------------------------------------------------------------
+;;;; MCP tool: create a workspace and launch a session in it
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-tool-new-topic (template topic)
+  "MCP tool: create workspace TOPIC from TEMPLATE and start a session there."
+  (let* ((template (string-trim (or template "")))
+         (topic (string-trim (or topic ""))))
+    (when (string-empty-p template)
+      (error "template is required — one of: %s"
+             (string-join (cc-butler-topic-names) ", ")))
+    (let ((dir (cc-butler-create-topic template topic t)))
+      (format "Created workspace %s from template `%s'. A Claude session is starting there; it may take a few seconds to accept input, and if the template clones repos the session starts when the clone finishes. Use list_claude_sessions to confirm it is up, then send_to_session to brief it."
+              dir template))))
+
+;; Idempotent registration.
+(when (fboundp 'claude-code-ide-make-tool)
+  (setq claude-code-ide-mcp-server-tools
+        (seq-remove
+         (lambda (spec)
+           (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
+                   '("new_topic")))
+         claude-code-ide-mcp-server-tools))
+  (claude-code-ide-make-tool
+   :function #'cc-butler-tool-new-topic
+   :name "new_topic"
+   :description "Create a new topic workspace from a template and launch a Claude session in it — the way you grow the fleet. The workspace is scaffolded (.projectile, CLAUDE.md, and the statusLine that makes its context size readable) and the session is launched through the shared path every role uses. Pass template=\"arbitrary\" to start a session in an existing directory instead, giving that directory's absolute path as topic."
+   :args '((:name "template" :type string
+                  :description "Workspace template name, or \"arbitrary\" to use an existing directory. If you do not know the registered names, try \"default\" (built-in, repo-free) — a wrong name returns the valid list.")
+           (:name "topic" :type string
+                  :description "Short topic name, used as the directory name — no spaces or slashes. When template is \"arbitrary\", pass the absolute path of the existing directory instead."))))
 
 (provide 'cc-butler-workspace)
 ;;; cc-butler-workspace.el ends here

@@ -51,10 +51,110 @@ before this fix.  It should scaffold directly, no clone attempted."
     (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) "blanktest"))
               ((symbol-function 'read-string) (lambda (&rest _) "mytopic"))
               ((symbol-function 'cc-butler--finish-topic)
-               (lambda (topic-dir _template) (setq finished-dir topic-dir))))
+               (lambda (topic-dir _template &optional _no-reopen)
+                 (setq finished-dir topic-dir))))
       (cc-butler-new-topic))
     (should finished-dir)
     (should (file-directory-p finished-dir))))
+
+;;;; ------------------------------------------------------------------
+;;;; cc-butler-create-topic: the non-interactive core.  Split out so the
+;;;; butler can create sessions over MCP — driving the interactive entry
+;;;; point meant cl-letf-ing its prompts from outside, and when the elisp
+;;;; MCP server died the fleet could not be grown at all.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-workspace/create-topic-needs-no-prompts ()
+  "The core provisions a workspace with no minibuffer interaction at all —
+`completing-read'/`read-string' are booby-trapped here, so any prompt fails
+the test rather than hanging the suite."
+  (let ((cc-butler-project-templates nil)
+        (base (make-temp-file "cc-createtopic" t))
+        finished)
+    (setf (alist-get 'blanktest cc-butler-project-templates)
+          (list :base-dir base :dir-format "%s" :repos nil :claude-import nil))
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) (error "must not prompt")))
+              ((symbol-function 'read-string)
+               (lambda (&rest _) (error "must not prompt")))
+              ((symbol-function 'cc-butler--finish-topic)
+               (lambda (dir template &optional no-reopen)
+                 (setq finished (list dir template no-reopen)))))
+      (let ((ret (cc-butler-create-topic "blanktest" "mytopic" t)))
+        (should (equal ret (nth 0 finished)))
+        (should (file-directory-p ret))
+        (should (string-suffix-p "mytopic" (directory-file-name ret)))
+        ;; no-reopen must reach the launch path: an MCP call originates in a
+        ;; side window, where re-opening the manager signals.
+        (should (eq (nth 2 finished) t))))))
+
+(ert-deftest cc-butler-workspace/create-topic-accepts-a-symbol-template ()
+  "Callers may pass the template as a symbol or a string."
+  (let ((cc-butler-project-templates nil)
+        (base (make-temp-file "cc-createtopic" t))
+        finished)
+    (setf (alist-get 'blanktest cc-butler-project-templates)
+          (list :base-dir base :dir-format "%s" :repos nil :claude-import nil))
+    (cl-letf (((symbol-function 'cc-butler--finish-topic)
+               (lambda (dir &rest _) (setq finished dir))))
+      (cc-butler-create-topic 'blanktest "sym" t)
+      (should finished))))
+
+(ert-deftest cc-butler-workspace/create-topic-rejects-unknown-template ()
+  "An unknown template names the valid ones — the caller is an LLM that
+cannot see the registry."
+  (let ((cc-butler-project-templates nil))
+    (setf (alist-get 'blanktest cc-butler-project-templates)
+          (list :base-dir "/tmp" :dir-format "%s" :repos nil))
+    (let ((err (should-error (cc-butler-create-topic "nope" "t" t)
+                             :type 'user-error)))
+      (should (string-match-p "blanktest" (error-message-string err))))))
+
+(ert-deftest cc-butler-workspace/create-topic-rejects-bad-topic-names ()
+  "A topic name becomes a directory name, so spaces and slashes are refused
+before anything is created."
+  (let ((cc-butler-project-templates nil))
+    (setf (alist-get 'blanktest cc-butler-project-templates)
+          (list :base-dir "/tmp" :dir-format "%s" :repos nil))
+    (should-error (cc-butler-create-topic "blanktest" "" t) :type 'user-error)
+    (should-error (cc-butler-create-topic "blanktest" "  " t) :type 'user-error)
+    (should-error (cc-butler-create-topic "blanktest" "a b" t) :type 'user-error)
+    (should-error (cc-butler-create-topic "blanktest" "a/b" t) :type 'user-error)))
+
+(ert-deftest cc-butler-workspace/create-topic-arbitrary-uses-the-given-dir ()
+  "template=\"arbitrary\" treats the topic as an existing directory and
+scaffolds it in place with a nil template."
+  (let ((dir (make-temp-file "cc-arb" t))
+        finished)
+    (cl-letf (((symbol-function 'cc-butler--finish-topic)
+               (lambda (d template &optional no-reopen)
+                 (setq finished (list d template no-reopen)))))
+      (let ((ret (cc-butler-create-topic "arbitrary" dir t)))
+        (should (equal (expand-file-name ret) (expand-file-name dir)))
+        (should (null (nth 1 finished)))
+        (should (eq (nth 2 finished) t))))))
+
+(ert-deftest cc-butler-workspace/create-topic-arbitrary-needs-a-directory ()
+  "`arbitrary' with no directory is refused rather than defaulting somewhere."
+  (should-error (cc-butler-create-topic "arbitrary" "" t) :type 'user-error))
+
+(ert-deftest cc-butler-workspace/new-topic-delegates-to-the-core ()
+  "The interactive entry point only collects input; the work is the core's,
+so the two paths cannot drift apart."
+  (let (called)
+    (cl-letf (((symbol-function 'completing-read) (lambda (&rest _) "blanktest"))
+              ((symbol-function 'read-string) (lambda (&rest _) "mytopic"))
+              ((symbol-function 'cc-butler-create-topic)
+               (lambda (tpl topic &optional _n) (setq called (cons tpl topic)))))
+      (cc-butler-new-topic)
+      (should (equal called '("blanktest" . "mytopic"))))))
+
+(ert-deftest cc-butler-workspace/topic-names-include-arbitrary ()
+  "The selectable names are the registered templates plus the `arbitrary'
+pseudo-template."
+  (let ((cc-butler-project-templates nil))
+    (setf (alist-get 'one cc-butler-project-templates) (list :base-dir "/tmp"))
+    (should (equal (cc-butler-topic-names) '("one" "arbitrary")))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; cc-butler-new-session: routes through the SAME choke point as
