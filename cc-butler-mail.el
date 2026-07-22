@@ -302,8 +302,25 @@ that has list_changed carries a hardcoded tool list, not the butler tools).
 
 Signals a `user-error' so no caller (rearm-session, the rearm_session MCP tool,
 or a bulk re-arm) silently parks the fleet again.  Recover a parked session with
-`cc-butler-dismiss-mcp-all'."
-  (user-error "cc-butler: re-arm via /mcp is disabled — it only opens the panel and parks the session (recover with M-x cc-butler-dismiss-mcp-all; real fix = HTTP SSE + list_changed)"))
+`cc-butler-dismiss-mcp-all'.
+
+WHAT THIS DOES *NOT* MEAN — read this before concluding a running session
+must be restarted to see newly-registered tools.  It does not.  What is
+disabled is the PROGRAMMATIC path only: typing the slash command at a
+session from the outside.  A HUMAN opening the `/mcp' panel in that session
+and choosing reconnect DOES deliver the current tool list to a session that
+is already running, with no restart and no work lost.  Confirmed
+2026-07-23: `new_topic', `compact_session', `compact_large_sessions' and
+`session_status' were registered while the butler and steward were live,
+a human reconnected both from the panel, and both had all four immediately.
+
+So the correct advice for \"a running control-plane session is missing a
+tool that was just registered\" is: ask a human to reconnect it from the
+`/mcp' panel.  Restarting is not required, and the difference matters —
+restarting the butler throws away the context that made it useful.  The
+transport-level fix remains worth building because it removes the human
+step, but it is an ergonomics fix, not the only route."
+  (user-error "cc-butler: programmatic re-arm via /mcp is disabled — it only opens the panel and parks the session. A HUMAN reconnecting from the /mcp panel in that session DOES work and needs no restart (recover a parked session with M-x cc-butler-dismiss-mcp-all; ergonomics fix = HTTP SSE + list_changed)"))
 
 ;;;###autoload
 (defun cc-butler-rearm-session ()
