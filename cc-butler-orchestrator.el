@@ -598,9 +598,14 @@ three are empty."
   (let* ((inbox (cc-butler--inbox-urgent-block "steward"))
          (events (cc-butler-tool-inbox))
          (has-events (not (equal events "No pending worker events.")))
-         (stale (cc-butler--fleet-stale-waiting-summary)))
+         (stale (cc-butler--fleet-stale-waiting-summary))
+         ;; cc-butler-compact loads after this module, so reach it late.
+         ;; Same bargain as the stale-waiting nudge: elisp reports what is
+         ;; over the context ceiling, the steward decides when to act.
+         (ceiling (and (fboundp 'cc-butler-compact-fleet-summary)
+                       (ignore-errors (cc-butler-compact-fleet-summary)))))
     (mapconcat #'identity
-               (delq nil (list inbox (and has-events events) stale))
+               (delq nil (list inbox (and has-events events) stale ceiling))
                "\n\n")))
 
 (defun cc-butler--pending-decisions-hook-sh ()
