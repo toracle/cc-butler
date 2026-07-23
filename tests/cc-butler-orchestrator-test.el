@@ -415,5 +415,141 @@ false positive."
                         (list :foreground "#999999" :background "#262626"))
     (should-not (cc-butler--line-ghost-p (point-min) (point-max)))))
 
+;;;; ---- type+submit atomicity (2026-07-23) ------------------------------
+;;;; `cc-butler--send-input' writes twice for a submitting send: the text,
+;;;; then the Return. Between them sat a `sleep-for' — the settle delay —
+;;;; and `sleep-for' runs timers. Elisp being single-threaded, that was the
+;;;; ONLY yield point in the sequence, and it was inside it: any other
+;;;; cc-butler timer (mail delivery, the compaction monitor's steward
+;;;; notify, a dispatch, the compaction driver) could fire there and type
+;;;; and submit its own text on the same session, leaving the first
+;;;; writer's Return to land on whatever state the second produced.
+;;;; `cc-butler--settle' keeps the wall-clock wait but spends it without
+;;;; yielding, so the pair is atomic with respect to every timer.
+
+(defvar cc-butler-orchestrator-test--writes nil
+  "Terminal writes recorded by `cc-butler-orchestrator-test--with-stub-terminal'.
+Newest first; read it through `cc-butler-orchestrator-test--recorded-writes'.")
+
+(defun cc-butler-orchestrator-test--recorded-writes ()
+  "The recorded terminal writes, oldest first."
+  (reverse cc-butler-orchestrator-test--writes))
+
+(defmacro cc-butler-orchestrator-test--with-stub-terminal (&rest body)
+  "Run BODY with session \"/worker/\" backed by a stub terminal.
+`claude-code-ide--terminal-send-string' and
+`claude-code-ide--terminal-send-return' record `(:string TEXT)' and
+`(:return)' entries into `cc-butler-orchestrator-test--writes' instead of
+touching a real terminal, so a send's byte-level shape and ordering can
+be asserted directly."
+  (declare (indent 0))
+  `(let ((cc-butler-session-io-timeout 5)
+         (cc-butler-orchestrator-test--writes nil)
+         (term-buf (get-buffer-create " *cc-butler-test-term*")))
+     (unwind-protect
+         (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                    (lambda (_d) (buffer-name term-buf)))
+                   ((symbol-function 'cc-butler--display-name) (lambda (d) d))
+                   ((symbol-function 'claude-code-ide--terminal-send-string)
+                    (lambda (s) (push (list :string s) cc-butler-orchestrator-test--writes)))
+                   ((symbol-function 'claude-code-ide--terminal-send-return)
+                    (lambda () (push (list :return) cc-butler-orchestrator-test--writes))))
+           ,@body)
+       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-orchestrator/send-input-is-not-interleaved-by-another-timer ()
+  "Regression for the 2026-07-23 race. Given a second writer pending on a
+timer while a submitting send is mid-sequence (scheduled here from inside
+the first writer's terminal write, exactly as mail delivery or the
+compaction monitor would already be armed), Then the two sends come out
+as two complete, ordered sequences — text then Return, text then Return —
+and are never interleaved. Against the old `sleep-for' settle the pending
+timer fired inside the gap and produced text-A, text-B, Return-B,
+Return-A: writer A's Return submitting writer B's text."
+  (cc-butler-orchestrator-test--with-stub-terminal
+    (let ((cc-butler-submit-delay 0.1)
+          (record (symbol-function 'claude-code-ide--terminal-send-string))
+          (scheduled nil))
+      (cl-letf (((symbol-function 'claude-code-ide--terminal-send-string)
+                 (lambda (s)
+                   (funcall record s)
+                   ;; Arm the interloper once, while the first send is
+                   ;; still between its two writes.
+                   (unless scheduled
+                     (setq scheduled t)
+                     (run-with-timer
+                      0 nil (lambda () (cc-butler--send-input "/worker/" "BBB" t)))))))
+        (cc-butler--send-input "/worker/" "AAA" t)
+        ;; Only now, with the first send complete, give the timer its
+        ;; chance to run.
+        (let ((deadline (+ (float-time) 2)))
+          (while (and (< (length cc-butler-orchestrator-test--writes) 4)
+                      (< (float-time) deadline))
+            (sleep-for 0.01))))
+      (should (equal '((:string "AAA") (:return) (:string "BBB") (:return))
+                     (cc-butler-orchestrator-test--recorded-writes))))))
+
+(ert-deftest cc-butler-orchestrator/send-input-never-yields-between-text-and-return ()
+  "`cc-butler--send-input' must not call `sleep-for', `sit-for' or
+`accept-process-output' anywhere in a submitting send — those are exactly
+the forms that let another timer run between the text and the Return, and
+that is the 2026-07-23 race. All three are stubbed to signal here, so the
+yield cannot be reintroduced later by someone who does not know why the
+settle delay stopped being a `sleep-for'."
+  (cc-butler-orchestrator-test--with-stub-terminal
+    (let ((cc-butler-submit-delay 0.02))
+      (cl-letf (((symbol-function 'sleep-for)
+                 (lambda (&rest _) (error "send-input yielded via sleep-for")))
+                ((symbol-function 'sit-for)
+                 (lambda (&rest _) (error "send-input yielded via sit-for")))
+                ((symbol-function 'accept-process-output)
+                 (lambda (&rest _) (error "send-input yielded via accept-process-output"))))
+        (should (cc-butler--send-input "/worker/" "hello" t))))
+    (should (equal '((:string "hello") (:return))
+                   (cc-butler-orchestrator-test--recorded-writes)))))
+
+(ert-deftest cc-butler-orchestrator/settle-waits-at-least-the-requested-time ()
+  "`cc-butler--settle' still spends the wall clock it is asked for — the
+settle delay is load-bearing (a Return sent too early is dropped before
+the input is processed); only the yielding was removed."
+  (let ((start (float-time)))
+    (cc-butler--settle 0.05)
+    (let ((elapsed (- (float-time) start)))
+      (should (>= elapsed 0.05))
+      (should (< elapsed 1)))))
+
+(ert-deftest cc-butler-orchestrator/settle-is-a-no-op-for-nil-zero-and-negative ()
+  "`cc-butler--settle' returns immediately for nil, 0 and a negative
+duration, so a caller may disable the delay by setting the knob to 0."
+  (dolist (seconds (list nil 0 -1))
+    (let ((start (float-time)))
+      (cc-butler--settle seconds)
+      (should (< (- (float-time) start) 0.02)))))
+
+(ert-deftest cc-butler-orchestrator/send-input-multi-line-is-one-bracketed-paste ()
+  "A multi-line body still goes out as ONE bracketed paste with its
+newlines literal and exactly one Return — the atomicity fix must not
+disturb the paste framing that keeps an embedded LF from submitting."
+  (cc-butler-orchestrator-test--with-stub-terminal
+    (cc-butler--send-input "/worker/" "first line\nsecond line\nthird" t)
+    (should (equal (list (list :string "\e[200~first line\nsecond line\nthird\e[201~")
+                         (list :return))
+                   (cc-butler-orchestrator-test--recorded-writes)))))
+
+(ert-deftest cc-butler-orchestrator/send-input-single-line-is-unwrapped-with-one-return ()
+  "A single-line body goes out unwrapped, followed by exactly one Return."
+  (cc-butler-orchestrator-test--with-stub-terminal
+    (cc-butler--send-input "/worker/" "just one line" t)
+    (should (equal '((:string "just one line") (:return))
+                   (cc-butler-orchestrator-test--recorded-writes)))))
+
+(ert-deftest cc-butler-orchestrator/send-input-without-submit-sends-no-return ()
+  "With SUBMIT nil the text is typed and nothing else — no Return, and no
+settle delay to spend."
+  (cc-butler-orchestrator-test--with-stub-terminal
+    (cc-butler--send-input "/worker/" "typed but not submitted")
+    (should (equal '((:string "typed but not submitted"))
+                   (cc-butler-orchestrator-test--recorded-writes)))))
+
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here

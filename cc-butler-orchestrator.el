@@ -232,9 +232,39 @@ butler-ghost-text-not-a-blocker-authorization-or-data."
 (defcustom cc-butler-submit-delay 0.1
   "Seconds to wait after sending text before the submitting Return.
 The worker's input must settle before Enter or the Return is dropped and
-nothing submits (the same delay `claude-code-ide-send-prompt' uses)."
+nothing submits (the same delay `claude-code-ide-send-prompt' uses).
+Spent as a non-yielding busy-wait (`cc-butler--settle') so nothing can
+run between the typing and the Return, so Emacs is unresponsive for this
+long on every submitting send — keep it small."
   :type 'number
   :group 'cc-butler)
+
+(defun cc-butler--settle (seconds)
+  "Let SECONDS of wall clock pass WITHOUT yielding to Emacs.
+A no-op when SECONDS is nil or not positive.
+
+The busy-wait is deliberate, and the whole point of this function.
+`sleep-for', `sit-for', `accept-process-output' and `redisplay' all give
+timers a chance to run; Elisp being single-threaded, a stretch of code
+with none of those forms in it is atomic with respect to every cc-butler
+timer.  Used between the two halves of a terminal write (type, then
+Return), a yielding wait is precisely the hole another timer slips
+through to type and submit its own text on the same session — see
+`cc-butler--send-input'.
+
+Waiting without yielding is sufficient here because the thing we are
+waiting on is not Emacs: the bytes we just wrote have already been handed
+to the pty and are consumed by the OS and the worker subprocess, which
+run regardless of what Emacs does.  Only wall-clock time is needed, not
+Emacs attention.  The price is that Emacs is unresponsive for the
+duration, which is why the caller's delay is a fraction of a second
+\(`cc-butler-submit-delay', 0.1s) — cheap next to a dropped Return or a
+corrupted prompt."
+  (when (and (numberp seconds) (> seconds 0))
+    (let ((deadline (+ (float-time) seconds)))
+      (while (< (float-time) deadline)
+        ;; Spin on purpose.  Anything that waits here would run timers.
+        nil))))
 
 (defun cc-butler--send-input (dir text &optional submit)
   "Type TEXT into session DIR's terminal; when SUBMIT, also press Return.
@@ -244,7 +274,17 @@ keeps the embedded newlines literal so only the final Return submits.
 Carriage returns are normalized to LF and stray ESC bytes are stripped so
 the body cannot break out of the paste or submit mid-prompt.  A short
 settle delay precedes the Return so it is not dropped before the input is
-processed."
+processed.
+
+That delay deliberately does NOT yield (`cc-butler--settle', a busy-wait,
+not `sleep-for').  Typing and submitting are two writes that must reach
+the worker as one indivisible act, and a yielding wait between them lets
+another timer — mail delivery, the compaction monitor, a dispatch — call
+this same function on this same session, type and submit its own text,
+and leave our Return to land on whatever state it produced.  That is the
+2026-07-23 race: a command left typed-but-unsubmitted, and stale text
+prepended to the next dispatch.  Keep this sequence free of `sleep-for',
+`sit-for', `accept-process-output' and `redisplay'."
   (with-timeout (cc-butler-session-io-timeout
                  (error "Timed out sending input to session %s after %ss (terminal may be stuck; text may be partially delivered)"
                         (cc-butler--display-name dir) cc-butler-session-io-timeout))
@@ -259,7 +299,7 @@ processed."
             (claude-code-ide--terminal-send-string (concat "\e[200~" body "\e[201~"))
           (claude-code-ide--terminal-send-string body))
         (when submit
-          (sleep-for cc-butler-submit-delay)
+          (cc-butler--settle cc-butler-submit-delay)
           (claude-code-ide--terminal-send-return)))
       t)))
 
