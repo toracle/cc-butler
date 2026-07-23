@@ -97,6 +97,17 @@ cache).  Discarding the cache is exactly what we want: `/compact' rewrites
 the context wholesale, so the cache is about to be worthless regardless."
   :type 'string :group 'cc-butler)
 
+(defcustom cc-butler-compact-restore-retries 3
+  "How many times the restore command may be re-sent before failing.
+
+Typing and submitting are two separate terminal writes with a gap between
+them (`cc-butler-submit-delay').  A worker notification arriving in that gap
+starts the session's turn, and the Return lands on a session that is no
+longer at its input box — so the command sits there typed but unsubmitted.
+The session stays on the cheap model, and the stale text collides with
+whatever is dispatched next."
+  :type 'integer :group 'cc-butler)
+
 (defcustom cc-butler-compact-modal-answers 3
   "How many times one step may answer a confirmation modal before failing.
 The modal is re-answered, not latched after one try.  A single attempt can
@@ -422,9 +433,64 @@ dead until a human notices, which on 2026-07-23 took two and a half hours."
                       (cc-butler--display-name dir))
       t)))
 
+(defun cc-butler-compact--send-raw (dir string)
+  "Write STRING into DIR's terminal — no Return, no paste wrapping.
+`cc-butler--send-input' is the call for text; this is for the control
+characters it does not carry.  Like it, the write happens inside the session
+buffer, because the terminal primitives act on the current buffer and take
+no session argument."
+  (when-let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
+    (with-current-buffer buf
+      (claude-code-ide--terminal-send-string string))
+    t))
+
+(defun cc-butler-compact--send-return (dir)
+  "Press Return in DIR's terminal without typing anything first.
+Used to submit a command already sitting in the input box."
+  (when-let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
+    (with-current-buffer buf
+      (claude-code-ide--terminal-send-return))
+    t))
+
+(defun cc-butler-compact--own-input (dir st)
+  "Return the text WE left unsubmitted in DIR's input box, or nil.
+
+Only ever our own.  What is in the box is compared against the last thing
+this driver typed, so genuinely typed operator input — the thing the whole
+guard exists to protect — is never mistaken for ours and never touched.  A
+prefix counts: the send can be interrupted partway through the string, not
+only between the string and the Return."
+  (let ((sent (plist-get st :last-sent)))
+    (when sent
+      (let ((typed (ignore-errors (cc-butler-compact--typed-text dir))))
+        (and typed (string-prefix-p typed sent) typed)))))
+
+(defun cc-butler-compact--clear-own-input (dir st)
+  "Remove text this driver left sitting in DIR's input box.
+
+The input-box analogue of `cc-butler-compact--ensure-no-modal', and for the
+same reason: an abandoned `/model opus' does not just fail quietly, it waits
+in the box and prepends itself to whatever is dispatched next.  That is how
+a compaction failure turns into a corrupted instruction to an unrelated
+session later.
+
+C-u is the kill-to-start the input box responds to.  Verified afterwards —
+if the box is still not clear this says so in the log rather than reporting
+a tidy finish over a dirty screen."
+  (ignore-errors
+    (when-let ((mine (cc-butler-compact--own-input dir st)))
+      (cc-butler-compact--send-raw dir "\C-u")
+      (let ((left (cc-butler-compact--own-input dir st)))
+        (cc-butler--log "compact: %s │ %s unsubmitted %S from the input box"
+                        (cc-butler--display-name dir)
+                        (if left "FAILED to clear" "cleared") mine)
+        (not left)))))
+
 (defun cc-butler-compact--finish (dir fmt &rest args)
   "Conclude the compaction of DIR with a message/log built from FMT/ARGS."
   (cc-butler-compact--ensure-no-modal dir)
+  (when-let ((st (gethash dir cc-butler-compact--state)))
+    (cc-butler-compact--clear-own-input dir st))
   (cc-butler-compact--end-state dir)
   (let ((msg (apply #'format fmt args)))
     (cc-butler--log "compact: %s │ %s" (cc-butler--display-name dir) msg)
@@ -442,7 +508,7 @@ dead until a human notices, which on 2026-07-23 took two and a half hours."
 (defun cc-butler-compact--step (dir phase text)
   "Send TEXT to DIR, enter PHASE, and re-arm the clock."
   (cc-butler-compact--set-state dir :phase phase :sent-time (float-time)
-                                :answers 0)
+                                :answers 0 :last-sent text)
   (cc-butler--send-input dir text t)
   (cc-butler--log "compact: %s │ %s (sent %s)"
                   (cc-butler--display-name dir) phase text)
@@ -652,6 +718,22 @@ and refuses when the current model cannot be named well enough to restore."
       (cc-butler-compact--poll-restore-wait
        dir (gethash dir cc-butler-compact--state) (float-time)))))
 
+(defun cc-butler-compact--send-restore (dir st arg)
+  "Put the restore command into DIR, retrying a send that never submitted.
+
+If our command is already sitting in the box, only the Return was lost —
+submit what is there rather than typing it again, which would append to it
+and produce `/model opus/model opus'.  Otherwise send it fresh."
+  (if (cc-butler-compact--own-input dir st)
+      (progn
+        (cc-butler-compact--set-state dir :phase 'restoring
+                                      :sent-time (float-time) :answers 0)
+        (cc-butler-compact--send-return dir)
+        (cc-butler--log "compact: %s │ restoring (submitted the command already typed)"
+                        (cc-butler--display-name dir))
+        (cc-butler-compact--schedule-poll dir))
+    (cc-butler-compact--step dir 'restoring (format "/model %s" arg))))
+
 (defun cc-butler-compact--poll-restore-wait (dir st sent)
   "Hold the model restore until DIR is idle, then send it.
 
@@ -670,7 +752,7 @@ and answers any modal that is already up while it waits."
      ((cc-butler-compact--answer-modal dir st "pre-restore")
       (cc-butler-compact--schedule-poll dir))
      ((cc-butler--waiting-p dir)
-      (cc-butler-compact--step dir 'restoring (format "/model %s" arg)))
+      (cc-butler-compact--send-restore dir st arg))
      ((> (- (float-time) sent) cc-butler-compact-timeout)
       (cc-butler-compact--finish
        dir "compacted (%s) but model NOT restored — session never reached a waiting point; still on %s, wanted %s"
@@ -688,6 +770,24 @@ and answers any modal that is already up while it waits."
                                  (or (plist-get st :note) "no delta observed") tag))
      ((cc-butler-compact--answer-modal dir st "model restore")
       (cc-butler-compact--schedule-poll dir))
+     ;; The command is still sitting in the box: typed, never submitted.
+     ;; A notification landed in the gap between the string and the Return
+     ;; and started the turn, so the Return went to a session that was no
+     ;; longer at its input box.  Waiting cannot fix this — nothing is in
+     ;; flight — so go back and send it again once the session is idle.
+     ((cc-butler-compact--own-input dir st)
+      (let ((tries (or (plist-get st :restore-tries) 0)))
+        (if (>= tries cc-butler-compact-restore-retries)
+            (cc-butler-compact--finish
+             dir "compacted (%s) but model NOT restored — the restore never submitted after %d attempts; session left on %s, wanted %s"
+             (or (plist-get st :note) "no delta observed")
+             (1+ tries) (or tag "?") arg)
+          (cc-butler-compact--set-state dir :restore-tries (1+ tries))
+          (cc-butler--log "compact: %s │ restore never submitted (attempt %d) — waiting for idle to retry"
+                          (cc-butler--display-name dir) (1+ tries))
+          (cc-butler-compact--set-state dir :phase 'restore-wait
+                                        :sent-time (float-time))
+          (cc-butler-compact--schedule-poll dir))))
      ((> (- (float-time) sent) cc-butler-compact-step-timeout)
       (cc-butler-compact--finish
        dir "compacted (%s) but model NOT restored — session is on %s, wanted %s"
