@@ -730,17 +730,51 @@ something that will never clear itself."
                (lambda (_d &optional _i) "an interactive menu/wizard is open")))
       (should (string-match-p "menu" (cc-butler-compact-fleet-summary))))))
 
-(ert-deftest cc-butler-compact/monitor-reports-to-the-steward-queue ()
-  "The monitor delivers by queueing an event the steward drains on its next
-turn — it does not type into anyone."
+(ert-deftest cc-butler-compact/monitor-notifies-and-queues ()
+  "By default the steward is TOLD, not left to ask: the report is typed in
+and submitted, and also queued so it survives if typing was refused."
   (cc-butler-compact-test--with-fleet '(("/butler/" . 514000))
     (let (sent)
       (cl-letf (((symbol-function 'cc-butler--send-input)
-                 (lambda (&rest a) (push a sent))))
+                 (lambda (dir text &optional submit)
+                   (push (list dir text submit) sent))))
         (cc-butler-compact--monitor-scan)
+        ;; queued
         (should (= (length cc-butler--inbox) 1))
         (should (string-match-p "/butler/" (plist-get (car cc-butler--inbox) :body)))
+        ;; and delivered into the steward, submitted
+        (should (= (length sent) 1))
+        (should (equal (nth 0 (car sent)) "/steward/"))
+        (should (nth 2 (car sent)))
+        (should (string-match-p "/butler/" (nth 1 (car sent))))))))
+
+(ert-deftest cc-butler-compact/monitor-report-carries-the-remedies ()
+  "A report that says only \"this is too big\" leaves the reader to remember
+what may be done — including that a FINISHED worker should be closed rather
+than compacted, which is the part that gets forgotten."
+  (cc-butler-compact-test--with-fleet '(("/butler/" . 514000))
+    (let ((out (cc-butler-compact-fleet-summary)))
+      (should (string-match-p "compact_session" out))
+      (should (string-match-p "compact_large_sessions" out))
+      (should (string-match-p "close_topic" out)))))
+
+(ert-deftest cc-butler-compact/monitor-can-be-set-to-queue-only ()
+  "`nil' notify keeps the old non-intrusive behaviour available."
+  (cc-butler-compact-test--with-fleet '(("/butler/" . 514000))
+    (let ((cc-butler-compact-monitor-notify nil) sent)
+      (cl-letf (((symbol-function 'cc-butler--send-input)
+                 (lambda (&rest a) (push a sent))))
+        (cc-butler-compact--monitor-scan)
+        (should cc-butler--inbox)
         (should-not sent)))))
+
+(ert-deftest cc-butler-compact/monitor-does-nothing-without-an-ops-session ()
+  "With no butler and no steward there is nobody to tell, so the scan must
+not queue reports that will be drained by whoever starts up next."
+  (cc-butler-compact-test--with-fleet '(("/butler/" . 514000))
+    (cl-letf (((symbol-function 'cc-butler--ops-dir) (lambda () nil)))
+      (cc-butler-compact--monitor-scan)
+      (should-not cc-butler--inbox))))
 
 (ert-deftest cc-butler-compact/monitor-does-not-repeat-an-unchanged-fleet ()
   "A standing situation must not be restated every scan, or the steward
@@ -773,11 +807,12 @@ reported fresh rather than suppressed as a repeat."
     (should-not cc-butler--inbox)
     (should-not cc-butler-compact--last-report)))
 
-(ert-deftest cc-butler-compact/monitor-nudge-respects-the-compaction-guard ()
+(ert-deftest cc-butler-compact/monitor-notify-respects-the-compaction-guard ()
   "If it is not safe to type a slash command at the steward, it is not safe
-to type a nudge either — same guard, no exceptions."
+to type a report at it either — same guard, no exceptions.  The queued copy
+still gets through, so a blocked steward is not left uninformed."
   (cc-butler-compact-test--with-fleet '(("/butler/" . 514000))
-    (let ((cc-butler-compact-monitor-nudge t) sent)
+    (let ((cc-butler-compact-monitor-notify 'submit) sent)
       (cl-letf (((symbol-function 'cc-butler--send-input)
                  (lambda (&rest a) (push a sent)))
                 ((symbol-function 'cc-butler-compact--blocked-reason)
