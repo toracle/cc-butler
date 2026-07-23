@@ -560,6 +560,64 @@ removes it."
                 (and (window-live-p list-win)
                      (split-window list-win nil 'right)))))))
 
+(defcustom cc-butler-terminal-min-width 80
+  "Columns a session's PTY is never sized below.
+
+A new session's terminal buffer is not displayed in any window when it is
+created, and the size that eventually reaches the PTY comes from whatever
+window it first lands in — `claude-code-ide--sync-terminal-dimensions'
+applies `window-body-width' with no lower bound.  With the frame split
+narrow, sessions have come up at ELEVEN columns: the TUI cannot lay out its
+input row, so keystrokes go nowhere and the session presents as \"input
+doesn't work\" rather than as a size problem, which is what makes it
+expensive to diagnose.
+
+80x24 is the conventional terminal floor and what ghostel itself falls back
+to when no window is available."
+  :type 'integer :group 'cc-butler)
+
+(defcustom cc-butler-terminal-min-height 24
+  "Rows a session's PTY is never sized below.  See
+`cc-butler-terminal-min-width' — same reasoning, same floor."
+  :type 'integer :group 'cc-butler)
+
+(defun cc-butler--pty-size-floor (buf)
+  "Raise BUF's terminal to the configured floor if it sits below it.
+Returns the (ROWS . COLS) enforced, or nil when nothing needed doing.
+
+Both writes matter and they are not the same thing: `set-process-window-size'
+is the pty ioctl, which is what the CLI on the far end reads, while
+`ghostel--set-size-with-cell-dims' is libghostty's own grid, which is what
+gets rendered into the buffer.  Fixing one and not the other leaves the
+process and the display disagreeing about how wide the world is."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (let* ((proc (get-buffer-process buf))
+             (rows (max (or (bound-and-true-p ghostel--term-rows) 0)
+                        cc-butler-terminal-min-height))
+             (cols (max (or (bound-and-true-p ghostel--term-cols) 0)
+                        cc-butler-terminal-min-width)))
+        (when (and (process-live-p proc)
+                   (or (> rows (or (bound-and-true-p ghostel--term-rows) 0))
+                       (> cols (or (bound-and-true-p ghostel--term-cols) 0))))
+          (ignore-errors (set-process-window-size proc rows cols))
+          (when-let ((term (and (fboundp 'ghostel--set-size-with-cell-dims)
+                                (bound-and-true-p ghostel--term))))
+            (ignore-errors
+              (ghostel--set-size-with-cell-dims term rows cols)))
+          (cc-butler--log "session: %s │ pty raised to %dx%d (was %sx%s)"
+                          (buffer-name buf) rows cols
+                          (or (bound-and-true-p ghostel--term-rows) "?")
+                          (or (bound-and-true-p ghostel--term-cols) "?"))
+          (cons rows cols))))))
+
+(defun cc-butler--ensure-pty-size (dir)
+  "Enforce the PTY floor on session DIR, whatever the window layout is.
+Called on the launch path, where the terminal has never been displayed and
+so has no window to take an honest size from."
+  (cc-butler--pty-size-floor
+   (get-buffer (claude-code-ide--get-buffer-name dir))))
+
 (defun cc-butler--terminal-resize (buffer window)
   "Resize the ghostel terminal in BUFFER to fit WINDOW and redraw.
 `set-window-buffer' does not run `window-size-change-functions', so
@@ -596,7 +654,11 @@ first."
       (setq-default window-adjust-process-window-size-function
                     #'window-adjust-process-window-size-largest)
       (unwind-protect (ignore-errors (ghostel--adjust-size window))
-        (setq-default window-adjust-process-window-size-function orig)))))
+        (setq-default window-adjust-process-window-size-function orig))
+      ;; A refit is sized from a window, so it can drop back under the floor
+      ;; the moment the frame is split narrow.  Re-apply it here, or the
+      ;; launch-time guarantee lasts only until the first layout change.
+      (cc-butler--pty-size-floor (current-buffer)))))
 
 (defun cc-butler--session-refit-on-change ()
   "Buffer-local `window-configuration-change-hook': re-fit the PTY to the
@@ -855,6 +917,11 @@ never be handed a false-ready session (cc-butler#8)."
   (let ((default-directory (file-name-as-directory (expand-file-name dir))))
     (cc-butler--with-channel (claude-code-ide))
     (cc-butler--configure-session dir))
+  ;; Before the readiness wait, not after: that wait watches for the TUI's
+  ;; input row, and a terminal eleven columns wide cannot draw one.  Sizing
+  ;; first means a narrow frame costs nothing; sizing after would mean
+  ;; timing out on a session that was only ever too narrow to look ready.
+  (cc-butler--ensure-pty-size dir)
   (cc-butler--wait-for-session-ready dir))
 
 (defvar cc-butler-after-preview-functions nil

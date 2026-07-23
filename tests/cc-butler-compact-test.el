@@ -537,6 +537,121 @@ dead until a human notices.  Every terminating path clears the screen first."
     (should-not (cc-butler-compact--active-p "w"))))
 
 ;;;; ------------------------------------------------------------------
+;;;; The restore that never submitted — the 2026-07-23 residual race
+;;;; ------------------------------------------------------------------
+
+;; Typing and submitting are two terminal writes with a gap between them.  A
+;; worker notification arriving in that gap starts the session's turn, so the
+;; Return lands on a session no longer sitting at its input box.  The command
+;; stays typed but unsubmitted: the session is stranded on the cheap model,
+;; and the stale text waits in the box to prepend itself to the next dispatch.
+;; #15 fixed the modal; this is the send underneath it.
+
+(defmacro cc-butler-compact-test--with-unsubmitted (text &rest body)
+  "Run BODY with TEXT sitting unsubmitted in the session's input box."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'cc-butler-compact--typed-text)
+              (lambda (_d) ,text))
+             ((symbol-function 'cc-butler-compact--send-raw)
+              (lambda (_d s) (push (concat "RAW:" s) cc-butler-compact-test--sent) t))
+             ((symbol-function 'cc-butler-compact--send-return)
+              (lambda (_d) (push "RETURN" cc-butler-compact-test--sent) t)))
+     ,@body))
+
+(defun cc-butler-compact-test--to-restore (dir)
+  "Drive DIR to the point where /model opus has just been sent."
+  (cc-butler-compact-session dir)
+  (setq cc-butler-compact-test--model "Sonnet-5")
+  (cc-butler-compact--poll dir)            ; -> /compact
+  (setq cc-butler-compact-test--ctx 90000)
+  (cc-butler-compact--poll dir))           ; -> /model opus
+
+(ert-deftest cc-butler-compact/unsubmitted-restore-is-resent ()
+  "REGRESSION (2026-07-23): the restore was typed but the Return was lost to a
+notification, leaving the session on the cheap model with the command sitting
+in its box.  Waiting cannot fix it — nothing is in flight — so it must be
+sent again once the session is idle."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-test--to-restore "w")
+    (should (equal (car cc-butler-compact-test--sent) "/model opus"))
+    (cc-butler-compact-test--with-unsubmitted "/model opus"
+      ;; Seen sitting there: back to waiting for idle rather than timing out.
+      (cc-butler-compact--poll "w")
+      (should (cc-butler-compact--active-p "w"))
+      (should (equal (plist-get (gethash "w" cc-butler-compact--state) :phase)
+                     'restore-wait))
+      ;; Idle again — the text is already there, so only the Return is needed.
+      (cc-butler-compact--poll "w")
+      (should (equal (car cc-butler-compact-test--sent) "RETURN")))))
+
+(ert-deftest cc-butler-compact/an-already-typed-restore-is-not-typed-twice ()
+  "Retyping a command that is already in the box appends to it and produces
+`/model opus/model opus'.  The text is right; only the Return was lost."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-test--to-restore "w")
+    (cc-butler-compact-test--with-unsubmitted "/model opus"
+      (cc-butler-compact--poll "w")        ; -> restore-wait
+      (cc-butler-compact--poll "w")        ; -> submit
+      (should (= 1 (seq-count (lambda (s) (equal s "/model opus"))
+                              cc-butler-compact-test--sent)))
+      (should (equal (cc-butler-compact-test--sent-in-order)
+                     '("/model sonnet" "/compact" "/model opus" "RETURN"))))))
+
+(ert-deftest cc-butler-compact/unsubmitted-restore-retries-are-bounded ()
+  "Re-sending is bounded in the same spirit as the modal retry: a send that
+never takes must end as an explicit failure, not an endless loop."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-test--to-restore "w")
+    (cc-butler-compact-test--with-unsubmitted "/model opus"
+      (let ((msg nil))
+        (dotimes (_ (* 2 (1+ cc-butler-compact-restore-retries)))
+          (when (cc-butler-compact--active-p "w")
+            (setq msg (or (cc-butler-compact--poll "w") msg))))
+        (should-not (cc-butler-compact--active-p "w"))
+        (should (string-match-p "never submitted" msg))
+        (should (string-match-p "NOT restored" msg))))))
+
+(ert-deftest cc-butler-compact/self-left-text-is-cleared-on-every-exit ()
+  "The input-box analogue of #15's ensure-no-modal.  An abandoned `/model
+opus' does not fail quietly — it waits in the box and prepends itself to
+whatever is dispatched next, which is how a compaction failure becomes a
+corrupted instruction to an unrelated session later."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-test--to-restore "w")
+    (cc-butler-compact-test--with-unsubmitted "/model opus"
+      (cc-butler-compact--set-state
+       "w" :restore-tries cc-butler-compact-restore-retries)
+      (cc-butler-compact--poll "w")        ; retries exhausted -> finish
+      (should-not (cc-butler-compact--active-p "w"))
+      ;; C-u went out on the way past.
+      (should (member "RAW:\C-u" cc-butler-compact-test--sent)))))
+
+(ert-deftest cc-butler-compact/operator-input-is-never-cleared ()
+  "The clear only ever removes OUR text.  Genuinely typed operator input is
+the thing this driver exists to protect; touching it would be worse than any
+failure it is cleaning up after."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-test--to-restore "w")
+    (cc-butler-compact-test--with-unsubmitted "please stop and check the logs"
+      (let ((st (gethash "w" cc-butler-compact--state)))
+        (should-not (cc-butler-compact--own-input "w" st))
+        (should-not (cc-butler-compact--clear-own-input "w" st)))
+      (cc-butler-compact--set-state
+       "w" :sent-time (- (float-time) (1+ cc-butler-compact-step-timeout)))
+      (cc-butler-compact--poll "w")        ; times out and finishes
+      (should-not (cc-butler-compact--active-p "w"))
+      (should-not (member "RAW:\C-u" cc-butler-compact-test--sent)))))
+
+(ert-deftest cc-butler-compact/a-partial-send-still-counts-as-ours ()
+  "The interruption can land partway through the string, not only between the
+string and the Return, so a prefix of what we sent is still ours to clean."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-test--to-restore "w")
+    (cc-butler-compact-test--with-unsubmitted "/model op"
+      (let ((st (gethash "w" cc-butler-compact--state)))
+        (should (equal (cc-butler-compact--own-input "w" st) "/model op"))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Guards
 ;;;; ------------------------------------------------------------------
 
