@@ -165,11 +165,19 @@ non-hung path."
             (should (equal "hello from the terminal" (cc-butler--read-output "/worker/")))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
-;;;; ---- ghost/autocomplete input-line redaction (2026-07-21, cc-butler#6) --
-;;;; read_session_output used to return ghost-faced input-line text
+;;;; ---- ghost/autocomplete input-line redaction (cc-butler#6) -----------
+;;;; read_session_output used to return a painted ghost suggestion
 ;;;; byte-identical to real typed input (buffer-substring-no-properties
-;;;; strips the one signal that tells them apart). See governance principle
-;;;; butler-ghost-text-not-a-blocker-authorization-or-data.
+;;;; strips every rendering signal). The first fix compared the row's face
+;;;; FOREGROUND against a constant; measured live 2026-07-23, this fleet
+;;;; paints ghost text #8686a8 on #00005f, never the #a7a7a7 that constant
+;;;; held, so the comparison never matched and the "cannot tell -> real"
+;;;; fail-safe promoted every ghost row to real input. Detection is now the
+;;;; terminal cursor (`cc-butler--input-state'), and THE POINT OF THESE
+;;;; TESTS is that the color is irrelevant — proven by running one row
+;;;; through both measured colors and through no face at all and getting an
+;;;; outcome that depends only on where the cursor sits. See governance
+;;;; principle butler-ghost-text-not-a-blocker-authorization-or-data.
 
 (defun cc-butler-orchestrator-test--insert-border-line ()
   "Insert a border-rule line, as Claude Code draws immediately above and
@@ -177,69 +185,190 @@ below the live input row."
   (insert (make-string 24 cc-butler--border-rule-char))
   (insert "\n"))
 
-(defun cc-butler-orchestrator-test--insert-ghost-line (text)
-  "Insert TEXT as the input row — sandwiched between two border-rule
-lines, matching how Claude Code actually renders the live input area —
-with TEXT painted in the ghost/autocomplete face signature. The prompt is
-followed by U+00A0 NO-BREAK SPACE, not an ordinary space — that is what
-Claude Code actually renders (confirmed 2026-07-21, cc-butler#6 second
-miss); using an ordinary space here is what let that miss ship green."
+(defconst cc-butler-orchestrator-test--prompt
+  (concat "❯" (string #x00A0))
+  "The live input prompt as Claude Code actually renders it: `❯' followed by
+U+00A0 NO-BREAK SPACE, not an ordinary space (confirmed 2026-07-21,
+cc-butler#6).  Spelled as an explicit code point so no editor can silently
+normalise it to a plain space — a fixture with an ordinary space is exactly
+what let an earlier miss ship green at 157/157.")
+
+(defconst cc-butler-orchestrator-test--ghost-face-now
+  '(:foreground "#8686a8" :background "#00005f")
+  "The face this fleet actually paints ghost input-line text with, read out
+of the daemon's diagnostic ring on 2026-07-23.")
+
+(defconst cc-butler-orchestrator-test--ghost-face-legacy
+  '(:foreground "#a7a7a7" :background "#262626")
+  "The face the deleted color check keyed on (measured 2026-07-21).
+Kept as a fixture on purpose: the fix must be indifferent to WHICH of these
+a session happens to paint.")
+
+(defun cc-butler-orchestrator-test--insert-input-row (text &optional face)
+  "Insert TEXT as the input row — sandwiched between two border-rule lines,
+matching how Claude Code renders the live input area — painted in FACE, or
+unfaced when FACE is nil."
   (cc-butler-orchestrator-test--insert-border-line)
-  (insert "❯ ")
+  (insert cc-butler-orchestrator-test--prompt)
   (let ((start (point)))
     (insert text)
-    (put-text-property start (point) 'face
-                        (list :foreground cc-butler--ghost-face-fg
-                              :background cc-butler--ghost-face-bg)))
+    (when face (put-text-property start (point) 'face face)))
   (insert "\n")
   (cc-butler-orchestrator-test--insert-border-line))
 
+(defun cc-butler-orchestrator-test--insert-ghost-line (text)
+  "Insert TEXT as a ghost-painted input row (this fleet's measured face)."
+  (cc-butler-orchestrator-test--insert-input-row
+   text cc-butler-orchestrator-test--ghost-face-now))
+
+(defmacro cc-butler-orchestrator-test--with-term (fill cursor-needle &rest body)
+  "Run BODY against a fake session terminal buffer.
+FILL is evaluated in the buffer to paint the screen.  The terminal cursor is
+reported at the END of the first match of CURSOR-NEEDLE; when CURSOR-NEEDLE
+is nil the backend reports NO cursor at all — the unreadable case."
+  (declare (indent 2))
+  `(let ((buf (generate-new-buffer " *cc-butler-test-term*")))
+     (unwind-protect
+         (with-current-buffer buf
+           ,fill
+           (let ((cursor (when ,cursor-needle
+                           (goto-char (point-min))
+                           (search-forward ,cursor-needle)
+                           (point))))
+             (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                        (lambda (_d) (buffer-name buf)))
+                       ((symbol-function 'cc-butler--refresh-terminal-text) #'ignore)
+                       ((symbol-function 'ghostel-cursor-point) (lambda () cursor)))
+               ,@body)))
+       (kill-buffer buf))))
+
+(ert-deftest cc-butler-orchestrator/redaction-ignores-the-face-color-entirely ()
+  "THE regression for cc-butler#6, from the rows measured live 2026-07-23.
+One row is painted three ways — this fleet's ghost face #8686a8/#00005f, the
+legacy #a7a7a7/#262626 the deleted constant keyed on, and no face at all —
+and run past the cursor in both positions.  The outcome must track the
+CURSOR and nothing else: parked at the prompt the row is a painted
+suggestion and is redacted whatever its color; past the text it is real
+input and survives whatever its color.  A color rule cannot produce this
+table — it gets both #8686a8 rows and both unfaced rows wrong — which is
+what makes this a falsifying test rather than a restatement of the code."
+  (dolist (face (list cc-butler-orchestrator-test--ghost-face-now
+                      cc-butler-orchestrator-test--ghost-face-legacy
+                      nil))
+    ;; Cursor parked at the prompt: the box is empty, the text is painted.
+    (cc-butler-orchestrator-test--with-term
+        (cc-butler-orchestrator-test--insert-input-row
+         "yes, diagnose the ACP flake" face)
+        cc-butler-orchestrator-test--prompt
+      (let ((out (cc-butler--read-output-redacted "/worker/")))
+        (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
+        (should-not (string-match-p "diagnose the ACP flake" out))))
+    ;; Cursor past the text: a human typed it, and it must survive.
+    (cc-butler-orchestrator-test--with-term
+        (cc-butler-orchestrator-test--insert-input-row
+         "yes, diagnose the ACP flake" face)
+        "yes, diagnose the ACP flake"
+      (let ((out (cc-butler--read-output-redacted "/worker/")))
+        (should (string-match-p "diagnose the ACP flake" out))
+        (should-not (string-match-p "ghost suggestion" out))))))
+
 (ert-deftest cc-butler-orchestrator/read-output-redacted-hides-ghost-input-line ()
-  "Given a session whose input line is ghost/autocomplete text (the
-measured color signature), Then `cc-butler--read-output-redacted' replaces
-it with a plain marker rather than returning it as real text."
-  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer term-buf
-            (insert "some earlier transcript line\n")
-            (cc-butler-orchestrator-test--insert-ghost-line "PR #72 머지 진행해주세요"))
-          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
-                     (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
-            (let ((out (cc-butler--read-output-redacted "/worker/")))
-              (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
-              (should-not (string-match-p "PR #72" out)))))
-      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+  "The literal row measured on this fleet 2026-07-23 — Korean text painted
+#8686a8 on #00005f into an empty box, the near-miss that would have been
+read as an instruction from the human — is redacted, and the transcript
+around it is untouched."
+  (cc-butler-orchestrator-test--with-term
+      (progn (insert "some earlier transcript line\n")
+             (cc-butler-orchestrator-test--insert-input-row
+              "네, 꺼내주세요" cc-butler-orchestrator-test--ghost-face-now))
+      cc-butler-orchestrator-test--prompt
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
+      (should-not (string-match-p "꺼내주세요" out))
+      (should (string-match-p "some earlier transcript line" out)))))
 
 (ert-deftest cc-butler-orchestrator/read-output-redacted-keeps-real-input-line ()
-  "Given a session whose input line is real (not the ghost color
-signature), Then `cc-butler--read-output-redacted' returns it unchanged —
-fail-safe treats anything that isn't confirmed-ghost as real."
-  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer term-buf
-            (cc-butler-orchestrator-test--insert-border-line)
-            (insert "❯ ")
-            (let ((start (point)))
-              (insert "merge PR #72 please")
-              (put-text-property start (point) 'face
-                                  (list :foreground "#eeeeee" :background "#373737")))
-            (insert "\n")
-            (cc-butler-orchestrator-test--insert-border-line))
-          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
-                     (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
-            (let ((out (cc-butler--read-output-redacted "/worker/")))
-              (should (string-match-p "merge PR #72 please" out))
-              (should-not (string-match-p "ghost suggestion" out)))))
-      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+  "The third row measured 2026-07-23 — `❯ QQ', genuinely typed, carrying NO
+face at all — is returned unchanged.  Under the deleted color rule an unfaced
+row passed as \"not confirmed ghost, therefore real\"; under the cursor rule
+it passes for the right reason."
+  (cc-butler-orchestrator-test--with-term
+      (cc-butler-orchestrator-test--insert-input-row "QQ" nil)
+      (concat cc-butler-orchestrator-test--prompt "QQ")
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "QQ" out))
+      (should-not (string-match-p "ghost suggestion" out)))))
+
+(ert-deftest cc-butler-orchestrator/redaction-unknown-cursor-redacts-and-says-so ()
+  "FAIL-SAFE DIRECTION, read side.  When the cursor cannot be read at all (a
+non-ghostel backend), the row is REDACTED — the opposite of the compaction
+guard, which believes the painted row in exactly this situation.  Showing a
+suggestion as real input is how it becomes a false instruction; withholding
+a real line is visible and recoverable.  And the marker must say UNVERIFIED
+rather than \"ghost\": no determination was made, and a reader must never be
+handed a guess wearing the costume of an answer."
+  (cc-butler-orchestrator-test--with-term
+      (cc-butler-orchestrator-test--insert-input-row "merge PR #72 please" nil)
+      nil                               ; backend reports no cursor at all
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "UNVERIFIED" out))
+      (should-not (string-match-p "merge PR #72" out))
+      (should-not (string-match-p "ghost suggestion, not user input" out)))))
+
+(ert-deftest cc-butler-orchestrator/redaction-unknown-because-cursor-is-outside-any-box ()
+  "The other route to UNKNOWN: a modal dialog owns the screen, so the cursor
+sits nowhere near the input box.  Still redacted, still UNVERIFIED — \"no box
+at the cursor\" is not evidence that the box is empty."
+  (cc-butler-orchestrator-test--with-term
+      (progn (insert "❯ 1. yes\n  2. no\n")
+             (cc-butler-orchestrator-test--insert-input-row "leftover suggestion" nil))
+      "1. yes"
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "UNVERIFIED" out))
+      (should-not (string-match-p "leftover suggestion" out)))))
+
+(ert-deftest cc-butler-orchestrator/redaction-leaves-an-empty-nbsp-padded-box-alone ()
+  "An empty box — `❯' plus U+00A0 padding, cursor at the prompt — holds no
+text that could be misread, so it is left exactly as it is.  A marker here
+would fire on every idle session in the fleet and train readers to ignore
+markers, which is how the next real one gets missed."
+  (cc-butler-orchestrator-test--with-term
+      (cc-butler-orchestrator-test--insert-input-row "" nil)
+      cc-butler-orchestrator-test--prompt
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should-not (string-match-p "ghost suggestion" out))
+      (should-not (string-match-p "UNVERIFIED" out)))))
+
+(ert-deftest cc-butler-orchestrator/redaction-keeps-a-typed-slash-command ()
+  "A typed slash command is real input even though Claude Code renders it in
+an accent color (#b1b9f9 on this fleet) — the case that makes \"decorated,
+therefore ghost\" unusable in either direction."
+  (cc-butler-orchestrator-test--with-term
+      (cc-butler-orchestrator-test--insert-input-row "/compact" '(:foreground "#b1b9f9"))
+      (concat cc-butler-orchestrator-test--prompt "/compact")
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "/compact" out))
+      (should-not (string-match-p "ghost suggestion" out)))))
+
+(ert-deftest cc-butler-orchestrator/redaction-keeps-multi-line-typed-input ()
+  "A multi-line box: the cursor sits on the second row, everything typed
+ahead of it counts as real input, and nothing is redacted."
+  (cc-butler-orchestrator-test--with-term
+      (progn (cc-butler-orchestrator-test--insert-border-line)
+             (insert cc-butler-orchestrator-test--prompt "first line\n")
+             (insert "  second line\n")
+             (cc-butler-orchestrator-test--insert-border-line))
+      "second line"
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "first line" out))
+      (should (string-match-p "second line" out))
+      (should-not (string-match-p "ghost suggestion" out))
+      (should-not (string-match-p "UNVERIFIED" out)))))
 
 (ert-deftest cc-butler-orchestrator/read-output-redacted-passthrough-when-no-input-line ()
-  "Given a session with no \"❯ \"-prefixed line at all (fail-safe case:
-nothing to detect), Then `cc-butler--read-output-redacted' returns the
-plain text unchanged, same as `cc-butler--read-output'."
+  "Given a session with no border-framed input row at all (nothing to
+detect), Then `cc-butler--read-output-redacted' returns the plain text
+unchanged, same as `cc-butler--read-output'."
   (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
     (unwind-protect
         (progn
@@ -251,10 +380,10 @@ plain text unchanged, same as `cc-butler--read-output'."
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
 (ert-deftest cc-butler-orchestrator/read-output-unfiltered-unaffected-by-redaction ()
-  "Given the same ghost-faced input line, Then the ORIGINAL
-`cc-butler--read-output' (still used by cc-butler-cleanup.el's model/context
-detectors) is completely unaffected by the new redaction path — it keeps
-returning the raw text, properties stripped, exactly as before."
+  "Given the same ghost input line, Then the ORIGINAL `cc-butler--read-output'
+\(still used by cc-butler-cleanup.el's model/context detectors) is completely
+unaffected by the redaction path — it keeps returning the raw text,
+properties stripped, exactly as before."
   (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
     (unwind-protect
         (progn
@@ -268,152 +397,42 @@ returning the raw text, properties stripped, exactly as before."
 
 (ert-deftest cc-butler-orchestrator/read-output-redacted-not-fooled-by-scrollback-echo ()
   "Given a scrollback echo of a previously SUBMITTED message (\"❯ /compact\",
-unpainted — plain transcript text, not the input row) followed by the
-genuinely empty, border-sandwiched live input row, Then
-`cc-butler--read-output-redacted' does not mistake the echo for the input
-row. This is the actual root cause of the first redesign's live miss
-2026-07-21 (cc-butler#6): a backward text search for \"❯ \" matches
-submitted-message echoes just as easily as the live row, since both share
-the identical marker."
-  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer term-buf
-            (insert "❯ /compact\n")
-            (insert "Compacted.\n")
-            (cc-butler-orchestrator-test--insert-border-line)
-            (insert "❯ \n")
-            (cc-butler-orchestrator-test--insert-border-line))
-          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
-                     (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
-            (let ((out (cc-butler--read-output-redacted "/worker/")))
-              (should (string-match-p "❯ /compact" out))
-              (should-not (string-match-p "ghost suggestion" out)))))
-      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+plain transcript text, not the input row) followed by the genuinely empty,
+border-sandwiched live input row, Then the echo is not mistaken for the input
+row and is not touched.  This is the root cause of the first redesign's live
+miss 2026-07-21 (cc-butler#6): a backward text search for \"❯ \" matches
+submitted-message echoes just as easily as the live row."
+  (cc-butler-orchestrator-test--with-term
+      (progn (insert "❯ /compact\n")
+             (insert "Compacted.\n")
+             (cc-butler-orchestrator-test--insert-input-row "" nil))
+      "❯ /compact"                      ; cursor left in the echo, not in the box
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "❯ /compact" out))
+      (should-not (string-match-p "ghost suggestion" out)))))
 
 (ert-deftest cc-butler-orchestrator/border-line-with-embedded-title-still-detected ()
-  "Given a top border line with a title embedded in the middle (Claude
-Code sometimes draws the topic/branch name there, e.g. \"───── some-topic
-──\" — confirmed 2026-07-21 on a real live session), Then the input row
-between it and a plain border below is still found and redacted
-correctly — the border check is framing, not purity."
-  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer term-buf
-            (insert (make-string 10 cc-butler--border-rule-char))
-            (insert " plugin-gateway-routing-audit ")
-            (insert (make-string 4 cc-butler--border-rule-char))
-            (insert "\n")
-            (insert "❯ ")
-            (let ((start (point)))
-              (insert "PR #72 머지 진행해주세요")
-              (put-text-property start (point) 'face
-                                  (list :foreground cc-butler--ghost-face-fg
-                                        :background cc-butler--ghost-face-bg)))
-            (insert "\n")
-            (cc-butler-orchestrator-test--insert-border-line))
-          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
-                     (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
-            (let ((out (cc-butler--read-output-redacted "/worker/")))
-              (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
-              (should-not (string-match-p "PR #72" out)))))
-      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
-
-(ert-deftest cc-butler-orchestrator/read-output-redacted-hides-ghost-with-nbsp-prompt-pad ()
-  "Regression for the SECOND cc-butler#6 miss (2026-07-21): a real live
-phantom (\"move to #7\", the correct next-step guess) passed through
-`cc-butler--read-output-redacted' completely unredacted. Root cause:
-Claude Code pads the prompt with U+00A0 NO-BREAK SPACE after \"❯\", not
-an ordinary space, so the old fixed-offset check (`looking-at-p \"❯ \"'
-with an ordinary space) failed to match, fell back to sampling the
-unfaced \"❯\" glyph itself, and the fail-safe correctly-but-wrongly
-called an unreadable sample \"real\". Built from the ACTUAL captured row
-— \"❯\" + U+00A0 + ghost-faced text — not a synthetic fixture with an
-ordinary space; that is exactly the gap that let the bug ship at
-157/157 green. `cc-butler--line-ghost-p' fixes this by scanning every
-cell in the row instead of trusting one offset to hold it."
-  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer term-buf
-            (cc-butler-orchestrator-test--insert-border-line)
-            (insert "❯ ")
-            (let ((start (point)))
-              (insert "move to #7")
-              (put-text-property start (point) 'face
-                                  (list :foreground cc-butler--ghost-face-fg
-                                        :background cc-butler--ghost-face-bg)))
-            (insert "\n")
-            (cc-butler-orchestrator-test--insert-border-line))
-          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
-                     (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
-            (let ((out (cc-butler--read-output-redacted "/worker/")))
-              (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
-              (should-not (string-match-p "move to #7" out)))))
-      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
-
-(ert-deftest cc-butler-orchestrator/line-ghost-p-skips-unfaced-prompt-glyph ()
-  "`cc-butler--line-ghost-p' judges on a faced cell, not on offset 0 (the
-prompt glyph, which carries no face at all whether padded with an
-ordinary space or U+00A0) — direct unit coverage of the scan itself,
-independent of the border/redaction machinery around it."
-  (with-temp-buffer
-    (insert "❯ ")
-    (let ((start (point)))
-      (insert "phantom text")
-      (put-text-property start (point) 'face
-                          (list :foreground cc-butler--ghost-face-fg
-                                :background cc-butler--ghost-face-bg)))
-    (should (cc-butler--line-ghost-p (point-min) (point-max)))))
-
-(ert-deftest cc-butler-orchestrator/line-ghost-p-nil-when-nothing-faced ()
-  "`cc-butler--line-ghost-p' returns nil (fail-safe: treat as real) when no
-cell in the row carries any face at all — the genuinely-empty live input
-row case, not a detection failure."
-  (with-temp-buffer
-    (insert "❯ ")
-    (should-not (cc-butler--line-ghost-p (point-min) (point-max)))))
-
-(ert-deftest cc-butler-orchestrator/line-ghost-p-detects-ghost-even-when-glyph-is-faced ()
-  "The prompt glyph's own face is NOT constant — sometimes nil (the
-original captured phantom), sometimes a dim #999999/#262626 status style
-(observed live 2026-07-21 on a genuinely-empty row). `cc-butler--line-ghost-p'
-must not resolve on whichever cell comes first in the row; it must find
-the ghost signature wherever it actually is, even when a non-ghost face
-(the glyph's dim style) comes before it. This is the case a
-\"first-faced-cell\" reading of the function would fail — direct
-verification that the actual scan does not have that failure mode."
-  (with-temp-buffer
-    (insert "❯")
-    (put-text-property (1- (point)) (point) 'face
-                        (list :foreground "#999999" :background "#262626"))
-    (insert " ")
-    (put-text-property (1- (point)) (point) 'face
-                        (list :foreground "#999999" :background "#262626"))
-    (let ((start (point)))
-      (insert "some ghost suggestion")
-      (put-text-property start (point) 'face
-                          (list :foreground cc-butler--ghost-face-fg
-                                :background cc-butler--ghost-face-bg)))
-    (should (cc-butler--line-ghost-p (point-min) (point-max)))))
-
-(ert-deftest cc-butler-orchestrator/line-ghost-p-nil-when-glyph-faced-but-row-otherwise-empty ()
-  "A dim-faced prompt glyph (#999999/#262626, not the ghost signature) on
-an otherwise-empty row must still read as real/empty, not ghost —
-confirms the dim status style near the prompt does not itself trigger a
-false positive."
-  (with-temp-buffer
-    (insert "❯")
-    (put-text-property (1- (point)) (point) 'face
-                        (list :foreground "#999999" :background "#262626"))
-    (insert " ")
-    (put-text-property (1- (point)) (point) 'face
-                        (list :foreground "#999999" :background "#262626"))
-    (should-not (cc-butler--line-ghost-p (point-min) (point-max)))))
+  "Given a top border line with a title embedded in the middle (Claude Code
+sometimes draws the topic/branch name there, e.g. \"───── some-topic ──\" —
+confirmed 2026-07-21 on a real live session), Then the row between it and a
+plain border below is still found and redacted — the border check is framing,
+not purity, and it is still the rule CHARACTER, never a color."
+  (cc-butler-orchestrator-test--with-term
+      (progn (insert (make-string 10 cc-butler--border-rule-char))
+             (insert " plugin-gateway-routing-audit ")
+             (insert (make-string 4 cc-butler--border-rule-char))
+             (insert "\n")
+             (insert cc-butler-orchestrator-test--prompt)
+             (let ((start (point)))
+               (insert "PR #72 머지 진행해주세요")
+               (put-text-property start (point) 'face
+                                  cc-butler-orchestrator-test--ghost-face-now))
+             (insert "\n")
+             (cc-butler-orchestrator-test--insert-border-line))
+      cc-butler-orchestrator-test--prompt
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
+      (should-not (string-match-p "PR #72" out)))))
 
 ;;;; ---- type+submit atomicity (2026-07-23) ------------------------------
 ;;;; `cc-butler--send-input' writes twice for a submitting send: the text,

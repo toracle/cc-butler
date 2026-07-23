@@ -123,24 +123,18 @@ dialog until a human clears it.  That is the 2026-07-23 freeze."
 (defconst cc-butler-compact--rule-regexp "\\`[ \t]*───"
   "Match a horizontal rule — the top or bottom edge of the input box.")
 
-(defconst cc-butler-compact--blank "[ \t ​]"
-  "One character of input-box padding.
-Not the same set as ordinary whitespace: Claude Code pads the `❯' prompt
-with U+00A0 NO-BREAK SPACE on some builds (measured on this fleet
-2026-07-22; upstream hit the same thing in cc-butler#6).  `string-trim'
-leaves NBSP in place, so an empty box trims to a one-character string and
-every idle session in the fleet reads as \"has text typed in it\".")
-
 (defun cc-butler-compact--rule-p (line)
   "Non-nil when LINE is an input-box rule."
   (and (stringp line) (string-match-p cc-butler-compact--rule-regexp line)))
 
-(defun cc-butler-compact--strip (s)
-  "Strip the prompt glyph and padding — NBSP included — from both ends of S."
-  (replace-regexp-in-string
-   (concat "\\`\\(?:" cc-butler-compact--blank "\\|[❯>]\\)+"
-           "\\|" cc-butler-compact--blank "+\\'")
-   "" (or s "")))
+;; The prompt/padding vocabulary — the NBSP-aware `cc-butler--input-pad'
+;; character class and this stripper — moved down to cc-butler-session.el on
+;; 2026-07-24 with the ghost-vs-real decision it serves (cc-butler#6), so the
+;; redaction path in the orchestrator shares one definition of it rather than
+;; growing a second.  The compaction-local name stays as an alias: it reads
+;; better in `cc-butler-compact--input-line' below, and it is one definition
+;; either way.
+(defalias 'cc-butler-compact--strip 'cc-butler--strip-input-pad)
 
 (defcustom cc-butler-compact-menu-lines 25
   "How many lines up from the bottom count as the live screen.
@@ -165,11 +159,11 @@ Used two ways: as a pre-flight refusal, and — after `/model' — as the
 signal that the prompt-cache confirmation is up and waiting for a choice."
   (let* ((all (split-string (or screen "") "\n"))
          (lines (last all (min (length all) cc-butler-compact-menu-lines)))
-         (marked (concat "\\`" cc-butler-compact--blank "*❯"
-                         cc-butler-compact--blank "*[0-9]+\\."
-                         cc-butler-compact--blank "*[^ \t ]"))
-         (option (concat "\\`" cc-butler-compact--blank "*[0-9]+\\."
-                         cc-butler-compact--blank "*[^ \t ]")))
+         (marked (concat "\\`" cc-butler--input-pad "*❯"
+                         cc-butler--input-pad "*[0-9]+\\."
+                         cc-butler--input-pad "*[^ \t ]"))
+         (option (concat "\\`" cc-butler--input-pad "*[0-9]+\\."
+                         cc-butler--input-pad "*[^ \t ]")))
     (and (cl-some (lambda (l) (string-match-p marked l)) lines)
          (cl-some (lambda (l) (string-match-p option l)) lines)
          t)))
@@ -191,81 +185,35 @@ its padding are stripped."
       (let ((s (cc-butler-compact--strip found)))
         (unless (string-empty-p s) s)))))
 
-(defconst cc-butler-compact--box-scan-lines 12
-  "How far from the cursor to look for the input box's rules.
-Bounds the search for a multi-line input box, without letting a cursor
-parked somewhere unrelated be mistaken for one.")
-
-(defun cc-butler-compact--box-region-at (pos)
-  "Return (BEG . END) of the input-box text preceding POS, or nil.
-BEG is just after the box's opening rule and END is POS, so the result
-covers everything typed ahead of the cursor — multi-line input included."
-  (save-excursion
-    (goto-char pos)
-    (let ((cursor-bol (line-beginning-position))
-          top bottom (n 0))
-      (unless (save-excursion (goto-char cursor-bol) (looking-at "[ \t]*───"))
-        (save-excursion
-          (goto-char cursor-bol)
-          (while (and (not top) (< n cc-butler-compact--box-scan-lines)
-                      (zerop (forward-line -1)))
-            (setq n (1+ n))
-            (when (looking-at "[ \t]*───") (setq top (line-end-position)))))
-        (setq n 0)
-        (save-excursion
-          (goto-char cursor-bol)
-          (while (and (not bottom) (< n cc-butler-compact--box-scan-lines)
-                      (zerop (forward-line 1)))
-            (setq n (1+ n))
-            (when (looking-at "[ \t]*───") (setq bottom t))))
-        (when (and top bottom) (cons (1+ top) pos))))))
-
 (defun cc-butler-compact--typed-text (dir)
   "Return the text actually TYPED into DIR's input box, or nil if empty.
 
-Reads the terminal CURSOR, not the painted row.  Claude Code paints a
-dimmed suggestion — a previous prompt, or a `Try \"...\"' placeholder — into
-an EMPTY input box.  That suggestion is decoration: the terminal's input
-buffer holds nothing and the cursor stays at the prompt.  Type one
-character and the suggestion vanishes and the cursor advances.  So the
-cursor's distance past the prompt IS the length of the pending input, and
-the painted text is evidence of nothing at all.
+Ghost-vs-real is decided by `cc-butler--input-state' — the terminal cursor,
+not the painted row.  See that docstring for why no color check can do this
+job, and for the live measurements behind it.
 
-Measured across the live fleet 2026-07-23: eight sessions; every empty or
-suggestion-showing box had its cursor at column 2, immediately after `❯ ' —
-including one painting a full sentence of dimmed Korean — while a session
-with `abcd' genuinely typed had it at column 6.
+FAIL-SAFE DIRECTION, compaction guard: an UNKNOWN state is treated as REAL
+INPUT.  What this answer gates is whether the driver may TYPE INTO the
+session.  Appending `/compact' to the end of a half-finished sentence a
+human is composing corrupts their input and then submits something neither
+of us wrote; declining a compaction that could safely have run costs one
+sweep, and the session comes back around on the next one.  The two mistakes
+are not the same size, so when the cursor is unreadable we fall back to the
+painted row and believe whatever is painted there.
 
-This replaced a face-color test, which cannot be made to work.  Real input
-is not reliably unfaced: a typed slash command renders in an accent color
-\(#b1b9f9 on this fleet).  The suggestion color is theme-dependent
-\(#8686a8 here; the constants upstream keys on say #a7a7a7, which is why
-`cc-butler--ghost-face-p' still carries diagnostics for an unresolved miss,
-cc-butler#6).  Telling `dim' from `accent' apart by hex is exactly the check
-this codebase has been burned by three times.  The cursor is state, styling
-is not — and reading styling as state is the same error that had the butler
-repeatedly judging its own delivered sends to be unsubmitted.
-
-Fail-safe: if the cursor cannot be read (a non-ghostel terminal backend) or
-does not sit inside an input box, fall back to the painted row and treat
-whatever is painted there as real."
+The redaction in `cc-butler--redact-ghost-input-line' gates the opposite
+thing — whether to SHOW a row to a reader — meets the opposite asymmetry,
+and therefore takes UNKNOWN the other way.  That divergence is precisely
+why `cc-butler--input-state' reports three outcomes instead of resolving to
+a boolean on its callers' behalf."
   (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
     (when (buffer-live-p buf)
       (cc-butler--refresh-terminal-text buf)
-      (with-current-buffer buf
-        (let ((cursor (and (fboundp 'ghostel-cursor-point)
-                           (ignore-errors (ghostel-cursor-point)))))
-          (if (not cursor)
-              (cc-butler-compact--input-line (cc-butler--read-output dir 40))
-            (let ((region (cc-butler-compact--box-region-at cursor)))
-              (if (not region)
-                  ;; The cursor is not inside an input box — a dialog may own
-                  ;; the screen.  Do not conclude the box is empty.
-                  (cc-butler-compact--input-line (cc-butler--read-output dir 40))
-                (let ((typed (cc-butler-compact--strip
-                              (buffer-substring-no-properties
-                               (car region) (cdr region)))))
-                  (unless (string-empty-p typed) typed))))))))))
+      (pcase (with-current-buffer buf (cc-butler--input-state))
+        (`(real . ,typed) typed)
+        (`(ghost . ,_) nil)
+        ;; UNKNOWN -> assume real; see the fail-safe note above.
+        (_ (cc-butler-compact--input-line (cc-butler--read-output dir 40)))))))
 
 (defun cc-butler-compact--pending-input-p (dir)
   "Non-nil when DIR's input box holds text the operator actually typed.

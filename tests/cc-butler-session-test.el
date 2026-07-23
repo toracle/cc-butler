@@ -411,5 +411,148 @@ launch-time guarantee lasts only until the first layout change."
       (cc-butler--fit-pty-largest 'window))
     (should floored)))
 
+;;;; ---- the shared ghost-vs-real predicate (cc-butler#6, 2026-07-24) ----
+;;;; `cc-butler--input-state' is the ONE answer to "is there real typed
+;;;; input in this box".  It lives here, below both callers, because the
+;;;; compaction guard (cc-butler-compact.el) and read_session_output's
+;;;; redaction (cc-butler-orchestrator.el) used to answer it separately and
+;;;; only one of the two was right.  It reports three outcomes and resolves
+;;;; none of them: the callers need opposite fail-safes, so each picks its
+;;;; own direction at its own call site.
+
+(defconst cc-butler-session-test--prompt (concat "❯" (string #x00A0))
+  "`❯' + U+00A0 NO-BREAK SPACE, the prompt Claude Code actually renders.
+Spelled as explicit code points so no editor can normalise the NBSP away —
+a fixture with an ordinary space is what let an earlier miss ship green.")
+
+(defmacro cc-butler-session-test--with-box (fill cursor-needle &rest body)
+  "Run BODY in a buffer painted by FILL, with the terminal cursor reported
+at the end of the first match of CURSOR-NEEDLE (nil = no cursor readable)."
+  (declare (indent 2))
+  `(with-temp-buffer
+     ,fill
+     (let ((cursor (when ,cursor-needle
+                     (goto-char (point-min))
+                     (search-forward ,cursor-needle)
+                     (point))))
+       (cl-letf (((symbol-function 'ghostel-cursor-point) (lambda () cursor)))
+         ,@body))))
+
+(defun cc-butler-session-test--box (text)
+  "Insert a border-framed input box holding TEXT after the prompt."
+  (insert (make-string 24 cc-butler--border-rule-char) "\n")
+  (insert cc-butler-session-test--prompt text "\n")
+  (insert (make-string 24 cc-butler--border-rule-char) "\n"))
+
+(ert-deftest cc-butler-session/input-state-ghost-when-cursor-is-at-the-prompt ()
+  "A painted suggestion leaves the cursor at the prompt because the input
+buffer is genuinely empty — so the box reads GHOST no matter how much text
+is painted into it (measured across eight live sessions 2026-07-23)."
+  (cc-butler-session-test--with-box
+      (cc-butler-session-test--box "네, 꺼내주세요")
+      cc-butler-session-test--prompt
+    (should (equal '(ghost) (cc-butler--input-state)))))
+
+(ert-deftest cc-butler-session/input-state-real-when-cursor-is-past-the-prompt ()
+  "Typed text advances the cursor, and the distance past the prompt IS the
+pending input."
+  (cc-butler-session-test--with-box
+      (cc-butler-session-test--box "abcd")
+      (concat cc-butler-session-test--prompt "abcd")
+    (should (equal '(real . "abcd") (cc-butler--input-state)))))
+
+(ert-deftest cc-butler-session/input-state-is-blind-to-the-face-color ()
+  "The whole point of the redesign: the painted color decides nothing.  The
+same row in this fleet's ghost face (#8686a8/#00005f), in the legacy face
+the deleted constant keyed on (#a7a7a7/#262626), in an accent face, and
+unfaced, all classify identically — by the cursor alone."
+  (dolist (face '((:foreground "#8686a8" :background "#00005f")
+                  (:foreground "#a7a7a7" :background "#262626")
+                  (:foreground "#b1b9f9")
+                  nil))
+    (cc-butler-session-test--with-box
+        (progn (insert (make-string 24 cc-butler--border-rule-char) "\n")
+               (insert cc-butler-session-test--prompt)
+               (let ((start (point)))
+                 (insert "merge PR #72 please")
+                 (when face (put-text-property start (point) 'face face)))
+               (insert "\n")
+               (insert (make-string 24 cc-butler--border-rule-char) "\n"))
+        cc-butler-session-test--prompt
+      (should (equal '(ghost) (cc-butler--input-state))))))
+
+(ert-deftest cc-butler-session/input-state-empty-nbsp-padded-box-is-ghost ()
+  "An empty box trims to a one-character string under `string-trim' because
+the padding is U+00A0, not a space.  `cc-butler--strip-input-pad' knows that;
+losing it made every idle session in the fleet read as \"has text typed\"."
+  (cc-butler-session-test--with-box
+      (cc-butler-session-test--box "")
+      cc-butler-session-test--prompt
+    (should (equal '(ghost) (cc-butler--input-state)))))
+
+(ert-deftest cc-butler-session/input-state-typed-slash-command-is-real ()
+  "A half-typed slash command is the most dangerous pending input there is —
+our own command would be appended to it — and Claude Code renders it in an
+accent face, which a face-based rule read as \"decorated, therefore ghost\"."
+  (cc-butler-session-test--with-box
+      (progn (insert (make-string 24 cc-butler--border-rule-char) "\n")
+             (insert cc-butler-session-test--prompt)
+             (let ((start (point)))
+               (insert "/clear")
+               (put-text-property start (point) 'face '(:foreground "#b1b9f9")))
+             (insert "\n")
+             (insert (make-string 24 cc-butler--border-rule-char) "\n"))
+      (concat cc-butler-session-test--prompt "/clear")
+    (should (equal '(real . "/clear") (cc-butler--input-state)))))
+
+(ert-deftest cc-butler-session/input-state-multi-line-input-is-seen-whole ()
+  "A multi-line box must report everything ahead of the cursor, not just the
+cursor's own row — otherwise a second line looks empty and we type into it."
+  (cc-butler-session-test--with-box
+      (progn (insert (make-string 24 cc-butler--border-rule-char) "\n")
+             (insert cc-butler-session-test--prompt "first line\n")
+             (insert "  second line\n")
+             (insert (make-string 24 cc-butler--border-rule-char) "\n"))
+      "second line"
+    (let ((state (cc-butler--input-state)))
+      (should (eq 'real (car state)))
+      (should (string-match-p "first line" (cdr state)))
+      (should (string-match-p "second line" (cdr state))))))
+
+(ert-deftest cc-butler-session/input-state-unknown-when-no-cursor-is-readable ()
+  "A terminal backend with no readable cursor yields UNKNOWN — never GHOST.
+Reporting an unread box as empty would hand the redaction path a false
+determination and the compaction guard a licence to type."
+  (cc-butler-session-test--with-box
+      (cc-butler-session-test--box "something")
+      nil
+    (should (equal '(unknown) (cc-butler--input-state)))))
+
+(ert-deftest cc-butler-session/input-state-unknown-when-cursor-is-outside-a-box ()
+  "A modal dialog owns the screen and the cursor sits nowhere near an input
+box.  That is UNKNOWN, not GHOST: \"no box at the cursor\" is not evidence
+that the box is empty."
+  (cc-butler-session-test--with-box
+      (progn (insert "❯ 1. yes\n  2. no\n")
+             (cc-butler-session-test--box "leftover"))
+      "1. yes"
+    (should (equal '(unknown) (cc-butler--input-state)))))
+
+(ert-deftest cc-butler-session/input-state-never-resolves-unknown-itself ()
+  "Guard on the design constraint, not on a behaviour: `cc-butler--input-state'
+must keep UNKNOWN as its own outcome.  If it ever collapses UNKNOWN into
+GHOST or REAL, one of the two call sites silently inherits the other's
+fail-safe — and those fail-safes point in opposite directions on purpose
+\(compaction refuses to type; redaction refuses to show)."
+  (should (memq (car (cc-butler-session-test--with-box
+                         (cc-butler-session-test--box "text")
+                         nil
+                       (cc-butler--input-state)))
+                '(unknown)))
+  (should (eq 'ghost (car (cc-butler-session-test--with-box
+                              (cc-butler-session-test--box "text")
+                              cc-butler-session-test--prompt
+                            (cc-butler--input-state))))))
+
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here

@@ -77,7 +77,8 @@ terminal screen, after a force-refresh, or nil if the buffer isn't live.
 Bounded by `cc-butler-session-io-timeout' so a stuck redraw cannot hang
 the caller.  Shared by `cc-butler--read-output' (plain text, properties
 stripped) and `cc-butler--read-output-redacted' (ghost-input-line-aware,
-still needs the live `face' properties BUF carries before they're gone)."
+which needs BUF itself — the terminal cursor lives on the buffer, not in
+any string cut out of it)."
   (with-timeout (cc-butler-session-io-timeout
                  (error "Timed out reading session %s's output after %ss (redraw or buffer access may be stuck)"
                         (cc-butler--display-name dir) cc-butler-session-io-timeout))
@@ -98,131 +99,73 @@ plain text.  See `cc-butler--output-buffer-and-bounds'."
     (with-current-buffer (car bb)
       (string-trim (buffer-substring-no-properties (cadr bb) (cddr bb))))))
 
-(defconst cc-butler--ghost-face-fg "#a7a7a7"
-  "Foreground color Claude Code renders ghost/autocomplete input-line text
-with (measured 2026-07-21) — see governance principle
-butler-ghost-text-not-a-blocker-authorization-or-data.")
+(defconst cc-butler--ghost-marker "❯ [ghost suggestion, not user input]"
+  "Stand-in for an input row that holds a painted suggestion, not input.")
 
-(defconst cc-butler--ghost-face-bg "#262626"
-  "Background color Claude Code renders ghost/autocomplete input-line text
-with (measured 2026-07-21) — pairs with `cc-butler--ghost-face-fg'.")
-
-(defun cc-butler--ghost-face-p (face)
-  "Return non-nil if FACE (a plist, as ghostel paints terminal cells)
-matches the color signature Claude Code renders ghost/autocomplete text
-with."
-  (and (consp face)
-       (equal (plist-get face :foreground) cc-butler--ghost-face-fg)
-       (equal (plist-get face :background) cc-butler--ghost-face-bg)))
-
-;; --- TEMPORARY diagnostics for cc-butler#6 (silent redaction miss,
-;; 2026-07-21) — remove once the miss is root-caused.  Pure observability:
-;; does not alter `cc-butler--redact-ghost-input-line's return value at all.
-(defvar cc-butler--ghost-redaction-debug nil
-  "TEMPORARY ring of the last few redaction attempts, newest first. Each
-entry: (:time STR :found BOOL :line-text STR :faces ((OFFSET . FACE) ...)).
-Remove along with `cc-butler--ghost-redaction-debug-record' and its call
-site in `cc-butler--redact-ghost-input-line' once cc-butler#6 is
-root-caused.")
-
-(defconst cc-butler--ghost-redaction-debug-max 30
-  "TEMPORARY cap on `cc-butler--ghost-redaction-debug' entries.")
-
-(defun cc-butler--ghost-redaction-debug-record (entry)
-  "TEMPORARY: push ENTRY onto `cc-butler--ghost-redaction-debug', capped."
-  (push entry cc-butler--ghost-redaction-debug)
-  (when (> (length cc-butler--ghost-redaction-debug) cc-butler--ghost-redaction-debug-max)
-    (setq cc-butler--ghost-redaction-debug
-          (seq-take cc-butler--ghost-redaction-debug cc-butler--ghost-redaction-debug-max))))
-
-(defun cc-butler--line-ghost-p (line-beg line-end)
-  "Return non-nil if any character in [LINE-BEG,LINE-END) carries the
-ghost/autocomplete face signature (`cc-butler--ghost-face-p'). Scans
-every cell in the row rather than sampling a single fixed offset — the
-prompt glyph and any padding after it carry no face at all (confirmed
-2026-07-21: Claude Code pads \"❯\" with U+00A0 NO-BREAK SPACE on some
-builds, not an ordinary space, so a fixed offset can land on an unfaced
-cell and wrongly read as real). An entirely unfaced row still yields
-nil — fail-safe: nothing readable to call ghost."
-  (let ((pos line-beg))
-    (catch 'found
-      (while (< pos line-end)
-        (when (cc-butler--ghost-face-p (get-text-property pos 'face))
-          (throw 'found t))
-        (setq pos (1+ pos)))
-      nil)))
+(defconst cc-butler--unreadable-input-marker
+  "❯ [input row UNVERIFIED — could not tell real input from a ghost suggestion; redacted]"
+  "Stand-in for an input row whose ghost-vs-real state could not be read.
+Says so out loud, deliberately.  The alternative to a noisy marker is
+handing a reader a clean-looking line that was actually a guess, and a
+guess that reads as a human instruction is the whole failure mode this
+redaction exists to prevent.  A reader who sees this can go look at the
+session; a reader handed a confident wrong answer cannot know to.")
 
 (defun cc-butler--redact-ghost-input-line (start end)
-  "In the current buffer, return the text between START and END as a
-plain string, with one exception: if the input row — the line
-sandwiched between two consecutive border-rule lines, see
-`cc-butler--find-input-line' — is rendered in the ghost/autocomplete
-color signature (not real input), its content is replaced with a plain
-marker instead of being returned as if it were real.
+  "Return the current buffer's text between START and END, with the live
+input row replaced by a marker unless it holds text a human really typed.
 
-The input row used to be found by a backward search for a literal
-\"❯ \" prefix. That was abandoned 2026-07-21 (cc-butler#6) for two
-independent reasons, either one enough on its own: (1) the prefix is not
-unique to the live row — Claude Code echoes SUBMITTED messages in
-scrollback with the identical \"❯ \" marker, so a text search for it can
-land on a past message instead of the live row, and on an empty live row
-it frequently matches nothing at all in range; (2) a first attempt at
-replacing it with the border rule's own COLOR was also rejected before
-being built on — that color was measured #0891b2 on one session and
-#888888 on five others sampled the same day, so it is theme-dependent,
-same as the ghost signature itself. The row is found instead by the
-border rule's CONTENT (`cc-butler--border-line-p', the U+2500
-box-drawing character repeated) — deliberately not by any color — which
-holds regardless of theme, and regardless of whether the row itself is
-empty, ghost, or real. Do not \"simplify\" this back to a color check on
-the border; that was tried and found fragile before this landed.
+The row is LOCATED by the border rules that frame it
+\(`cc-butler--find-input-line', anchored on the U+2500 rule CHARACTER, never
+on a color).  What is IN it is judged by `cc-butler--input-state' — the
+terminal cursor.  A row that is empty once padding is stripped is left
+alone either way: there is no text in it to be misread, and a marker there
+would be noise on every idle session in the fleet.
 
-Judging ghost-vs-real used to sample ONE fixed offset into the row (just
-past a literal \"❯ \" prefix). That was abandoned 2026-07-21 (cc-butler#6,
-second miss on the same day): a live phantom (\"move to #7\") passed
-through unredacted because Claude Code pads the prompt with U+00A0
-NO-BREAK SPACE after \"❯\", not an ordinary space — the literal prefix
-match failed, the fallback landed on the unfaced \"❯\" glyph itself, and
-the fail-safe correctly-but-wrongly treated an unreadable single sample
-as real. `cc-butler--line-ghost-p' scans every cell in the row instead
-of trusting one offset to be the right one — robust to NBSP padding, to
-a changed prompt glyph, and to the single-point-sample risk at once,
-not just the specific character that broke this time.
+FAIL-SAFE DIRECTION, read_session_output: an UNKNOWN state is treated as
+GHOST and redacted.  What this answer gates is whether to SHOW a row to a
+reader.  A ghost suggestion shown as real input gets read as an instruction
+from the human — on 2026-07-23 a painted sentence very nearly became one —
+and nothing downstream can audit it back to the screen it came from.  A
+real line withheld is withheld VISIBLY: the marker is right there, and the
+reader can open the session.  So the unreadable case is redacted, and it
+carries `cc-butler--unreadable-input-marker' rather than the ghost marker
+so that a guess is never presented as a determination.  The compaction
+guard in `cc-butler-compact--typed-text' gates the opposite thing and takes
+UNKNOWN the opposite way; that is why `cc-butler--input-state' reports
+three outcomes instead of a boolean.
 
-Fail-safe: if no such sandwich is found in range, or no cell in the row
-carries any face at all, the text is returned unchanged — an unreadable
-signal is always treated as real, never optimistically assumed to be
-ghost. See governance principle
-butler-ghost-text-not-a-blocker-authorization-or-data."
+DELETED HERE 2026-07-24 (cc-butler#6): this used to compare the row's face
+FOREGROUND against a constant — #a7a7a7 on #262626.  Measured live on this
+fleet, ghost text is painted #8686a8 on #00005f, so the comparison never
+once matched; and because the old fail-safe leaned the other way (\"cannot
+tell -> real input\"), every ghost row was silently promoted to real input.
+Styling is not state.  Do not reintroduce a color check here — that is the
+third time this codebase has paid for one."
   (save-excursion
     (let* ((line-beg (cc-butler--find-input-line start end))
-           (line-end (and line-beg (save-excursion (goto-char line-beg) (line-end-position)))))
-      ;; TEMPORARY diagnostic capture — see the defvar above. Kept in
-      ;; place until this redesign is confirmed against a real live
-      ;; phantom, not just synthetic input (cc-butler#6).
-      (if (not line-beg)
-          (cc-butler--ghost-redaction-debug-record
-           (list :time (format-time-string "%H:%M:%S") :found nil))
-        (let* ((l-len (- line-end line-beg))
-               (offsets (seq-filter (lambda (o) (< o l-len))
-                                    '(0 1 2 3 4 5 6 8 10 15 20 30 40)))
-               (faces (mapcar (lambda (o) (cons o (get-text-property (+ line-beg o) 'face)))
-                             offsets)))
-          (cc-butler--ghost-redaction-debug-record
-           (list :time (format-time-string "%H:%M:%S") :found t
-                 :line-text (buffer-substring-no-properties line-beg line-end)
-                 :faces faces))))
-      (if (and line-beg (cc-butler--line-ghost-p line-beg line-end))
+           (line-end (and line-beg (save-excursion (goto-char line-beg)
+                                                   (line-end-position))))
+           (painted (and line-beg
+                         (cc-butler--strip-input-pad
+                          (buffer-substring-no-properties line-beg line-end))))
+           (marker (and painted (not (string-empty-p painted))
+                        (pcase (car (cc-butler--input-state))
+                          ('real nil)
+                          ('ghost cc-butler--ghost-marker)
+                          (_ cc-butler--unreadable-input-marker)))))
+      (if marker
           (concat (buffer-substring-no-properties start line-beg)
-                  "❯ [ghost suggestion, not user input]"
+                  marker
                   (buffer-substring-no-properties line-end end))
         (buffer-substring-no-properties start end)))))
 
 (defun cc-butler--read-output-redacted (dir &optional lines)
-  "Like `cc-butler--read-output', but a ghost/autocomplete input line is
-replaced with a plain marker instead of being returned as real text —
-used by the `read_session_output' MCP tool so a caller can never mistake
-a phantom for a blocker, an authorization, or data.  See
+  "Like `cc-butler--read-output', but the live input row is replaced with a
+plain marker unless a human really typed into it — used by the
+`read_session_output' MCP tool so a caller can never mistake a painted
+suggestion for a blocker, an authorization, or data.  A row whose state
+cannot be determined is redacted too, and says so.  See
 `cc-butler--redact-ghost-input-line' and governance principle
 butler-ghost-text-not-a-blocker-authorization-or-data."
   (when-let ((bb (cc-butler--output-buffer-and-bounds dir lines)))
@@ -1158,9 +1101,9 @@ is rendered as a document in 정수님's inbox; otherwise it queues for
 
 (defun cc-butler-tool-read-session (name &optional lines)
   "MCP tool: return the recent terminal output of session NAME.
-A ghost/autocomplete input-line suggestion is redacted to a plain marker
-rather than returned as if it were real input — see
-`cc-butler--read-output-redacted'."
+An input row holding a ghost/autocomplete suggestion — or one whose state
+could not be read at all — is redacted to a plain marker rather than
+returned as if it were real input.  See `cc-butler--read-output-redacted'."
   (let ((dir (cc-butler--dir-by-name name)))
     (if (not dir)
         (format "No session named %S.  Call list_claude_sessions for names." name)
@@ -1307,7 +1250,7 @@ without anything being typed into its input box."
 (claude-code-ide-make-tool
  :function #'cc-butler-tool-read-session
  :name "read_session_output"
- :description "Read the recent terminal screen of another Claude session by name, to see what it is doing or asking. The text is that session's live TUI screen (may include UI chrome). A detected ghost/autocomplete input-line suggestion is replaced with a plain marker rather than returned as real text — it is never the session's actual input."
+ :description "Read the recent terminal screen of another Claude session by name, to see what it is doing or asking. The text is that session's live TUI screen (may include UI chrome). The input row is returned only when the session's terminal cursor shows a human really typed into it; a ghost/autocomplete suggestion painted into an empty box is replaced with a plain marker, and a row whose state cannot be determined is replaced with an UNVERIFIED marker rather than shown as if it were real input."
  :args '((:name "name"
                 :type string
                 :description "Session name from list_claude_sessions (e.g. 'app-billing').")

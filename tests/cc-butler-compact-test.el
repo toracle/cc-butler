@@ -202,6 +202,27 @@ row check rather than assuming empty."
         (fmakunbound 'ghostel-cursor-point)
         (should (equal (cc-butler-compact--typed-text "d") "something"))))))
 
+(ert-deftest cc-butler-compact/unknown-cursor-is-treated-as-real-input ()
+  "FAIL-SAFE DIRECTION, compaction guard — the deliberate OPPOSITE of
+`cc-butler-orchestrator/redaction-unknown-cursor-redacts-and-says-so'.
+Both call sites ask `cc-butler--input-state' the same question and get the
+same UNKNOWN back; this one resolves it toward REAL INPUT and refuses to
+compact, because typing over a sentence a human is composing corrupts their
+input and submits something neither of us wrote, while a skipped compaction
+costs one sweep.  The read side resolves it the other way, because showing a
+suggestion as real input is how it becomes a false instruction.  That is why
+the shared predicate reports three outcomes instead of a boolean."
+  (let ((screen (string-join '("─────" "❯ half-typed sentence" "─────") "\n")))
+    (cl-letf (((symbol-function 'cc-butler--refresh-terminal-text) #'ignore)
+              ((symbol-function 'cc-butler--read-output) (lambda (&rest _) screen))
+              ((symbol-function 'claude-code-ide--get-buffer-name)
+               (lambda (_d) (buffer-name (current-buffer))))
+              ((symbol-function 'ghostel-cursor-point) (lambda () nil)))
+      (with-temp-buffer
+        (insert screen)
+        (should (equal (cc-butler-compact--typed-text "d") "half-typed sentence"))
+        (should (cc-butler-compact--pending-input-p "d"))))))
+
 (ert-deftest cc-butler-compact/prose-numbered-lists-are-not-menus ()
   "REGRESSION (live, 2026-07-22): reading 40 lines pulls in scrollback, and
 Claude writes numbered lists constantly.  Without the selection caret, a
