@@ -301,5 +301,115 @@ false-ready session into which a `send_to_session' silently vanishes
         (cc-butler--launch-session "/tmp/some-worker/")))
     (should (equal waited-for (file-name-as-directory (expand-file-name "/tmp/some-worker/"))))))
 
+;;;; ------------------------------------------------------------------
+;;;; PTY minimum size
+;;;; ------------------------------------------------------------------
+
+;; A new session's terminal buffer is never displayed before it is created,
+;; so the size that reaches the pty comes from whatever window it first
+;; lands in — applied with no lower bound.  With the frame split narrow,
+;; sessions have come up at ELEVEN columns: the TUI cannot lay out its input
+;; row, keystrokes go nowhere, and it presents as "input doesn't work"
+;; rather than as a size problem.
+
+(defmacro cc-butler-test--with-pty (rows cols &rest body)
+  "Run BODY with a fake ghostel session buffer sized ROWSxCOLS.
+Binds `sized' to the (ROWS . COLS) passed to `set-process-window-size' and
+`grid' to the (ROWS . COLS) passed to ghostel's own sizer."
+  (declare (indent 2))
+  `(let ((buf (generate-new-buffer " *cc-pty-test*"))
+         (sized nil) (grid nil))
+     (unwind-protect
+         (with-current-buffer buf
+           (setq-local ghostel--term-rows ,rows)
+           (setq-local ghostel--term-cols ,cols)
+           (setq-local ghostel--term 'fake-term)
+           (cl-letf (((symbol-function 'get-buffer-process) (lambda (_b) 'proc))
+                     ((symbol-function 'process-live-p) (lambda (_p) t))
+                     ((symbol-function 'set-process-window-size)
+                      (lambda (_p r c) (setq sized (cons r c))))
+                     ((symbol-function 'ghostel--set-size-with-cell-dims)
+                      (lambda (_t r c) (setq grid (cons r c))))
+                     ((symbol-function 'cc-butler--log) #'ignore)
+                     ((symbol-function 'claude-code-ide--get-buffer-name)
+                      (lambda (_d) (buffer-name buf))))
+             ,@body))
+       (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/pty-floor-raises-a-degenerate-terminal ()
+  "REGRESSION: an 11-column session is raised to the floor, and BOTH the pty
+ioctl and ghostel's grid are corrected — the process and the display have to
+agree about how wide the world is."
+  (cc-butler-test--with-pty 24 11
+    (should (equal (cc-butler--pty-size-floor (current-buffer))
+                   (cons cc-butler-terminal-min-height
+                         cc-butler-terminal-min-width)))
+    (should (equal sized (cons cc-butler-terminal-min-height
+                               cc-butler-terminal-min-width)))
+    (should (equal grid sized))))
+
+(ert-deftest cc-butler-session/pty-floor-never-shrinks-a-healthy-terminal ()
+  "A terminal already at or above the floor is left completely alone — this
+is a floor, not a resize policy, and must not fight the window layout."
+  (cc-butler-test--with-pty 50 200
+    (should-not (cc-butler--pty-size-floor (current-buffer)))
+    (should-not sized)
+    (should-not grid)))
+
+(ert-deftest cc-butler-session/pty-floor-raises-only-the-dimension-below-it ()
+  "Height and width are floored independently; a tall narrow window keeps its
+height."
+  (cc-butler-test--with-pty 60 11
+    (cc-butler--pty-size-floor (current-buffer))
+    (should (equal (car sized) 60))
+    (should (equal (cdr sized) cc-butler-terminal-min-width))))
+
+(ert-deftest cc-butler-session/launch-sizes-the-pty-before-waiting-for-ready ()
+  "Order is load-bearing: the readiness wait watches for the TUI's input row,
+and a terminal eleven columns wide cannot draw one.  Sizing after the wait
+would mean timing out on a session that was only ever too narrow to look
+ready."
+  (let ((orig-featurep (symbol-function 'featurep)) (order nil))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/claude"))
+              ((symbol-function 'featurep)
+               (lambda (f) (or (eq f 'ghostel) (funcall orig-featurep f))))
+              ((symbol-function 'claude-code-ide) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler--configure-session) (lambda (_d) nil))
+              ((symbol-function 'cc-butler--ensure-pty-size)
+               (lambda (_d) (push 'sized order)))
+              ((symbol-function 'cc-butler--wait-for-session-ready)
+               (lambda (_d) (push 'waited order))))
+      (let ((claude-code-ide-terminal-backend 'ghostel)
+            (claude-code-ide-cli-path "/usr/bin/claude"))
+        (cc-butler--launch-session "/tmp/some-worker/")))
+    (should (equal (nreverse order) '(sized waited)))))
+
+(ert-deftest cc-butler-session/resume-also-sizes-the-pty ()
+  "`cc-butler--resume-in' is the OTHER spawn site.  A restore after a restart
+brings every session back at once into whatever layout the frame is in,
+which is the likeliest time to hit this at all."
+  (require 'cc-butler-persist)
+  (let ((order nil))
+    (cl-letf (((symbol-function 'claude-code-ide) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler--ensure-pty-size)
+               (lambda (_d) (push 'sized order)))
+              ((symbol-function 'cc-butler--wait-for-session-ready)
+               (lambda (_d) (push 'waited order))))
+      (cc-butler--resume-in "/tmp/some-worker/"))
+    (should (equal (nreverse order) '(sized waited)))))
+
+(ert-deftest cc-butler-session/refit-reapplies-the-floor ()
+  "A refit is sized from a window, so it can drop back under the floor the
+moment the frame is split narrow.  Without re-applying it there, the
+launch-time guarantee lasts only until the first layout change."
+  (let ((floored nil))
+    (cl-letf (((symbol-function 'derived-mode-p) (lambda (&rest _) t))
+              ((symbol-function 'ghostel--adjust-size) (lambda (_w) nil))
+              ((symbol-function 'window-live-p) (lambda (_w) t))
+              ((symbol-function 'cc-butler--pty-size-floor)
+               (lambda (_b) (setq floored t))))
+      (cc-butler--fit-pty-largest 'window))
+    (should floored)))
+
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here

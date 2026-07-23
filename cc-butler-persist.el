@@ -154,6 +154,11 @@ gets spawned, and the startup race that can drop a caller's first
                               " " (mapconcat #'identity cc-butler-resume-args " "))))
         (default-directory (file-name-as-directory (expand-file-name dir))))
     (cc-butler--with-channel (claude-code-ide)))
+  ;; The second spawn site, and it needs the same floor for the same reason
+  ;; — see `cc-butler--ensure-pty-size'.  A restore after a restart is in
+  ;; fact the likeliest time to hit it, since every session comes back at
+  ;; once into whatever layout the frame happens to be in.
+  (cc-butler--ensure-pty-size dir)
   (cc-butler--wait-for-session-ready dir))
 
 ;;;###autoload
