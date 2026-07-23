@@ -660,6 +660,129 @@ of dirs actually started."
     started))
 
 ;;;; ------------------------------------------------------------------
+;;;; Fleet monitor: tell the steward WHAT needs compacting, mechanically
+;;;; ------------------------------------------------------------------
+;;
+;; Deciding when a session should be compacted is arithmetic — a number is
+;; over a threshold — and nothing is gained by having a model rediscover it
+;; by reading terminals.  Deciding WHEN to act on that, against whose turn
+;; and at what cost, is judgement.  So elisp reports and the steward
+;; decides; this layer is deliberately not clever and never acts on its own.
+
+(defcustom cc-butler-compact-monitor-interval 900
+  "Seconds between fleet compaction scans when the monitor is enabled."
+  :type 'number :group 'cc-butler)
+
+(defcustom cc-butler-compact-monitor-repeat 3600
+  "Seconds before the monitor re-reports an unchanged set of candidates.
+Without this the steward is told the same thing every scan; with it, a
+standing situation is restated occasionally rather than constantly.  A
+CHANGED set always reports immediately regardless."
+  :type 'number :group 'cc-butler)
+
+(defcustom cc-butler-compact-monitor-nudge nil
+  "When non-nil, the monitor also types a short note into the steward.
+Off by default: the report already reaches the steward on its next turn
+via `pending_events', and typing into a session is the intrusive option.
+Turn this on only if the steward can sit idle long enough to matter — it
+still refuses to type unless the steward is safely idle."
+  :type 'boolean :group 'cc-butler)
+
+(defvar cc-butler-compact--last-report nil
+  "Cons of (NAMES . TIME) for the monitor's last report, for de-duplication.")
+
+(defvar cc-butler-compact--monitor-timer nil
+  "Timer running the fleet compaction scan, or nil.")
+
+(defun cc-butler-compact-fleet-summary ()
+  "Return a report of sessions that want compacting, or nil when none.
+
+Pure observation: computed fresh from the current context figures, acts on
+nothing, and is safe to call on every steward turn.  Each candidate is
+annotated with whether it could be compacted right now or what is in the
+way, so the steward can tell \"do it\" from \"wait\" without going to look."
+  (let (rows)
+    (dolist (dir (cc-butler-compact-candidates))
+      (let* ((ctx (cc-butler-cleanup-context-for dir))
+             (why (cc-butler-compact--blocked-reason dir)))
+        (push (format "- %s (%.0fk) — %s"
+                      (cc-butler--display-name dir)
+                      (/ (or ctx 0) 1000.0)
+                      (cond ((cc-butler-compact-waiting-p dir)
+                             "compaction already queued, waiting for it to go idle")
+                            ((null why) "ready: compact_session now")
+                            ((string-prefix-p "session is busy" why)
+                             "mid-turn: compact_session queues it and it starts when the turn ends")
+                            (t why)))
+              rows)))
+    (when rows
+      (format "🧠 Context ceiling: %d session(s) over %.0fk and wanting compaction:\n%s\n(Yours to time — compaction interrupts whatever the session is doing next. compact_session NAME, or compact_large_sessions for the sweep.)"
+              (length rows) (/ cc-butler-compact-threshold 1000.0)
+              (mapconcat #'identity (nreverse rows) "\n")))))
+
+(defun cc-butler-compact--monitor-scan ()
+  "One monitor tick: report new or long-standing candidates to the steward.
+Reports by queueing an event the steward drains on its next turn — this
+never types into a session unless `cc-butler-compact-monitor-nudge' is on
+and the steward is safely idle."
+  (let* ((dirs (cc-butler-compact-candidates))
+         (names (sort (mapcar #'cc-butler--display-name dirs) #'string<))
+         (last-names (car cc-butler-compact--last-report))
+         (last-time (cdr cc-butler-compact--last-report))
+         (changed (not (equal names last-names)))
+         (stale (or (null last-time)
+                    (> (- (float-time) last-time) cc-butler-compact-monitor-repeat))))
+    (when (and names (or changed stale))
+      (when-let ((summary (cc-butler-compact-fleet-summary)))
+        (setq cc-butler-compact--last-report (cons names (float-time)))
+        (cc-butler-compact--report-to-ops summary)))
+    ;; Nothing over the line any more: forget, so recovery is reported afresh.
+    (unless names (setq cc-butler-compact--last-report nil))))
+
+(defun cc-butler-compact--report-to-ops (summary)
+  "Put SUMMARY in front of the steward (or the butler in single mode)."
+  (let ((ops (cc-butler--ops-dir)))
+    (push (list :time (current-time) :dir nil :name "cc-butler" :id nil
+                :body summary)
+          cc-butler--inbox)
+    (cc-butler--log "compact monitor │ reported %d candidate(s) to %s"
+                    (length (cc-butler-compact-candidates))
+                    (if ops (cc-butler--display-name ops) "nobody"))
+    ;; The optional nudge reuses the compaction guard: if it is not safe to
+    ;; type a slash command at the steward, it is not safe to type this.
+    (when (and cc-butler-compact-monitor-nudge ops
+               (not (cc-butler-compact--blocked-reason ops)))
+      (ignore-errors
+        (cc-butler--send-input
+         ops "[cc-butler] Context ceiling reached in the fleet — call pending_events for the list."
+         nil)))))
+
+;;;###autoload
+(define-minor-mode cc-butler-compact-monitor-mode
+  "Periodically report sessions that want compacting to the steward.
+
+The scan is arithmetic — context size against a threshold — so it belongs
+in a timer, not in a model's memory of what it meant to check.  It reports
+and stops there; every decision about timing stays with the steward.
+
+Independent of the `pending_events' payload, which already carries the same
+summary on every steward turn.  This exists for the case that one cannot
+cover: a steward taking no turns at all still gets told."
+  :global t :group 'cc-butler
+  (when (timerp cc-butler-compact--monitor-timer)
+    (cancel-timer cc-butler-compact--monitor-timer))
+  (setq cc-butler-compact--monitor-timer nil
+        cc-butler-compact--last-report nil)
+  (when cc-butler-compact-monitor-mode
+    (setq cc-butler-compact--monitor-timer
+          (run-with-timer cc-butler-compact-monitor-interval
+                          cc-butler-compact-monitor-interval
+                          #'cc-butler-compact--monitor-scan))
+    (cc-butler--log "compact monitor │ on (every %ds, threshold %.0fk)"
+                    cc-butler-compact-monitor-interval
+                    (/ cc-butler-compact-threshold 1000.0))))
+
+;;;; ------------------------------------------------------------------
 ;;;; MCP tools — the whole point: the LLM calls one function
 ;;;; ------------------------------------------------------------------
 

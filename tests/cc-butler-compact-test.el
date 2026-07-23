@@ -680,5 +680,111 @@ never a silent no-op that reads as success."
             ((symbol-function 'cc-butler--display-name) (lambda (_d) "butler")))
     (should (string-match-p "butler" (cc-butler-tool-compact-large-sessions)))))
 
+;;;; ------------------------------------------------------------------
+;;;; Fleet monitor: elisp reports, the steward decides
+;;;; ------------------------------------------------------------------
+
+(defmacro cc-butler-compact-test--with-fleet (sizes &rest body)
+  "Run BODY with a fake fleet: SIZES is an alist of (NAME . CONTEXT)."
+  (declare (indent 1))
+  `(let ((cc-butler-compact-threshold 300000)
+         (cc-butler-compact--last-report nil)
+         (cc-butler--inbox nil)
+         (cc-butler--steward "/steward/"))
+     (cl-letf (((symbol-function 'cc-butler--sessions)
+                (lambda () (mapcar (lambda (c) (list :dir (car c))) ,sizes)))
+               ((symbol-function 'cc-butler-cleanup-context-for)
+                (lambda (d) (alist-get d ,sizes nil nil #'equal)))
+               ((symbol-function 'cc-butler--display-name) (lambda (d) d))
+               ((symbol-function 'cc-butler--ops-dir) (lambda () "/steward/"))
+               ((symbol-function 'cc-butler--log) #'ignore)
+               ((symbol-function 'cc-butler-compact--blocked-reason)
+                (lambda (_d &optional _i) nil))
+               ((symbol-function 'cc-butler-compact-waiting-p) (lambda (_d) nil)))
+       ,@body)))
+
+(ert-deftest cc-butler-compact/fleet-summary-lists-only-what-is-over ()
+  "The report is arithmetic — over the threshold or not — and says what the
+steward can do about each one."
+  (cc-butler-compact-test--with-fleet '(("/butler/" . 514000) ("/w/" . 152000))
+    (let ((out (cc-butler-compact-fleet-summary)))
+      (should (string-match-p "/butler/" out))
+      (should (string-match-p "514k" out))
+      (should-not (string-match-p "/w/" out))
+      (should (string-match-p "ready: compact_session now" out)))))
+
+(ert-deftest cc-butler-compact/fleet-summary-is-nil-when-nothing-is-over ()
+  "Silence when there is nothing to say — this runs on every steward turn."
+  (cc-butler-compact-test--with-fleet '(("/w/" . 10000))
+    (should-not (cc-butler-compact-fleet-summary))))
+
+(ert-deftest cc-butler-compact/fleet-summary-distinguishes-busy-from-blocked ()
+  "A mid-turn session is actionable (compact_session queues it); a session
+with a menu open is not.  Collapsing the two would make the steward wait on
+something that will never clear itself."
+  (cc-butler-compact-test--with-fleet '(("/b/" . 514000))
+    (cl-letf (((symbol-function 'cc-butler-compact--blocked-reason)
+               (lambda (_d &optional _i) "session is busy — not at a safe waiting point")))
+      (should (string-match-p "queues it" (cc-butler-compact-fleet-summary))))
+    (cl-letf (((symbol-function 'cc-butler-compact--blocked-reason)
+               (lambda (_d &optional _i) "an interactive menu/wizard is open")))
+      (should (string-match-p "menu" (cc-butler-compact-fleet-summary))))))
+
+(ert-deftest cc-butler-compact/monitor-reports-to-the-steward-queue ()
+  "The monitor delivers by queueing an event the steward drains on its next
+turn — it does not type into anyone."
+  (cc-butler-compact-test--with-fleet '(("/butler/" . 514000))
+    (let (sent)
+      (cl-letf (((symbol-function 'cc-butler--send-input)
+                 (lambda (&rest a) (push a sent))))
+        (cc-butler-compact--monitor-scan)
+        (should (= (length cc-butler--inbox) 1))
+        (should (string-match-p "/butler/" (plist-get (car cc-butler--inbox) :body)))
+        (should-not sent)))))
+
+(ert-deftest cc-butler-compact/monitor-does-not-repeat-an-unchanged-fleet ()
+  "A standing situation must not be restated every scan, or the steward
+learns to ignore it."
+  (cc-butler-compact-test--with-fleet '(("/butler/" . 514000))
+    (cc-butler-compact--monitor-scan)
+    (cc-butler-compact--monitor-scan)
+    (cc-butler-compact--monitor-scan)
+    (should (= (length cc-butler--inbox) 1))))
+
+(ert-deftest cc-butler-compact/monitor-reports-again-when-the-set-changes ()
+  "A newly-over session is news even if an old one was already reported."
+  (let ((fleet '(("/butler/" . 514000))))
+    (cc-butler-compact-test--with-fleet fleet
+      (cc-butler-compact--monitor-scan)
+      (should (= (length cc-butler--inbox) 1))
+      (cl-letf (((symbol-function 'cc-butler--sessions)
+                 (lambda () '((:dir "/butler/") (:dir "/steward2/"))))
+                ((symbol-function 'cc-butler-cleanup-context-for)
+                 (lambda (_d) 514000)))
+        (cc-butler-compact--monitor-scan)
+        (should (= (length cc-butler--inbox) 2))))))
+
+(ert-deftest cc-butler-compact/monitor-says-nothing-when-fleet-is-healthy ()
+  "No candidates, no message — and the memory resets so a recurrence is
+reported fresh rather than suppressed as a repeat."
+  (cc-butler-compact-test--with-fleet '(("/w/" . 10000))
+    (setq cc-butler-compact--last-report (cons '("/w/") (float-time)))
+    (cc-butler-compact--monitor-scan)
+    (should-not cc-butler--inbox)
+    (should-not cc-butler-compact--last-report)))
+
+(ert-deftest cc-butler-compact/monitor-nudge-respects-the-compaction-guard ()
+  "If it is not safe to type a slash command at the steward, it is not safe
+to type a nudge either — same guard, no exceptions."
+  (cc-butler-compact-test--with-fleet '(("/butler/" . 514000))
+    (let ((cc-butler-compact-monitor-nudge t) sent)
+      (cl-letf (((symbol-function 'cc-butler--send-input)
+                 (lambda (&rest a) (push a sent)))
+                ((symbol-function 'cc-butler-compact--blocked-reason)
+                 (lambda (_d &optional _i) "unsubmitted text is sitting in the input box")))
+        (cc-butler-compact--monitor-scan)
+        (should cc-butler--inbox)        ; still reported to the queue
+        (should-not sent)))))            ; but nothing typed
+
 (provide 'cc-butler-compact-test)
 ;;; cc-butler-compact-test.el ends here
