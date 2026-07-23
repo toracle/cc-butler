@@ -97,6 +97,14 @@ cache).  Discarding the cache is exactly what we want: `/compact' rewrites
 the context wholesale, so the cache is about to be worthless regardless."
   :type 'string :group 'cc-butler)
 
+(defcustom cc-butler-compact-modal-answers 3
+  "How many times one step may answer a confirmation modal before failing.
+The modal is re-answered, not latched after one try.  A single attempt can
+land while the modal is still rendering and select nothing, and a latch
+would then never try again — leaving the session sitting on an unanswered
+dialog until a human clears it.  That is the 2026-07-23 freeze."
+  :type 'integer :group 'cc-butler)
+
 ;;;; ------------------------------------------------------------------
 ;;;; Screen reading — pure functions over terminal text
 ;;;; ------------------------------------------------------------------
@@ -352,8 +360,71 @@ stops a second compaction racing the same session.")
     (when (timerp (plist-get st :timer)) (cancel-timer (plist-get st :timer))))
   (remhash dir cc-butler-compact--state))
 
+(defun cc-butler-compact--answer-cooldown ()
+  "Seconds to leave between two answers of the same modal.
+Two poll intervals: long enough for the terminal to have repainted, so a
+retry is a response to a modal that is really still up rather than to a
+stale frame."
+  (* 2 cc-butler-compact-poll-interval))
+
+(defun cc-butler-compact--answer-modal (dir st what)
+  "Answer a confirmation modal on DIR's screen if one is up.
+ST is the compaction state; WHAT names the step, for the log.  Returns
+non-nil when an answer was sent, so a caller can use this directly as a
+`cond' branch.
+
+Both model switches raise the same modal — the one into
+`cc-butler-compact-model' and the one back to the original — so both go
+through here rather than each open-coding its own handling.
+
+`cc-butler--send-input' with SUBMIT is the mechanism that actually selects
+an entry.  A bare Return does not, and `claude-code-ide--terminal-send-string'
+alone reaches the modal without selecting anything; confirmed by hand on
+2026-07-23 while clearing this modal from a frozen session.
+
+Answering is retried up to `cc-butler-compact-modal-answers' times rather
+than latched after one attempt: the first answer can arrive before the
+modal has finished rendering and select nothing at all.
+
+Retries are spaced by `cc-butler-compact--answer-cooldown' seconds.  The
+screen this reads is a frame, so an answered modal can still be painted on
+the next tick; answering again immediately would drop a stray \"1\" into the
+input box of whatever screen followed.  Waiting a couple of poll intervals
+means a modal still visible after the cooldown is one that genuinely did
+not take."
+  (let ((tries (or (plist-get st :answers) 0))
+        (last (plist-get st :answered-at)))
+    (when (and (< tries cc-butler-compact-modal-answers)
+               (or (null last)
+                   (> (- (float-time) last) (cc-butler-compact--answer-cooldown)))
+               (cc-butler-compact--menu-p (cc-butler--read-output dir 40)))
+      (cc-butler-compact--set-state dir :answers (1+ tries)
+                                    :answered-at (float-time))
+      (cc-butler--send-input dir cc-butler-compact-modal-answer t)
+      (cc-butler--log "compact: %s │ answered %s modal with %s (attempt %d)"
+                      (cc-butler--display-name dir) what
+                      cc-butler-compact-modal-answer (1+ tries))
+      t)))
+
+(defun cc-butler-compact--ensure-no-modal (dir)
+  "Answer a confirmation modal still standing on DIR, if there is one.
+Called from `cc-butler-compact--finish', so every way this driver can stop
+— success, timeout, abort — passes through here first.
+
+Giving up on a compaction is recoverable; walking away from a session
+parked on a modal the driver itself opened is not.  That session is stopped
+dead until a human notices, which on 2026-07-23 took two and a half hours."
+  (ignore-errors
+    (when (and (get-buffer (claude-code-ide--get-buffer-name dir))
+               (cc-butler-compact--menu-p (cc-butler--read-output dir 40)))
+      (cc-butler--send-input dir cc-butler-compact-modal-answer t)
+      (cc-butler--log "compact: %s │ cleared a modal left standing at finish"
+                      (cc-butler--display-name dir))
+      t)))
+
 (defun cc-butler-compact--finish (dir fmt &rest args)
   "Conclude the compaction of DIR with a message/log built from FMT/ARGS."
+  (cc-butler-compact--ensure-no-modal dir)
   (cc-butler-compact--end-state dir)
   (let ((msg (apply #'format fmt args)))
     (cc-butler--log "compact: %s │ %s" (cc-butler--display-name dir) msg)
@@ -371,7 +442,7 @@ stops a second compaction racing the same session.")
 (defun cc-butler-compact--step (dir phase text)
   "Send TEXT to DIR, enter PHASE, and re-arm the clock."
   (cc-butler-compact--set-state dir :phase phase :sent-time (float-time)
-                                :answered nil)
+                                :answers 0)
   (cc-butler--send-input dir text t)
   (cc-butler--log "compact: %s │ %s (sent %s)"
                   (cc-butler--display-name dir) phase text)
@@ -533,6 +604,8 @@ and refuses when the current model cannot be named well enough to restore."
         (cc-butler-compact--finish dir "session vanished mid-compaction — aborted"))
        ((eq phase 'switching)   (cc-butler-compact--poll-switch dir st sent))
        ((eq phase 'compacting)  (cc-butler-compact--poll-compact dir st sent))
+       ((eq phase 'restore-wait)
+        (cc-butler-compact--poll-restore-wait dir st sent))
        ((eq phase 'restoring)   (cc-butler-compact--poll-restore dir st sent))
        (t (cc-butler-compact--finish dir "unknown phase %S — stopped" phase))))))
 
@@ -542,14 +615,7 @@ and refuses when the current model cannot be named well enough to restore."
     (cond
      ((cc-butler-compact--model-is-p tag cc-butler-compact-model)
       (cc-butler-compact--step dir 'compacting "/compact"))
-     ;; The modal is answered at most once: a slow render must not draw a
-     ;; second Return onto whatever screen follows.
-     ((and (not (plist-get st :answered))
-           (cc-butler-compact--menu-p (cc-butler--read-output dir 40)))
-      (cc-butler-compact--set-state dir :answered t)
-      (cc-butler--send-input dir cc-butler-compact-modal-answer t)
-      (cc-butler--log "compact: %s │ answered switch modal with %s"
-                      (cc-butler--display-name dir) cc-butler-compact-modal-answer)
+     ((cc-butler-compact--answer-modal dir st "model switch")
       (cc-butler-compact--schedule-poll dir))
      ((> (- (float-time) sent) cc-butler-compact-step-timeout)
       (cc-butler-compact--abort dir "model switch timed out"))
@@ -580,7 +646,37 @@ and refuses when the current model cannot be named well enough to restore."
     (if (not arg)
         (cc-butler-compact--finish dir "compacted (%s); model unchanged"
                                    (or (plist-get st :note) "no delta observed"))
-      (cc-butler-compact--step dir 'restoring (format "/model %s" arg)))))
+      ;; Do not type yet — hold until the session is at a waiting point.
+      (cc-butler-compact--set-state dir :phase 'restore-wait
+                                    :sent-time (float-time) :answers 0)
+      (cc-butler-compact--poll-restore-wait
+       dir (gethash dir cc-butler-compact--state) (float-time)))))
+
+(defun cc-butler-compact--poll-restore-wait (dir st sent)
+  "Hold the model restore until DIR is idle, then send it.
+
+`/compact' can still be running when the compact phase stops watching, and
+typing `/model' into a session that is mid-work is what caused the
+2026-07-23 freeze: the restore was sent while the compaction ran on, so the
+confirmation modal appeared long after the restore step's own timeout had
+fired and stopped polling.  Nothing was left watching, and the session sat
+on an unanswered dialog for two and a half hours.
+
+Sending only from a waiting point keeps the modal inside the window that is
+actually being watched.  The wait is bounded by `cc-butler-compact-timeout'
+and answers any modal that is already up while it waits."
+  (let ((arg (plist-get st :orig-arg)))
+    (cond
+     ((cc-butler-compact--answer-modal dir st "pre-restore")
+      (cc-butler-compact--schedule-poll dir))
+     ((cc-butler--waiting-p dir)
+      (cc-butler-compact--step dir 'restoring (format "/model %s" arg)))
+     ((> (- (float-time) sent) cc-butler-compact-timeout)
+      (cc-butler-compact--finish
+       dir "compacted (%s) but model NOT restored — session never reached a waiting point; still on %s, wanted %s"
+       (or (plist-get st :note) "no delta observed")
+       (or (cc-butler-compact--model-now dir) "?") arg))
+     (t (cc-butler-compact--schedule-poll dir)))))
 
 (defun cc-butler-compact--poll-restore (dir st sent)
   "Wait for the original model to come back, answering the modal."
@@ -590,10 +686,7 @@ and refuses when the current model cannot be named well enough to restore."
      ((cc-butler-compact--model-is-p tag arg)
       (cc-butler-compact--finish dir "compacted (%s); model restored to %s"
                                  (or (plist-get st :note) "no delta observed") tag))
-     ((and (not (plist-get st :answered))
-           (cc-butler-compact--menu-p (cc-butler--read-output dir 40)))
-      (cc-butler-compact--set-state dir :answered t)
-      (cc-butler--send-input dir cc-butler-compact-modal-answer t)
+     ((cc-butler-compact--answer-modal dir st "model restore")
       (cc-butler-compact--schedule-poll dir))
      ((> (- (float-time) sent) cc-butler-compact-step-timeout)
       (cc-butler-compact--finish
@@ -609,7 +702,9 @@ and refuses when the current model cannot be named well enough to restore."
     (if (and arg (not (cc-butler-compact--model-is-p
                        (cc-butler-compact--model-now dir) arg)))
         (progn (cc-butler-compact--set-state dir :note (format "aborted: %s" why))
-               (cc-butler-compact--step dir 'restoring (format "/model %s" arg)))
+               ;; Same held restore as the success path — an abort is if
+               ;; anything MORE likely to leave the session mid-work.
+               (cc-butler-compact--restore dir))
       (cc-butler-compact--finish dir "aborted: %s" why))))
 
 ;;;; ------------------------------------------------------------------

@@ -308,7 +308,8 @@ state change rather than on elapsed time."
     (cc-butler-compact--poll "w")
     (should (equal (cc-butler-compact-test--sent-in-order)
                    '("/model sonnet" "1")))
-    ;; A second tick while the modal is still rendering must NOT answer twice.
+    ;; A second tick while the modal is still rendering must NOT answer twice:
+    ;; the screen is a frame, and the modal may already be gone.
     (cc-butler-compact--poll "w")
     (should (equal (cc-butler-compact-test--sent-in-order)
                    '("/model sonnet" "1")))
@@ -413,6 +414,127 @@ failure naming both the actual and the wanted model."
     (let ((msg (cc-butler-compact--poll "w")))
       (should (string-match-p "NOT restored" msg))
       (should (string-match-p "Sonnet-5" msg)))))
+
+;;;; ------------------------------------------------------------------
+;;;; The restore modal — the 2026-07-23 freeze
+;;;; ------------------------------------------------------------------
+
+;; Switching back to the original model raises the SAME confirmation modal as
+;; switching away.  On 2026-07-23 a live compaction of this very session left
+;; it parked on that modal for two and a half hours.  The restore phase did
+;; have a modal branch, so the failure was never "no handling" — it was that
+;; the modal arrived outside the window anything was watching.  These cover
+;; the three separate defects that produced it.
+
+(ert-deftest cc-butler-compact/restore-modal-is-answered ()
+  "The confirmation modal on the way BACK is answered, exactly as the one on
+the way out.  Both switches raise it; only one of them used to survive it."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")            ; -> /compact
+    (setq cc-butler-compact-test--ctx 90000)
+    (cc-butler-compact--poll "w")            ; -> /model opus
+    (should (equal (car cc-butler-compact-test--sent) "/model opus"))
+    ;; Restoring raises the modal too.
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--modal-screen)
+    (cc-butler-compact--poll "w")
+    (should (equal (cc-butler-compact-test--sent-in-order)
+                   '("/model sonnet" "/compact" "/model opus" "1")))
+    ;; Answered, the switch lands and the machine finishes cleanly.
+    (setq cc-butler-compact-test--model "Opus-4.8"
+          cc-butler-compact-test--screen cc-butler-compact-test--idle-screen)
+    (cc-butler-compact--poll "w")
+    (should-not (cc-butler-compact--active-p "w"))))
+
+(ert-deftest cc-butler-compact/restore-modal-is-retried-after-a-cooldown ()
+  "One answer can land before the modal has finished rendering and select
+nothing.  A latch would then never try again — which is how a session ends
+up sitting on a dialog nobody answers.  Retry, but only after the cooldown,
+so a stale frame cannot draw a stray answer onto the screen behind it."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")
+    (setq cc-butler-compact-test--ctx 90000)
+    (cc-butler-compact--poll "w")            ; -> /model opus
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--modal-screen)
+    (cc-butler-compact--poll "w")            ; answer #1
+    (should (equal (car cc-butler-compact-test--sent) "1"))
+    ;; Immediately after: no second answer, the frame may simply be stale.
+    (cc-butler-compact--poll "w")
+    (should (equal (length cc-butler-compact-test--sent) 4))
+    ;; Cooldown elapses and the modal is still genuinely up: answer again.
+    (cc-butler-compact--set-state
+     "w" :answered-at (- (float-time) (1+ (cc-butler-compact--answer-cooldown))))
+    (cc-butler-compact--poll "w")
+    (should (equal (cc-butler-compact-test--sent-in-order)
+                   '("/model sonnet" "/compact" "/model opus" "1" "1")))))
+
+(ert-deftest cc-butler-compact/restore-is-held-until-the-session-is-idle ()
+  "REGRESSION (2026-07-23): the compact phase gave up watching while /compact
+was STILL RUNNING and typed /model opus into a busy session.  The modal
+appeared long after the restore step's own 90s clock had expired, so nothing
+was polling by the time it came up.  The restore must not be typed at all
+until the session is at a waiting point."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")            ; -> /compact
+    ;; /compact overruns its timeout and the session is still working.
+    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+      (cc-butler-compact--set-state
+       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+      (cc-butler-compact--poll "w")
+      ;; Nothing typed: the restore is held, not fired into a busy session.
+      (should (equal (cc-butler-compact-test--sent-in-order)
+                     '("/model sonnet" "/compact")))
+      (should (cc-butler-compact--active-p "w"))
+      (cc-butler-compact--poll "w")
+      (should (equal (length cc-butler-compact-test--sent) 2)))
+    ;; The turn ends; now the restore goes out, inside a watched window.
+    (cc-butler-compact--poll "w")
+    (should (equal (cc-butler-compact-test--sent-in-order)
+                   '("/model sonnet" "/compact" "/model opus")))))
+
+(ert-deftest cc-butler-compact/held-restore-still-gives-up-eventually ()
+  "Holding for idle must not become its own way to hang: a session that never
+reaches a waiting point ends the compaction with an explicit failure."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")
+    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+      (cc-butler-compact--set-state
+       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+      (cc-butler-compact--poll "w")          ; -> held in restore-wait
+      (cc-butler-compact--set-state
+       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+      (let ((msg (cc-butler-compact--poll "w")))
+        (should (string-match-p "NOT restored" msg))
+        (should (string-match-p "waiting point" msg)))
+      (should-not (cc-butler-compact--active-p "w")))))
+
+(ert-deftest cc-butler-compact/never-walks-away-from-a-standing-modal ()
+  "REGRESSION (2026-07-23): giving up is recoverable; abandoning a session
+parked on a modal the driver itself opened is not — that session is stopped
+dead until a human notices.  Every terminating path clears the screen first."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")            ; -> /compact
+    (setq cc-butler-compact-test--ctx 90000)
+    (cc-butler-compact--poll "w")            ; -> /model opus
+    ;; The restore times out with the modal still standing.
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--modal-screen)
+    (cc-butler-compact--set-state
+     "w" :answers cc-butler-compact-modal-answers  ; retries exhausted
+     :sent-time (- (float-time) (1+ cc-butler-compact-step-timeout)))
+    (let ((msg (cc-butler-compact--poll "w")))
+      (should (string-match-p "NOT restored" msg)))
+    ;; It still cleared the dialog on the way out.
+    (should (equal (car cc-butler-compact-test--sent) "1"))
+    (should-not (cc-butler-compact--active-p "w"))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Guards
