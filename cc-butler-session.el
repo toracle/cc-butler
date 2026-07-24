@@ -812,6 +812,130 @@ sandwich (closest to END), or nil if none is found."
       result)))
 
 ;;;; ------------------------------------------------------------------
+;;;; Ghost suggestion vs real typed input (promoted here from
+;;;; cc-butler-compact.el on 2026-07-24, cc-butler#6).  Two callers ask the
+;;;; very same question — the compaction driver, before it types into a
+;;;; session, and `read_session_output', before it shows an input row to a
+;;;; reader — and for three days they answered it two different ways, only
+;;;; one of which was right.  session.el is the lowest module both can
+;;;; reach (orchestrator.el requires it directly, compact.el reaches it
+;;;; through cleanup.el) and it requires neither of them, so the single
+;;;; answer lives here.
+;;;; ------------------------------------------------------------------
+
+(defconst cc-butler--input-pad "[ \t ​]"
+  "One character of input-box padding.
+Not the same set as ordinary whitespace: Claude Code pads the `❯' prompt
+with U+00A0 NO-BREAK SPACE on some builds (measured on this fleet
+2026-07-22; upstream hit the same thing in cc-butler#6).  `string-trim'
+leaves NBSP in place, so an empty box trims to a one-character string and
+every idle session in the fleet reads as \"has text typed in it\".")
+
+(defun cc-butler--strip-input-pad (s)
+  "Strip the prompt glyph and padding — NBSP included — from both ends of S."
+  (replace-regexp-in-string
+   (concat "\\`\\(?:" cc-butler--input-pad "\\|[❯>]\\)+"
+           "\\|" cc-butler--input-pad "+\\'")
+   "" (or s "")))
+
+(defconst cc-butler--input-box-scan-lines 12
+  "How far from the cursor to look for the input box's rules.
+Bounds the search for a multi-line input box, without letting a cursor
+parked somewhere unrelated be mistaken for one.")
+
+(defun cc-butler--input-box-region-at (pos)
+  "Return (BEG . END) of the input-box text preceding POS, or nil.
+BEG is just after the box's opening rule and END is POS, so the result
+covers everything typed ahead of the cursor — multi-line input included."
+  (save-excursion
+    (goto-char pos)
+    (let ((cursor-bol (line-beginning-position))
+          top bottom (n 0))
+      (unless (save-excursion (goto-char cursor-bol) (looking-at "[ \t]*───"))
+        (save-excursion
+          (goto-char cursor-bol)
+          (while (and (not top) (< n cc-butler--input-box-scan-lines)
+                      (zerop (forward-line -1)))
+            (setq n (1+ n))
+            (when (looking-at "[ \t]*───") (setq top (line-end-position)))))
+        (setq n 0)
+        (save-excursion
+          (goto-char cursor-bol)
+          (while (and (not bottom) (< n cc-butler--input-box-scan-lines)
+                      (zerop (forward-line 1)))
+            (setq n (1+ n))
+            (when (looking-at "[ \t]*───") (setq bottom t))))
+        (when (and top bottom) (cons (1+ top) pos))))))
+
+(declare-function ghostel-cursor-point "ghostel" ())
+
+(defun cc-butler--input-state (&optional buffer)
+  "Classify what sits in the live input box of BUFFER (default: current).
+
+BUFFER is a session's terminal buffer, and must already be up to date —
+this function reads the buffer, it does not redraw it, so callers force
+`cc-butler--refresh-terminal-text' first.
+
+Return a cons cell (STATE . TEXT), exactly one of:
+
+  (real . STRING)   the operator has genuinely typed STRING into the box
+  (ghost . nil)     the box is empty; whatever is painted in it is decoration
+  (unknown . nil)   the question could not be answered from this buffer
+
+The judgement is the terminal CURSOR, not the painted row.  Claude Code
+paints a dimmed suggestion — a previous prompt, or a `Try \"...\"'
+placeholder — into an EMPTY input box.  That suggestion is decoration: the
+terminal's input buffer holds nothing and the cursor stays at the prompt.
+Type one character and the suggestion vanishes and the cursor advances.  So
+the cursor's distance past the prompt IS the length of the pending input,
+and the painted text is evidence of nothing at all.
+
+Measured across the live fleet 2026-07-23: eight sessions; every empty or
+suggestion-showing box had its cursor at column 2, immediately after `❯ ' —
+including one painting a full sentence of dimmed Korean — while a session
+with `abcd' genuinely typed had it at column 6.
+
+This replaced a face-color test, which cannot be made to work.  Real input
+is not reliably unfaced: a typed slash command renders in an accent color
+\(#b1b9f9 on this fleet).  The suggestion color is theme-dependent — this
+fleet paints it #8686a8 on #00005f, while the constant the redaction path
+compared against until 2026-07-24 said #a7a7a7 on #262626, so that
+comparison never once matched here and every ghost row was silently
+promoted to real input (cc-butler#6).  Telling `dim' from `accent' apart by
+hex is exactly the check this codebase has now been burned by three times.
+The cursor is state; styling is not.
+
+`unknown' is deliberately NOT resolved into one of the other two here.  The
+two callers need OPPOSITE fail-safes — refusing to type into a session is
+cheap, showing unverified text as if it were a human's instruction is not —
+so the direction is each call site's to choose, in the open, next to the
+reasoning for choosing it.  Do not add a fail-safe default to this
+function; that is how one caller ends up silently inheriting the other
+caller's asymmetry."
+  (with-current-buffer (or buffer (current-buffer))
+    (let ((cursor (and (fboundp 'ghostel-cursor-point)
+                       (ignore-errors (ghostel-cursor-point)))))
+      (cond
+       ;; No usable cursor: a non-ghostel terminal backend, or a backend
+       ;; that answered with something we cannot position against.
+       ((not (and cursor (number-or-marker-p cursor)
+                  (<= (point-min) cursor) (<= cursor (point-max))))
+        (cons 'unknown nil))
+       (t
+        (let ((region (cc-butler--input-box-region-at cursor)))
+          (if (not region)
+              ;; The cursor is not inside an input box at all — a modal
+              ;; dialog may own the screen.  That is not the same thing as
+              ;; an empty box, and must not be reported as one.
+              (cons 'unknown nil)
+            (let ((typed (cc-butler--strip-input-pad
+                          (buffer-substring-no-properties
+                           (car region) (cdr region)))))
+              (if (string-empty-p typed)
+                  (cons 'ghost nil)
+                (cons 'real typed))))))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Launch readiness (cc-butler#8, 2026-07-21) — a freshly spawned
 ;;;; `claude' CLI process is not immediately ready to read stdin.  A send
 ;;;; landing in that window is silently dropped, with no error and no
@@ -836,8 +960,10 @@ screen, shown the first time a directory is opened (confirmed 2026-07-21
 on two never-before-launched directories). Anchor detection on this
 exact phrase, not on the numbered-option layout alone or on color —
 another first-run dialog could share that shape, and this codebase has
-already been burned twice today by a color assumption that varied by
-theme (`cc-butler--border-rule-char', `cc-butler--ghost-face-p')."
+already been burned repeatedly by a color assumption that varied by
+theme (`cc-butler--border-rule-char', and the ghost-face constants
+deleted from cc-butler-orchestrator.el on 2026-07-24 — see
+`cc-butler--input-state')."
   )
 
 (defun cc-butler--trust-dialog-showing-p (buf)
