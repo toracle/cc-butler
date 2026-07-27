@@ -160,17 +160,38 @@ third time this codebase has paid for one."
                   (buffer-substring-no-properties line-end end))
         (buffer-substring-no-properties start end)))))
 
+(defun cc-butler--break-status-markers (text)
+  "Make any echoed statusline markers in TEXT human-readable but UN-SCRAPABLE.
+`read_session_output' renders ANOTHER session's terminal into the caller's
+scrollback; a `CTX:'/`MODEL:' statusline marker echoed there could be
+misattributed as the caller's OWN by a positional scrape (the 2026-07-27
+misattribution).  Rewriting the colon form to `=' keeps the values fully
+visible for human verification (CTX=371538, MODEL=Opus-4.8 — the numbers are
+NOT stripped) while removing the exact `CTX:'/`MODEL:' shape the statusline
+scrape requires, so a coordinator's scrollback can never poison session_status.
+Defense-in-depth alongside the bottom-chrome anchor in
+`cc-butler-cleanup--statusline-fields'.  Only affects text handed to a reader
+of ANOTHER session; a worker verifying its OWN buffer still sees the real
+CTX:/MODEL: statusline."
+  (replace-regexp-in-string
+   "MODEL:" "MODEL="
+   (replace-regexp-in-string "CTX:" "CTX=" text)))
+
 (defun cc-butler--read-output-redacted (dir &optional lines)
   "Like `cc-butler--read-output', but the live input row is replaced with a
 plain marker unless a human really typed into it — used by the
 `read_session_output' MCP tool so a caller can never mistake a painted
 suggestion for a blocker, an authorization, or data.  A row whose state
-cannot be determined is redacted too, and says so.  See
+cannot be determined is redacted too, and says so.  Echoed `CTX:'/`MODEL:'
+statusline markers are additionally broken to `CTX='/`MODEL=' (still readable,
+no longer scrapable) so another session's marker cannot be misread as the
+caller's own — see `cc-butler--break-status-markers'.  See
 `cc-butler--redact-ghost-input-line' and governance principle
 butler-ghost-text-not-a-blocker-authorization-or-data."
   (when-let ((bb (cc-butler--output-buffer-and-bounds dir lines)))
     (with-current-buffer (car bb)
-      (string-trim (cc-butler--redact-ghost-input-line (cadr bb) (cddr bb))))))
+      (cc-butler--break-status-markers
+       (string-trim (cc-butler--redact-ghost-input-line (cadr bb) (cddr bb)))))))
 
 (defcustom cc-butler-submit-delay 0.1
   "Seconds to wait after sending text before the submitting Return.

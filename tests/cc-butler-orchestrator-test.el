@@ -411,6 +411,21 @@ submitted-message echoes just as easily as the live row."
       (should (string-match-p "❯ /compact" out))
       (should-not (string-match-p "ghost suggestion" out)))))
 
+(ert-deftest cc-butler-orchestrator/redaction-breaks-echoed-status-markers ()
+  "P1 (c) marker-breaking: read_session_output renders ANOTHER session's
+terminal into the caller's scrollback, where a `CTX:'/`MODEL:' statusline
+echo could be misattributed as the caller's own by a positional scrape.  The
+redaction rewrites the colon form to `=' — the values stay visible
+(CTX=371538, MODEL=Opus-4.8) but the scrapable `CTX:'/`MODEL:' shape is gone."
+  (cc-butler-orchestrator-test--with-term
+      (progn (insert "CTX:371538 20% MODEL:Opus-4.8\n")
+             (cc-butler-orchestrator-test--insert-input-row "" nil))
+      cc-butler-orchestrator-test--prompt   ; empty box, cursor at the prompt
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "CTX=371538" out))
+      (should (string-match-p "MODEL=Opus-4.8" out))
+      (should-not (string-match-p "CTX:371538" out)))))
+
 (ert-deftest cc-butler-orchestrator/border-line-with-embedded-title-still-detected ()
   "Given a top border line with a title embedded in the middle (Claude Code
 sometimes draws the topic/branch name there, e.g. \"───── some-topic ──\" —
