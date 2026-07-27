@@ -291,6 +291,11 @@ argument that was sent."
          (cc-butler-compact-test--ctx 400000))
      (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d))
                ((symbol-function 'cc-butler--waiting-p) (lambda (_d) (float-time)))
+               ;; idle by transcript activity: newest write is ancient, so the
+               ;; real `cc-butler--transcript-idle-p' reports idle without any
+               ;; filesystem access.  Busy tests override this to a fresh time.
+               ((symbol-function 'cc-butler--session-last-activity)
+                (lambda (_d) (- (float-time) 100000)))
                ((symbol-function 'cc-butler--log) #'ignore)
                ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
                ((symbol-function 'claude-code-ide--get-buffer-name)
@@ -677,10 +682,11 @@ string and the Return, so a prefix of what we sent is still ours to clean."
 ;;;; ------------------------------------------------------------------
 
 (ert-deftest cc-butler-compact/refuses-a-busy-session ()
-  "A session that is not at a waiting point is refused: our Enter would land
-in the middle of its work."
+  "A session whose transcript is active within the idle window is refused: our
+Enter would land in the middle of its work."
   (cc-butler-compact-test--with-session "w"
-    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (float-time))))   ; wrote just now -> busy
       (should (string-match-p "busy" (cc-butler-compact--blocked-reason "w")))
       (should-error (cc-butler-compact-session "w") :type 'user-error))
     (should-not cc-butler-compact-test--sent)))
@@ -689,12 +695,53 @@ in the middle of its work."
   "The idle-waiting caller needs to test the blockers that will STILL apply
 once the session goes idle, without busy masking them."
   (cc-butler-compact-test--with-session "w"
-    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (float-time))))   ; transcript fresh -> busy
       (should (cc-butler-compact--blocked-reason "w"))
       (should-not (cc-butler-compact--blocked-reason "w" t))
-      ;; a menu is not excused by ignore-busy — waiting does not close it
+      ;; a menu is not excused by ignore-busy — idling does not close it
       (setq cc-butler-compact-test--screen cc-butler-compact-test--modal-screen)
       (should (string-match-p "menu" (cc-butler-compact--blocked-reason "w" t))))))
+
+;;;; ------------------------------------------------------------------
+;;;; P2: the busy gate is transcript activity, not the waiting flag
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/idle-by-transcript-is-compactable ()
+  "Repro A (fails under the old waiting-flag gate): the notification flag says
+NOT waiting, but the newest transcript write was 900s ago (> the 600s idle
+window), so the session is genuinely idle and compactable.  The old gate keyed
+on the flag and would have refused it as busy."
+  (cc-butler-compact-test--with-session "w"
+    (let ((cc-butler-idle-threshold 600))
+      (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+                ((symbol-function 'cc-butler--session-last-activity)
+                 (lambda (_d) (- (float-time) 900))))
+        (should (null (cc-butler-compact--blocked-reason "w")))))))
+
+(ert-deftest cc-butler-compact/fresh-transcript-is-busy-despite-idle-flag ()
+  "Repro B (fails under the old gate): the waiting flag says idle, but a
+transcript was written 5s ago.  The transcript gate correctly reports busy;
+the old flag gate would have called it idle and compacted underneath it — the
+exact defect."
+  (cc-butler-compact-test--with-session "w"
+    (let ((cc-butler-idle-threshold 600))
+      (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) (float-time)))
+                ((symbol-function 'cc-butler--session-last-activity)
+                 (lambda (_d) (- (float-time) 5))))
+        (should (string-match-p "busy" (cc-butler-compact--blocked-reason "w")))))))
+
+(ert-deftest cc-butler-compact/live-subagent-keeps-session-busy ()
+  "Repro C: the main transcript may be cold while a sub-agent is still writing.
+`cc-butler--session-last-activity' returns the MAX over both, so a fresh
+sub-agent write (modelled here as a fresh last-activity) keeps the session busy
+even with the waiting flag set idle."
+  (cc-butler-compact-test--with-session "w"
+    (let ((cc-butler-idle-threshold 600))
+      (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) (float-time)))
+                ((symbol-function 'cc-butler--session-last-activity)
+                 (lambda (_d) (- (float-time) 3))))   ; fresh sub-agent write
+        (should (string-match-p "busy" (cc-butler-compact--blocked-reason "w")))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Self-compaction: the butler must be able to target ITSELF
@@ -722,8 +769,9 @@ is typed while it waits."
   "The queued compaction begins on its own the moment the turn ends."
   (cc-butler-compact-test--with-session "w"
     (let ((busy t))
-      (cl-letf (((symbol-function 'cc-butler--waiting-p)
-                 (lambda (_d) (if busy nil (float-time)))))
+      ;; "mid-turn" now means an active transcript (the gate the driver uses).
+      (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+                 (lambda (_d) (if busy (float-time) (- (float-time) 100000)))))
         (cc-butler-compact-session-when-idle "w")
         ;; still mid-turn: poll changes nothing
         (cc-butler-compact--idle-poll "w" (+ (float-time) 600))
@@ -756,7 +804,10 @@ failure by half an hour."
 (ert-deftest cc-butler-compact/queued-compaction-can-be-cancelled ()
   "A queued compaction is cancellable before it types anything."
   (cc-butler-compact-test--with-session "w"
-    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+    ;; busy = active transcript, so a stray idle-poll after cancel keeps waiting
+    ;; rather than starting and typing.
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (float-time))))
       (cc-butler-compact-session-when-idle "w")
       (should (cc-butler-compact-cancel "w"))
       (should-not (cc-butler-compact-waiting-p "w"))
@@ -800,6 +851,62 @@ neither prompt."
 ;;;; Fleet sweep
 ;;;; ------------------------------------------------------------------
 
+;;;; ------------------------------------------------------------------
+;;;; P3: percentage-first hybrid threshold
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/over-threshold-37pct-not-flagged ()
+  "A session at 37%% of its window is NOT a candidate even when its absolute
+token count (371538) is well past the old 300k floor: the percentage is the
+honest signal across differently-sized windows."
+  (let ((cc-butler-compact-threshold-fraction 0.60))
+    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx 371538 :pct 37 :model "Opus-4.8"))))
+      (should-not (cc-butler-compact--over-threshold-p "/d/")))))
+
+(ert-deftest cc-butler-compact/over-threshold-65pct-flagged ()
+  "At 65%% (>= the 0.60 fraction) the session is a candidate."
+  (let ((cc-butler-compact-threshold-fraction 0.60))
+    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx 130000 :pct 65 :model "Opus-4.8"))))
+      (should (cc-butler-compact--over-threshold-p "/d/")))))
+
+(ert-deftest cc-butler-compact/over-threshold-falls-back-to-ctx-when-no-pct ()
+  "With no percentage on the statusline, fall back to CTX against the window:
+just over window*fraction is a candidate, just under is not."
+  (let ((cc-butler-compact-threshold-fraction 0.60)
+        (cc-butler-cleanup-context-window 200000))   ; * 0.60 = 120000
+    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx nil :pct nil :model "Opus-4.8"))))
+      (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 130000)))
+        (should (cc-butler-compact--over-threshold-p "/d/")))
+      (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 110000)))
+        (should-not (cc-butler-compact--over-threshold-p "/d/"))))))
+
+(ert-deftest cc-butler-compact/over-threshold-is-window-adaptive ()
+  "The SAME ctx yields opposite verdicts under different context windows —
+the point of a fraction rather than an absolute floor."
+  (let ((cc-butler-compact-threshold-fraction 0.60))
+    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx nil :pct nil :model "m")))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 150000)))
+      (let ((cc-butler-cleanup-context-window 200000))   ; *0.6 = 120000 -> over
+        (should (cc-butler-compact--over-threshold-p "/d/")))
+      (let ((cc-butler-cleanup-context-window 300000))   ; *0.6 = 180000 -> under
+        (should-not (cc-butler-compact--over-threshold-p "/d/"))))))
+
+(ert-deftest cc-butler-compact/candidates-use-percentage-not-absolute ()
+  "The sweep gate is the percentage: a session at 37%% is not swept even though
+its 371538 tokens exceed the old absolute 300k threshold (which would have
+listed it)."
+  (let ((cc-butler-compact-threshold-fraction 0.60)
+        (cc-butler-compact-threshold 300000))
+    (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () '((:dir "/d/"))))
+              ((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx 371538 :pct 37 :model "Opus-4.8")))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 371538)))
+      (should (null (cc-butler-compact-candidates))))))
+
 (ert-deftest cc-butler-compact/sweep-includes-butler-and-steward ()
   "The whole point: the butler and steward are candidates like anyone else.
 Excluding them would leave the largest context in the fleet untouchable."
@@ -810,7 +917,7 @@ Excluding them would leave the largest context in the fleet untouchable."
               ((symbol-function 'cc-butler-cleanup-context-for)
                (lambda (d) (cond ((equal d "/b/") 471792)
                                  ((equal d "/s/") 361689)
-                                 (t 203356)))))
+                                 (t 90000)))))   ; worker well under the fraction
       (should (equal (cc-butler-compact-candidates) '("/b/" "/s/"))))))
 
 (ert-deftest cc-butler-compact/sweep-orders-largest-first ()
@@ -964,7 +1071,7 @@ never a silent no-op that reads as success."
 (ert-deftest cc-butler-compact/fleet-summary-lists-only-what-is-over ()
   "The report is arithmetic — over the threshold or not — and says what the
 steward can do about each one."
-  (cc-butler-compact-test--with-fleet '(("/butler/" . 514000) ("/w/" . 152000))
+  (cc-butler-compact-test--with-fleet '(("/butler/" . 514000) ("/w/" . 90000))
     (let ((out (cc-butler-compact-fleet-summary)))
       (should (string-match-p "/butler/" out))
       (should (string-match-p "514k" out))
