@@ -124,27 +124,22 @@ misses the statusline entirely; the below-the-input-box scan resolves the OWN
   (cl-letf (((symbol-function 'cc-butler--read-output) (lambda (&rest _) "nope")))
     (should (null (cc-butler-cleanup--default-context (list :dir "/d"))))))
 
-(ert-deftest cc-butler-cleanup/context-parses-clear-hint-k ()
-  "Legacy fallback (removed in the fallback-removal commit): the idle \"/clear
-to save <N>k tokens\" hint, when no own statusline is anchored."
+(ert-deftest cc-butler-cleanup/context-clear-hint-alone-is-nil ()
+  "After fallback removal: a native \"/clear to save <N>k tokens\" hint is NOT
+the own statusline (not below the input box, no MODEL:), so the anchored reader
+returns an honest nil rather than a scraped number."
   (cl-letf (((symbol-function 'cc-butler--read-output)
              (lambda (&rest _) "  Context left until auto-compact\n\
   /clear to save 152k tokens\n")))
-    (should (= 152000 (cc-butler-cleanup--default-context (list :dir "/d"))))))
+    (should (null (cc-butler-cleanup--default-context (list :dir "/d"))))))
 
-(ert-deftest cc-butler-cleanup/context-parses-clear-hint-m ()
-  "Legacy fallback: the M (millions) form of the save hint."
-  (cl-letf (((symbol-function 'cc-butler--read-output)
-             (lambda (&rest _) "/clear to save 1.2M tokens")))
-    (should (= 1200000 (cc-butler-cleanup--default-context (list :dir "/d"))))))
-
-(ert-deftest cc-butler-cleanup/context-parses-percent-used ()
-  "Legacy fallback: estimate tokens from \"<N>% context used\" against the
-configured context window."
+(ert-deftest cc-butler-cleanup/context-percent-used-alone-is-nil ()
+  "After fallback removal: a bare \"<N>% context used\" native hint is not the
+own statusline shape either -> honest nil."
   (let ((cc-butler-cleanup-context-window 200000))
     (cl-letf (((symbol-function 'cc-butler--read-output)
                (lambda (&rest _) "45% context used")))
-      (should (= 90000 (cc-butler-cleanup--default-context (list :dir "/d")))))))
+      (should (null (cc-butler-cleanup--default-context (list :dir "/d")))))))
 
 (ert-deftest cc-butler-cleanup/context-marker-wins-over-tui-hints ()
   "The OWN statusline (CTX:...MODEL: below the input box) is read; a native TUI
@@ -175,6 +170,24 @@ hint sitting above the input box in scrollback is ignored."
    "\n")
   "A screen whose bottom chrome carries the OWN statusline while a FOREIGN
 session's statusline is echoed higher up in scrollback.")
+
+(ert-deftest cc-butler-cleanup/context-nil-when-no-own-statusline ()
+  "P1 (b), the case that bit us and the reason the fallbacks had to go: the
+bottom chrome has NO statusline (input box + mode hint only) but scrollback
+holds a foreign CTX:.  The anchored reader must return nil, never the foreign
+number (the legacy first-match fallback would have returned 85437)."
+  (cl-letf (((symbol-function 'cc-butler--read-output)
+             (lambda (&rest _)
+               (string-join
+                '("earlier work"
+                  "CTX:85437 42% MODEL:Opus-4.8"   ; foreign, in scrollback
+                  "some more scrollback"
+                  "──────────────────────────────────────────────"
+                  "❯ "
+                  "──────────────────────────────────────────────"
+                  "  ⏵⏵ auto mode on (shift+tab to cycle)")
+                "\n"))))
+    (should (null (cc-butler-cleanup--default-context (list :dir "/d"))))))
 
 (ert-deftest cc-butler-cleanup/context-reads-own-statusline-not-foreign-echo ()
   "P1 core: with a foreign CTX echoed ABOVE the own statusline, the anchored

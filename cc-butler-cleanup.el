@@ -384,24 +384,19 @@ full-shape line below it (a session with no statusline chrome), return nil."
 
 (defun cc-butler-cleanup--default-context (session)
   "Default: read SESSION's current context size (input tokens) from its terminal.
-PREFERS the OWN statusline anchored below the input box via
-`cc-butler-cleanup--statusline-fields' (:ctx).  When that is absent it falls
-back to the legacy unanchored terminal hints; those fallbacks are removed in a
-following commit (they are echo-pollutable and positionally unanchored)."
+Reads ONLY the OWN statusline anchored below the input box via
+`cc-butler-cleanup--statusline-fields' (:ctx).  Returns nil when this session
+shows no own statusline (not installed, or mid-task).
+
+The legacy unanchored fallbacks (first-match `CTX:', \"save Nk/Nm tokens\",
+\"<N>% context used\") were removed here: they are positionally unanchored and
+echo-pollutable, so they could return a number scraped from another session's
+output in scrollback.  Per the DoD, no own statusline means an honest nil, not
+a scraped guess."
   (let ((out (cc-butler--read-output (plist-get session :dir)
                                      cc-butler-cleanup-read-lines)))
     (when out
-      (or (plist-get (cc-butler-cleanup--statusline-fields out) :ctx)
-          (cond
-           ((string-match "CTX:\\([0-9]+\\)" out)
-            (string-to-number (match-string 1 out)))
-           ((string-match "save \\([0-9.]+\\)[kK] tokens" out)
-            (round (* 1000 (string-to-number (match-string 1 out)))))
-           ((string-match "save \\([0-9.]+\\)[mM] tokens" out)
-            (round (* 1000000 (string-to-number (match-string 1 out)))))
-           ((string-match "\\([0-9]+\\)% context used" out)
-            (round (* (/ (string-to-number (match-string 1 out)) 100.0)
-                      cc-butler-cleanup-context-window))))))))
+      (plist-get (cc-butler-cleanup--statusline-fields out) :ctx))))
 
 ;;;; --- context feedback for the sessions list (cached) ---------------
 
