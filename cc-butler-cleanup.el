@@ -338,25 +338,70 @@ no explicit token count is shown."
   :type 'integer
   :group 'cc-butler)
 
+(defconst cc-butler-cleanup--statusline-re
+  "CTX:\\([0-9]+\\)[^\n]*?MODEL:\\([A-Za-z0-9_.-]+\\)"
+  "Full-shape statusline regexp: CTX digits and MODEL on the SAME line.
+`CTX:?' (no digits) deliberately does NOT match — no number means an honest
+nil, never a scraped-from-scrollback guess.")
+
+(defun cc-butler-cleanup--statusline-fields (out)
+  "Parse the session's OWN statusline out of terminal text OUT.
+Return a plist (:ctx INT-or-nil :pct INT-or-nil :model STR-or-nil), or nil when
+no own statusline is present.  The own statusline is the CTX:...MODEL: line that
+sits BELOW the live input box (the persistent bottom chrome: statusline +
+mode hint + any sub-agent-progress block).  A CTX: marker echoed from ANOTHER
+session sits in scrollback ABOVE the input box and MUST NOT be read as ours; a
+positional first/last-match is wrong (see the 2026-07-27 misattribution).
+
+The bound is STRUCTURAL, not a line count: it reuses
+`cc-butler--find-input-line' to locate the LAST input-box chrome and scans only
+the region below it.  A fixed
+\"last N lines\" window would regress delegating workers — a live sub-agent
+renders a progress block BELOW the mode hint, pushing the statusline to
+from-end 4/5+, so a count would miss it for exactly the best-behaved sessions.
+Scanning below the input box structurally excludes every scrollback echo and is
+immune to any number of agent-progress lines.  When there is no input box, or no
+full-shape line below it (a session with no statusline chrome), return nil."
+  (when (stringp out)
+    (with-temp-buffer
+      (insert out)
+      (let ((row (cc-butler--find-input-line (point-min) (point-max)))
+            found)
+        (when row
+          (goto-char row)
+          (forward-line 1)              ; step past the input row + into below-box
+          (while (and (not found) (< (point) (point-max)))
+            (let ((line (buffer-substring-no-properties
+                         (line-beginning-position) (line-end-position))))
+              (when (string-match cc-butler-cleanup--statusline-re line)
+                (let ((ctx (string-to-number (match-string 1 line)))
+                      (model (match-string 2 line))
+                      (pct (when (string-match " \\([0-9]+\\)%" line)
+                             (string-to-number (match-string 1 line)))))
+                  (setq found (list :ctx ctx :pct pct :model model)))))
+            (forward-line 1)))
+        found))))
+
 (defun cc-butler-cleanup--default-context (session)
   "Default: read SESSION's current context size (input tokens) from its terminal.
-Tries, in order: a `CTX:<n>' marker (from the optional statusLine helper); the
-default Claude Code hint \"/clear to save <N>k tokens\" (also M); or \"<N>%
-context used\" (estimated against `cc-butler-cleanup-context-window').  Returns
-nil when the terminal shows no context indicator (e.g. mid-task)."
+PREFERS the OWN statusline anchored below the input box via
+`cc-butler-cleanup--statusline-fields' (:ctx).  When that is absent it falls
+back to the legacy unanchored terminal hints; those fallbacks are removed in a
+following commit (they are echo-pollutable and positionally unanchored)."
   (let ((out (cc-butler--read-output (plist-get session :dir)
                                      cc-butler-cleanup-read-lines)))
     (when out
-      (cond
-       ((string-match "CTX:\\([0-9]+\\)" out)
-        (string-to-number (match-string 1 out)))
-       ((string-match "save \\([0-9.]+\\)[kK] tokens" out)
-        (round (* 1000 (string-to-number (match-string 1 out)))))
-       ((string-match "save \\([0-9.]+\\)[mM] tokens" out)
-        (round (* 1000000 (string-to-number (match-string 1 out)))))
-       ((string-match "\\([0-9]+\\)% context used" out)
-        (round (* (/ (string-to-number (match-string 1 out)) 100.0)
-                  cc-butler-cleanup-context-window)))))))
+      (or (plist-get (cc-butler-cleanup--statusline-fields out) :ctx)
+          (cond
+           ((string-match "CTX:\\([0-9]+\\)" out)
+            (string-to-number (match-string 1 out)))
+           ((string-match "save \\([0-9.]+\\)[kK] tokens" out)
+            (round (* 1000 (string-to-number (match-string 1 out)))))
+           ((string-match "save \\([0-9.]+\\)[mM] tokens" out)
+            (round (* 1000000 (string-to-number (match-string 1 out)))))
+           ((string-match "\\([0-9]+\\)% context used" out)
+            (round (* (/ (string-to-number (match-string 1 out)) 100.0)
+                      cc-butler-cleanup-context-window))))))))
 
 ;;;; --- context feedback for the sessions list (cached) ---------------
 
@@ -397,12 +442,14 @@ when no size has ever been read for DIR."
 
 (defun cc-butler-cleanup--default-model (session)
   "Default: read SESSION's current model name from its terminal.
-Reads the `MODEL:<name>' marker emitted by the optional statusLine helper.
-Returns nil when the terminal shows no model indicator."
+Reads the OWN statusline's `:model' anchored in the bottom chrome via
+`cc-butler-cleanup--statusline-fields' (same anchor as the context reader),
+so a MODEL: echoed from another session's terminal in scrollback can never be
+misattributed as ours.  Returns nil when this session shows no own statusline."
   (let ((out (cc-butler--read-output (plist-get session :dir)
                                      cc-butler-cleanup-read-lines)))
-    (when (and out (string-match "MODEL:\\([A-Za-z0-9_.-]+\\)" out))
-      (match-string 1 out))))
+    (when out
+      (plist-get (cc-butler-cleanup--statusline-fields out) :model))))
 
 ;;;; --- model feedback for the sessions list (cached) -------------------
 
