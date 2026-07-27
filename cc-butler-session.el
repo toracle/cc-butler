@@ -280,6 +280,15 @@ future harness change) simply contributes nothing; the main glob still counts."
                       (file-expand-wildcards (expand-file-name "*.jsonl" proj) t)
                       (file-expand-wildcards
                        (expand-file-name "*/subagents/*.jsonl" proj) t))))
+         ;; NOTE: this is the FILE mtime (a stat) — when a transcript was last
+         ;; WRITTEN, NOT when a conversation turn last happened.  A metadata-only
+         ;; write bumps it with zero new rows (observed 2026-07-27: a transcript's
+         ;; mtime advanced ~2000s while its row count and last-turn timestamp were
+         ;; unchanged).  For the idle gate this fails SAFE — a dead session then
+         ;; reads BUSY, so we refuse to compact rather than compact wrongly, which
+         ;; is the direction we want — so we keep the cheap stat.  If exact
+         ;; conversation-liveness is ever needed, read the last row's timestamp
+         ;; inside the newest .jsonl (precise) rather than the file mtime.
          (times (delq nil
                       (mapcar
                        (lambda (f)
