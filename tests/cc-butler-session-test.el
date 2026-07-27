@@ -554,5 +554,66 @@ fail-safe — and those fail-safes point in opposite directions on purpose
                               cc-butler-session-test--prompt
                             (cc-butler--input-state))))))
 
+;;;; ------------------------------------------------------------------
+;;;; P2: transcript-based liveness (compaction gate)
+;;;; ------------------------------------------------------------------
+
+(require 'cl-lib)
+
+(ert-deftest cc-butler-session/claude-project-dir-slugs-the-path ()
+  "The per-project dir is ~/.claude/projects/<slug>/ where slug replaces every
+`/' and `.' in the absolute path with `-'."
+  (should (equal (cc-butler--claude-project-dir "/tmp/foo.bar/")
+                 (expand-file-name "-tmp-foo-bar/" "~/.claude/projects/")))
+  (should (null (cc-butler--claude-project-dir nil))))
+
+(ert-deftest cc-butler-session/last-activity-is-max-over-both-globs ()
+  "`cc-butler--session-last-activity' returns the MAX mtime over the main
+transcript glob AND the sub-agent glob."
+  (let ((now (float-time)))
+    (cl-letf (((symbol-function 'file-expand-wildcards)
+               (lambda (pat &optional _full)
+                 (if (string-match-p "subagents" pat)
+                     '("/p/x/subagents/a.jsonl")   ; sub-agent transcript
+                   '("/p/main.jsonl"))))           ; main transcript
+              ((symbol-function 'file-attributes)
+               (lambda (f &rest _)
+                 ;; sub-agent is the FRESHER of the two
+                 (list nil nil nil nil nil
+                       (if (string-match-p "subagents" f)
+                           (seconds-to-time (- now 10))
+                         (seconds-to-time (- now 500)))))))
+      (should (< (abs (- (cc-butler--session-last-activity "/d/") (- now 10)))
+                 1.0)))))
+
+(ert-deftest cc-butler-session/last-activity-degrades-without-subagents ()
+  "Empty sub-agent glob falls back to the main glob; both empty -> nil."
+  (cl-letf (((symbol-function 'file-attributes)
+             (lambda (_f &rest _)
+               (list nil nil nil nil nil (seconds-to-time (- (float-time) 42))))))
+    ;; only main present
+    (cl-letf (((symbol-function 'file-expand-wildcards)
+               (lambda (pat &optional _full)
+                 (unless (string-match-p "subagents" pat) '("/p/main.jsonl")))))
+      (should (numberp (cc-butler--session-last-activity "/d/"))))
+    ;; both empty -> nil
+    (cl-letf (((symbol-function 'file-expand-wildcards) (lambda (&rest _) nil)))
+      (should (null (cc-butler--session-last-activity "/d/"))))))
+
+(ert-deftest cc-butler-session/transcript-idle-p-honours-threshold ()
+  "Idle only once activity is at least the threshold old; unknown activity
+\(nil) is treated as BUSY, the safe default for a destructive op."
+  (let ((cc-butler-idle-threshold 600)
+        (now (float-time)))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (- now 900))))
+      (should (cc-butler--transcript-idle-p "/d/")))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (- now 5))))
+      (should-not (cc-butler--transcript-idle-p "/d/")))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) nil)))
+      (should-not (cc-butler--transcript-idle-p "/d/")))))
+
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here

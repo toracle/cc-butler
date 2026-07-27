@@ -232,6 +232,71 @@ oldest request first (FIFO); absence means the session is not waiting.")
   "Mark session DIR as no longer awaiting input."
   (when dir (remhash dir cc-butler--waiting)))
 
+;;;; ------------------------------------------------------------------
+;;;; Transcript-based liveness (compaction gate)
+;;;; ------------------------------------------------------------------
+;;
+;; The notification/waiting flag can get stuck: a session that reports
+;; "waiting" but is actually mid-work (or whose flag was never cleared) would
+;; be judged idle and compacted underneath itself.  A session's real activity
+;; is observable directly from Claude's per-project transcripts: the harness
+;; appends to a JSONL transcript on every turn, main and sub-agent alike, so
+;; the newest transcript mtime is a ground-truth "last active" clock.
+
+(defcustom cc-butler-idle-threshold 600
+  "Seconds since a session's newest transcript write below which it is BUSY.
+A session counts as active while ANY of its transcripts — the main one OR a
+sub-agent's — was written within this window.  The 600s backstop covers the one
+gap where a sub-agent is mid a single long tool-call and appends no JSONL for a
+while.  Compaction is destructive (it rewrites the whole transcript), so the
+gate errs toward BUSY: a session is idle only once EVERY transcript has been
+quiet at least this long."
+  :type 'number
+  :group 'cc-butler)
+
+(defun cc-butler--claude-project-dir (dir)
+  "Return the Claude per-project directory for DIR, or nil.
+Claude encodes a project path into ~/.claude/projects/ by replacing every `/'
+and `.' in the absolute path with `-'.  This is the shared slug transform used
+by both the memory dir and the transcript-activity probe, factored out so the
+two cannot drift."
+  (when dir
+    (expand-file-name
+     (concat (replace-regexp-in-string
+              "[/.]" "-" (directory-file-name (expand-file-name dir)))
+             "/")
+     "~/.claude/projects/")))
+
+(defun cc-butler--session-last-activity (dir)
+  "Return the newest transcript mtime for session DIR as float-time, or nil.
+Takes the MAX modification time over the main transcript(s)
+<projdir>/*.jsonl and every sub-agent transcript <projdir>/*/subagents/*.jsonl.
+Returns nil when no transcript is found at all — the caller treats that as
+\"cannot confirm idle\".  Degrades gracefully: a missing sub-agent layout (a
+future harness change) simply contributes nothing; the main glob still counts."
+  (let* ((proj (cc-butler--claude-project-dir dir))
+         (files (and proj
+                     (append
+                      (file-expand-wildcards (expand-file-name "*.jsonl" proj) t)
+                      (file-expand-wildcards
+                       (expand-file-name "*/subagents/*.jsonl" proj) t))))
+         (times (delq nil
+                      (mapcar
+                       (lambda (f)
+                         (when-let ((a (file-attributes f)))
+                           (float-time (file-attribute-modification-time a))))
+                       files))))
+    (when times (apply #'max times))))
+
+(defun cc-butler--transcript-idle-p (dir)
+  "Non-nil when session DIR is SAFELY idle by transcript activity.
+Idle means its newest transcript write (main or sub-agent) was at least
+`cc-butler-idle-threshold' seconds ago.  When no transcript is found the state
+cannot be confirmed, so this returns nil (treat as BUSY — do not compact); the
+safe default, since compaction is destructive."
+  (let ((last (cc-butler--session-last-activity dir)))
+    (and last (>= (- (float-time) last) cc-butler-idle-threshold))))
+
 (defcustom cc-butler-message-transport 'in-memory
   "Transport for up-direction agent messages (report / escalate / drains).
 `in-memory' (default) keeps the volatile queues; `maildir' routes them

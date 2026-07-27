@@ -307,13 +307,11 @@ a prior butler home) to reuse its contents."
 
 (defun cc-butler--claude-memory-dir (project-dir)
   "Return the Claude per-project memory directory for PROJECT-DIR, or nil.
-Claude encodes a project path by replacing `/' and `.' with `-'."
-  (when project-dir
-    (expand-file-name
-     (concat (replace-regexp-in-string
-              "[/.]" "-" (directory-file-name (expand-file-name project-dir)))
-             "/memory/")
-     "~/.claude/projects/")))
+The per-project directory (Claude's `/'-and-`.'-to-`-' slug of the path) is the
+shared `cc-butler--claude-project-dir'; the memory dir is its `memory/'
+subdirectory."
+  (when-let ((proj (cc-butler--claude-project-dir project-dir)))
+    (expand-file-name "memory/" proj)))
 
 (defun cc-butler--shared-state-note ()
   "Return a CLAUDE.md section pointing both roles at the shared docs + memory.
