@@ -851,6 +851,62 @@ neither prompt."
 ;;;; Fleet sweep
 ;;;; ------------------------------------------------------------------
 
+;;;; ------------------------------------------------------------------
+;;;; P3: percentage-first hybrid threshold
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/over-threshold-37pct-not-flagged ()
+  "A session at 37%% of its window is NOT a candidate even when its absolute
+token count (371538) is well past the old 300k floor: the percentage is the
+honest signal across differently-sized windows."
+  (let ((cc-butler-compact-threshold-fraction 0.60))
+    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx 371538 :pct 37 :model "Opus-4.8"))))
+      (should-not (cc-butler-compact--over-threshold-p "/d/")))))
+
+(ert-deftest cc-butler-compact/over-threshold-65pct-flagged ()
+  "At 65%% (>= the 0.60 fraction) the session is a candidate."
+  (let ((cc-butler-compact-threshold-fraction 0.60))
+    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx 130000 :pct 65 :model "Opus-4.8"))))
+      (should (cc-butler-compact--over-threshold-p "/d/")))))
+
+(ert-deftest cc-butler-compact/over-threshold-falls-back-to-ctx-when-no-pct ()
+  "With no percentage on the statusline, fall back to CTX against the window:
+just over window*fraction is a candidate, just under is not."
+  (let ((cc-butler-compact-threshold-fraction 0.60)
+        (cc-butler-cleanup-context-window 200000))   ; * 0.60 = 120000
+    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx nil :pct nil :model "Opus-4.8"))))
+      (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 130000)))
+        (should (cc-butler-compact--over-threshold-p "/d/")))
+      (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 110000)))
+        (should-not (cc-butler-compact--over-threshold-p "/d/"))))))
+
+(ert-deftest cc-butler-compact/over-threshold-is-window-adaptive ()
+  "The SAME ctx yields opposite verdicts under different context windows —
+the point of a fraction rather than an absolute floor."
+  (let ((cc-butler-compact-threshold-fraction 0.60))
+    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx nil :pct nil :model "m")))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 150000)))
+      (let ((cc-butler-cleanup-context-window 200000))   ; *0.6 = 120000 -> over
+        (should (cc-butler-compact--over-threshold-p "/d/")))
+      (let ((cc-butler-cleanup-context-window 300000))   ; *0.6 = 180000 -> under
+        (should-not (cc-butler-compact--over-threshold-p "/d/"))))))
+
+(ert-deftest cc-butler-compact/candidates-use-percentage-not-absolute ()
+  "The sweep gate is the percentage: a session at 37%% is not swept even though
+its 371538 tokens exceed the old absolute 300k threshold (which would have
+listed it)."
+  (let ((cc-butler-compact-threshold-fraction 0.60)
+        (cc-butler-compact-threshold 300000))
+    (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () '((:dir "/d/"))))
+              ((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx 371538 :pct 37 :model "Opus-4.8")))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 371538)))
+      (should (null (cc-butler-compact-candidates))))))
+
 (ert-deftest cc-butler-compact/sweep-includes-butler-and-steward ()
   "The whole point: the butler and steward are candidates like anyone else.
 Excluding them would leave the largest context in the fleet untouchable."
@@ -861,7 +917,7 @@ Excluding them would leave the largest context in the fleet untouchable."
               ((symbol-function 'cc-butler-cleanup-context-for)
                (lambda (d) (cond ((equal d "/b/") 471792)
                                  ((equal d "/s/") 361689)
-                                 (t 203356)))))
+                                 (t 90000)))))   ; worker well under the fraction
       (should (equal (cc-butler-compact-candidates) '("/b/" "/s/"))))))
 
 (ert-deftest cc-butler-compact/sweep-orders-largest-first ()
@@ -1015,7 +1071,7 @@ never a silent no-op that reads as success."
 (ert-deftest cc-butler-compact/fleet-summary-lists-only-what-is-over ()
   "The report is arithmetic — over the threshold or not — and says what the
 steward can do about each one."
-  (cc-butler-compact-test--with-fleet '(("/butler/" . 514000) ("/w/" . 152000))
+  (cc-butler-compact-test--with-fleet '(("/butler/" . 514000) ("/w/" . 90000))
     (let ((out (cc-butler-compact-fleet-summary)))
       (should (string-match-p "/butler/" out))
       (should (string-match-p "514k" out))

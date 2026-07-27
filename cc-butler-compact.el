@@ -60,6 +60,19 @@ surfaces a worker for cleanup (externalize and tear down), this one is the
 cheaper in-place remedy that also applies to the butler itself."
   :type 'integer :group 'cc-butler)
 
+(defcustom cc-butler-compact-threshold-fraction 0.60
+  "Fraction of the model context window at/above which a session is a compaction
+candidate.  The PREFERRED signal is the statusline's own used-percentage
+\(the `<pct>%' in CTX:<n> <pct>% MODEL:...); when that percentage is absent it
+falls back to CTX / `cc-butler-cleanup-context-window'.
+
+This is the primary gate, replacing the absolute `cc-butler-compact-threshold':
+an absolute token count mis-scales across models with different context windows
+— a large-window model at 37%% of its window is not a compaction candidate even
+though it is well past a fixed 300k — so the percentage is the honest signal.
+`cc-butler-compact-threshold' is kept for compatibility but no longer gates."
+  :type 'number :group 'cc-butler)
+
 (defcustom cc-butler-compact-model "sonnet"
   "Model to switch a session to before compacting it.
 Compaction re-reads the whole transcript, so it is the single most expensive
@@ -258,6 +271,29 @@ polls faster than the TTL and must see the switch the moment it lands."
   (when (boundp 'cc-butler-cleanup--context-cache)
     (remhash dir cc-butler-cleanup--context-cache))
   (cc-butler-cleanup-context-for dir))
+
+(defun cc-butler-compact--statusline-fields-now (dir)
+  "Parse DIR's OWN statusline fields from a fresh terminal read, or nil.
+Anchored to the bottom chrome via `cc-butler-cleanup--statusline-fields', so it
+reads only this session's statusline, not an echo in scrollback."
+  (when-let ((out (cc-butler--read-output dir cc-butler-cleanup-read-lines)))
+    (cc-butler-cleanup--statusline-fields out)))
+
+(defun cc-butler-compact--over-threshold-p (dir)
+  "Non-nil when DIR is at/above the compaction threshold (hybrid signal).
+Prefers the statusline's own used-percentage (at/above
+`cc-butler-compact-threshold-fraction' of the window); when the percentage is
+absent, falls back to the context-token
+figure against `cc-butler-cleanup-context-window'.  Returns nil when neither is
+known — an unknown size is not a candidate (honest, never a guess)."
+  (let ((pct (plist-get (cc-butler-compact--statusline-fields-now dir) :pct))
+        (frac cc-butler-compact-threshold-fraction))
+    (if (integerp pct)
+        (>= pct (* 100 frac))
+      (let ((ctx (cc-butler-cleanup-context-for dir)))
+        (and (integerp ctx)
+             (> cc-butler-cleanup-context-window 0)
+             (> ctx (* cc-butler-cleanup-context-window frac)))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Pre-flight guards
@@ -760,14 +796,16 @@ and answers any modal that is already up while it waits."
 ;;;; ------------------------------------------------------------------
 
 (defun cc-butler-compact-candidates ()
-  "Return dirs of sessions over `cc-butler-compact-threshold', largest first.
-Includes the butler and the steward by design."
+  "Return dirs of sessions over the compaction threshold, largest first.
+Candidacy is `cc-butler-compact--over-threshold-p' (the percentage-first hybrid
+gate); ordering is by context-token size so an interrupted sweep did the most
+important work first.  Includes the butler and the steward by design."
   (let (out)
     (dolist (s (cc-butler--sessions))
       (let* ((dir (plist-get s :dir))
              (ctx (cc-butler-cleanup-context-for dir)))
-        (when (and (integerp ctx) (> ctx cc-butler-compact-threshold))
-          (push (cons dir ctx) out))))
+        (when (cc-butler-compact--over-threshold-p dir)
+          (push (cons dir (or ctx 0)) out))))
     (mapcar #'car (sort out (lambda (a b) (> (cdr a) (cdr b)))))))
 
 ;;;###autoload
@@ -993,12 +1031,11 @@ the ceiling with nobody reading."
             (if (integerp ctx) (format "%.0fk" (/ ctx 1000.0)) "?")
             (or model "?")
             (if (cc-butler--waiting-p dir) "WAITING" "running")
-            (cond ((and (integerp ctx) (> ctx cc-butler-compact-threshold) (not why))
-                   "OVER THRESHOLD — compactable now")
-                  ((and (integerp ctx) (> ctx cc-butler-compact-threshold))
-                   (format "OVER THRESHOLD — blocked: %s" why))
-                  (why (format "blocked: %s" why))
-                  (t "ok")))))
+            (let ((over (cc-butler-compact--over-threshold-p dir)))
+              (cond ((and over (not why)) "OVER THRESHOLD — compactable now")
+                    (over (format "OVER THRESHOLD — blocked: %s" why))
+                    (why (format "blocked: %s" why))
+                    (t "ok"))))))
 
 (defun cc-butler-tool-session-status ()
   "MCP tool: per-session context size, model, and compaction readiness."
