@@ -83,8 +83,11 @@ any string cut out of it)."
                  (error "Timed out reading session %s's output after %ss (redraw or buffer access may be stuck)"
                         (cc-butler--display-name dir) cc-butler-session-io-timeout))
     (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
-      (when (buffer-live-p buf)
-        (cc-butler--refresh-terminal-text buf)
+      ;; A failed refresh leaves the last frame that DID render sitting in the
+      ;; buffer.  Serving it would present old text as the current screen, and a
+      ;; caller acting on that — answering a permission dialog it cannot
+      ;; actually see — is the expensive mistake.  Report nothing instead.
+      (when (and (buffer-live-p buf) (cc-butler--refresh-terminal-text buf))
         (with-current-buffer buf
           (let* ((n (max 1 (or lines 40)))
                  (start (save-excursion (goto-char (point-max))
@@ -1126,8 +1129,18 @@ returned as if it were real input.  See `cc-butler--read-output-redacted'."
   (let ((dir (cc-butler--dir-by-name name)))
     (if (not dir)
         (format "No session named %S.  Call list_claude_sessions for names." name)
-      (or (cc-butler--read-output-redacted dir (and lines (truncate lines)))
-          "(no output)"))))
+      (let ((out (cc-butler--read-output-redacted dir (and lines (truncate lines)))))
+        (cond
+         ;; "the screen is empty" and "we do not know what the screen says" are
+         ;; different facts.  Collapsing them into one reassuring string is what
+         ;; let a frozen terminal read as ordinary output for hours.
+         ((null out)
+          (format "(could not read %s's screen: its terminal text could not be refreshed, \
+so it may be stale.  Deliberately not showing the last frame — acting on an old \
+screen is worse than seeing none.  Check the cc-butler log for the refresh error.)"
+                  name))
+         ((string-empty-p out) "(no output)")
+         (t out))))))
 
 (defun cc-butler-tool-send-session (name text)
   "MCP tool: type TEXT into session NAME and submit it."

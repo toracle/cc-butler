@@ -828,15 +828,37 @@ depends on but cannot install or verify for you."
 
 (defun cc-butler--refresh-terminal-text (buffer)
   "Force BUFFER's text to be re-synced from the live ghostel grid.
+Return non-nil when BUFFER's text can be trusted, nil when a refresh was
+attempted and FAILED.
+
 ghostel only repaints a buffer that is displayed in a window; a
 background session buffer is never redisplayed, so its text can be a
 stale frame.  Drive a full `ghostel--redraw' directly (the same call
 ghostel makes on config changes) so the text reflects the current frame
-without needing a window."
+without needing a window.
+
+For a background session buffer this call is the ONLY thing that ever writes
+text into it, which is why its failure has to be reported rather than
+swallowed.  It used to be wrapped in `ignore-errors' and the caller read the
+buffer regardless, so a persistently failing redraw served the last frame that
+DID render as though it were the live screen — indistinguishable from ordinary
+output, and unfalsifiable, since nothing recorded that a refresh had failed.  A
+read that cannot report its own failure is not a read.
+
+A buffer with no ghostel terminal is NOT a failure: its text belongs to some
+other backend, and calling that stale would blank out every non-ghostel setup."
   (with-current-buffer buffer
-    (when (and (boundp 'ghostel--term) ghostel--term (fboundp 'ghostel--redraw))
+    (if (not (and (boundp 'ghostel--term) ghostel--term (fboundp 'ghostel--redraw)))
+        'no-terminal                    ; not ours to refresh; trust it as-is
       (let ((inhibit-read-only t))
-        (ignore-errors (ghostel--redraw ghostel--term t))))))
+        (condition-case err
+            (progn (ghostel--redraw ghostel--term t) t)
+          (error
+           ;; The reason is the whole point: without it the failure is
+           ;; permanently undiagnosable, which is how this went unnoticed.
+           (cc-butler--log "read: %s │ terminal refresh FAILED (%s) — text may be stale"
+                           (buffer-name buffer) (error-message-string err))
+           nil))))))
 
 (defconst cc-butler--border-rule-char ?─
   "The box-drawing horizontal-rule character Claude Code draws immediately

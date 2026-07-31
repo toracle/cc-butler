@@ -178,7 +178,7 @@ timeout when the row is already there."
             (insert (make-string 24 cc-butler--border-rule-char)))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
                     (cc-butler-launch-ready-timeout 2))
             (should (progn (cc-butler--wait-for-session-ready "/worker/") t))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
@@ -194,7 +194,7 @@ caller a false-ready session (cc-butler#8)."
           (with-current-buffer term-buf (insert "still starting up...\n"))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
                     (cc-butler-launch-ready-timeout 0.3))
             (should-error (cc-butler--wait-for-session-ready "/worker/"))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
@@ -268,7 +268,7 @@ this is the exact case a genuinely new directory hits."
           (with-current-buffer term-buf (cc-butler-session-test--insert-trust-dialog))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
                     ((symbol-function 'claude-code-ide--terminal-send-return)
                      (lambda ()
                        (cl-incf return-count)
@@ -614,6 +614,50 @@ transcript glob AND the sub-agent glob."
     (cl-letf (((symbol-function 'cc-butler--session-last-activity)
                (lambda (_d) nil)))
       (should-not (cc-butler--transcript-idle-p "/d/")))))
+
+;;;; ------------------------------------------------------------------
+;;;; A read must be able to report its own failure
+;;;; ------------------------------------------------------------------
+
+;; For a background session buffer, forcing the redraw is the ONLY thing that
+;; ever writes text into it.  When that call failed the error was swallowed and
+;; the caller read the untouched buffer anyway — so a permanently failing
+;; refresh was served as ordinary output, indistinguishable from a live screen.
+;; A stale screen believed to be current is worse than no screen at all.
+
+(ert-deftest cc-butler-session/refresh-reports-a-failed-redraw ()
+  "A redraw that signals must be reported as failure, not swallowed."
+  (let (logged)
+    (cl-letf (((symbol-function 'cc-butler--log)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) logged)))
+              ((symbol-function 'ghostel--redraw)
+               (lambda (&rest _) (error "ReentrantRedraw"))))
+      (with-temp-buffer
+        (setq-local ghostel--term 'fake-term)
+        (should (null (cc-butler--refresh-terminal-text (current-buffer))))
+        ;; and it must say WHY — swallowing the reason is what made this
+        ;; undiagnosable in the first place
+        (should logged)
+        (should (string-match-p "ReentrantRedraw"
+                                (mapconcat #'identity logged " ")))))))
+
+(ert-deftest cc-butler-session/refresh-succeeds-quietly ()
+  "A redraw that works reports success and logs nothing."
+  (let (logged)
+    (cl-letf (((symbol-function 'cc-butler--log)
+               (lambda (&rest args) (push args logged)))
+              ((symbol-function 'ghostel--redraw) (lambda (&rest _) t)))
+      (with-temp-buffer
+        (setq-local ghostel--term 'fake-term)
+        (should (cc-butler--refresh-terminal-text (current-buffer)))
+        (should (null logged))))))
+
+(ert-deftest cc-butler-session/no-terminal-is-not-a-failure ()
+  "A buffer with no ghostel terminal is not a FAILED refresh — its text is
+maintained by something else (another backend, or a plain buffer).  Reporting
+that as failure would blank out every non-ghostel setup."
+  (with-temp-buffer
+    (should (cc-butler--refresh-terminal-text (current-buffer)))))
 
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here
