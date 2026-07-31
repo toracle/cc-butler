@@ -237,8 +237,86 @@ A dimmed suggestion is not input — see `cc-butler-compact--typed-text'."
 ;;;; Model names
 ;;;; ------------------------------------------------------------------
 
-(defconst cc-butler-compact--families '("opus" "sonnet" "haiku")
-  "Model families `/model' accepts as a bare alias.")
+;; There used to be a hardcoded list of families here.  A closed list is wrong
+;; for this: the CLI already ships a `fable' family, and a `claude-mythos-5'
+;; whose family has no bare alias at all, so the day a new family stalls every
+;; compaction has already passed — this fleet simply has not run one yet.
+;;
+;; Nothing needs a list.  The statusline emits either the model's id
+;; (`claude-sonnet-5') or its display name with punctuation collapsed
+;; (`Opus 4.8' -> `Opus-4.8'), and the id form is recoverable from either.  The
+;; family is then just the id's first segment, so families nobody has heard of
+;; resolve on their own.
+
+(defconst cc-butler-compact--bare-aliases
+  '("opus" "sonnet" "haiku" "fable" "best" "opusplan" "default")
+  "Aliases `/model' accepts with no version attached.
+Used ONLY to resolve a tag that carries no version of its own, where shape
+cannot tell a real model from noise.  Deliberately not the gate on which
+families are supported — a versioned tag resolves without consulting this.")
+
+(defun cc-butler-compact--model-id (tag)
+  "Return the model id TAG names, or nil.
+`Opus-4.8' -> `claude-opus-4-8'; an id-shaped tag is returned as-is.  The
+result is a well-formed id, not a promise that the model exists."
+  (when (and (stringp tag) (not (string-empty-p tag)))
+    (let ((low (downcase tag)))
+      (if (string-prefix-p "claude-" low)
+          low
+        (concat "claude-" (replace-regexp-in-string "\\." "-" low))))))
+
+(defun cc-butler-compact--model-family (tag)
+  "Return the family TAG belongs to (`opus', `fable', ...), or nil.
+The family is the id's first segment after the `claude-' prefix, so this
+works for families that did not exist when this was written."
+  (when-let ((id (cc-butler-compact--model-id tag)))
+    (let ((rest (substring id (length "claude-"))))
+      (car (split-string rest "-" t)))))
+
+(defun cc-butler-compact--model-args (tag)
+  "Return the `/model' arguments that restore TAG, best first.
+
+Two candidates, and the order is the point.  The exact id restores the model
+the session was actually on: compaction is meant to hand a session back as it
+found it, and restoring by family alias silently moves it to whatever is
+newest in that family — a change nobody asked for.  The family alias follows
+as a fallback, because an id can be refused (deprecated, renamed, or a display
+name whose shape this maps wrongly — see the untested `[1m]' variants), and a
+refused argument leaves the session sitting on the cheap compaction model.
+Falling back to the family means the worst case is \"restored to the latest in
+the right family\" rather than \"quietly left on the cheap model\".
+
+A tag with no version (a bare `Opus' does occur) cannot name an exact model —
+`claude-opus' is not an id — so only the family is offered.
+
+On what a refused argument does: reading the installed CLI (2.1.220), an
+argument that is not a known alias is probed against the API and, if the probe
+fails, reported as an error with the model LEFT UNCHANGED — there is no fuzzy
+matching, so a wrong model cannot be selected by accident.  Documentation for
+releases before 2.1.200 describes a different, less safe behaviour (the value
+was kept and failed on the next request).  That is not a path this takes, since
+every argument here is derived from a tag the session itself displayed, and an
+unresolvable tag is refused before anything is typed.  Neither behaviour was
+confirmed by experiment — deliberately not tested against a live session."
+  (when (stringp tag)
+    (let* ((id (cc-butler-compact--model-id tag))
+           (versioned (and id (string-match-p "[0-9]" id) id))
+           (family (cc-butler-compact--model-family tag)))
+      (delete-dups
+       (delq nil
+             (list versioned
+                   ;; The family is only trustworthy if it came from something
+                   ;; that looks like a real model.  A tag carrying no version
+                   ;; is indistinguishable from noise by shape alone —
+                   ;; "Some-Future-Model" would otherwise yield "some" — so an
+                   ;; unversioned tag is resolved only when it IS a known bare
+                   ;; alias.  Note what this list is NOT: it is not the gate on
+                   ;; new families, which is what made the old allowlist fail.
+                   ;; A versioned tag from a family nobody listed still
+                   ;; resolves above, without consulting this at all.
+                   (when (or versioned
+                             (member (downcase tag) cc-butler-compact--bare-aliases))
+                     family)))))))
 
 (defun cc-butler-compact--model-arg (tag)
   "Return the `/model' argument that restores model TAG, or nil.
@@ -248,15 +326,25 @@ Display names are not valid `/model' arguments, so map back to the family
 alias.  Returning nil is load-bearing: a model we cannot name is a model we
 cannot restore, and the driver refuses to switch away from it at all rather
 than strand a session on the wrong model."
-  (when (stringp tag)
-    (let ((low (downcase tag)))
-      (cl-find-if (lambda (f) (string-match-p (regexp-quote f) low))
-                  cc-butler-compact--families))))
+  (car (cc-butler-compact--model-args tag)))
 
 (defun cc-butler-compact--model-is-p (tag arg)
-  "Non-nil when statusline TAG denotes the model named by `/model' ARG."
+  "Non-nil when statusline TAG denotes the model named by `/model' ARG.
+
+Both sides are normalised to ids before comparing.  This used to substring-match
+ARG inside TAG, which worked only while ARG was always a bare family: with an
+exact id as the argument, `claude-opus-4-8' does not appear anywhere inside
+`Opus-4.8', so a restore that SUCCEEDED would never be confirmed and would time
+out.  Deriving the argument and checking that it landed have to happen in the
+same space.
+
+A bare family argument still matches any model of that family — that is how the
+switch to the cheap model is detected, and what makes the fallback confirmable."
   (and (stringp tag) (stringp arg)
-       (string-match-p (regexp-quote (downcase arg)) (downcase tag))))
+       (let ((tag-id (cc-butler-compact--model-id tag)))
+         (and tag-id
+              (or (equal tag-id (cc-butler-compact--model-id arg))
+                  (equal (downcase arg) (cc-butler-compact--model-family tag)))))))
 
 (defun cc-butler-compact--model-now (dir)
   "Read DIR's current model tag, bypassing the cleanup layer's TTL cache.
@@ -626,12 +714,13 @@ and refuses when the current model cannot be named well enough to restore."
     ;; original is unrecoverable, and an unrestorable session is worse than
     ;; an uncompacted one.
     (let* ((tag (cc-butler-compact--model-now dir))
-           (arg (cc-butler-compact--model-arg tag))
+           (args (cc-butler-compact--model-args tag))
+           (arg (car args))
            (ctx (cc-butler-compact--context-now dir)))
       (unless arg
         (user-error "Refusing to compact %s: cannot determine a restorable model (statusline says %s)"
                     name (or tag "nothing")))
-      (cc-butler-compact--set-state dir :orig-model tag :orig-arg arg
+      (cc-butler-compact--set-state dir :orig-model tag :orig-args args :orig-arg arg
                                     :orig-ctx ctx :note nil)
       (cc-butler--log "compact: %s │ start (ctx %s, model %s)"
                       name (or ctx "?") tag)
@@ -773,9 +862,22 @@ and answers any modal that is already up while it waits."
                                         :sent-time (float-time))
           (cc-butler-compact--schedule-poll dir))))
      ((> (- (float-time) sent) cc-butler-compact-step-timeout)
-      (cc-butler-compact--finish
-       dir "compacted (%s) but model NOT restored — session is on %s, wanted %s"
-       (or (plist-get st :note) "no delta observed") (or tag "?") arg))
+      ;; The exact id may simply have been refused, in which case `/model' left
+      ;; the session unchanged — still on the cheap compaction model.  That is
+      ;; the silent downgrade this is meant to avoid, so try the next candidate
+      ;; (the family alias) before reporting failure.
+      (let ((rest (cdr (plist-get st :orig-args))))
+        (if rest
+            (progn
+              (cc-butler--log "compact: %s │ %s did not land — falling back to %s"
+                              (cc-butler--display-name dir) arg (car rest))
+              (cc-butler-compact--set-state dir :orig-args rest :orig-arg (car rest)
+                                            :phase 'restore-wait
+                                            :sent-time (float-time) :answers 0)
+              (cc-butler-compact--schedule-poll dir))
+          (cc-butler-compact--finish
+           dir "compacted (%s) but model NOT restored — session is on %s, wanted %s"
+           (or (plist-get st :note) "no delta observed") (or tag "?") arg))))
      (t (cc-butler-compact--schedule-poll dir)))))
 
 (defun cc-butler-compact--abort (dir why)
