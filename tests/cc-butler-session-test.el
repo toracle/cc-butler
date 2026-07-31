@@ -810,6 +810,93 @@ sitting in front of Emacs — the same binding ghostel's own path uses."
           (should (eq before (window-buffer (selected-window)))))
       (kill-buffer buf))))
 
+;; REGRESSION (2026-07-31, live): the borrow above took the SELECTED window
+;; without asking whether it could be used.  cc-butler dedicates its own
+;; session-list window (`cc-butler-session.el', `set-window-dedicated-p'), so
+;; whenever point rested there `set-window-buffer' signalled "Window is
+;; dedicated to `*claude-sessions*'".  That signal escaped the honest-nil
+;; channel this same change built — it sits outside the `condition-case' in
+;; `cc-butler--redraw-in-window' — so reads AND the compaction probe failed
+;; with a raw Emacs error instead of reporting a refresh they could not do.
+;; Gated on two conditions at once (buffer displayed nowhere AND the selected
+;; window dedicated), which is why it struck intermittently.
+
+(defmacro cc-butler-session-test--with-two-windows (list-buf &rest body)
+  "Run BODY with a fresh two-window layout: LIST-BUF in the selected window,
+a scratch buffer in a second one.  Restores the layout afterwards."
+  (declare (indent 1))
+  `(save-window-excursion
+     (delete-other-windows)
+     (split-window (selected-window) nil 'right)
+     (set-window-buffer (selected-window) ,list-buf)
+     ,@body))
+
+(ert-deftest cc-butler-session/refresh-does-not-borrow-a-dedicated-window ()
+  "A dedicated window cannot be lent — `set-window-buffer' signals on one.
+Another window must be used instead, and the dedicated one left untouched."
+  (let ((buf (get-buffer-create " *ccb-dedicated*"))
+        (listbuf (get-buffer-create " *ccb-fake-list*"))
+        rec)
+    (unwind-protect
+        (cc-butler-session-test--with-two-windows listbuf
+          (set-window-dedicated-p (selected-window) t)
+          ;; the conditions that produced the live failure, both present
+          (should (window-dedicated-p (selected-window)))
+          (should-not (get-buffer-window-list buf nil t))
+          (with-current-buffer buf (setq-local ghostel--term 'fake-term))
+          (cc-butler-session-test--recording-redraw rec
+            (should (cc-butler--refresh-terminal-text buf)))
+          (should (= 1 (length rec)))
+          (should (car (car rec)))      ; it did get a window showing the buffer
+          ;; and the dedicated window is exactly as it was
+          (should (eq listbuf (window-buffer (selected-window))))
+          (should (window-dedicated-p (selected-window))))
+      (kill-buffer buf)
+      (kill-buffer listbuf))))
+
+(ert-deftest cc-butler-session/refresh-refuses-rather-than-rearranging-the-frame ()
+  "With no window that may be borrowed, report the failure and stop.
+Splitting one to make room would let a READ rearrange the frame a human is
+looking at — an observation that alters what it observes.  The honest nil
+costs that session's text until something displays it, which is the cheaper
+mistake, and the caller already renders it as \"could not read\"."
+  (let ((buf (get-buffer-create " *ccb-nowindow*"))
+        (listbuf (get-buffer-create " *ccb-fake-list2*")))
+    (unwind-protect
+        (cc-butler-session-test--with-two-windows listbuf
+          (dolist (w (window-list)) (set-window-dedicated-p w t))
+          (with-current-buffer buf (setq-local ghostel--term 'fake-term))
+          (let ((before (length (window-list))) rec)
+            ;; stub the render too, so a nil here can only mean "no window to
+            ;; borrow" and not "there was no terminal to redraw in the first
+            ;; place" — those are different answers and `no-terminal' is truthy
+            (cc-butler-session-test--recording-redraw rec
+              (should-not (cc-butler--refresh-terminal-text buf))
+              (should-not rec))          ; never got as far as rendering
+            ;; no window was split into existence to get around it
+            (should (= before (length (window-list))))))
+      (kill-buffer buf)
+      (kill-buffer listbuf))))
+
+(ert-deftest cc-butler-session/refresh-reports-an-unborrowable-window-as-failure ()
+  "Dedication is one way acquiring a window can fail; there will be others.
+Every such failure has to leave by the same nil the caller already checks —
+a reporting channel an exception can step around is not a channel.  Pinning
+this to the dedicated case alone would reopen the same hole on the next
+window error nobody predicted."
+  (let ((buf (get-buffer-create " *ccb-borrowfail*")) rec)
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local ghostel--term 'fake-term)
+          (cc-butler-session-test--recording-redraw rec
+            (cl-letf (((symbol-function 'set-window-buffer)
+                       (lambda (&rest _) (error "some other window problem"))))
+              (should-not (cc-butler--refresh-terminal-text buf))))
+          ;; nil because the borrow failed, not because there was nothing to
+          ;; redraw: the render was available and simply never reached
+          (should-not rec))
+      (kill-buffer buf))))
+
 (ert-deftest cc-butler-session/refresh-coalesces-a-burst-of-reads ()
   "A full redraw rebuilds the whole buffer from the grid — up to
 `ghostel-max-scrollback' of it — and one refresh cycle reads every session in

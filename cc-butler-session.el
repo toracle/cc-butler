@@ -1008,6 +1008,28 @@ retries that follow it, turning a transient failure into a lasting freeze.")
                            (buffer-name buffer) (error-message-string err))
            nil))))))
 
+(defun cc-butler--borrowable-window ()
+  "A live window whose buffer may be swapped out for an instant, or nil.
+
+Never the minibuffer, and never a dedicated window: cc-butler dedicates its
+own session-list window, and `set-window-buffer' signals `Window is dedicated
+to ...' on one instead of declining.  Since the list window is normally where
+point rests, taking the selected window unconditionally meant every read of an
+undisplayed session failed whenever someone was looking at the list.
+
+Prefers the selected window — the cheapest to borrow and put back — then any
+other.  Deliberately does NOT split a window to manufacture one: a read must
+not rearrange the frame a human is looking at.  When there is nothing to
+borrow the answer is nil, and the caller says so out loud.
+
+`cc-butler--main-win' makes the same choice for the same reason; it may split
+because its purpose is to SHOW a human something, which is not this one's."
+  (seq-find (lambda (w)
+              (and (window-live-p w)
+                   (not (window-minibuffer-p w))
+                   (not (window-dedicated-p w))))
+            (cons (selected-window) (window-list nil 'no-minibuffer))))
+
 (defun cc-butler--redraw-with-window (buffer)
   "Force BUFFER's text to be re-synced, lending it a window if it has none.
 
@@ -1020,22 +1042,29 @@ buffer did not move (1128 bytes before and after); with it, ok and 1128 ->
 157599.  The grid held the current screen the whole time; only the hand-off into
 the Emacs buffer was failing.
 
-Prefer a window that already shows BUFFER; otherwise borrow the selected one
-inside `save-window-excursion', which puts it back.  Never borrow the
-minibuffer."
+Prefer a window that already shows BUFFER; otherwise borrow one inside
+`save-window-excursion', which puts it back."
   (let ((win (car (get-buffer-window-list buffer nil t))))
     (if win
         (cc-butler--redraw-in-window win buffer)
-      (let ((lender (if (window-minibuffer-p (selected-window))
-                        (get-mru-window nil nil t)
-                      (selected-window))))
-        (if (not (window-live-p lender))
-            (progn (cc-butler--log "read: %s │ no window available to refresh into"
+      (let ((lender (cc-butler--borrowable-window)))
+        (if (not lender)
+            (progn (cc-butler--log "read: %s │ no window may be borrowed to refresh into"
                                    (buffer-name buffer))
                    nil)
-          (save-window-excursion
-            (set-window-buffer lender buffer 'keep-margins)
-            (cc-butler--redraw-in-window lender buffer)))))))
+          ;; Acquiring the window is guarded too, not just the render inside it.
+          ;; `set-window-buffer' SIGNALS rather than returning a code, and this
+          ;; function's whole contract is to answer non-nil/nil so the caller can
+          ;; tell a trustworthy buffer from a stale one.  An exception thrown past
+          ;; that contract is not a failure report — it is the absence of one.
+          (condition-case err
+              (save-window-excursion
+                (set-window-buffer lender buffer 'keep-margins)
+                (cc-butler--redraw-in-window lender buffer))
+            (error
+             (cc-butler--log "read: %s │ could not borrow a window (%s) — text may be stale"
+                             (buffer-name buffer) (error-message-string err))
+             nil)))))))
 
 (defconst cc-butler--border-rule-char ?─
   "The box-drawing horizontal-rule character Claude Code draws immediately
