@@ -336,6 +336,14 @@ Each entry is a plist (:time :dir :name :body).  Drained by the
   "Format the session label (name + id) for session DIR."
   (cc-butler--who (cc-butler--display-name dir) (cc-butler--session-id dir)))
 
+(defconst cc-butler--via-separator " → "
+  "How hops in a relay path are joined.  One definition, so the inbox
+envelope and a relayed terminal message render a path the same way.")
+
+(defun cc-butler--via-string (via)
+  "Render VIA, a hop list or an already-formatted string, as a relay path."
+  (if (listp via) (mapconcat #'identity via cc-butler--via-separator) via))
+
 (defcustom cc-butler-log-buffer-name "*cc-butler-log*"
   "Name of the cc-butler message-log buffer that tees butler<->worker traffic."
   :type 'string

@@ -1142,17 +1142,68 @@ screen is worse than seeing none.  Check the cc-butler log for the refresh error
          ((string-empty-p out) "(no output)")
          (t out))))))
 
+(defun cc-butler--relay-command-p (text)
+  "Non-nil when TEXT is a bare slash command rather than a message.
+A command is an OPERATION on the session, not prose for anyone to read, and
+prefixing it would put the attribution at the start of the input — `/model opus'
+would then arrive as text instead of running.  The sender is still logged."
+  (and (stringp text)
+       (string-prefix-p "/" (string-trim-left text))
+       (not (string-search "\n" (string-trim text)))))
+
+(defun cc-butler--relay-attribution (self dir)
+  "Return the line marking a message as relayed from SELF to DIR.
+
+Written by the CODE, never by the sending model.  Text delivered this way lands
+in the target's input box looking exactly like something a human typed, so
+without this a session cannot tell a peer's suggestion from an instruction and a
+message carries whatever authority the reader assumes.  Asking each sender to
+label itself is asking it to remember; this cannot be forgotten.
+
+It attests the CHANNEL, not the origin: it says which session delivered the
+text, not who authored the intent behind it.  A relayed instruction and the
+sender's own opinion are indistinguishable here by design — `From' (the origin
+author, per the provenance SDD §8) is deliberately NOT set, because nothing in
+the code can tell relaying from deciding, and inventing a default would be
+deciding an open policy question in passing.
+
+The identity is trustworthy: a session's id is minted at launch into its own MCP
+config and recovered server-side from the request path, so a session cannot
+claim to be another.  Name AND id, because display names can collide."
+  (format "[cc-butler · %s]"
+          (cc-butler--via-string
+           (list (cc-butler--who-dir self) (cc-butler--display-name dir)))))
+
 (defun cc-butler-tool-send-session (name text)
-  "MCP tool: type TEXT into session NAME and submit it."
+  "MCP tool: type TEXT into session NAME and submit it.
+The text is prefixed with a line naming the sending session — see
+`cc-butler--relay-attribution'."
   (let ((self (cc-butler--caller-dir))
         (dir (cc-butler--dir-by-name name)))
     (cond
      ((not dir)
       (format "No session named %S.  Call list_claude_sessions for names." name))
+     ;; Decide this BEFORE the send.  The identity is legitimately absent on
+     ;; several paths — no MCP request in scope (a timer, a hook, a bare
+     ;; `emacsclient --eval'), or a session id that is stale or was never
+     ;; registered — and it used to be caught only when formatting the log
+     ;; line, AFTER the text had been delivered.  The sender was told it
+     ;; failed while the receiver had the message, and a sender that believes
+     ;; it failed re-sends, delivering the same instruction twice.  A nil
+     ;; identity also silently disables the self-send guard below.
+     ;; Which path produced it in the wild could not be determined from the
+     ;; code; `claude-code-ide-debug' logs the session id on every request and
+     ;; would settle it.  Matches report_to_steward, which already refuses.
+     ((not self)
+      (error "No calling session context for this request"))
      ((equal dir self)
       (error "Refusing to send to the calling session itself"))
      (t
-      (cc-butler--send-input dir text t)
+      (cc-butler--send-input
+       dir (if (cc-butler--relay-command-p text)
+               text
+             (concat (cc-butler--relay-attribution self dir) "\n" text))
+       t)
       (cc-butler--clear-waiting dir)       ; commanding a worker attends to it
       (cc-butler--log "%s → %s │ %s" (cc-butler--who-dir self) (cc-butler--who-dir dir) text)
       (cc-butler--maybe-refresh)

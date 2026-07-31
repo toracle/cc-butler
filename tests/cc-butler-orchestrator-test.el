@@ -629,6 +629,90 @@ do not know what the screen says."
       (let ((out (cc-butler-tool-read-session "s")))
         (should-not (equal out "(no output)"))
         (should (string-match-p "refresh\\|stale\\|could not" out))))))
+;;;; Attribution: the code says who is speaking, not the model
+;;;; ------------------------------------------------------------------
+
+;; Text delivered by `send_to_session' arrives in the target's input box looking
+;; exactly like something a human typed there.  A worker therefore cannot tell a
+;; peer's suggestion from an instruction, and a message carries whatever
+;; authority the reader assumes.  Relying on the sending model to add "this is
+;; from me" is relying on it to remember; the code can simply do it.
+
+(defmacro cc-butler-orch-test--sending (self target &rest body)
+  "Run BODY with the send path stubbed; sent text collects in `sent'."
+  (declare (indent 2))
+  `(let ((sent nil))
+     (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () ,self))
+               ((symbol-function 'cc-butler--dir-by-name) (lambda (_n) ,target))
+               ((symbol-function 'cc-butler--send-input)
+                (lambda (_d text &optional _s) (push text sent) t))
+               ((symbol-function 'cc-butler--clear-waiting) #'ignore)
+               ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+               ((symbol-function 'cc-butler--log) #'ignore)
+               ((symbol-function 'cc-butler--display-name)
+                (lambda (d) (file-name-nondirectory (directory-file-name d))))
+               ((symbol-function 'cc-butler--session-id) (lambda (_d) "sid-1")))
+       ,@body)))
+
+(ert-deftest cc-butler-orchestrator/relayed-text-carries-its-sender ()
+  "The attribution is prepended by the CODE, on its own line, and names the
+sending session — so the receiver can tell a relayed message from typed input."
+  (cc-butler-orch-test--sending "/steward/" "/worker/"
+    (cc-butler-tool-send-session "worker" "Read gh issue #13")
+    (let ((text (car sent)))
+      (should (string-match-p "\\`\\[cc-butler" text))
+      (should (string-match-p "steward" text))
+      (should (string-match-p "worker" text))
+      ;; the message itself is untouched, on its own line below
+      (should (string-match-p "\n Read gh issue #13\\'\\|\nRead gh issue #13\\'" text)))))
+
+(ert-deftest cc-butler-orchestrator/attribution-names-the-session-not-just-the-label ()
+  "Display names can collide (two dirs under one project root flatten to the
+same label), so the attribution carries the session id too."
+  (cc-butler-orch-test--sending "/steward/" "/worker/"
+    (cc-butler-tool-send-session "worker" "hello")
+    (should (string-match-p "sid-1" (car sent)))))
+
+(ert-deftest cc-butler-orchestrator/a-slash-command-is-not-attributed ()
+  "A bare slash command is an OPERATION on the session, not a message to read.
+Prefixing it would put `[cc-butler ...]' at the start of the input, so the line
+would stop being a command at all — `/model opus' would arrive as prose."
+  (cc-butler-orch-test--sending "/steward/" "/worker/"
+    (cc-butler-tool-send-session "worker" "/model opus")
+    (should (equal "/model opus" (car sent)))))
+
+(ert-deftest cc-butler-orchestrator/no-caller-identity-sends-nothing ()
+  "The identity is missing on real paths (no MCP request in scope, a stale or
+unregistered session id).  Today the text is delivered and THEN the formatting
+raises, so the sender is told it failed while the receiver has it — and a
+sender that believes it failed re-sends, delivering the same instruction twice.
+Decide before the side effect, matching report_to_steward."
+  (cc-butler-orch-test--sending nil "/worker/"
+    (should-error (cc-butler-tool-send-session "worker" "hello"))
+    (should (null sent))))
+
+(ert-deftest cc-butler-orchestrator/self-send-is-still-refused ()
+  "The self-send guard still holds, and nothing is typed on the way out.
+It compares identities, so a nil identity used to make it silently false —
+refusing a nil identity earlier is what keeps this guard meaningful."
+  (cc-butler-orch-test--sending "/worker/" "/worker/"
+    (should-error (cc-butler-tool-send-session "worker" "hello"))
+    (should (null sent))))
+
+(ert-deftest cc-butler-orchestrator/driver-commands-are-never-attributed ()
+  "GUARD.  Compaction types `/model sonnet', `/compact' and `1' through
+`cc-butler--send-input' directly.  Attribution must live at the MCP tool layer
+only: prefixing at the send primitive would corrupt every one of them."
+  (let ((sent nil))
+    (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name) (lambda (_d) "nope"))
+              ((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cl-letf (((symbol-function 'claude-code-ide--terminal-send-string)
+                 (lambda (s) (push s sent)))
+                ((symbol-function 'claude-code-ide--terminal-send-return) #'ignore)
+                ((symbol-function 'get-buffer) (lambda (_n) (current-buffer)))
+                ((symbol-function 'buffer-live-p) (lambda (_b) t)))
+        (cc-butler--send-input "/w/" "/model sonnet" t)
+        (should (equal '("/model sonnet") sent))))))
 
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here
