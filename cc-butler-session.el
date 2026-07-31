@@ -306,6 +306,106 @@ safe default, since compaction is destructive."
   (let ((last (cc-butler--session-last-activity dir)))
     (and last (>= (- (float-time) last) cc-butler-idle-threshold))))
 
+;;;; ---- model of record, when the screen cannot say -------------------
+
+;; The statusline is a RENDERING of the model, not the record of it — and a
+;; rendering can be unavailable for reasons that have nothing to do with the
+;; session's actual state: mid-turn (the chrome is replaced by progress
+;; output), just restarted or cleared (never drawn), or a window too narrow to
+;; fit `MODEL:' on the line at all.  The last of these is permanent: no retry
+;; ever succeeds, because the characters were never written to the buffer.
+;;
+;; The transcript is a record rather than a rendering, so it answers in all of
+;; those cases.  Measured against 32 live transcripts on 2026-07-31; the
+;; conditions established by that measurement are enforced below.
+
+(defconst cc-butler--transcript-model-re
+  "\"model\":\"\\([A-Za-z0-9_.-]+\\)\""
+  "The model on an assistant row, at .message.model.
+Values observed: `claude-opus-5', `claude-sonnet-5', `claude-opus-4-8', and the
+fully dated `claude-haiku-4-5-20251001'.  All contain the family substring
+`cc-butler-compact--model-arg' matches on, so no mapping table is needed —
+deliberately do not try to parse a version out of them.")
+
+(defconst cc-butler--transcript-set-model-re
+  "Set model to \\(.\\{1,60\\}?\\) and saved"
+  "The `/model' confirmation written as a `<local-command-stdout>' user row.
+This records the EFFECT of a switch, unlike the `<command-name>/model' row
+which records only the intent, so this is the one to trust.")
+
+(defun cc-butler--transcript-model-in-line (line)
+  "Return the model LINE names, or nil if it names none."
+  (cond
+   ;; a sub-agent runs on its OWN model; its rows never speak for the session
+   ((string-match-p "\"isSidechain\":true" line) nil)
+   ((and (string-match-p "\"type\":\"assistant\"" line)
+         (string-match cc-butler--transcript-model-re line))
+    (let ((m (match-string 1 line)))
+      ;; `<synthetic>' marks a locally generated row (interrupt, API error).
+      ;; It is a sentinel, not a model — but it cannot reach here anyway, as
+      ;; `<' and `>' are outside the character class.  Checked regardless so
+      ;; the intent survives a future widening of that class.
+      (unless (equal m "<synthetic>") m)))
+   ((string-match cc-butler--transcript-set-model-re line)
+    ;; strip the JSON-escaped SGR bold sequences around the display name
+    (let ((name (replace-regexp-in-string
+                 "\\\\u00[0-9a-fA-F][0-9a-fA-F]\\[[0-9;]*m" ""
+                 (match-string 1 line))))
+      (let ((trimmed (string-trim name)))
+        (unless (string-empty-p trimmed) trimmed))))))
+
+(defun cc-butler--transcript-model (dir)
+  "Return the model session DIR is on RIGHT NOW per its transcript, or nil.
+
+Scans the newest MAIN transcript backwards and returns whichever comes LAST:
+an assistant row's model, or a `/model' confirmation.  Taking only the newest
+assistant row is not enough and is actively wrong — after a `/model' switch the
+newest assistant row still names the OLD model until the new one answers, which
+may be days later or never (measured: wrong for 4 of 10 live sessions, staleness
+from seconds to 4.4 days, sometimes for a model that never produced a row).
+
+Sub-agent transcripts are excluded twice over: the glob is non-recursive (a
+sub-agent file can be the newest file in the tree), and sidechain rows are
+skipped by row.  Returns nil when the transcript carries no model signal at all
+— a young session that has never answered is genuinely unknowable here, and the
+caller must refuse rather than guess."
+  (when-let* ((proj (cc-butler--claude-project-dir dir))
+              (files (file-expand-wildcards (expand-file-name "*.jsonl" proj) t))
+              (newest (car (sort files
+                                 (lambda (a b)
+                                   (time-less-p
+                                    (file-attribute-modification-time
+                                     (file-attributes b))
+                                    (file-attribute-modification-time
+                                     (file-attributes a)))))))
+              (size (file-attribute-size (file-attributes newest))))
+    ;; Transcripts reach tens of MB, so read backwards in growing chunks rather
+    ;; than loading the file.  The decisive row sat within 84 KB of EOF in every
+    ;; file measured, but a SINGLE row can exceed 1 MB, so the window has to be
+    ;; able to grow past one before giving up.
+    (let ((window 262144) (limit 4194304) model)
+      (while (and (not model) (<= window limit))
+        (let ((from (max 0 (- size window))))
+          (with-temp-buffer
+            (insert-file-contents-literally newest nil from size)
+            (decode-coding-region (point-min) (point-max) 'utf-8 t)
+            ;; a non-zero start almost certainly lands mid-row; that partial
+            ;; first line is unparseable, and a wider window will re-read it whole
+            (when (> from 0)
+              (goto-char (point-min))
+              (forward-line 1)
+              (delete-region (point-min) (point)))
+            (goto-char (point-max))
+            (while (and (not model) (> (point) (point-min)))
+              (forward-line -1)
+              (setq model (cc-butler--transcript-model-in-line
+                           (buffer-substring-no-properties
+                            (line-beginning-position) (line-end-position)))))))
+        (when (and (not model) (>= (- size window) 0))
+          (setq window (* window 4)))
+        (when (>= window (* size 2)) (setq window (1+ limit))))  ; whole file seen
+      model)))
+
 (defcustom cc-butler-message-transport 'in-memory
   "Transport for up-direction agent messages (report / escalate / drains).
 `in-memory' (default) keeps the volatile queues; `maildir' routes them
