@@ -306,6 +306,106 @@ safe default, since compaction is destructive."
   (let ((last (cc-butler--session-last-activity dir)))
     (and last (>= (- (float-time) last) cc-butler-idle-threshold))))
 
+;;;; ---- model of record, when the screen cannot say -------------------
+
+;; The statusline is a RENDERING of the model, not the record of it — and a
+;; rendering can be unavailable for reasons that have nothing to do with the
+;; session's actual state: mid-turn (the chrome is replaced by progress
+;; output), just restarted or cleared (never drawn), or a window too narrow to
+;; fit `MODEL:' on the line at all.  The last of these is permanent: no retry
+;; ever succeeds, because the characters were never written to the buffer.
+;;
+;; The transcript is a record rather than a rendering, so it answers in all of
+;; those cases.  Measured against 32 live transcripts on 2026-07-31; the
+;; conditions established by that measurement are enforced below.
+
+(defconst cc-butler--transcript-model-re
+  "\"model\":\"\\([A-Za-z0-9_.-]+\\)\""
+  "The model on an assistant row, at .message.model.
+Values observed: `claude-opus-5', `claude-sonnet-5', `claude-opus-4-8', and the
+fully dated `claude-haiku-4-5-20251001'.  All contain the family substring
+`cc-butler-compact--model-arg' matches on, so no mapping table is needed —
+deliberately do not try to parse a version out of them.")
+
+(defconst cc-butler--transcript-set-model-re
+  "Set model to \\(.\\{1,60\\}?\\) and saved"
+  "The `/model' confirmation written as a `<local-command-stdout>' user row.
+This records the EFFECT of a switch, unlike the `<command-name>/model' row
+which records only the intent, so this is the one to trust.")
+
+(defun cc-butler--transcript-model-in-line (line)
+  "Return the model LINE names, or nil if it names none."
+  (cond
+   ;; a sub-agent runs on its OWN model; its rows never speak for the session
+   ((string-match-p "\"isSidechain\":true" line) nil)
+   ((and (string-match-p "\"type\":\"assistant\"" line)
+         (string-match cc-butler--transcript-model-re line))
+    (let ((m (match-string 1 line)))
+      ;; `<synthetic>' marks a locally generated row (interrupt, API error).
+      ;; It is a sentinel, not a model — but it cannot reach here anyway, as
+      ;; `<' and `>' are outside the character class.  Checked regardless so
+      ;; the intent survives a future widening of that class.
+      (unless (equal m "<synthetic>") m)))
+   ((string-match cc-butler--transcript-set-model-re line)
+    ;; strip the JSON-escaped SGR bold sequences around the display name
+    (let ((name (replace-regexp-in-string
+                 "\\\\u00[0-9a-fA-F][0-9a-fA-F]\\[[0-9;]*m" ""
+                 (match-string 1 line))))
+      (let ((trimmed (string-trim name)))
+        (unless (string-empty-p trimmed) trimmed))))))
+
+(defun cc-butler--transcript-model (dir)
+  "Return the model session DIR is on RIGHT NOW per its transcript, or nil.
+
+Scans the newest MAIN transcript backwards and returns whichever comes LAST:
+an assistant row's model, or a `/model' confirmation.  Taking only the newest
+assistant row is not enough and is actively wrong — after a `/model' switch the
+newest assistant row still names the OLD model until the new one answers, which
+may be days later or never (measured: wrong for 4 of 10 live sessions, staleness
+from seconds to 4.4 days, sometimes for a model that never produced a row).
+
+Sub-agent transcripts are excluded twice over: the glob is non-recursive (a
+sub-agent file can be the newest file in the tree), and sidechain rows are
+skipped by row.  Returns nil when the transcript carries no model signal at all
+— a young session that has never answered is genuinely unknowable here, and the
+caller must refuse rather than guess."
+  (when-let* ((proj (cc-butler--claude-project-dir dir))
+              (files (file-expand-wildcards (expand-file-name "*.jsonl" proj) t))
+              (newest (car (sort files
+                                 (lambda (a b)
+                                   (time-less-p
+                                    (file-attribute-modification-time
+                                     (file-attributes b))
+                                    (file-attribute-modification-time
+                                     (file-attributes a)))))))
+              (size (file-attribute-size (file-attributes newest))))
+    ;; Transcripts reach tens of MB, so read backwards in growing chunks rather
+    ;; than loading the file.  The decisive row sat within 84 KB of EOF in every
+    ;; file measured, but a SINGLE row can exceed 1 MB, so the window has to be
+    ;; able to grow past one before giving up.
+    (let ((window 262144) (limit 4194304) model)
+      (while (and (not model) (<= window limit))
+        (let ((from (max 0 (- size window))))
+          (with-temp-buffer
+            (insert-file-contents-literally newest nil from size)
+            (decode-coding-region (point-min) (point-max) 'utf-8 t)
+            ;; a non-zero start almost certainly lands mid-row; that partial
+            ;; first line is unparseable, and a wider window will re-read it whole
+            (when (> from 0)
+              (goto-char (point-min))
+              (forward-line 1)
+              (delete-region (point-min) (point)))
+            (goto-char (point-max))
+            (while (and (not model) (> (point) (point-min)))
+              (forward-line -1)
+              (setq model (cc-butler--transcript-model-in-line
+                           (buffer-substring-no-properties
+                            (line-beginning-position) (line-end-position)))))))
+        (when (and (not model) (>= (- size window) 0))
+          (setq window (* window 4)))
+        (when (>= window (* size 2)) (setq window (1+ limit))))  ; whole file seen
+      model)))
+
 (defcustom cc-butler-message-transport 'in-memory
   "Transport for up-direction agent messages (report / escalate / drains).
 `in-memory' (default) keeps the volatile queues; `maildir' routes them
@@ -335,6 +435,14 @@ Each entry is a plist (:time :dir :name :body).  Drained by the
 (defun cc-butler--who-dir (dir)
   "Format the session label (name + id) for session DIR."
   (cc-butler--who (cc-butler--display-name dir) (cc-butler--session-id dir)))
+
+(defconst cc-butler--via-separator " → "
+  "How hops in a relay path are joined.  One definition, so the inbox
+envelope and a relayed terminal message render a path the same way.")
+
+(defun cc-butler--via-string (via)
+  "Render VIA, a hop list or an already-formatted string, as a relay path."
+  (if (listp via) (mapconcat #'identity via cc-butler--via-separator) via))
 
 (defcustom cc-butler-log-buffer-name "*cc-butler-log*"
   "Name of the cc-butler message-log buffer that tees butler<->worker traffic."
@@ -828,15 +936,106 @@ depends on but cannot install or verify for you."
 
 (defun cc-butler--refresh-terminal-text (buffer)
   "Force BUFFER's text to be re-synced from the live ghostel grid.
+Return non-nil when BUFFER's text can be trusted, nil when a refresh was
+attempted and FAILED.
+
 ghostel only repaints a buffer that is displayed in a window; a
 background session buffer is never redisplayed, so its text can be a
 stale frame.  Drive a full `ghostel--redraw' directly (the same call
 ghostel makes on config changes) so the text reflects the current frame
-without needing a window."
+without needing a window.
+
+For a background session buffer this call is the ONLY thing that ever writes
+text into it, which is why its failure has to be reported rather than
+swallowed.  It used to be wrapped in `ignore-errors' and the caller read the
+buffer regardless, so a persistently failing redraw served the last frame that
+DID render as though it were the live screen — indistinguishable from ordinary
+output, and unfalsifiable, since nothing recorded that a refresh had failed.  A
+read that cannot report its own failure is not a read.
+
+A buffer with no ghostel terminal is NOT a failure: its text belongs to some
+other backend, and calling that stale would blank out every non-ghostel setup."
   (with-current-buffer buffer
-    (when (and (boundp 'ghostel--term) ghostel--term (fboundp 'ghostel--redraw))
-      (let ((inhibit-read-only t))
-        (ignore-errors (ghostel--redraw ghostel--term t))))))
+    (cond
+     ((not (and (boundp 'ghostel--term) ghostel--term (fboundp 'ghostel--redraw)))
+      'no-terminal)                     ; not ours to refresh; trust it as-is
+     ((cc-butler--refresh-recent-p buffer) 'recent)
+     (t (cc-butler--redraw-with-window buffer)))))
+
+(defcustom cc-butler-refresh-coalesce-seconds 1.0
+  "Seconds a forced terminal redraw is reused before another is done.
+
+A forced redraw rebuilds a buffer's whole text from the grid — up to
+`ghostel-max-scrollback' of it — and one refresh cycle touches EVERY session
+(each list row's context/model tag falls back to a read on a cache miss).
+Doing that per read, with a window borrow on top, is how
+`cc-butler-session-io-timeout' gets hit.  Coalescing a burst bounds the cost
+without reintroducing the old failure: staleness is capped at this value
+instead of being unbounded."
+  :type 'number
+  :group 'cc-butler)
+
+(defvar cc-butler--refresh-times (make-hash-table :test 'eq)
+  "Buffer -> time of its last SUCCESSFUL forced redraw.
+Failures are deliberately not recorded: remembering one would suppress the
+retries that follow it, turning a transient failure into a lasting freeze.")
+
+(defun cc-butler--refresh-recent-p (buffer)
+  "Non-nil when BUFFER was redrawn within `cc-butler-refresh-coalesce-seconds'."
+  (when-let ((last (gethash buffer cc-butler--refresh-times)))
+    (< (- (float-time) last) cc-butler-refresh-coalesce-seconds)))
+
+(defun cc-butler--redraw-in-window (win buffer)
+  "Redraw BUFFER's text from its grid, with WIN selected.  See caller."
+  (with-selected-window win
+    (with-current-buffer buffer
+      ;; The bindings ghostel's own redraw path establishes.  `inhibit-redisplay'
+      ;; is what keeps a borrowed window from flashing another session's screen
+      ;; at whoever is sitting in front of Emacs; `inhibit-modification-hooks'
+      ;; keeps arbitrary `after-change-functions' from running re-entrantly
+      ;; inside the native render.
+      (let ((inhibit-read-only t)
+            (inhibit-redisplay t)
+            (inhibit-modification-hooks t))
+        (condition-case err
+            (progn (ghostel--redraw ghostel--term t)
+                   (puthash buffer (float-time) cc-butler--refresh-times)
+                   t)
+          (error
+           ;; The reason is the whole point: without it the failure is
+           ;; permanently undiagnosable, which is how this went unnoticed.
+           (cc-butler--log "read: %s │ terminal refresh FAILED (%s) — text may be stale"
+                           (buffer-name buffer) (error-message-string err))
+           nil))))))
+
+(defun cc-butler--redraw-with-window (buffer)
+  "Force BUFFER's text to be re-synced, lending it a window if it has none.
+
+The native redraw requires the SELECTED WINDOW to be displaying the buffer —
+ghostel's own path always calls it inside `with-selected-window', and cc-butler
+did not.  Nothing displays a background session, so the call failed every time,
+which `ignore-errors' then hid.  Measured on a live frozen session: without the
+binding, \"Specified window is not displaying the current buffer\" and the
+buffer did not move (1128 bytes before and after); with it, ok and 1128 ->
+157599.  The grid held the current screen the whole time; only the hand-off into
+the Emacs buffer was failing.
+
+Prefer a window that already shows BUFFER; otherwise borrow the selected one
+inside `save-window-excursion', which puts it back.  Never borrow the
+minibuffer."
+  (let ((win (car (get-buffer-window-list buffer nil t))))
+    (if win
+        (cc-butler--redraw-in-window win buffer)
+      (let ((lender (if (window-minibuffer-p (selected-window))
+                        (get-mru-window nil nil t)
+                      (selected-window))))
+        (if (not (window-live-p lender))
+            (progn (cc-butler--log "read: %s │ no window available to refresh into"
+                                   (buffer-name buffer))
+                   nil)
+          (save-window-excursion
+            (set-window-buffer lender buffer 'keep-margins)
+            (cc-butler--redraw-in-window lender buffer)))))))
 
 (defconst cc-butler--border-rule-char ?─
   "The box-drawing horizontal-rule character Claude Code draws immediately

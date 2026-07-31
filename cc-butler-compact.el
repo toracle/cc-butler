@@ -352,13 +352,56 @@ switch to the cheap model is detected, and what makes the fallback confirmable."
               (or (equal tag-id (cc-butler-compact--model-id arg))
                   (equal (downcase arg) (cc-butler-compact--model-family tag)))))))
 
+;; Two callers read the model, and they want OPPOSITE things from it.  Serving
+;; both from one function is what made compaction refuse so often: the polling
+;; loop's demand for freshness was silently imposed on the pre-flight capture,
+;; where it is exactly wrong.  Keep them separate, and keep both rationales
+;; written down — the reasoning is easy to mistake for an accident and delete.
+
 (defun cc-butler-compact--model-now (dir)
-  "Read DIR's current model tag, bypassing the cleanup layer's TTL cache.
-The cache is right for a status display and wrong for a state machine that
-polls faster than the TTL and must see the switch the moment it lands."
+  "Read DIR's current model tag FRESH, bypassing the cleanup layer's TTL cache.
+For the state machine, which polls faster than the TTL and must see the `/model'
+switch the moment it lands; a remembered value would make it act on a model the
+session has already left.
+
+FRESHNESS OVER AVAILABILITY, deliberately.  Do not add a fallback here — nil
+means \"the screen does not say so right now\", which is the honest answer to
+\"has the switch landed yet?\".  If you want an answer that survives an
+illegible screen, you want `cc-butler-compact--model-for-restore'."
   (when (boundp 'cc-butler-cleanup--model-cache)
     (remhash dir cc-butler-cleanup--model-cache))
   (cc-butler-cleanup-model-for dir))
+
+(defun cc-butler-compact--model-for-restore (dir)
+  "Return the model to put DIR back on after compaction, or nil if unknowable.
+
+AVAILABILITY OVER FRESHNESS, deliberately — the mirror of
+`cc-butler-compact--model-now', and the reason these are two functions.  This
+is asked ONCE, before anything is switched, and the question is \"what was this
+session on?\".  A momentarily illegible screen is not evidence that the answer
+changed, so treating it as unknown — and refusing to compact — punished exactly
+the sessions that most needed compacting: the busy ones (mid-turn, so the chrome
+is covered) and the large ones.  Worst of all, a window too narrow to render
+`MODEL:' made a session PERMANENTLY un-compactable, since no retry can recover
+characters the terminal never wrote.
+
+Three sources, best first:
+  1. the screen, read fresh — the live truth whenever it is legible;
+  2. the transcript — a record rather than a rendering, so it answers when the
+     screen cannot, and it also catches a `/model' switch the screen missed;
+  3. the last-known cached value — a remembered screen, better than nothing.
+Still nil when nothing knows: the driver then refuses, which stays correct.  A
+model we cannot name is a model we cannot restore, and refusing beats stranding
+a session on the wrong one."
+  ;; Read the remembered value FIRST: `--model-now' evicts the entry before it
+  ;; re-reads, so by the time the screen has come back nil there is nothing left
+  ;; to fall back to.  Eviction is correct for the polling caller and must stay
+  ;; — so this caller takes its copy before triggering it.
+  (let ((remembered (and (boundp 'cc-butler-cleanup--model-cache)
+                         (cdr (gethash dir cc-butler-cleanup--model-cache)))))
+    (or (cc-butler-compact--model-now dir)
+        (cc-butler--transcript-model dir)
+        remembered)))
 
 (defun cc-butler-compact--context-now (dir)
   "Read DIR's current context size, bypassing the TTL cache.  See above."
@@ -719,12 +762,18 @@ and refuses when the current model cannot be named well enough to restore."
     ;; Capture the model BEFORE anything is typed — after the switch the
     ;; original is unrecoverable, and an unrestorable session is worse than
     ;; an uncompacted one.
-    (let* ((tag (cc-butler-compact--model-now dir))
+    ;; Both halves matter: the TAG comes from three sources (screen, then
+    ;; transcript, then last-known), and the ARGUMENTS derived from it are a
+    ;; candidate list (exact id first, family alias as fallback).  Taking
+    ;; either alone is wrong -- without the first, a session whose screen is
+    ;; illegible cannot be compacted at all; without the second, an unlisted
+    ;; model family cannot be restored.
+    (let* ((tag (cc-butler-compact--model-for-restore dir))
            (args (cc-butler-compact--model-args tag))
            (arg (car args))
            (ctx (cc-butler-compact--context-now dir)))
       (unless arg
-        (user-error "Refusing to compact %s: cannot determine a restorable model (statusline says %s)"
+        (user-error "Refusing to compact %s: cannot determine a restorable model (screen, transcript and last-known all say %s)"
                     name (or tag "nothing")))
       (cc-butler-compact--set-state dir :orig-model tag :orig-args args :orig-arg arg
                                     :orig-ctx ctx :note nil)
