@@ -161,7 +161,7 @@ non-hung path."
           (with-current-buffer term-buf (insert "hello from the terminal\n"))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t)))
             (should (equal "hello from the terminal" (cc-butler--read-output "/worker/")))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
@@ -237,7 +237,7 @@ is nil the backend reports NO cursor at all — the unreadable case."
                            (point))))
              (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                         (lambda (_d) (buffer-name buf)))
-                       ((symbol-function 'cc-butler--refresh-terminal-text) #'ignore)
+                       ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_b) t))
                        ((symbol-function 'ghostel-cursor-point) (lambda () cursor)))
                ,@body)))
        (kill-buffer buf))))
@@ -375,7 +375,7 @@ unchanged, same as `cc-butler--read-output'."
           (with-current-buffer term-buf (insert "plain transcript output\n"))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t)))
             (should (equal "plain transcript output" (cc-butler--read-output-redacted "/worker/")))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
@@ -391,7 +391,7 @@ properties stripped, exactly as before."
             (cc-butler-orchestrator-test--insert-ghost-line "PR #72 머지 진행해주세요"))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t)))
             (should (string-match-p "PR #72" (cc-butler--read-output "/worker/")))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
@@ -584,6 +584,135 @@ settle delay to spend."
     (cc-butler--send-input "/worker/" "typed but not submitted")
     (should (equal '((:string "typed but not submitted"))
                    (cc-butler-orchestrator-test--recorded-writes)))))
+
+;;;; ------------------------------------------------------------------
+;;;; A failed refresh must not be served as output
+;;;; ------------------------------------------------------------------
+
+(defmacro cc-butler-orch-test--with-term-buffer (refresh-ok &rest body)
+  "Run BODY with a fake session buffer holding known-stale text.
+REFRESH-OK is what `cc-butler--refresh-terminal-text' reports."
+  (declare (indent 1))
+  `(let ((buf (get-buffer-create " *cc-butler-orch-test-term*")))
+     (unwind-protect
+         (progn
+           (with-current-buffer buf
+             (erase-buffer)
+             (insert "text from an hour ago\nstill the same frame\n"))
+           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                      (lambda (_d) (buffer-name buf)))
+                     ((symbol-function 'cc-butler--display-name) (lambda (_d) "s"))
+                     ((symbol-function 'cc-butler--refresh-terminal-text)
+                      (lambda (_b) ,refresh-ok)))
+             ,@body))
+       (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest cc-butler-orchestrator/read-refuses-to-serve-a-stale-frame ()
+  "When the refresh failed, the buffer still holds the last frame that DID
+render.  Returning it would present hours-old text as the current screen, and
+a coordinator acting on it (answering a dialog it cannot actually see) is the
+expensive failure.  Honest nil instead."
+  (cc-butler-orch-test--with-term-buffer nil
+    (should (null (cc-butler--read-output "/d/")))))
+
+(ert-deftest cc-butler-orchestrator/read-returns-text-when-refresh-worked ()
+  "The refusal is conditional on the refresh actually failing."
+  (cc-butler-orch-test--with-term-buffer t
+    (should (string-match-p "still the same frame" (cc-butler--read-output "/d/")))))
+
+(ert-deftest cc-butler-orchestrator/read-tool-distinguishes-stale-from-empty ()
+  "\"(no output)\" and \"could not be refreshed\" are different facts and the
+tool must not collapse them: one says the screen is empty, the other says we
+do not know what the screen says."
+  (cc-butler-orch-test--with-term-buffer nil
+    (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/")))
+      (let ((out (cc-butler-tool-read-session "s")))
+        (should-not (equal out "(no output)"))
+        (should (string-match-p "refresh\\|stale\\|could not" out))))))
+;;;; Attribution: the code says who is speaking, not the model
+;;;; ------------------------------------------------------------------
+
+;; Text delivered by `send_to_session' arrives in the target's input box looking
+;; exactly like something a human typed there.  A worker therefore cannot tell a
+;; peer's suggestion from an instruction, and a message carries whatever
+;; authority the reader assumes.  Relying on the sending model to add "this is
+;; from me" is relying on it to remember; the code can simply do it.
+
+(defmacro cc-butler-orch-test--sending (self target &rest body)
+  "Run BODY with the send path stubbed; sent text collects in `sent'."
+  (declare (indent 2))
+  `(let ((sent nil))
+     (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () ,self))
+               ((symbol-function 'cc-butler--dir-by-name) (lambda (_n) ,target))
+               ((symbol-function 'cc-butler--send-input)
+                (lambda (_d text &optional _s) (push text sent) t))
+               ((symbol-function 'cc-butler--clear-waiting) #'ignore)
+               ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+               ((symbol-function 'cc-butler--log) #'ignore)
+               ((symbol-function 'cc-butler--display-name)
+                (lambda (d) (file-name-nondirectory (directory-file-name d))))
+               ((symbol-function 'cc-butler--session-id) (lambda (_d) "sid-1")))
+       ,@body)))
+
+(ert-deftest cc-butler-orchestrator/relayed-text-carries-its-sender ()
+  "The attribution is prepended by the CODE, on its own line, and names the
+sending session — so the receiver can tell a relayed message from typed input."
+  (cc-butler-orch-test--sending "/steward/" "/worker/"
+    (cc-butler-tool-send-session "worker" "Read gh issue #13")
+    (let ((text (car sent)))
+      (should (string-match-p "\\`\\[cc-butler" text))
+      (should (string-match-p "steward" text))
+      (should (string-match-p "worker" text))
+      ;; the message itself is untouched, on its own line below
+      (should (string-match-p "\n Read gh issue #13\\'\\|\nRead gh issue #13\\'" text)))))
+
+(ert-deftest cc-butler-orchestrator/attribution-names-the-session-not-just-the-label ()
+  "Display names can collide (two dirs under one project root flatten to the
+same label), so the attribution carries the session id too."
+  (cc-butler-orch-test--sending "/steward/" "/worker/"
+    (cc-butler-tool-send-session "worker" "hello")
+    (should (string-match-p "sid-1" (car sent)))))
+
+(ert-deftest cc-butler-orchestrator/a-slash-command-is-not-attributed ()
+  "A bare slash command is an OPERATION on the session, not a message to read.
+Prefixing it would put `[cc-butler ...]' at the start of the input, so the line
+would stop being a command at all — `/model opus' would arrive as prose."
+  (cc-butler-orch-test--sending "/steward/" "/worker/"
+    (cc-butler-tool-send-session "worker" "/model opus")
+    (should (equal "/model opus" (car sent)))))
+
+(ert-deftest cc-butler-orchestrator/no-caller-identity-sends-nothing ()
+  "The identity is missing on real paths (no MCP request in scope, a stale or
+unregistered session id).  Today the text is delivered and THEN the formatting
+raises, so the sender is told it failed while the receiver has it — and a
+sender that believes it failed re-sends, delivering the same instruction twice.
+Decide before the side effect, matching report_to_steward."
+  (cc-butler-orch-test--sending nil "/worker/"
+    (should-error (cc-butler-tool-send-session "worker" "hello"))
+    (should (null sent))))
+
+(ert-deftest cc-butler-orchestrator/self-send-is-still-refused ()
+  "The self-send guard still holds, and nothing is typed on the way out.
+It compares identities, so a nil identity used to make it silently false —
+refusing a nil identity earlier is what keeps this guard meaningful."
+  (cc-butler-orch-test--sending "/worker/" "/worker/"
+    (should-error (cc-butler-tool-send-session "worker" "hello"))
+    (should (null sent))))
+
+(ert-deftest cc-butler-orchestrator/driver-commands-are-never-attributed ()
+  "GUARD.  Compaction types `/model sonnet', `/compact' and `1' through
+`cc-butler--send-input' directly.  Attribution must live at the MCP tool layer
+only: prefixing at the send primitive would corrupt every one of them."
+  (let ((sent nil))
+    (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name) (lambda (_d) "nope"))
+              ((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cl-letf (((symbol-function 'claude-code-ide--terminal-send-string)
+                 (lambda (s) (push s sent)))
+                ((symbol-function 'claude-code-ide--terminal-send-return) #'ignore)
+                ((symbol-function 'get-buffer) (lambda (_n) (current-buffer)))
+                ((symbol-function 'buffer-live-p) (lambda (_b) t)))
+        (cc-butler--send-input "/w/" "/model sonnet" t)
+        (should (equal '("/model sonnet") sent))))))
 
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here

@@ -112,7 +112,7 @@ CURSOR-NEEDLE, or at `point-max' when CURSOR-NEEDLE is nil."
                                     (search-forward ,cursor-needle) (point))
                            (point-max))))
              (cl-letf (((symbol-function 'ghostel-cursor-point) (lambda () cursor))
-                       ((symbol-function 'cc-butler--refresh-terminal-text) #'ignore)
+                       ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_b) t))
                        ((symbol-function 'claude-code-ide--get-buffer-name)
                         (lambda (_d) (buffer-name buf))))
                ,@body)))
@@ -194,7 +194,7 @@ must not conclude the box is empty.  Fail safe, back to the painted row."
   "On a terminal backend with no readable cursor, degrade to the old painted
 row check rather than assuming empty."
   (let ((screen (string-join '("─────" "❯ something" "─────") "\n")))
-    (cl-letf (((symbol-function 'cc-butler--refresh-terminal-text) #'ignore)
+    (cl-letf (((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_b) t))
               ((symbol-function 'cc-butler--read-output) (lambda (&rest _) screen))
               ((symbol-function 'claude-code-ide--get-buffer-name)
                (lambda (_d) (buffer-name (current-buffer)))))
@@ -213,7 +213,7 @@ costs one sweep.  The read side resolves it the other way, because showing a
 suggestion as real input is how it becomes a false instruction.  That is why
 the shared predicate reports three outcomes instead of a boolean."
   (let ((screen (string-join '("─────" "❯ half-typed sentence" "─────") "\n")))
-    (cl-letf (((symbol-function 'cc-butler--refresh-terminal-text) #'ignore)
+    (cl-letf (((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_b) t))
               ((symbol-function 'cc-butler--read-output) (lambda (&rest _) screen))
               ((symbol-function 'claude-code-ide--get-buffer-name)
                (lambda (_d) (buffer-name (current-buffer))))
