@@ -802,6 +802,53 @@ and must still have had nothing typed into it."
       (should-not cc-butler-compact-test--sent)
       (should-not (cc-butler-compact-waiting-p "w")))))
 
+(ert-deftest cc-butler-compact/a-throwing-idle-poll-keeps-the-compaction-queued ()
+  "REGRESSION (2026-07-31): the poll drops the queue entry FIRST and only then
+asks whether it is safe to start.  When that question signalled — as it did on
+a dedicated window — the re-queue below was never reached, so the compaction
+vanished outright: no retry, no deadline message, and `waiting-p' went false,
+so it stopped even showing as queued.  A destructive step taken before the
+thing it feeds has succeeded, the same shape as draining a queue before its
+delivery is assembled.
+
+Failing to determine safety is also not permission to proceed: the gate errs
+toward BUSY everywhere else, and compaction is destructive."
+  (cc-butler-compact-test--with-session "w"
+    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+      (cc-butler-compact-session-when-idle "w")
+      (should (cc-butler-compact-waiting-p "w"))
+      (cl-letf (((symbol-function 'cc-butler-compact--blocked-reason)
+                 (lambda (&rest _) (error "window trouble"))))
+        (cc-butler-compact--idle-poll "w" (+ (float-time) 600)))
+      (should (cc-butler-compact-waiting-p "w"))   ; still queued, will retry
+      (should-not cc-butler-compact-test--sent))))  ; and did not start blind
+
+(ert-deftest cc-butler-compact/the-safety-probe-survives-a-dedicated-window ()
+  "The compaction probe reads the session's screen, so it inherited the
+window-borrow failure verbatim — observed 2026-07-31 under exactly these two
+conditions at once.  Guarded here as well as at the source: this is the path
+that was seen to break, and it reaches the borrow through a different caller
+than `read_session_output' does."
+  (let ((buf (get-buffer-create " *ccb-compact-probe*"))
+        (listbuf (get-buffer-create " *ccb-compact-list*")))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (split-window (selected-window) nil 'right)
+          (set-window-buffer (selected-window) listbuf)
+          (set-window-dedicated-p (selected-window) t)
+          (with-current-buffer buf
+            (setq-local ghostel--term 'fake-term)
+            (insert "a screen\n"))
+          (should-not (get-buffer-window-list buf nil t))
+          (cl-letf (((symbol-function 'ghostel--redraw) (lambda (&rest _) t))
+                    ((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (&rest _) (buffer-name buf))))
+            ;; the assertion is that this RETURNS rather than signalling
+            (should-not (cc-butler-compact--typed-text "d"))))
+      (kill-buffer buf)
+      (kill-buffer listbuf))))
+
 (ert-deftest cc-butler-compact/queueing-still-refuses-what-waiting-cannot-fix ()
   "An open menu or genuinely typed input is refused up front rather than
 queued — idling does not clear either, so queueing would just defer a
