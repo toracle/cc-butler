@@ -714,5 +714,96 @@ only: prefixing at the send primitive would corrupt every one of them."
         (cc-butler--send-input "/w/" "/model sonnet" t)
         (should (equal '("/model sonnet") sent))))))
 
+;;;; ------------------------------------------------------------------
+;;;; Draining must not destroy what it has not yet delivered
+;;;; ------------------------------------------------------------------
+
+;; Both queues emptied themselves BETWEEN reading their items and rendering
+;; them, so anything that went wrong while rendering took the items with it.
+;; And "emptied" meant discarded: nothing downstream could recover, or even
+;; tell that a delivery had been lost.
+;;
+;; These are the first tests to touch the drains at all — the existing payload
+;; tests stub them at the function boundary, so they pass regardless of what
+;; the drain does with the queue.
+
+(ert-deftest cc-butler-orchestrator/decision-drain-keeps-items-when-rendering-fails ()
+  "Rendering happens BEFORE the queue is emptied.  A malformed item used to
+signal from inside the formatter, unwinding past a clear that had already
+run — no string was ever returned and the decisions were gone."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--butler-inbox-drained nil)
+        (cc-butler--butler-inbox
+         (list (list :time "not-a-time" :summary "malformed" :name "w"))))
+    (should-error (cc-butler-tool-pending-decisions))
+    ;; still there to try again with
+    (should cc-butler--butler-inbox)))
+
+(ert-deftest cc-butler-orchestrator/event-drain-keeps-items-when-rendering-fails ()
+  "The worker-event queue is the same shape and gets the same guarantee."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--inbox-drained nil)
+        (cc-butler--inbox
+         (list (list :time "not-a-time" :name "w" :body "malformed"))))
+    (should-error (cc-butler-tool-inbox))
+    (should cc-butler--inbox)))
+
+(ert-deftest cc-butler-orchestrator/a-drain-archives-rather-than-discards ()
+  "Emptying the queue must not mean losing its contents.  Delivery can still
+fail after the drain — the hook can be killed at its timeout, `jq' can be
+missing — and the only way to notice, or to recover, is if the drained items
+still exist somewhere.  Mirrors the maildir drain, which renames into
+`archive/' rather than deleting."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--butler-inbox-drained nil)
+        (cc-butler--butler-inbox
+         (list (list :time (current-time) :summary "decide this" :name "w"))))
+    (let ((out (cc-butler-tool-pending-decisions)))
+      (should (string-match-p "decide this" out)))
+    (should (null cc-butler--butler-inbox))          ; not delivered twice
+    (should (= 1 (length cc-butler--butler-inbox-drained)))))
+
+(ert-deftest cc-butler-orchestrator/an-empty-drain-says-whether-anything-was-delivered ()
+  "\"No pending decisions.\" is ambiguous: it means both `nothing was ever
+sent' and `something was sent and already handed to someone else'.  The hook
+drains every turn, so a direct call almost always loses the race and reads the
+second case as the first.  That ambiguity produced a false diagnosis on
+2026-07-31 — two empty drains were reported as a silent non-delivery, and the
+escalation had simply not been sent yet."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--butler-inbox-drained nil)
+        (cc-butler--butler-inbox
+         (list (list :time (current-time) :summary "s" :name "w"))))
+    (cc-butler-tool-pending-decisions)                       ; first consumer wins
+    (let ((second (cc-butler-tool-pending-decisions)))        ; second sees nothing
+      (should (string-match-p "No pending decisions" second))
+      (should (string-match-p "delivered" second)))))
+
+(ert-deftest cc-butler-orchestrator/the-archive-is-bounded ()
+  "It is a recovery window, not a log — it must not grow without limit."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler-drained-keep 3)
+        (cc-butler--butler-inbox-drained nil))
+    (dotimes (i 6)
+      (let ((cc-butler--butler-inbox
+             (list (list :time (current-time) :summary (format "d%d" i) :name "w"))))
+        (cc-butler-tool-pending-decisions)))
+    (should (= 3 (length cc-butler--butler-inbox-drained)))))
+
+(ert-deftest cc-butler-orchestrator/events-payload-does-not-lose-a-drain-to-a-later-failure ()
+  "The events payload computes MORE ingredients after draining, and the fleet
+scan is a larger error surface than the drain itself.  A failure there must not
+take the events with it."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--inbox-drained nil)
+        (cc-butler--inbox
+         (list (list :time (current-time) :name "w" :body "done: PR #42"))))
+    (cl-letf (((symbol-function 'cc-butler--inbox-urgent-block) (lambda (_a) nil))
+              ((symbol-function 'cc-butler--fleet-stale-waiting-summary)
+               (lambda () (error "fleet scan blew up"))))
+      ;; whatever the payload does, the drained events must remain recoverable
+      (ignore-errors (cc-butler--pending-events-hook-payload))
+      (should (or cc-butler--inbox cc-butler--inbox-drained)))))
+
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here

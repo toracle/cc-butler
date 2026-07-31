@@ -33,7 +33,13 @@
 
 (defcustom cc-butler-decision-workflow nil
   "When non-nil, escalations are also rendered as answerable decision documents.
-A reversible toggle, independent of `cc-butler-message-transport'."
+A reversible toggle, independent of `cc-butler-message-transport'.
+
+KNOWN GAP before enabling: with this on, escalations are rendered into the
+decision documents under `open/', which `cc-butler-tool-pending-decisions'
+does NOT scan — while `escalate_to_butler' returns the same success string
+either way.  Escalations would be answerable by the human but invisible to a
+butler that drains `pending_decisions'.  Dormant while this is nil."
   :type 'boolean
   :group 'cc-butler)
 

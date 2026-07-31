@@ -410,7 +410,14 @@ caller must refuse rather than guess."
   "Transport for up-direction agent messages (report / escalate / drains).
 `in-memory' (default) keeps the volatile queues; `maildir' routes them
 through a durable, lock-free, auditable file inbox (see `cc-butler-mail').
-Switchable at runtime for rollback."
+Switchable at runtime for rollback.
+
+KNOWN GAP before switching to `maildir': the maildir drain identifies the
+caller via `cc-butler--caller-dir', which is nil under a bare
+`emacsclient --eval' — which is exactly how the UserPromptSubmit hooks drain.
+The hook would then drain nothing and report it as an empty queue, with no
+error.  Durability improves (the maildir archives rather than deletes) while
+the hook path silently stops delivering.  Dormant while this is `in-memory'."
   :type '(choice (const :tag "In-memory queues" in-memory)
                  (const :tag "Durable maildir inbox" maildir))
   :group 'cc-butler)
