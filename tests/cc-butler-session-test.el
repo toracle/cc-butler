@@ -663,12 +663,14 @@ answers.  The later `Set model to' row is the one that reflects reality."
      (concat "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":"
              "\"<local-command-stdout>Set model to \\u001b[1mOpus 5\\u001b[22m"
              " and saved as your default for new sessions</local-command-stdout>\"}}"))
-    (let ((tag (cc-butler--transcript-model "/d/")))
-      (should (stringp tag))
-      ;; the tag only has to be resolvable by `cc-butler-compact--model-arg',
-      ;; which matches the family substring case-insensitively
-      (should (string-match-p "opus" (downcase tag)))
-      (should-not (string-match-p "sonnet" (downcase tag))))))
+    ;; Assert the EXACT tag, not merely that "opus" occurs somewhere in it.
+    ;; A `Set model to' row reports the display name verbatim — spaces intact —
+    ;; unlike the statusline, which collapses them.  A loose assertion here
+    ;; passes for `Opus 5' and equally for anything else containing "opus", so
+    ;; it silently rests on whatever the consumer happens to tolerate; when the
+    ;; consumer's matching rule changes, this keeps passing while the pipeline
+    ;; breaks.  Pin the shape so the next change to the consumer has to face it.
+    (should (equal "Opus 5" (cc-butler--transcript-model "/d/")))))
 
 (ert-deftest cc-butler-session/transcript-model-ignores-subagent-transcripts ()
   "Sub-agents run on their OWN model and their transcripts can be the newest
