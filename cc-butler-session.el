@@ -910,7 +910,16 @@ Package-Requires; it lives in the user's own Emacs init."
                    (format "`claude-code-ide-terminal-backend' is `%s', not `ghostel' — cc-butler's OSC-title tracking, terminal resize, and screen-refresh features are ghostel-specific and will silently no-op under this backend."
                            (or backend "unset")))
             problems))
-    (nreverse problems)))
+    ;; Which copy of cc-butler is running is the same class of question as
+    ;; these — invisible until it bites, and answerable before the launch.
+    ;; Defined in cc-butler.el (it belongs beside the source logic); by the
+    ;; time any launch or `cc-butler-doctor' runs, that file has finished
+    ;; loading.
+    (append (nreverse problems) (cc-butler--source-diagnostics))))
+
+;; Lives in cc-butler.el, which requires THIS file — so the reference is
+;; forward at compile time and resolved at run time.
+(declare-function cc-butler--source-diagnostics "cc-butler" ())
 
 ;;;###autoload
 (defun cc-butler-doctor ()
