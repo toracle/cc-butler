@@ -728,14 +728,26 @@ the same state under test as in production."
      ((> (float-time) deadline)
       (cc-butler--log "compact: %s │ gave up waiting for idle (nothing typed)" name)
       (message "cc-butler compact: %s — gave up waiting for a safe idle point" name))
-     ((cc-butler-compact--blocked-reason dir)
-      ;; Still busy, or something new is in the way; keep waiting.
-      (cc-butler-compact--queue-idle-poll dir deadline))
      (t
-      (condition-case err
-          (cc-butler-compact-session dir)
-        (error (cc-butler--log "compact: %s │ queued start failed: %s" name
-                               (error-message-string err))))))))
+      ;; The queue entry was already dropped above, so anything that throws
+      ;; between there and the re-queue below loses the compaction outright —
+      ;; no retry, no deadline notice, and `cc-butler-compact-waiting-p' goes
+      ;; false, so it stops even showing as queued.  Failing to DETERMINE
+      ;; whether starting is safe is not permission to start: every other gate
+      ;; here errs toward BUSY, because compaction is destructive.
+      (let ((why (condition-case err
+                     (cc-butler-compact--blocked-reason dir)
+                   (error
+                    (cc-butler--log "compact: %s │ could not tell whether it is safe to start (%s) — keeping it queued"
+                                    name (error-message-string err))
+                    "could not determine whether it is safe"))))
+        (if why
+            ;; Still busy, or something new is in the way; keep waiting.
+            (cc-butler-compact--queue-idle-poll dir deadline)
+          (condition-case err
+              (cc-butler-compact-session dir)
+            (error (cc-butler--log "compact: %s │ queued start failed: %s" name
+                                   (error-message-string err))))))))))
 
 ;;;###autoload
 (defun cc-butler-compact-session (dir)
