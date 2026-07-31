@@ -76,5 +76,177 @@ concluding a merge reached the fleet when nothing was pulled."
       ;; and the tool-list caveat, which is the other recurring wrong conclusion
       (should (string-match-p "/mcp" out)))))
 
+;;;; ------------------------------------------------------------------
+;;;; Which source directory loads — one place decides
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-source/override-wins-over-the-load-location ()
+  "One function answers \"which copy is this\".  Everything that needs the
+answer must go through it, so there is no second place to disagree."
+  (let ((cc-butler--source-override nil))
+    (should (equal (cc-butler-source-dir) cc-butler--dir)))
+  (let ((cc-butler--source-override "/elsewhere/"))
+    (should (equal (cc-butler-source-dir) "/elsewhere/"))))
+
+(ert-deftest cc-butler-source/override-survives-loading-cc-butler-el-again ()
+  "`cc-butler-reload' re-reads cc-butler.el FIRST.  If the override were a
+`defconst' — or a top-level `setq' — that self-load would reset it and a
+switch would bounce straight back to the copy it was switching away from,
+reporting success.  This test loads the real file, so it fails if the
+declaration form is ever changed to one that re-initialises.
+
+Deliberately does NOT `let'-bind the override: a dynamic `let' restores the
+old value on exit, so a reset by the load would be undone before the
+assertion could see it and the test would pass under `defconst' too."
+  (let ((saved cc-butler--source-override))
+    (unwind-protect
+        (progn
+          (setq cc-butler--source-override "/elsewhere/")
+          (load (expand-file-name "cc-butler.el" cc-butler--dir) nil t)
+          (should (equal cc-butler--source-override "/elsewhere/")))
+      (setq cc-butler--source-override saved))))
+
+(ert-deftest cc-butler-source/reload-loads-from-the-override ()
+  "The switch is only real if `cc-butler-reload' follows it — otherwise the
+override is a label on a box whose contents never moved."
+  (let ((cc-butler--source-override "/elsewhere/")
+        (loaded nil))
+    (cl-letf (((symbol-function 'load)
+               (lambda (f &rest _) (push f loaded) t))
+              ((symbol-function 'file-exists-p) (lambda (&rest _) t))
+              ((symbol-function 'cc-butler--stale-elc) (lambda () nil)))
+      (let ((res (cc-butler-reload)))
+        (should (equal (plist-get res :dir) "/elsewhere/"))))
+    (should loaded)
+    (should (cl-every (lambda (f) (string-prefix-p "/elsewhere/" f)) loaded))))
+
+(ert-deftest cc-butler-source/refuses-a-directory-that-is-not-cc-butler ()
+  "Validate BEFORE mutating.  A switch that fails halfway leaves the override
+pointing somewhere unloadable, and the next reload takes the whole control
+plane down with it."
+  (let ((dir (file-name-as-directory (make-temp-file "cc-not-butler" t)))
+        (cc-butler--source-override nil))
+    (should-error (cc-butler-use-checkout dir) :type 'user-error)
+    (should-not cc-butler--source-override)))
+
+(ert-deftest cc-butler-source/names-the-files-a-directory-is-missing ()
+  "\"Not a cc-butler checkout\" sends the caller looking; the missing file
+names say what is actually wrong — usually a module added since they cloned."
+  (let ((dir (file-name-as-directory (make-temp-file "cc-partial" t))))
+    (dolist (f (cons 'cc-butler cc-butler--modules))
+      (write-region "" nil (expand-file-name (concat (symbol-name f) ".el") dir)))
+    (should-not (cc-butler--missing-sources dir))
+    (delete-file (expand-file-name "cc-butler-compact.el" dir))
+    (should (equal (cc-butler--missing-sources dir) '("cc-butler-compact.el")))))
+
+(ert-deftest cc-butler-source/refusal-distinguishes-wrong-place-from-stale-clone ()
+  "Two different mistakes deserve two different messages.  A directory that
+is not cc-butler at all listing every one of its 15 absent modules is a wall
+to scroll past; a clone missing exactly the module added last week is the one
+case where naming the file is the whole answer."
+  (let ((elsewhere (file-name-as-directory (make-temp-file "cc-elsewhere" t)))
+        (stale (file-name-as-directory (make-temp-file "cc-stale-clone" t))))
+    (dolist (f (cons 'cc-butler cc-butler--modules))
+      (write-region "" nil (expand-file-name (concat (symbol-name f) ".el") stale)))
+    (delete-file (expand-file-name "cc-butler-compact.el" stale))
+    (let ((wrong (should-error (cc-butler-use-checkout elsewhere) :type 'user-error))
+          (clone (should-error (cc-butler-use-checkout stale) :type 'user-error)))
+      (should (string-match-p "not a cc-butler" (error-message-string wrong)))
+      (should-not (string-match-p "cc-butler-compact.el" (error-message-string wrong)))
+      (should (string-match-p "cc-butler-compact.el" (error-message-string clone))))))
+
+(ert-deftest cc-butler-reload/tool-surfaces-the-source-state ()
+  "The MCP caller cannot see the filesystem — the same reason a stale .elc is
+spelled out here.  Which copy just got reloaded, and whether it is behind, is
+the thing that caller is least able to find out for itself."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 3 :dir "/x/" :stale nil)))
+            ((symbol-function 'shell-command-to-string) (lambda (&rest _) ""))
+            ((symbol-function 'cc-butler--source-diagnostics)
+             (lambda () '((warn . "SOURCE-STATE-MARKER")))))
+    (should (string-match-p "SOURCE-STATE-MARKER" (cc-butler-tool-reload-code)))))
+
+(ert-deftest cc-butler-source/switches-to-a-complete-checkout ()
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-checkout" t)))
+         (cc-butler--source-override nil)
+         (reloaded nil))
+    (dolist (f (cons 'cc-butler cc-butler--modules))
+      (write-region "" nil (expand-file-name (concat (symbol-name f) ".el") dir)))
+    (cl-letf (((symbol-function 'cc-butler-reload)
+               (lambda () (setq reloaded t) (list :count 1 :dir dir :stale nil))))
+      (cc-butler-use-checkout dir))
+    (should reloaded)
+    (should (equal cc-butler--source-override dir))))
+
+(ert-deftest cc-butler-source/use-installed-refuses-when-nothing-is-installed ()
+  "Refusing leaves the caller where they were.  Silently clearing the override
+would drop them onto whichever copy happened to load, which is the accident
+this whole mechanism exists to make impossible."
+  (cl-letf (((symbol-function 'cc-butler--installed-dir) (lambda () nil)))
+    (let ((cc-butler--source-override "/elsewhere/"))
+      (should-error (cc-butler-use-installed) :type 'user-error)
+      (should (equal cc-butler--source-override "/elsewhere/")))))
+
+;;;; ------------------------------------------------------------------
+;;;; Making the source state visible, and drift mechanical
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-source/diagnostics-stay-quiet-on-the-installed-copy ()
+  "The ordinary case has to stay silent.  A warning that fires every launch
+is one people learn to scroll past, which costs the warning that matters."
+  (cl-letf (((symbol-function 'cc-butler--installed-dir) (lambda () "/elpa/cc-butler/"))
+            ((symbol-function 'cc-butler-source-dir) (lambda () "/elpa/cc-butler/"))
+            ((symbol-function 'cc-butler--source-behind) (lambda (_) nil)))
+    (should-not (cc-butler--source-diagnostics))))
+
+(ert-deftest cc-butler-source/diagnostics-name-a-checkout-that-is-not-installed ()
+  "This is the 19-day defect stated back: a development checkout winning the
+`load-path' with nothing, anywhere, saying so.  The path and the revision go
+in the message because \"you are on a checkout\" alone still leaves the
+reader to find out which one."
+  (cl-letf (((symbol-function 'cc-butler--installed-dir) (lambda () "/elpa/cc-butler/"))
+            ((symbol-function 'cc-butler-source-dir) (lambda () "/home/dev/cc-butler/"))
+            ((symbol-function 'cc-butler--source-revision) (lambda (_) "abc1234 a commit"))
+            ((symbol-function 'cc-butler--source-behind) (lambda (_) nil)))
+    (let ((out (cc-butler--source-diagnostics)))
+      (should out)
+      (should (cl-every (lambda (p) (eq (car p) 'warn)) out))
+      (let ((text (mapconcat #'cdr out "\n")))
+        (should (string-match-p "/home/dev/cc-butler/" text))
+        (should (string-match-p "abc1234" text))))))
+
+(ert-deftest cc-butler-source/diagnostics-count-the-drift ()
+  "Drift as a mechanical check, not a line in a document: what hid the last
+one was not missing discipline but missing visibility, and a document cannot
+supply visibility."
+  (cl-letf (((symbol-function 'cc-butler--installed-dir) (lambda () "/elpa/cc-butler/"))
+            ((symbol-function 'cc-butler-source-dir) (lambda () "/elpa/cc-butler/"))
+            ((symbol-function 'cc-butler--source-revision) (lambda (_) "abc1234 a commit"))
+            ((symbol-function 'cc-butler--source-behind) (lambda (_) 7)))
+    (let ((text (mapconcat #'cdr (cc-butler--source-diagnostics) "\n")))
+      (should (string-match-p "7 commits behind" text)))))
+
+(ert-deftest cc-butler-source/unknown-drift-is-never-reported-as-up-to-date ()
+  "Nil from the git probe means \"cannot determine\".  Rendering that as
+\"up to date\" would be the check quietly asserting the very thing it failed
+to establish."
+  (dolist (answer '(nil "" "fatal: bad revision 'origin/main'"))
+    (cl-letf (((symbol-function 'cc-butler--git) (lambda (&rest _) answer)))
+      (should-not (cc-butler--source-behind "/x/"))))
+  ;; zero commits behind is "not drifted", which is also not a report
+  (cl-letf (((symbol-function 'cc-butler--git) (lambda (&rest _) "0")))
+    (should-not (cc-butler--source-behind "/x/")))
+  (cl-letf (((symbol-function 'cc-butler--git) (lambda (&rest _) "3")))
+    (should (equal (cc-butler--source-behind "/x/") 3))))
+
+(ert-deftest cc-butler-source/preflight-carries-the-source-diagnostics ()
+  "`cc-butler-doctor' and every session launch both already read the preflight
+list, so landing it there surfaces the state in both — no second call site to
+keep in step, and no way to see one without the other."
+  (cl-letf (((symbol-function 'cc-butler--source-diagnostics)
+             (lambda () '((warn . "SOURCE-STATE-MARKER")))))
+    (let ((text (mapconcat #'cdr (cc-butler--launch-preflight-diagnostics) "\n")))
+      (should (string-match-p "SOURCE-STATE-MARKER" text)))))
+
 (provide 'cc-butler-reload-test)
 ;;; cc-butler-reload-test.el ends here
