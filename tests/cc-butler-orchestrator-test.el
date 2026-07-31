@@ -161,7 +161,7 @@ non-hung path."
           (with-current-buffer term-buf (insert "hello from the terminal\n"))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t)))
             (should (equal "hello from the terminal" (cc-butler--read-output "/worker/")))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
@@ -237,7 +237,7 @@ is nil the backend reports NO cursor at all — the unreadable case."
                            (point))))
              (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                         (lambda (_d) (buffer-name buf)))
-                       ((symbol-function 'cc-butler--refresh-terminal-text) #'ignore)
+                       ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_b) t))
                        ((symbol-function 'ghostel-cursor-point) (lambda () cursor)))
                ,@body)))
        (kill-buffer buf))))
@@ -375,7 +375,7 @@ unchanged, same as `cc-butler--read-output'."
           (with-current-buffer term-buf (insert "plain transcript output\n"))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t)))
             (should (equal "plain transcript output" (cc-butler--read-output-redacted "/worker/")))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
@@ -391,7 +391,7 @@ properties stripped, exactly as before."
             (cc-butler-orchestrator-test--insert-ghost-line "PR #72 머지 진행해주세요"))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t)))
             (should (string-match-p "PR #72" (cc-butler--read-output "/worker/")))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
@@ -586,6 +586,49 @@ settle delay to spend."
                    (cc-butler-orchestrator-test--recorded-writes)))))
 
 ;;;; ------------------------------------------------------------------
+;;;; A failed refresh must not be served as output
+;;;; ------------------------------------------------------------------
+
+(defmacro cc-butler-orch-test--with-term-buffer (refresh-ok &rest body)
+  "Run BODY with a fake session buffer holding known-stale text.
+REFRESH-OK is what `cc-butler--refresh-terminal-text' reports."
+  (declare (indent 1))
+  `(let ((buf (get-buffer-create " *cc-butler-orch-test-term*")))
+     (unwind-protect
+         (progn
+           (with-current-buffer buf
+             (erase-buffer)
+             (insert "text from an hour ago\nstill the same frame\n"))
+           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                      (lambda (_d) (buffer-name buf)))
+                     ((symbol-function 'cc-butler--display-name) (lambda (_d) "s"))
+                     ((symbol-function 'cc-butler--refresh-terminal-text)
+                      (lambda (_b) ,refresh-ok)))
+             ,@body))
+       (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest cc-butler-orchestrator/read-refuses-to-serve-a-stale-frame ()
+  "When the refresh failed, the buffer still holds the last frame that DID
+render.  Returning it would present hours-old text as the current screen, and
+a coordinator acting on it (answering a dialog it cannot actually see) is the
+expensive failure.  Honest nil instead."
+  (cc-butler-orch-test--with-term-buffer nil
+    (should (null (cc-butler--read-output "/d/")))))
+
+(ert-deftest cc-butler-orchestrator/read-returns-text-when-refresh-worked ()
+  "The refusal is conditional on the refresh actually failing."
+  (cc-butler-orch-test--with-term-buffer t
+    (should (string-match-p "still the same frame" (cc-butler--read-output "/d/")))))
+
+(ert-deftest cc-butler-orchestrator/read-tool-distinguishes-stale-from-empty ()
+  "\"(no output)\" and \"could not be refreshed\" are different facts and the
+tool must not collapse them: one says the screen is empty, the other says we
+do not know what the screen says."
+  (cc-butler-orch-test--with-term-buffer nil
+    (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/")))
+      (let ((out (cc-butler-tool-read-session "s")))
+        (should-not (equal out "(no output)"))
+        (should (string-match-p "refresh\\|stale\\|could not" out))))))
 ;;;; Attribution: the code says who is speaking, not the model
 ;;;; ------------------------------------------------------------------
 
