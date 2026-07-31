@@ -222,6 +222,95 @@ returned; the OWN model (from the bottom-chrome statusline) is."
     (should (= 37 (plist-get fields :pct)))
     (should (equal "Opus-4.8" (plist-get fields :model)))))
 
+;;;; ---- narrow window: a truncated statusline ------------------------
+
+;; PROVENANCE: the next constant is the VERBATIM tail captured read-only from a
+;; live session whose window was too narrow to render the whole statusline
+;; (session monocle-mobile-voice, captured 2026-07-31 via read_session_output).
+;; The trailing character is a real U+2026 HORIZONTAL ELLIPSIS written by Claude
+;; Code when it truncates the line to the window width, and `MODEL:' is absent
+;; from the screen text because the terminal cut it off -- those bytes never
+;; existed in the buffer.  It is kept exactly as captured, not retyped from
+;; memory, so this test exercises an observed failure rather than an imagined one.
+(defconst cc-butler-cleanup-test--truncated-tail
+  (string-join
+   '("──────────────────────────────────────────────"
+     "❯ "
+     "──────────────────────────────────────────────"
+     "  CTX:328011 33% >200k…"
+     "  ⏵⏵ auto mode on    ·")
+   "\n")
+  "A real bottom chrome whose statusline was truncated before `MODEL:'.")
+
+(ert-deftest cc-butler-cleanup/statusline-fields-survives-truncated-model ()
+  "A narrow window truncates `MODEL:' off the statusline.  The context reading
+must SURVIVE that: `:ctx' and `:pct' are still the session's own, and `:model'
+is honestly nil.  Requiring both markers on the line made a truncated line
+return nothing at all, which lost the context reading too."
+  (let ((fields (cc-butler-cleanup--statusline-fields
+                 cc-butler-cleanup-test--truncated-tail)))
+    (should (= 328011 (plist-get fields :ctx)))
+    (should (= 33 (plist-get fields :pct)))
+    (should (null (plist-get fields :model)))))
+
+(ert-deftest cc-butler-cleanup/context-survives-truncated-statusline ()
+  "The context reader reports the own size from a truncated statusline."
+  (cl-letf (((symbol-function 'cc-butler--read-output)
+             (lambda (&rest _) cc-butler-cleanup-test--truncated-tail)))
+    (should (= 328011 (cc-butler-cleanup--default-context (list :dir "/d"))))))
+
+(ert-deftest cc-butler-cleanup/anchor-rejects-foreign-line-even-when-relaxed ()
+  "DoD 9 -- relaxing the line shape must NOT weaken the ownership guarantee.
+Ownership is established by the STRUCTURAL anchor (below the last input box),
+never by the line carrying both markers.  Here a complete foreign statusline
+sits in scrollback ABOVE the box and the session's own line below it is
+truncated: the foreign numbers must be ignored even though they are the only
+full-shape line present."
+  (let ((fields (cc-butler-cleanup--statusline-fields
+                 (string-join
+                  '("scrollback from read_session_output:"
+                    "  CTX:371538 100% MODEL:claude-sonnet-5"   ; foreign, complete
+                    "(more scrollback)"
+                    "──────────────────────────────────────────────"
+                    "❯ "
+                    "──────────────────────────────────────────────"
+                    "  CTX:328011 33% >200k…"                   ; OWN, truncated
+                    "  ⏵⏵ auto mode on")
+                  "\n"))))
+    (should (= 328011 (plist-get fields :ctx)))
+    (should (null (plist-get fields :model)))))
+
+(ert-deftest cc-butler-cleanup/statusline-fields-tolerates-model-before-ctx ()
+  "Field ORDER on the line is not part of the contract -- only that the line is
+the session's own.  A layout that puts MODEL: first must parse."
+  (let ((fields (cc-butler-cleanup--statusline-fields
+                 "──────\n❯ \n──────\n  MODEL:Opus-5 CTX:139707 14%")))
+    (should (= 139707 (plist-get fields :ctx)))
+    (should (equal "Opus-5" (plist-get fields :model)))))
+
+(ert-deftest cc-butler-cleanup/truncation-inside-the-number-is-not-a-reading ()
+  "Truncation cuts at a CHARACTER count, not a field boundary, so a window a few
+columns narrower cuts the NUMBER in half: `CTX:32801…' is the first five digits
+of 328011.  Reporting 32801 would understate the session by an order of
+magnitude and nothing downstream could tell.  A number is only a reading when
+the line proves it ended — the ellipsis proves it did not."
+  (let ((fields (cc-butler-cleanup--statusline-fields
+                 "──────\n❯ \n──────\n  CTX:32801…")))
+    (should (null (plist-get fields :ctx)))))
+
+(ert-deftest cc-butler-cleanup/full-shape-line-wins-over-a-truncated-one ()
+  "If any line below the input box carries the whole statusline, it is the
+reading — even when a truncated CTX line appears first.  Matching a superset of
+lines must not make the scan stop EARLIER and discard the model."
+  (let ((fields (cc-butler-cleanup--statusline-fields
+                 (string-join
+                  '("──────" "❯ " "──────"
+                    "  CTX:111 11% >200k…"           ; truncated, appears first
+                    "  CTX:222 22% MODEL:Sonnet-5")  ; complete
+                  "\n"))))
+    (should (= 222 (plist-get fields :ctx)))
+    (should (equal "Sonnet-5" (plist-get fields :model)))))
+
 ;;;; ---- last-known-value persistence (no flicker) -------------------
 
 (ert-deftest cc-butler-cleanup/context-keeps-last-known-on-nil-read ()
