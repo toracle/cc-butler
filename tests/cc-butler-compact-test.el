@@ -1186,5 +1186,61 @@ still gets through, so a blocked steward is not left uninformed."
         (should cc-butler--inbox)        ; still reported to the queue
         (should-not sent)))))            ; but nothing typed
 
+;;;; ------------------------------------------------------------------
+;;;; Two callers, two freshness policies
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/model-now-still-bypasses-the-cache ()
+  "GUARD -- do not \"fix\" this away.  The polling loop asks repeatedly whether
+the `/model' switch has landed, and it polls faster than the cache TTL, so it
+MUST see the screen and not a remembered value.  This contract is the reason
+the pre-flight read had to become a separate caller instead."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (calls 0))
+    (puthash "/d/" (cons (float-time) "Stale-Model") cc-butler-cleanup--model-cache)
+    (let ((cc-butler-cleanup-model-function
+           (lambda (_s) (setq calls (1+ calls)) "Opus-5")))
+      ;; even though a fresh cache entry exists, the screen is re-read
+      (should (equal "Opus-5" (cc-butler-compact--model-now "/d/")))
+      (should (= 1 calls)))))
+
+(ert-deftest cc-butler-compact/restore-model-falls-back-to-transcript ()
+  "Cases 1-4: the screen cannot say (mid-turn, just restarted, or a window too
+narrow to render MODEL:).  The pre-flight read wants AVAILABILITY, so it falls
+through to the transcript rather than refusing."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-function (lambda (_s) nil)))   ; screen blank
+    (cl-letf (((symbol-function 'cc-butler--transcript-model)
+               (lambda (_d) "claude-opus-5")))
+      (should (equal "claude-opus-5"
+                     (cc-butler-compact--model-for-restore "/d/")))
+      ;; and it resolves to something /model actually accepts
+      (should (equal "opus"
+                     (cc-butler-compact--model-arg
+                      (cc-butler-compact--model-for-restore "/d/")))))))
+
+(ert-deftest cc-butler-compact/restore-model-prefers-the-screen ()
+  "The screen is the freshest truth when it is legible; the transcript is the
+floor beneath it, not a replacement for it."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-function (lambda (_s) "Sonnet-5")))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model)
+               (lambda (_d) "claude-opus-5")))
+      (should (equal "Sonnet-5" (cc-butler-compact--model-for-restore "/d/"))))))
+
+(ert-deftest cc-butler-compact/restore-model-uses-last-known-as-floor ()
+  "Screen blank AND no transcript signal: the cached last-known value is better
+than refusing.  With nothing at all, nil -- the driver then refuses, which is
+the behaviour we want to keep for a genuinely unknown model."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-function (lambda (_s) nil)))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model) (lambda (_d) nil)))
+      ;; a value was known once, before the window narrowed
+      (puthash "/d/" (cons (float-time) "Opus-4.8") cc-butler-cleanup--model-cache)
+      (should (equal "Opus-4.8" (cc-butler-compact--model-for-restore "/d/")))
+      ;; nothing ever known -> nil -> the driver refuses
+      (clrhash cc-butler-cleanup--model-cache)
+      (should (null (cc-butler-compact--model-for-restore "/e/"))))))
+
 (provide 'cc-butler-compact-test)
 ;;; cc-butler-compact-test.el ends here

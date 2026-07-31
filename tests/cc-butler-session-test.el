@@ -616,6 +616,95 @@ transcript glob AND the sub-agent glob."
       (should-not (cc-butler--transcript-idle-p "/d/")))))
 
 ;;;; ------------------------------------------------------------------
+;;;; Model of record: the transcript, when the screen cannot say
+;;;; ------------------------------------------------------------------
+
+;; Row shapes below are modelled on real transcripts measured 2026-07-31:
+;; the model lives at .message.model on `"type":"assistant"' rows, and a
+;; `/model' switch writes a `<local-command-stdout>Set model to ...' user row
+;; BEFORE any assistant row exists on the new model.
+
+(defun cc-butler-session-test--transcript (dir name &rest lines)
+  "Write LINES as NAME.jsonl under DIR and return the file."
+  (let ((f (expand-file-name name dir)))
+    (make-directory (file-name-directory f) t)
+    (with-temp-file f (insert (string-join lines "\n") "\n"))
+    f))
+
+(defmacro cc-butler-session-test--with-project (proj &rest body)
+  "Bind PROJ to a fresh temp project dir that `cc-butler--claude-project-dir'
+resolves to, run BODY, then delete it."
+  (declare (indent 1))
+  `(let ((,proj (file-name-as-directory (make-temp-file "ccb-proj" t))))
+     (unwind-protect
+         (cl-letf (((symbol-function 'cc-butler--claude-project-dir)
+                    (lambda (_d) ,proj)))
+           ,@body)
+       (delete-directory ,proj t))))
+
+(ert-deftest cc-butler-session/transcript-model-reads-last-assistant-row ()
+  "With no later switch, the newest assistant row names the model."
+  (cc-butler-session-test--with-project proj
+    (cc-butler-session-test--transcript
+     proj "s.jsonl"
+     "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet-5\"}}"
+     "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"go on\"}}"
+     "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-opus-5\"}}")
+    (should (equal "claude-opus-5" (cc-butler--transcript-model "/d/")))))
+
+(ert-deftest cc-butler-session/transcript-model-prefers-later-set-row ()
+  "THE staleness case.  After `/model', the newest assistant row still names the
+OLD model -- sometimes for days, sometimes forever if the new model never
+answers.  The later `Set model to' row is the one that reflects reality."
+  (cc-butler-session-test--with-project proj
+    (cc-butler-session-test--transcript
+     proj "s.jsonl"
+     "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet-5\"}}"
+     (concat "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":"
+             "\"<local-command-stdout>Set model to \\u001b[1mOpus 5\\u001b[22m"
+             " and saved as your default for new sessions</local-command-stdout>\"}}"))
+    ;; Assert the EXACT tag, not merely that "opus" occurs somewhere in it.
+    ;; A `Set model to' row reports the display name verbatim — spaces intact —
+    ;; unlike the statusline, which collapses them.  A loose assertion here
+    ;; passes for `Opus 5' and equally for anything else containing "opus", so
+    ;; it silently rests on whatever the consumer happens to tolerate; when the
+    ;; consumer's matching rule changes, this keeps passing while the pipeline
+    ;; breaks.  Pin the shape so the next change to the consumer has to face it.
+    (should (equal "Opus 5" (cc-butler--transcript-model "/d/")))))
+
+(ert-deftest cc-butler-session/transcript-model-ignores-subagent-transcripts ()
+  "Sub-agents run on their OWN model and their transcripts can be the newest
+file in the tree.  Only the main glob counts, and a sidechain row never does."
+  (cc-butler-session-test--with-project proj
+    (cc-butler-session-test--transcript
+     proj "s.jsonl"
+     "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-opus-5\"}}")
+    (cc-butler-session-test--transcript
+     proj "s/subagents/agent-1.jsonl"
+     "{\"type\":\"assistant\",\"isSidechain\":true,\"message\":{\"role\":\"assistant\",\"model\":\"claude-haiku-4-5-20251001\"}}")
+    (should (equal "claude-opus-5" (cc-butler--transcript-model "/d/")))))
+
+(ert-deftest cc-butler-session/transcript-model-skips-synthetic-rows ()
+  "`<synthetic>' marks a locally generated row (interrupt / API error); it is a
+sentinel, not a model."
+  (cc-butler-session-test--with-project proj
+    (cc-butler-session-test--transcript
+     proj "s.jsonl"
+     "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-opus-5\"}}"
+     "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"<synthetic>\"}}")
+    (should (equal "claude-opus-5" (cc-butler--transcript-model "/d/")))))
+
+(ert-deftest cc-butler-session/transcript-model-nil-without-signal ()
+  "A young session that has never answered carries no model signal at all --
+return nil so the caller can refuse, rather than guessing."
+  (cc-butler-session-test--with-project proj
+    (cc-butler-session-test--transcript
+     proj "s.jsonl"
+     "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}")
+    (should (null (cc-butler--transcript-model "/d/"))))
+  ;; no transcript at all
+  (cl-letf (((symbol-function 'cc-butler--claude-project-dir) (lambda (_d) nil)))
+    (should (null (cc-butler--transcript-model "/d/")))))
 ;;;; A read must be able to report its own failure
 ;;;; ------------------------------------------------------------------
 

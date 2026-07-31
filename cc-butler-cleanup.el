@@ -339,10 +339,35 @@ no explicit token count is shown."
   :group 'cc-butler)
 
 (defconst cc-butler-cleanup--statusline-re
-  "CTX:\\([0-9]+\\)[^\n]*?MODEL:\\([A-Za-z0-9_.-]+\\)"
-  "Full-shape statusline regexp: CTX digits and MODEL on the SAME line.
+  "CTX:\\([0-9]+\\)\\(?:[ \t]\\|$\\)"
+  "What marks a line as the session's statusline: CTX followed by digits that
+are DEMONSTRABLY COMPLETE — the number must be followed by whitespace or end
+the line.
+
+That trailing condition is not decoration.  A narrow window truncates on a
+character count, not a field boundary, so it can cut the number itself and
+leave `CTX:32801…' — the first five digits of 328011.  Whitespace-or-end is
+what distinguishes a number that finished from one the terminal interrupted;
+the ellipsis fails it.  Without this, a slightly narrower window would report a
+session as an order of magnitude smaller than it is, and nothing downstream
+could tell the difference.
 `CTX:?' (no digits) deliberately does NOT match — no number means an honest
-nil, never a scraped-from-scrollback guess.")
+nil, never a scraped-from-scrollback guess.
+
+This deliberately does NOT also require MODEL:.  Ownership is established by
+the STRUCTURAL anchor (the line sits below the last input box), never by the
+line carrying both markers; requiring both was a belt-and-braces check, not the
+guarantee itself.  It had a cost: a window too narrow to render the whole line
+truncates `MODEL:' away (`CTX:328011 33% >200k…', observed 2026-07-31), and an
+all-or-nothing match then threw away the CONTEXT reading too — so a narrow
+window blinded us to a session's size as well as its model.  Read each field
+independently and let a missing one be nil on its own.")
+
+(defconst cc-butler-cleanup--statusline-model-re
+  "MODEL:\\([A-Za-z0-9_.-]+\\)"
+  "The model field, matched independently of CTX and of field order.
+`MODEL:?' does not match: `?' is outside the class, so the statusline's own
+\"unknown\" sentinel stays honestly nil rather than becoming the string \"?\".")
 
 (defun cc-butler-cleanup--statusline-fields (out)
   "Parse the session's OWN statusline out of terminal text OUT.
@@ -361,26 +386,39 @@ renders a progress block BELOW the mode hint, pushing the statusline to
 from-end 4/5+, so a count would miss it for exactly the best-behaved sessions.
 Scanning below the input box structurally excludes every scrollback echo and is
 immune to any number of agent-progress lines.  When there is no input box, or no
-full-shape line below it (a session with no statusline chrome), return nil."
+CTX: line below it (a session with no statusline chrome), return nil.
+
+Fields are read independently: a line the terminal truncated mid-way still
+reports the fields that rendered, with the rest nil."
   (when (stringp out)
     (with-temp-buffer
       (insert out)
       (let ((row (cc-butler--find-input-line (point-min) (point-max)))
-            found)
+            first full)
         (when row
           (goto-char row)
           (forward-line 1)              ; step past the input row + into below-box
-          (while (and (not found) (< (point) (point-max)))
+          ;; Scan the WHOLE region below the box, not just to the first hit.
+          ;; Matching CTX-alone matches a superset of the lines the full shape
+          ;; matched, so stopping at the first hit could stop EARLIER than
+          ;; before and throw away a complete line further down — turning a
+          ;; relaxation into a regression.  A complete line always wins.
+          (while (and (not full) (< (point) (point-max)))
             (let ((line (buffer-substring-no-properties
                          (line-beginning-position) (line-end-position))))
               (when (string-match cc-butler-cleanup--statusline-re line)
-                (let ((ctx (string-to-number (match-string 1 line)))
-                      (model (match-string 2 line))
-                      (pct (when (string-match " \\([0-9]+\\)%" line)
-                             (string-to-number (match-string 1 line)))))
-                  (setq found (list :ctx ctx :pct pct :model model)))))
+                ;; each field is read on its own, so a line truncated by a
+                ;; narrow window still yields everything that DID render
+                (let* ((ctx (string-to-number (match-string 1 line)))
+                       (model (when (string-match
+                                     cc-butler-cleanup--statusline-model-re line)
+                                (match-string 1 line)))
+                       (pct (when (string-match " \\([0-9]+\\)%" line)
+                              (string-to-number (match-string 1 line))))
+                       (fields (list :ctx ctx :pct pct :model model)))
+                  (if model (setq full fields) (unless first (setq first fields))))))
             (forward-line 1)))
-        found))))
+        (or full first)))))
 
 (defun cc-butler-cleanup--default-context (session)
   "Default: read SESSION's current context size (input tokens) from its terminal.
