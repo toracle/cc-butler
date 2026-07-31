@@ -263,7 +263,13 @@ result is a well-formed id, not a promise that the model exists."
     (let ((low (downcase tag)))
       (if (string-prefix-p "claude-" low)
           low
-        (concat "claude-" (replace-regexp-in-string "\\." "-" low))))))
+        ;; Dots AND whitespace: the statusline collapses punctuation for us
+        ;; (`Opus 4.8' arrives as `Opus-4.8'), but a transcript `/model'
+        ;; confirmation reports the display name verbatim — spaces and all.
+        ;; Splitting on dots alone would yield `claude-opus 5', which `/model'
+        ;; rejects, and the fallback `opus 5' with it, stranding the session on
+        ;; the cheap compaction model — the outcome this file exists to prevent.
+        (concat "claude-" (replace-regexp-in-string "[.[:space:]]+" "-" low))))))
 
 (defun cc-butler-compact--model-family (tag)
   "Return the family TAG belongs to (`opus', `fable', ...), or nil.

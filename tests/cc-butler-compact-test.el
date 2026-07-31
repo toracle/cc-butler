@@ -1236,6 +1236,22 @@ but the exact id will, and it is tried first."
   (should (null (cc-butler-compact--model-args nil)))
   (should (null (cc-butler-compact--model-args ""))))
 
+(ert-deftest cc-butler-compact/model-args-handles-a-spaced-display-name ()
+  "A tag can carry SPACES, not just collapsed punctuation.  The statusline
+collapses `Opus 4.8' to `Opus-4.8', but a transcript `/model' confirmation
+reports the display name verbatim — `Opus 5' — and that is the higher-priority
+source, since it catches a switch the screen missed.  Splitting on dots alone
+would yield `claude-opus 5', which `/model' rejects; the driver would fall back
+to `opus 5', which it also rejects, and the session would be left on the cheap
+compaction model — the exact outcome this file exists to prevent."
+  (should (equal '("claude-opus-5" "opus")
+                 (cc-butler-compact--model-args "Opus 5")))
+  (should (equal '("claude-opus-4-8" "opus")
+                 (cc-butler-compact--model-args "Opus 4.8")))
+  ;; the collapsed forms keep working unchanged
+  (should (equal '("claude-opus-4-8" "opus")
+                 (cc-butler-compact--model-args "Opus-4.8"))))
+
 (ert-deftest cc-butler-compact/model-args-covers-every-observed-tag ()
   "Regression floor: every MODEL: tag actually seen in the wild must resolve.
 All of these work today via the family list; none may stop working."
