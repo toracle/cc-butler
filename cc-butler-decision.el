@@ -103,8 +103,7 @@ author (:origin, else :from) — never the last relayer; `Via' is the relay-path
     (concat
      ":PROPERTIES:\n"                        ; the document's own org properties
      (format ":From: %s\n" from)
-     (if via (format ":Via: %s\n"
-                     (if (listp via) (mapconcat #'identity via " → ") via)) "")
+     (if via (format ":Via: %s\n" (cc-butler--via-string via)) "")
      (format ":To: %s\n" cc-butler-human-agent)
      (if (string-empty-p whenstr) "" (format ":When: %s\n" whenstr))
      (format ":Kind: %s%s\n" kind
