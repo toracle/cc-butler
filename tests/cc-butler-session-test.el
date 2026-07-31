@@ -938,5 +938,106 @@ failure would suppress the retries that follow it."
             (should (= 2 calls))))
       (kill-buffer buf))))
 
+;;;; ---- a render must not restart inside itself ----------------------
+;;
+;; Observed live 2026-07-31: the session list rendered UPSIDE DOWN — each
+;; session's detail row above its own name row, butler and steward at the
+;; bottom, two orphaned detail rows at the top — and the selection overlay
+;; painted every session instead of one.  `cc-butler--entries' held
+;; 1,36,34,23,21,... : not ascending, so not buffer positions at all, which a
+;; single uninterrupted render cannot produce.
+;;
+;; The render reads each session's ctx/model tag while it draws, and that read
+;; borrows a window (cache TTL is 3s, so nearly every row really reads).  A
+;; refresh arriving during that read starts a SECOND render inside the first:
+;; it erases the buffer, rebuilds it, and leaves point at the top.  The outer
+;; loop then keeps inserting its remaining rows at that point — prepending
+;; them, hence the inversion — labels them with `start' positions that now
+;; point into the inner render's text, and finally stores entries that are no
+;; longer positions in the buffer anyone is looking at.
+
+(defun cc-butler-session-test--render-fixture ()
+  "Three sessions, each with a detail row.
+The detail row matters: a row is drawn in two inserts, and the tearing shows
+up between them.  A fixture with nothing to put on the second line renders in
+one insert per session and hides the defect."
+  (list (list :dir "/a/" :title "a" :osc "" :status "" :branch "main" :forge "")
+        (list :dir "/b/" :title "b" :osc "" :status "" :branch "main" :forge "")
+        (list :dir "/c/" :title "c" :osc "" :status "" :branch "main" :forge "")))
+
+(ert-deftest cc-butler-session/render-does-not-restart-inside-itself ()
+  "A refresh arriving mid-render must not tear the buffer it lands in.
+Reentry is triggered here the way it happens live — from the per-row ctx tag,
+which is what yields — rather than from a timer, so the test is deterministic."
+  (let ((cc-butler--butler nil) (cc-butler--steward nil)
+        (cc-butler--waiting (make-hash-table :test 'equal))
+        (cc-butler-session-test--sessions (cc-butler-session-test--render-fixture))
+        (reentered 0))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               #'cc-butler-session-test--fake-sessions)
+              ((symbol-function 'cc-butler-cleanup-context-tag)
+               (lambda (_dir)
+                 ;; Exactly one reentry, from inside the outer render's loop.
+                 (when (zerop reentered)
+                   (setq reentered 1)
+                   (cc-butler--render))
+                 nil))
+              ((symbol-function 'cc-butler-cleanup-model-tag) (lambda (_dir) nil))
+              ((symbol-function 'cc-butler-cleanup-context-over-threshold-p)
+               (lambda (_dir) nil)))
+      (with-temp-buffer
+        (cc-butler-mode)
+        (cc-butler--render)
+        (should (= 1 reentered))       ; the reentry really happened
+        ;; Assert on what a person sees, not on the text properties: the outer
+        ;; render paints its own dirs OVER the inner render's text, so a
+        ;; property lookup answers correctly about a row that is not there.
+        (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+          ;; Each session is drawn exactly once.  Reentry drew /b/ and /c/
+          ;; twice and left an ownerless detail row at the top.
+          (dolist (name '("● a" "● b" "● c"))
+            (should (= 1 (cl-count-if (lambda (l) (equal l name))
+                                      (split-string text "\n")))))
+          ;; The buffer opens on a session row, not on a stray detail row.
+          (should (string-prefix-p "●" text)))
+        (should (equal '("/a/" "/b/" "/c/") (mapcar #'car cc-butler--entries)))
+        (let ((ps (mapcar #'cdr cc-butler--entries)))
+          (should (equal ps (sort (copy-sequence ps) #'<))))))))
+
+(ert-deftest cc-butler-session/entries-stay-real-buffer-positions ()
+  "Every entry position must be a distinct, ascending position in the buffer.
+`cc-butler--highlight' derives the selected block from entry N's start and
+entry N+1's start, and navigation jumps by the same table, so once these stop
+being real positions the highlight lands somewhere other than the row it
+belongs to.  On screen that read as every session turning yellow at once.
+
+Live, the table held 1,36,34,23,21,...  Reentering on every row (the read
+happens per row, and its cache TTL is 3s, so live it really does) reproduces
+the same class of damage: positions that repeat instead of advancing."
+  (let ((cc-butler--butler nil) (cc-butler--steward nil)
+        (cc-butler--waiting (make-hash-table :test 'equal))
+        (cc-butler-session-test--sessions (cc-butler-session-test--render-fixture))
+        (depth 0))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               #'cc-butler-session-test--fake-sessions)
+              ((symbol-function 'cc-butler-cleanup-context-tag)
+               (lambda (_dir)
+                 (when (= depth 0)
+                   (let ((depth 1)) (cc-butler--render)))
+                 "ctx 9k"))
+              ((symbol-function 'cc-butler-cleanup-model-tag) (lambda (_dir) "Opus-5"))
+              ((symbol-function 'cc-butler-cleanup-context-over-threshold-p)
+               (lambda (_dir) nil)))
+      (with-temp-buffer
+        (cc-butler-mode)
+        (cc-butler--render)
+        (let ((ps (mapcar #'cdr cc-butler--entries)))
+          (should (equal ps (sort (copy-sequence ps) #'<)))
+          (should (equal ps (delete-dups (copy-sequence ps)))))
+        ;; And each recorded position really is where that session's row starts.
+        (dolist (e cc-butler--entries)
+          (should (equal (car e)
+                         (get-text-property (cdr e) 'cc-butler-dir))))))))
+
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here

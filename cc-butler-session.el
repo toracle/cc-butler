@@ -567,15 +567,32 @@ under the cursor just because some session's wait-state flipped mid-move."
 
 ;;;; Rendering
 
+(defvar cc-butler--rendering nil
+  "Non-nil while `cc-butler--render' is rebuilding the list.
+Drawing a row reads that session's ctx/model tag, and the read borrows a
+window and can yield — so a refresh can arrive in the middle of a redraw.  It
+must not start a second render: the inner one erases the buffer and rebuilds
+it under the outer one's feet, leaving the outer loop inserting its remaining
+rows wherever the inner one left point and recording positions that are no
+longer positions in the buffer anyone is looking at.")
+
 (defun cc-butler--render ()
   "Render all live sessions as multi-line blocks in the current buffer,
 preserving the cursor's current session across the redraw when possible
-(falls back to point-min only if that session is no longer present)."
-  (let ((inhibit-read-only t)
-        (dir (cc-butler--dir-at-point))
-        (sessions (cc-butler--ordered (cc-butler--sessions)))
-        entries)
-    (erase-buffer)
+(falls back to point-min only if that session is no longer present).
+
+A refresh that arrives while this is already drawing is DEFERRED, not run:
+see `cc-butler--rendering'.  Nothing is lost by deferring — the request is
+handed to the same debounced refresh every other caller uses, so the newer
+state is drawn a moment later by a redraw that starts from a whole buffer."
+  (if cc-butler--rendering
+      (progn (cc-butler--schedule-refresh) nil)
+    (let ((cc-butler--rendering t)
+          (inhibit-read-only t)
+          (dir (cc-butler--dir-at-point))
+          (sessions (cc-butler--ordered (cc-butler--sessions)))
+          entries)
+      (erase-buffer)
     (if (null sessions)
         (insert (propertize "No active Claude sessions.\n\n" 'face 'shadow)
                 (propertize "c" 'face 'bold) " start   "
@@ -642,11 +659,11 @@ preserving the cursor's current session across the redraw when possible
               (insert "   " (mapconcat #'identity segments "   ") "\n")))
           (insert "\n")
           (put-text-property start (point) 'cc-butler-dir (plist-get s :dir)))))
-    (setq cc-butler--entries (nreverse entries))
-    (if-let ((e (and dir (assoc dir cc-butler--entries))))
-        (goto-char (cdr e))
-      (goto-char (point-min)))
-    (cc-butler--highlight)))
+      (setq cc-butler--entries (nreverse entries))
+      (if-let ((e (and dir (assoc dir cc-butler--entries))))
+          (goto-char (cdr e))
+        (goto-char (point-min)))
+      (cc-butler--highlight))))
 
 (defun cc-butler--list-buffer ()
   "Return the session-list buffer, (re)rendering its contents."
