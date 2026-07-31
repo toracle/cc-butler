@@ -659,5 +659,108 @@ that as failure would blank out every non-ghostel setup."
   (with-temp-buffer
     (should (cc-butler--refresh-terminal-text (current-buffer)))))
 
+;;;; ------------------------------------------------------------------
+;;;; The refresh must give the redraw the context it requires
+;;;; ------------------------------------------------------------------
+
+;; Measured 2026-07-31 on a live frozen session: calling the native redraw with
+;; no window binding errors with "Specified window is not displaying the current
+;; buffer" and the buffer does not move (1128 -> 1128 bytes).  Supplying the
+;; binding ghostel's own redraw path uses, the same call returns ok and the
+;; buffer jumps to the live screen (1128 -> 157599).  The grid was current the
+;; whole time; only the hand-off into the Emacs buffer was failing.
+
+(defmacro cc-butler-session-test--recording-redraw (record &rest body)
+  "Run BODY with `ghostel--redraw' stubbed to push a snapshot onto RECORD.
+Each entry is (SELECTED-WINDOW-SHOWS-BUFFER . INHIBIT-REDISPLAY)."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'ghostel--redraw)
+              (lambda (&rest _)
+                (push (cons (eq (window-buffer (selected-window)) (current-buffer))
+                            inhibit-redisplay)
+                      ,record)
+                t)))
+     ,@body))
+
+(ert-deftest cc-butler-session/refresh-gives-the-redraw-a-window ()
+  "The native redraw requires the selected window to be showing the buffer.
+Nothing displays a background session, so one must be lent to it — otherwise
+the redraw errors and the buffer keeps whatever it last rendered."
+  (let ((buf (get-buffer-create " *ccb-refresh-test*")) rec)
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local ghostel--term 'fake-term)
+          (cc-butler-session-test--recording-redraw rec
+            (should (cc-butler--refresh-terminal-text buf)))
+          (should (= 1 (length rec)))
+          (should (car (car rec))))              ; window WAS showing the buffer
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/refresh-suppresses-redisplay-while-borrowing ()
+  "Lending a window must not flash another session's screen at whoever is
+sitting in front of Emacs — the same binding ghostel's own path uses."
+  (let ((buf (get-buffer-create " *ccb-refresh-test2*")) rec)
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local ghostel--term 'fake-term)
+          (cc-butler-session-test--recording-redraw rec
+            (cc-butler--refresh-terminal-text buf))
+          (should (cdr (car rec))))              ; inhibit-redisplay was bound
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/refresh-leaves-the-layout-as-it-found-it ()
+  "Borrowing a window is invisible: afterwards it shows exactly what it did."
+  (let ((buf (get-buffer-create " *ccb-refresh-test3*"))
+        (before (window-buffer (selected-window)))
+        rec)
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local ghostel--term 'fake-term)
+          (cc-butler-session-test--recording-redraw rec
+            (cc-butler--refresh-terminal-text buf))
+          (should (eq before (window-buffer (selected-window)))))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/refresh-coalesces-a-burst-of-reads ()
+  "A full redraw rebuilds the whole buffer from the grid — up to
+`ghostel-max-scrollback' of it — and one refresh cycle reads every session in
+the fleet.  Repeating that per read, now with a window borrow on top, is how an
+8s I/O timeout gets hit.  Within the coalesce window, reuse the last redraw;
+past it, redraw again."
+  (let ((buf (get-buffer-create " *ccb-refresh-test4*"))
+        (cc-butler-refresh-coalesce-seconds 30)
+        (cc-butler--refresh-times (make-hash-table :test 'eq))
+        rec)
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local ghostel--term 'fake-term)
+          (cc-butler-session-test--recording-redraw rec
+            (should (cc-butler--refresh-terminal-text buf))
+            (should (cc-butler--refresh-terminal-text buf))   ; coalesced
+            (should (= 1 (length rec)))
+            ;; past the window, it redraws again
+            (let ((cc-butler-refresh-coalesce-seconds 0))
+              (should (cc-butler--refresh-terminal-text buf))
+              (should (= 2 (length rec))))))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/refresh-does-not-coalesce-a-failure ()
+  "A failed redraw must not be remembered as a fresh one — otherwise one
+failure would suppress the retries that follow it."
+  (let ((buf (get-buffer-create " *ccb-refresh-test5*"))
+        (cc-butler-refresh-coalesce-seconds 30)
+        (cc-butler--refresh-times (make-hash-table :test 'eq))
+        (calls 0))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local ghostel--term 'fake-term)
+          (cl-letf (((symbol-function 'cc-butler--log) #'ignore)
+                    ((symbol-function 'ghostel--redraw)
+                     (lambda (&rest _) (setq calls (1+ calls)) (error "nope"))))
+            (should (null (cc-butler--refresh-terminal-text buf)))
+            (should (null (cc-butler--refresh-terminal-text buf)))
+            (should (= 2 calls))))
+      (kill-buffer buf))))
+
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here
