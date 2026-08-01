@@ -1414,5 +1414,50 @@ the behaviour we want to keep for a genuinely unknown model."
       (clrhash cc-butler-cleanup--model-cache)
       (should (null (cc-butler-compact--model-for-restore "/e/"))))))
 
+;;;; ------------------------------------------------------------------
+;;;; A throw must cost a tick, not the machine
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/a-throwing-poll-tick-does-not-end-the-compaction ()
+  "`cc-butler-compact--poll' is a timer callback, so it has no caller who could
+catch anything.  The re-arm sits at the tail of each branch, so an exception
+takes the next tick with it and the one-shot chain is simply over: no timeout
+can fire afterwards, because every timeout lives in the poll that stopped.
+
+Observed twice for real, in two different phases, once with the exception
+named — `(error \"Window is dedicated to '*claude-sessions*'\")' escaping a
+window borrow during the model-switch wait.
+
+Catching is only half of it.  A guard that swallows the error and returns has
+still lost the chain; the tick has to be retried."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (let (rearmed)
+      (cl-letf (((symbol-function 'cc-butler-compact--poll-switch)
+                 (lambda (&rest _) (error "Window is dedicated to '*claude-sessions*'")))
+                ((symbol-function 'cc-butler-compact--schedule-poll)
+                 (lambda (_dir) (push t rearmed))))
+        ;; must not signal: nothing above this is listening
+        (cc-butler-compact--poll "w")
+        (should rearmed)
+        (should (gethash "w" cc-butler-compact--state))))))
+
+(ert-deftest cc-butler-compact/a-poll-that-never-recovers-still-gives-up ()
+  "Retrying forever would be its own trap — a session pinned by a tick that can
+never succeed.  The overall budget already exists; the error path has to reach
+it, so a poll whose failures outlast `cc-butler-compact-timeout' leaves the
+failing phase by the ordinary abort route rather than spinning."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (* 2 cc-butler-compact-timeout)))
+    (cl-letf (((symbol-function 'cc-butler-compact--poll-switch)
+               (lambda (&rest _) (error "Window is dedicated to '*claude-sessions*'"))))
+      (cc-butler-compact--poll "w")
+      (let ((st (gethash "w" cc-butler-compact--state)))
+        ;; either concluded outright, or moved on to restoring the model —
+        ;; what must not remain is the phase that could not make progress
+        (should-not (eq 'switching (plist-get st :phase)))))))
+
 (provide 'cc-butler-compact-test)
 ;;; cc-butler-compact-test.el ends here

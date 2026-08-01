@@ -801,19 +801,49 @@ and refuses when the current model cannot be named well enough to restore."
       (message "cc-butler compact: %s — started (ctx %s)" name (or ctx "?")))))
 
 (defun cc-butler-compact--poll (dir)
-  "One poll tick: answer a modal, advance a phase, or time out."
+  "One poll tick: answer a modal, advance a phase, or time out.
+
+Runs from a one-shot timer, so there is no caller above it who could catch
+anything — and the re-arm sits at the tail of each branch below, which means
+an escaping exception ends the whole chain rather than the tick.  Everything
+that could have rescued the compaction afterwards, both timeouts included, is
+evaluated in here, so once the chain is gone nothing can fire at all.
+
+Hence the guard.  Note that it RE-ARMS: swallowing the error and returning
+would lose the compaction just as completely, only quietly.  A failed tick
+costs a tick.  If the failures outlast the whole budget the machine leaves by
+the ordinary abort route, which still restores the model."
   (when-let ((st (gethash dir cc-butler-compact--state)))
     (let ((phase (plist-get st :phase))
           (sent (plist-get st :sent-time)))
-      (cond
-       ((not (get-buffer (claude-code-ide--get-buffer-name dir)))
-        (cc-butler-compact--finish dir "session vanished mid-compaction — aborted"))
-       ((eq phase 'switching)   (cc-butler-compact--poll-switch dir st sent))
-       ((eq phase 'compacting)  (cc-butler-compact--poll-compact dir st sent))
-       ((eq phase 'restore-wait)
-        (cc-butler-compact--poll-restore-wait dir st sent))
-       ((eq phase 'restoring)   (cc-butler-compact--poll-restore dir st sent))
-       (t (cc-butler-compact--finish dir "unknown phase %S — stopped" phase))))))
+      (condition-case err
+          (cond
+           ((not (get-buffer (claude-code-ide--get-buffer-name dir)))
+            (cc-butler-compact--finish dir "session vanished mid-compaction — aborted"))
+           ((eq phase 'switching)   (cc-butler-compact--poll-switch dir st sent))
+           ((eq phase 'compacting)  (cc-butler-compact--poll-compact dir st sent))
+           ((eq phase 'restore-wait)
+            (cc-butler-compact--poll-restore-wait dir st sent))
+           ((eq phase 'restoring)   (cc-butler-compact--poll-restore dir st sent))
+           (t (cc-butler-compact--finish dir "unknown phase %S — stopped" phase)))
+        (error
+         (cc-butler--log "compact: %s │ poll tick failed in %S (%s) — retrying"
+                         (cc-butler--display-name dir) phase
+                         (error-message-string err))
+         (if (and sent (> (- (float-time) sent) cc-butler-compact-timeout))
+             ;; The exit path reads the session too, so it can fail for the
+             ;; very reason we are here.  If it does, drop the state rather
+             ;; than hand back a lock nothing will ever release.
+             (condition-case err2
+                 (cc-butler-compact--abort
+                  dir (format "polling never recovered (%s)"
+                              (error-message-string err)))
+               (error
+                (cc-butler--log "compact: %s │ giving up also failed (%s) — dropping the compaction"
+                                (cc-butler--display-name dir)
+                                (error-message-string err2))
+                (cc-butler-compact--end-state dir)))
+           (cc-butler-compact--schedule-poll dir)))))))
 
 (defun cc-butler-compact--poll-switch (dir st sent)
   "Wait for the switch to `cc-butler-compact-model', answering the modal."
