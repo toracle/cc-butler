@@ -719,10 +719,18 @@ the same state under test as in production."
            cc-butler-compact--pending))
 
 (defun cc-butler-compact--idle-poll (dir deadline)
-  "One idle-wait tick: start the compaction once DIR is safely idle."
+  "One idle-wait tick: start the compaction once DIR is safely idle.
+
+The queue entry is dropped on the first line below, so from there until the
+re-queue the compaction exists nowhere at all — anything that throws in that
+window loses it outright, and `cc-butler-compact-waiting-p' goes false, so it
+stops even showing as queued.  The inner guards further down close the middle
+of that window; this one closes the rest of it, and puts the wait back before
+doing anything else that could fail in turn."
   (remhash dir cc-butler-compact--pending)
-  (let ((name (cc-butler--display-name dir)))
-    (cond
+  (condition-case err
+      (let ((name (cc-butler--display-name dir)))
+        (cond
      ((not (get-buffer (claude-code-ide--get-buffer-name dir)))
       (cc-butler--log "compact: %s │ session vanished while queued" name))
      ((> (float-time) deadline)
@@ -747,7 +755,17 @@ the same state under test as in production."
           (condition-case err
               (cc-butler-compact-session dir)
             (error (cc-butler--log "compact: %s │ queued start failed: %s" name
-                                   (error-message-string err))))))))))
+                                   (error-message-string err)))))))))
+    (error
+     ;; Re-queue FIRST.  Naming the session for the log is itself one of the
+     ;; things that can throw in here, so it must not stand between the
+     ;; failure and the recovery.
+     (when (< (float-time) deadline)
+       (cc-butler-compact--queue-idle-poll dir deadline))
+     (ignore-errors
+       (cc-butler--log "compact: %s │ idle check failed (%s) — still queued"
+                       (cc-butler--display-name dir)
+                       (error-message-string err))))))
 
 ;;;###autoload
 (defun cc-butler-compact-session (dir)
@@ -1133,7 +1151,20 @@ way, so the steward can tell \"do it\" from \"wait\" without going to look."
 (defun cc-butler-compact--monitor-scan ()
   "One monitor tick: report new or long-standing candidates to the steward.
 No-op when there is no session to report to — a scan with nobody listening
-is just a way to be wrong later."
+is just a way to be wrong later.
+
+Reads every session, so it throws for the same reasons the compaction poll
+does, and it has been seen doing so.  Its timer repeats, so unlike the poll it
+survives; what it loses is that round, without a word.  Hence the guard: a
+skipped scan should say it was skipped."
+  (condition-case err
+      (cc-butler-compact--monitor-scan-1)
+    (error
+     (cc-butler--log "compact monitor │ scan failed (%s) — skipped this round"
+                     (error-message-string err)))))
+
+(defun cc-butler-compact--monitor-scan-1 ()
+  "The body of one monitor tick.  See `cc-butler-compact--monitor-scan'."
   (when (cc-butler--ops-dir)
     (let* ((dirs (cc-butler-compact-candidates))
            (names (sort (mapcar #'cc-butler--display-name dirs) #'string<))

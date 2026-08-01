@@ -1459,5 +1459,59 @@ failing phase by the ordinary abort route rather than spinning."
         ;; what must not remain is the phase that could not make progress
         (should-not (eq 'switching (plist-get st :phase)))))))
 
+(defun cc-butler-compact-test--must-not-throw (label thunk)
+  "Call THUNK, failing with the reason the boundary exists if it signals.
+
+The failure message carries the WHY on purpose.  Told only the rule — \"this
+must not throw\" — the cheapest way to satisfy it is to wrap the body in
+`condition-case', swallow, and move on, which passes the test and keeps the
+defect.  What the timer actually needs is for the work to survive, so the
+reason has to travel with the rule."
+  (condition-case err
+      (progn (funcall thunk) t)
+    (error
+     (ert-fail
+      (format "%s let an exception escape: %s
+
+It runs from a timer, and a timer has no caller who can catch.  Worse, a
+one-shot timer's re-arm sits at the tail of the branch that threw, so the
+exception does not cost a tick — it ends the chain, and every timeout that
+could have recovered the work lives inside that same chain.  Whatever state
+was left behind is then permanent, and reads as healthy.
+
+So catching is necessary but not sufficient: the handler has to put the work
+back — re-arm the poll, re-queue the wait — or the compaction is lost just as
+surely, only quietly."
+              label (error-message-string err))))))
+
+(ert-deftest cc-butler-compact/a-failed-idle-check-keeps-the-compaction-queued ()
+  "`cc-butler-compact--idle-poll' drops the queue entry on its first line, so
+until it re-queues, the compaction exists nowhere.  Anything throwing in that
+window loses it outright — no retry, no deadline notice, and
+`cc-butler-compact-waiting-p' goes false, so it stops even showing as queued.
+The file's own comment names this hole; the guards that were there covered
+only the middle of it."
+  (cc-butler-compact-test--with-session "w"
+    (let (requeued)
+      (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                 (lambda (_d) (error "Timed out reading session w's output after 5s")))
+                ((symbol-function 'cc-butler-compact--queue-idle-poll)
+                 (lambda (dir _deadline) (push dir requeued))))
+        (cc-butler-compact-test--must-not-throw
+         "cc-butler-compact--idle-poll"
+         (lambda () (cc-butler-compact--idle-poll "w" (+ (float-time) 600))))
+        (should (equal '("w") requeued))))))
+
+(ert-deftest cc-butler-compact/a-failed-monitor-scan-does-not-escape ()
+  "The fleet scan reads every session, so it throws for the same reasons the
+poll does — observed live, repeatedly.  Its timer repeats, so it survives; what
+is lost each time is that scan, silently."
+  (cl-letf (((symbol-function 'cc-butler--ops-dir) (lambda () "/ops/"))
+            ((symbol-function 'cc-butler-compact-candidates)
+             (lambda () (error "Window is dedicated to '*claude-sessions*'")))
+            ((symbol-function 'cc-butler--log) #'ignore))
+    (cc-butler-compact-test--must-not-throw
+     "cc-butler-compact--monitor-scan" #'cc-butler-compact--monitor-scan)))
+
 (provide 'cc-butler-compact-test)
 ;;; cc-butler-compact-test.el ends here
