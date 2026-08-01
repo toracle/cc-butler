@@ -1414,5 +1414,80 @@ the behaviour we want to keep for a genuinely unknown model."
       (clrhash cc-butler-cleanup--model-cache)
       (should (null (cc-butler-compact--model-for-restore "/e/"))))))
 
+;;;; ------------------------------------------------------------------
+;;;; The lock must not depend on the driver it is supposed to outlive
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/lock-releases-when-its-driver-has-died ()
+  "Every timeout in this machine is evaluated inside `cc-butler-compact--poll',
+which runs only while the poll timer is alive.  So a poll that throws takes the
+timeouts with it: nothing re-arms, the state entry becomes immortal, and the
+session can never be compacted again.
+
+Observed live 2026-08-01: phase `switching', 9.5 hours elapsed against a
+90-second step timeout, `:timer' present but absent from `timer-list'.  The
+90-second guard did not fire late — it could not fire at all, because it lived
+inside the thing that had stopped.  The lock must therefore read the clock."
+  (let ((cc-butler-compact--state (make-hash-table :test 'equal))
+        (dead (run-with-timer 3600 nil #'ignore)))
+    (cancel-timer dead)
+    (puthash "/d/" (list :phase 'switching
+                         :sent-time (- (float-time) (* 40 cc-butler-compact-timeout))
+                         :timer dead)
+             cc-butler-compact--state)
+    (should-not (cc-butler-compact--active-p "/d/"))))
+
+(ert-deftest cc-butler-compact/a-timerless-entry-still-holds-the-lock ()
+  "Liveness must not be inferred from the timer.  An entry parked under
+`cc-butler-compact--inhibit-timers' carries no timer at all, and a real one is
+momentarily absent from `timer-list' between firing and re-arming — so asking
+the timer whether the machine is alive answers no in two cases where it is.
+A fresh entry holds the lock whether or not anything is scheduled."
+  (let ((cc-butler-compact--state (make-hash-table :test 'equal)))
+    (puthash "/d/" (list :phase 'compacting :sent-time (float-time) :timer nil)
+             cc-butler-compact--state)
+    (should (cc-butler-compact--active-p "/d/"))))
+
+(ert-deftest cc-butler-compact/the-stale-bar-clears-the-longest-real-phase ()
+  "The bar has to sit above the longest budget any phase can legitimately use,
+plus the granularity at which the poll would notice — otherwise a compaction
+that is merely slow gets declared dead and a second one races it."
+  (let ((cc-butler-compact--state (make-hash-table :test 'equal))
+        (bar (cc-butler-compact--stale-after)))
+    (should (> bar cc-butler-compact-timeout))
+    (should (> bar cc-butler-compact-step-timeout))
+    (puthash "/d/" (list :phase 'compacting :sent-time (- (float-time) (- bar 5)))
+             cc-butler-compact--state)
+    (should (cc-butler-compact--active-p "/d/"))
+    (puthash "/d/" (list :phase 'compacting :sent-time (- (float-time) (+ bar 5)))
+             cc-butler-compact--state)
+    (should-not (cc-butler-compact--active-p "/d/"))))
+
+(ert-deftest cc-butler-compact/a-dead-driver-does-not-block-the-next-compaction ()
+  "The property end to end, through the surface every caller actually consults.
+`cc-butler-compact--active-p' is only the innermost layer; what stranded the
+session was `already in flight' reaching `compact_session' and `session_status'
+through `cc-butler-compact--blocked-reason'.  So the release is observed there,
+and then by letting a real second compaction through."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (should (cc-butler-compact--active-p "w"))
+    (should (string-match-p "already in flight"
+                            (cc-butler-compact--blocked-reason "w")))
+    ;; Kill the driver the way a throw from a poll does: under
+    ;; `--inhibit-timers' nothing is scheduled, so the entry simply sits there
+    ;; with no one to advance it — and no timeout can fire, because every
+    ;; timeout in this machine lives inside the poll that stopped.
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (* 2 (cc-butler-compact--stale-after))))
+    (should-not (cc-butler-compact--active-p "w"))
+    (should-not (cc-butler-compact--blocked-reason "w"))
+    ;; and the session is genuinely compactable again, not merely un-blocked
+    (cc-butler-compact-session "w")
+    (should (cc-butler-compact--active-p "w"))
+    (should (< (- (float-time)
+                  (plist-get (gethash "w" cc-butler-compact--state) :sent-time))
+               10))))
+
 (provide 'cc-butler-compact-test)
 ;;; cc-butler-compact-test.el ends here

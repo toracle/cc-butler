@@ -475,9 +475,36 @@ stops a second compaction racing the same session.")
 (defvar cc-butler-compact--inhibit-timers nil
   "When non-nil, schedule no real timers (tests drive polls by hand).")
 
+(defun cc-butler-compact--stale-after ()
+  "Seconds after which an untouched compaction state can only be wreckage.
+Sits above the longest budget any single phase may legitimately spend
+\(`cc-butler-compact-timeout'), plus the granularity at which a live poll
+would have noticed — so a compaction that is merely slow is never declared
+dead out from under itself."
+  (+ cc-butler-compact-timeout (* 2 cc-butler-compact-poll-interval)))
+
+(defun cc-butler-compact--stale-p (st)
+  "Non-nil when compaction state ST cannot still be making progress."
+  (let ((sent (plist-get st :sent-time)))
+    (and sent (> (- (float-time) sent) (cc-butler-compact--stale-after)))))
+
 (defun cc-butler-compact--active-p (dir)
-  "Non-nil when a compaction is already in flight for DIR."
-  (and (gethash dir cc-butler-compact--state) t))
+  "Non-nil when a compaction is really still in flight for DIR.
+
+Reads the clock, deliberately, and not the timer.  Every timeout in this
+machine is evaluated inside `cc-butler-compact--poll', so all of them exist
+only while the poll chain does: one throw from a poll skips the re-arm at the
+tail of its branch, the last one-shot timer is spent, and from then on the
+timeouts cannot fire at all.  The entry becomes immortal and this predicate —
+which is the lock — reports a healthy compaction forever.  A guard placed
+inside the thing it guards is not a guard, so the lock has to be able to
+answer after its driver is gone.
+
+Asking the timer instead would answer wrong in two ordinary cases: an entry
+parked under `cc-butler-compact--inhibit-timers' carries no timer at all, and
+a real one is briefly out of `timer-list' between firing and re-arming."
+  (when-let ((st (gethash dir cc-butler-compact--state)))
+    (not (cc-butler-compact--stale-p st))))
 
 (defun cc-butler-compact--set-state (dir &rest kvs)
   "Merge KVS into the compaction state for DIR; return the plist."
@@ -771,6 +798,16 @@ and refuses when the current model cannot be named well enough to restore."
   (let ((name (cc-butler--display-name dir)))
     (when-let ((why (cc-butler-compact--blocked-reason dir)))
       (user-error "Refusing to compact %s: %s" name why))
+    ;; The lock just read as free, so anything still under this key is the
+    ;; wreckage of a driver that stopped without saying so.  Drop it rather
+    ;; than merging fresh values into it, and say so in the log: the last one
+    ;; of these went unnoticed for nine hours precisely because it was silent.
+    (when-let ((st (gethash dir cc-butler-compact--state)))
+      (cc-butler--log
+       "compact: %s │ discarded a dead compaction — driver stopped in phase %S, %.0f min ago"
+       name (plist-get st :phase)
+       (/ (- (float-time) (or (plist-get st :sent-time) (float-time))) 60.0))
+      (cc-butler-compact--end-state dir))
     ;; Capture the model BEFORE anything is typed — after the switch the
     ;; original is unrecoverable, and an unrestorable session is worse than
     ;; an uncompacted one.
@@ -787,8 +824,12 @@ and refuses when the current model cannot be named well enough to restore."
       (unless arg
         (user-error "Refusing to compact %s: cannot determine a restorable model (screen, transcript and last-known all say %s)"
                     name (or tag "nothing")))
+      ;; :sent-time from the very first moment the lock exists.  `--step' will
+      ;; overwrite it a few forms below, but if anything throws in between, the
+      ;; entry would otherwise carry no clock at all — and an entry with no
+      ;; clock is the one shape `cc-butler-compact--stale-p' cannot ever free.
       (cc-butler-compact--set-state dir :orig-model tag :orig-args args :orig-arg arg
-                                    :orig-ctx ctx :note nil)
+                                    :orig-ctx ctx :note nil :sent-time (float-time))
       (cc-butler--log "compact: %s │ start (ctx %s, model %s)"
                       name (or ctx "?") tag)
       (if (cc-butler-compact--model-is-p tag cc-butler-compact-model)
