@@ -1513,5 +1513,53 @@ is lost each time is that scan, silently."
     (cc-butler-compact-test--must-not-throw
      "cc-butler-compact--monitor-scan" #'cc-butler-compact--monitor-scan)))
 
+;;;; ------------------------------------------------------------------
+;;;; What the session that asked can actually find out
+;;;; ------------------------------------------------------------------
+
+(defmacro cc-butler-compact-test--with-status (&rest body)
+  "Run BODY with the extra stubs `cc-butler-compact--status-line' needs."
+  (declare (indent 0))
+  `(let ((cc-butler-compact--last-outcome (make-hash-table :test 'equal)))
+     (cl-letf (((symbol-function 'cc-butler-cleanup-model-for) (lambda (_d) "Opus-5"))
+               ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+       ,@body)))
+
+(ert-deftest cc-butler-compact/status-shows-a-queued-compaction ()
+  "`compact_session' answers a queued request with \"Poll session_status to
+watch it happen\" — and that row never consulted the queue at all.  Its sole
+production reader was the fleet summary.  So a queued compaction looked
+exactly like one nobody had asked for, and the tool's own instruction could
+not be carried out."
+  (cc-butler-compact-test--with-fleet '(("/w/" . 90000))
+    (cc-butler-compact-test--with-status
+      (cl-letf (((symbol-function 'cc-butler-compact-waiting-p) (lambda (_d) t)))
+        (should (string-match-p "queued" (cc-butler-compact--status-line "/w/")))))))
+
+(ert-deftest cc-butler-compact/status-reports-an-attempt-that-ended-badly ()
+  "A give-up writes one butler-log line and one echo message and stops.  The
+session that asked sees neither: the log is an Emacs buffer with no reader
+keyed by session, and nothing durable records the fact.  All that changed for
+the requester was `already queued' quietly becoming available again — which
+is indistinguishable from a compaction still patiently waiting."
+  (cc-butler-compact-test--with-fleet '(("/w/" . 90000))
+    (cc-butler-compact-test--with-status
+      (cc-butler-compact--record-outcome
+       "/w/" "gave up waiting for idle (nothing typed)")
+      (let ((row (cc-butler-compact--status-line "/w/")))
+        (should (string-match-p "gave up" row))
+        (should (string-match-p "last attempt" row))))))
+
+(ert-deftest cc-butler-compact/a-give-up-is-recorded-and-a-new-attempt-clears-it ()
+  "Recorded where it happens, and superseded when someone tries again — a
+stale outcome hanging around after a fresh start would be its own lie."
+  (cc-butler-compact-test--with-session "w"
+    (let ((cc-butler-compact--last-outcome (make-hash-table :test 'equal)))
+      (cc-butler-compact--idle-poll "w" (- (float-time) 1))
+      (should (string-match-p
+               "gave up" (or (cdr (gethash "w" cc-butler-compact--last-outcome)) "")))
+      (cc-butler-compact-session "w")
+      (should-not (gethash "w" cc-butler-compact--last-outcome)))))
+
 (provide 'cc-butler-compact-test)
 ;;; cc-butler-compact-test.el ends here

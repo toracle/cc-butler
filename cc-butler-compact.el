@@ -492,6 +492,35 @@ stops a second compaction racing the same session.")
     (when (timerp (plist-get st :timer)) (cancel-timer (plist-get st :timer))))
   (remhash dir cc-butler-compact--state))
 
+(defvar cc-butler-compact--last-outcome (make-hash-table :test 'equal)
+  "Map a session dir -> (TIME . TEXT) for how its last compaction attempt ended.
+
+The state and queue tables are locks: each exists only while something is
+happening and is deleted the moment it stops, so nothing at all survives to
+tell the session that asked what became of its request.  A give-up writes one
+butler-log line — an Emacs buffer with no reader keyed by session — and one
+echo message, and stops.  Neither reaches the caller, who is left watching
+`already queued' quietly turn back into availability, which looks exactly like
+a compaction still patiently waiting.  This table is the part that outlives
+the lock, so `session_status' can answer the question the lock cannot.")
+
+(defun cc-butler-compact--record-outcome (dir text)
+  "Remember TEXT as how the last compaction attempt on DIR ended."
+  (puthash dir (cons (float-time) text) cc-butler-compact--last-outcome))
+
+(defun cc-butler-compact--forget-outcome (dir)
+  "Drop DIR's recorded outcome — a fresh attempt supersedes the last one.
+Leaving it would be its own lie: a finished verdict displayed beside a
+compaction that is running right now."
+  (remhash dir cc-butler-compact--last-outcome))
+
+(defun cc-butler-compact--ago (time)
+  "TIME rendered as a short interval before now."
+  (let ((s (- (float-time) time)))
+    (cond ((< s 90) (format "%.0fs" s))
+          ((< s 5400) (format "%.0fm" (/ s 60.0)))
+          (t (format "%.1fh" (/ s 3600.0))))))
+
 (defun cc-butler-compact--answer-cooldown ()
   "Seconds to leave between two answers of the same modal.
 Two poll intervals: long enough for the terminal to have repainted, so a
@@ -614,6 +643,9 @@ a tidy finish over a dirty screen."
     (cc-butler-compact--clear-own-input dir st))
   (cc-butler-compact--end-state dir)
   (let ((msg (apply #'format fmt args)))
+    ;; Outlives the lock this is about to drop, so the session that asked can
+    ;; still find out how it ended.
+    (cc-butler-compact--record-outcome dir msg)
     (cc-butler--log "compact: %s │ %s" (cc-butler--display-name dir) msg)
     (ignore-errors (cc-butler--maybe-refresh))
     (message "cc-butler compact: %s — %s" (cc-butler--display-name dir) msg)
@@ -732,8 +764,11 @@ doing anything else that could fail in turn."
       (let ((name (cc-butler--display-name dir)))
         (cond
      ((not (get-buffer (claude-code-ide--get-buffer-name dir)))
+      (cc-butler-compact--record-outcome dir "session vanished while queued")
       (cc-butler--log "compact: %s │ session vanished while queued" name))
      ((> (float-time) deadline)
+      (cc-butler-compact--record-outcome
+       dir "gave up waiting for idle (nothing typed)")
       (cc-butler--log "compact: %s │ gave up waiting for idle (nothing typed)" name)
       (message "cc-butler compact: %s — gave up waiting for a safe idle point" name))
      (t
@@ -789,6 +824,8 @@ and refuses when the current model cannot be named well enough to restore."
   (let ((name (cc-butler--display-name dir)))
     (when-let ((why (cc-butler-compact--blocked-reason dir)))
       (user-error "Refusing to compact %s: %s" name why))
+    ;; A fresh attempt supersedes whatever the last one concluded.
+    (cc-butler-compact--forget-outcome dir)
     ;; Capture the model BEFORE anything is typed — after the switch the
     ;; original is unrecoverable, and an unrestorable session is worse than
     ;; an uncompacted one.
@@ -1261,11 +1298,19 @@ the ceiling with nobody reading."
             (if (integerp ctx) (format "%.0fk" (/ ctx 1000.0)) "?")
             (or model "?")
             (if (cc-butler--waiting-p dir) "WAITING" "running")
-            (let ((over (cc-butler-compact--over-threshold-p dir)))
-              (cond ((and over (not why)) "OVER THRESHOLD — compactable now")
-                    (over (format "OVER THRESHOLD — blocked: %s" why))
-                    (why (format "blocked: %s" why))
-                    (t "ok"))))))
+            (let* ((over (cc-butler-compact--over-threshold-p dir))
+                   (now (cond ((cc-butler-compact-waiting-p dir)
+                               (concat (if over "OVER THRESHOLD — " "")
+                                       "queued — starts when this turn ends"))
+                              ((and over (not why)) "OVER THRESHOLD — compactable now")
+                              (over (format "OVER THRESHOLD — blocked: %s" why))
+                              (why (format "blocked: %s" why))
+                              (t "ok")))
+                   (last (gethash dir cc-butler-compact--last-outcome)))
+              (if last
+                  (format "%s │ last attempt %s ago: %s"
+                          now (cc-butler-compact--ago (car last)) (cdr last))
+                now)))))
 
 (defun cc-butler-tool-session-status ()
   "MCP tool: per-session context size, model, and compaction readiness."
@@ -1288,7 +1333,7 @@ the ceiling with nobody reading."
        (format "Compaction started for %s — it runs asynchronously (switch to %s, /compact, then restore the original model). Do not send it anything until it finishes; poll session_status to watch the context drop and the model come back."
                name cc-butler-compact-model))
       (_
-       (format "Compaction QUEUED for %s — it is mid-turn, so nothing has been typed yet. It will start on its own the moment that turn ends and the session is safely idle, and will give up after %d minutes. If you queued this for YOURSELF, just finish your turn normally: the compaction runs once you stop. Poll session_status to watch it happen."
+       (format "Compaction QUEUED for %s — it is mid-turn, so nothing has been typed yet. It will start on its own the moment that turn ends and the session is safely idle, and will give up after %d minutes. If you queued this for YOURSELF, just finish your turn normally: the compaction runs once you stop. Poll session_status: it shows the queued state while it waits, and afterwards reports how the attempt ended, a give-up included."
                name (round (/ cc-butler-compact-idle-wait 60)))))))
 
 (defun cc-butler-tool-compact-large-sessions ()
