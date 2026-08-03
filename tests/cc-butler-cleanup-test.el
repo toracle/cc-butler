@@ -262,6 +262,90 @@ then types the clear command — in that order.  No delete."
         (should (member cc-butler-cleanup-clear-command sent))
         (should-not (cc-butler-cleanup--active-p dir))))))
 
+;;;; ---- send-failure does not strand the lock (cc-butler#18) --------
+
+(ert-deftest cc-butler-cleanup/send-failure-during-externalize-releases-the-lock ()
+  "A `cc-butler--send-input' failure while sending the externalize
+instruction must not leave the cleanup lock held forever with no timer left
+to ever revisit it — mirrors the compaction driver's identical bug
+(cc-butler#18).  The session must come back cleanable, and the failure must
+reach the log, not be silently swallowed."
+  (cc-butler-cleanup-test--with-session dir "/tmp/cc-butler-x/ws-sf1/"
+    (let (logged)
+      (cl-letf (((symbol-function 'cc-butler--send-input)
+                 (lambda (&rest _) (error "Timed out sending input after 8s")))
+                ((symbol-function 'cc-butler--log)
+                 (lambda (fmt &rest args) (push (apply #'format fmt args) logged))))
+        (ignore-errors (cc-butler-session-cleanup dir 'clear)))
+      (should-not (cc-butler-cleanup--active-p dir))
+      (should (cl-some (lambda (l) (string-match-p "send failed" l)) logged)))))
+
+(ert-deftest cc-butler-cleanup/send-failure-during-clear-command-releases-the-lock ()
+  "The same failure mode one step later: externalize+verify succeeded and the
+final `/clear' send is what throws.  This send is NOT routed through
+`cc-butler-session-cleanup' — it is a second, separate `cc-butler--send-input'
+call inside `--teardown' — so it needs its own guard, not just one at the top."
+  (cc-butler-cleanup-test--with-session dir "/tmp/cc-butler-x/ws-sf2/"
+    (let* ((topic "/tmp/cc-butler-x/ws-sf2/")
+           (body (mapconcat (lambda (i) (format "l%d durable" i))
+                            (number-sequence 1 20) "\n")))
+      (cc-butler-cleanup-test--write-handoff topic body)
+      (cl-letf (((symbol-function 'cc-butler--read-output)
+                 (lambda (&rest _) cc-butler-cleanup-sentinel)))
+        (cc-butler-session-cleanup dir 'clear)
+        (let (logged)
+          (cl-letf (((symbol-function 'cc-butler--send-input)
+                     (lambda (&rest _) (error "Timed out sending input after 8s")))
+                    ((symbol-function 'cc-butler--log)
+                     (lambda (fmt &rest args) (push (apply #'format fmt args) logged))))
+            (ignore-errors (cc-butler-cleanup--poll dir)))
+          (should-not (cc-butler-cleanup--active-p dir))
+          (should (cl-some (lambda (l) (string-match-p "send failed" l)) logged)))))))
+
+;;;; ---- operator escape: cc-butler-cleanup-reset ---------------------
+
+(ert-deftest cc-butler-cleanup/reset-clears-a-stuck-state-without-restarting-emacs ()
+  "The last-resort escape: even a state this test cannot explain how it got
+stuck must be clearable without a full Emacs restart."
+  (cc-butler-cleanup-test--with-session dir "/tmp/cc-butler-x/ws-r1/"
+    (cc-butler-cleanup--set-state dir :phase 'externalizing :sent-time (float-time))
+    (should (cc-butler-cleanup--active-p dir))
+    (should (cc-butler-cleanup-reset dir))
+    (should-not (cc-butler-cleanup--active-p dir))))
+
+(ert-deftest cc-butler-cleanup/reset-on-a-clean-session-is-a-noop ()
+  "Resetting a session with nothing in flight does nothing and reports nil."
+  (cc-butler-cleanup-test--with-session dir "/tmp/cc-butler-x/ws-r2/"
+    (should-not (cc-butler-cleanup-reset dir))))
+
+;;;; ---- orphaned-state self-heal --------------------------------------
+
+(ert-deftest cc-butler-cleanup/stale-timerless-idle-state-is-auto-reaped ()
+  "A state entry with no live timer, old beyond
+`cc-butler-cleanup-state-max-age', sitting on an idle buffer — exactly the
+shape a lost-timer send failure leaves behind — is treated as orphaned and
+released the next time anything asks."
+  (cc-butler-cleanup-test--with-session dir "/tmp/cc-butler-x/ws-o1/"
+    (cc-butler-cleanup--set-state
+     dir :phase 'externalizing
+     :sent-time (- (float-time) (1+ cc-butler-cleanup-state-max-age)))
+    (should (cc-butler-cleanup--orphaned-p dir (gethash dir cc-butler-cleanup--state)))
+    (should-not (cc-butler-cleanup--active-p dir))))
+
+(ert-deftest cc-butler-cleanup/genuinely-in-flight-cleanup-is-never-reaped-by-age-alone ()
+  "The critical negative case: a cleanup that is actually still running — a
+poll still scheduled and watching it — must NOT be reaped merely because it
+has been running a long time.  Reaping this would double-fire teardown on a
+session already mid-flight."
+  (cc-butler-cleanup-test--with-session dir "/tmp/cc-butler-x/ws-o2/"
+    (cl-letf (((symbol-function 'cc-butler--read-output) (lambda (&rest _) "working…")))
+      (cc-butler-session-cleanup dir 'clear)
+      (cc-butler-cleanup--set-state
+       dir :sent-time (- (float-time) (1+ cc-butler-cleanup-state-max-age)))
+      (should (plist-get (gethash dir cc-butler-cleanup--state) :timer))
+      (should-not (cc-butler-cleanup--orphaned-p dir (gethash dir cc-butler-cleanup--state)))
+      (should (cc-butler-cleanup--active-p dir)))))
+
 ;;;; ---- safety ordering: no teardown before verify ------------------
 
 (ert-deftest cc-butler-cleanup/verify-fail-blocks-teardown ()

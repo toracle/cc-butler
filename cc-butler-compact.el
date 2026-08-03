@@ -80,6 +80,17 @@ switch.  Must be an argument `/model' accepts."
 Compacting a 400k-token session is minutes of work, not seconds."
   :type 'number :group 'cc-butler)
 
+(defcustom cc-butler-compact-state-max-age 3600
+  "Seconds an in-flight compaction state entry may sit with no live timer
+before the next access treats it as orphaned rather than merely slow (see
+`cc-butler-compact--orphaned-p').  A generous multiple of the machine's own
+worst-case budget with a live timer (two `cc-butler-compact-step-timeout's
+plus one `cc-butler-compact-timeout', ~1080s by default) — a compaction that
+is actually progressing is cleaned up by its own poll long before this ever
+matters; this only fires for an entry whose timer was lost outright (a send
+that threw before `--schedule-poll' was ever reached, cc-butler#18)."
+  :type 'number :group 'cc-butler)
+
 (defcustom cc-butler-compact-drop-ratio 0.7
   "Fraction of the pre-compact context size that counts as \"compacted\".
 The statusline is the only observable, so completion is inferred from the
@@ -335,8 +346,40 @@ stops a second compaction racing the same session.")
 (defvar cc-butler-compact--inhibit-timers nil
   "When non-nil, schedule no real timers (tests drive polls by hand).")
 
+(defun cc-butler-compact--orphaned-p (dir st)
+  "Non-nil when ST (DIR's in-flight compaction state) looks abandoned.
+Age alone is refused as a signal on purpose — it would happily reap a
+compaction that is genuinely still running (a very large context, a slow
+`/compact').  Requires ALL of: no `:timer' recorded (a poll is scheduled —
+real or, under `cc-butler-compact--inhibit-timers', its test placeholder —
+means the machine is still watching this entry and will conclude it on its
+own), old enough that a live compaction would long since have timed out,
+AND the terminal itself corroborates abandonment rather than being
+mid-dance — sitting at an ordinary idle waiting point with no menu open and
+nothing pending, which an actual in-flight switch/compact/restore would not
+be showing."
+  (let ((sent (plist-get st :sent-time)))
+    (and (numberp sent)
+         (not (plist-get st :timer))
+         (> (- (float-time) sent) cc-butler-compact-state-max-age)
+         (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
+           (or (not (buffer-live-p buf))
+               (and (cc-butler--waiting-p dir)
+                    (not (cc-butler-compact--menu-p (cc-butler--read-output dir 40)))
+                    (not (cc-butler-compact--pending-input-p dir))))))))
+
 (defun cc-butler-compact--active-p (dir)
-  "Non-nil when a compaction is already in flight for DIR."
+  "Non-nil when a compaction is already in flight for DIR.
+Lazily reaps an orphaned entry first (`cc-butler-compact--orphaned-p'), so a
+state stranded with no timer left to ever revisit it does not block this
+session's compactability forever — merely being asked notices and heals it,
+without waiting for a human to run `cc-butler-compact-reset'."
+  (when-let ((st (gethash dir cc-butler-compact--state)))
+    (when (cc-butler-compact--orphaned-p dir st)
+      (cc-butler--log "compact: %s │ orphaned state auto-cleared (stale %ss, no timer, idle buffer)"
+                      (cc-butler--display-name dir)
+                      (round (- (float-time) (plist-get st :sent-time))))
+      (cc-butler-compact--end-state dir)))
   (and (gethash dir cc-butler-compact--state) t))
 
 (defun cc-butler-compact--set-state (dir &rest kvs)
@@ -361,21 +404,67 @@ stops a second compaction racing the same session.")
     (message "cc-butler compact: %s — %s" (cc-butler--display-name dir) msg)
     msg))
 
+;;;###autoload
+(defun cc-butler-compact-reset (dir)
+  "Forcibly clear DIR's in-flight compaction state — an operator escape.
+`cc-butler-compact--send-or-fail' and the orphan self-heal in
+`cc-butler-compact--active-p' close the paths this project has actually
+found (cc-butler#18), but neither is trusted to be the only one: this is
+the always-available last resort, so a full Emacs restart is never the ONLY
+way to regain the ability to compact DIR again.  Does not touch the
+terminal — only forgets the recorded state, whatever it currently is."
+  (interactive (list (cc-butler--dir-by-name
+                      (completing-read "Force-reset compaction state: "
+                                       (mapcar #'cc-butler--display-name
+                                               (hash-table-keys cc-butler-compact--state))
+                                       nil t))))
+  (when (gethash dir cc-butler-compact--state)
+    (cc-butler-compact--end-state dir)
+    (cc-butler--log "compact: %s │ state force-reset by operator"
+                    (cc-butler--display-name dir))
+    (message "cc-butler compact: %s — state force-reset"
+             (cc-butler--display-name dir))
+    t))
+
 (defun cc-butler-compact--schedule-poll (dir)
-  "Arrange the next poll tick for DIR."
-  (unless cc-butler-compact--inhibit-timers
-    (cc-butler-compact--set-state
-     dir :timer (run-with-timer cc-butler-compact-poll-interval nil
-                                #'cc-butler-compact--poll dir))))
+  "Arrange the next poll tick for DIR.
+Always leaves a truthy `:timer' behind — a real timer, or under
+`cc-butler-compact--inhibit-timers' a placeholder `t' — so
+`cc-butler-compact--orphaned-p' can tell \"still being watched\" from
+\"nothing left to ever revisit this\" the same way in tests as in
+production (mirrors `cc-butler-compact--queue-idle-poll')."
+  (cc-butler-compact--set-state
+   dir :timer (or (unless cc-butler-compact--inhibit-timers
+                    (run-with-timer cc-butler-compact-poll-interval nil
+                                    #'cc-butler-compact--poll dir))
+                  t)))
+
+(defun cc-butler-compact--send-or-fail (dir phase text)
+  "Send TEXT to DIR, or conclude PHASE with a loud, un-swallowed failure.
+Return non-nil on success.  `cc-butler--send-input' can throw (a wedged
+terminal, `cc-butler-session-io-timeout' firing, a vanished buffer) — every
+caller here runs AFTER `cc-butler-compact--set-state' has already recorded
+that a compaction is in flight, so a send that throws and is not caught
+would leave that lock held with no timer ever scheduled to revisit it: the
+session becomes permanently \"compaction already in flight\" until a full
+Emacs restart (cc-butler#18).  Fail through `--finish' instead — same as
+every other give-up path in this file — so the lock always releases and the
+failure always reaches the log, not just the caller's `condition-case'."
+  (condition-case err
+      (progn (cc-butler--send-input dir text t) t)
+    (error
+     (cc-butler-compact--finish dir "send failed while %s (%s) — %s"
+                                phase text (error-message-string err))
+     nil)))
 
 (defun cc-butler-compact--step (dir phase text)
   "Send TEXT to DIR, enter PHASE, and re-arm the clock."
   (cc-butler-compact--set-state dir :phase phase :sent-time (float-time)
                                 :answered nil)
-  (cc-butler--send-input dir text t)
-  (cc-butler--log "compact: %s │ %s (sent %s)"
-                  (cc-butler--display-name dir) phase text)
-  (cc-butler-compact--schedule-poll dir))
+  (when (cc-butler-compact--send-or-fail dir phase text)
+    (cc-butler--log "compact: %s │ %s (sent %s)"
+                    (cc-butler--display-name dir) phase text)
+    (cc-butler-compact--schedule-poll dir)))
 
 (defcustom cc-butler-compact-idle-wait 1800
   "Seconds to wait for a busy session to reach a safe waiting point.
@@ -547,10 +636,10 @@ and refuses when the current model cannot be named well enough to restore."
      ((and (not (plist-get st :answered))
            (cc-butler-compact--menu-p (cc-butler--read-output dir 40)))
       (cc-butler-compact--set-state dir :answered t)
-      (cc-butler--send-input dir cc-butler-compact-modal-answer t)
-      (cc-butler--log "compact: %s │ answered switch modal with %s"
-                      (cc-butler--display-name dir) cc-butler-compact-modal-answer)
-      (cc-butler-compact--schedule-poll dir))
+      (when (cc-butler-compact--send-or-fail dir 'switching cc-butler-compact-modal-answer)
+        (cc-butler--log "compact: %s │ answered switch modal with %s"
+                        (cc-butler--display-name dir) cc-butler-compact-modal-answer)
+        (cc-butler-compact--schedule-poll dir)))
      ((> (- (float-time) sent) cc-butler-compact-step-timeout)
       (cc-butler-compact--abort dir "model switch timed out"))
      (t (cc-butler-compact--schedule-poll dir)))))
@@ -593,8 +682,8 @@ and refuses when the current model cannot be named well enough to restore."
      ((and (not (plist-get st :answered))
            (cc-butler-compact--menu-p (cc-butler--read-output dir 40)))
       (cc-butler-compact--set-state dir :answered t)
-      (cc-butler--send-input dir cc-butler-compact-modal-answer t)
-      (cc-butler-compact--schedule-poll dir))
+      (when (cc-butler-compact--send-or-fail dir 'restoring cc-butler-compact-modal-answer)
+        (cc-butler-compact--schedule-poll dir)))
      ((> (- (float-time) sent) cc-butler-compact-step-timeout)
       (cc-butler-compact--finish
        dir "compacted (%s) but model NOT restored — session is on %s, wanted %s"

@@ -414,6 +414,113 @@ failure naming both the actual and the wanted model."
       (should (string-match-p "NOT restored" msg))
       (should (string-match-p "Sonnet-5" msg)))))
 
+(ert-deftest cc-butler-compact/send-failure-on-the-initial-switch-releases-the-lock ()
+  "A `cc-butler--send-input' failure (e.g. the 8s session-io-timeout firing on
+a wedged terminal) while sending the very first `/model' switch must not
+leave the compaction lock held forever with no timer left to ever revisit
+it — cc-butler#18's investigation found exactly this: `--step' set the state
+BEFORE the send, and an unguarded send that throws skips
+`--schedule-poll' entirely, so the session was compactable-never-again until
+a full Emacs restart.  The session must come back compactable, and the
+failure must be visible in the log, not silently swallowed."
+  (cc-butler-compact-test--with-session "w"
+    (let (logged)
+      (cl-letf (((symbol-function 'cc-butler--send-input)
+                 (lambda (&rest _)
+                   (error "Timed out sending input to session w after 8s")))
+                ((symbol-function 'cc-butler--log)
+                 (lambda (fmt &rest args) (push (apply #'format fmt args) logged))))
+        (ignore-errors (cc-butler-compact-session "w")))
+      (should-not (cc-butler-compact--active-p "w"))
+      (should-not (cc-butler-compact--blocked-reason "w"))
+      (should (cl-some (lambda (l) (string-match-p "send failed" l)) logged)))))
+
+(ert-deftest cc-butler-compact/send-failure-answering-the-switch-modal-releases-the-lock ()
+  "The same failure mode, one step later: the switch modal is on screen and
+answering it (\"1\") is what throws.  This send is NOT routed through
+`--step' — it is a second, inline `cc-butler--send-input' call inside
+`--poll-switch' — so it needs its own guard, not just one at the top."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--modal-screen)
+    (let (logged)
+      (cl-letf (((symbol-function 'cc-butler--send-input)
+                 (lambda (&rest _)
+                   (error "Timed out sending input to session w after 8s")))
+                ((symbol-function 'cc-butler--log)
+                 (lambda (fmt &rest args) (push (apply #'format fmt args) logged))))
+        (ignore-errors (cc-butler-compact--poll "w")))
+      (should-not (cc-butler-compact--active-p "w"))
+      (should (cl-some (lambda (l) (string-match-p "send failed" l)) logged)))))
+
+;;;; ------------------------------------------------------------------
+;;;; Operator escape: cc-butler-compact-reset
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/reset-clears-a-stuck-state-without-restarting-emacs ()
+  "The last-resort escape: even a state this test cannot explain how it got
+stuck (not just the two send-failure paths above) must be clearable without
+a full Emacs restart."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact--set-state "w" :phase 'switching :sent-time (float-time))
+    (should (cc-butler-compact--active-p "w"))
+    (should (cc-butler-compact-reset "w"))
+    (should-not (cc-butler-compact--active-p "w"))
+    (should-not (cc-butler-compact--blocked-reason "w"))))
+
+(ert-deftest cc-butler-compact/reset-on-a-clean-session-is-a-noop ()
+  "Resetting a session with nothing in flight does nothing and reports nil,
+not an error."
+  (cc-butler-compact-test--with-session "w"
+    (should-not (cc-butler-compact-reset "w"))))
+
+;;;; ------------------------------------------------------------------
+;;;; Orphaned-state self-heal
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/stale-timerless-idle-state-is-auto-reaped ()
+  "A state entry with no live timer, old beyond `cc-butler-compact-state-max-age',
+sitting on an idle buffer with no menu and nothing pending — the exact shape
+a lost-timer send failure leaves behind — is treated as orphaned and
+released the next time anything asks."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact--set-state
+     "w" :phase 'switching
+     :sent-time (- (float-time) (1+ cc-butler-compact-state-max-age)))
+    ;; No :timer key at all — exactly what a send failure before
+    ;; `--schedule-poll' leaves behind.
+    (should (cc-butler-compact--orphaned-p "w" (gethash "w" cc-butler-compact--state)))
+    (should-not (cc-butler-compact--active-p "w"))))
+
+(ert-deftest cc-butler-compact/genuinely-in-flight-compaction-is-never-reaped-by-age-alone ()
+  "The critical negative case: a compaction that is actually still running —
+a live timer scheduled — must NOT be reaped merely because it has been
+running a long time.  Reaping this would double-fire the driver on a
+session already mid-dance."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    ;; Old enough that the timerless heuristic alone would look orphaned...
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-state-max-age)))
+    ;; ...but a poll is still scheduled and watching it (a real timer in
+    ;; production; under `cc-butler-compact--inhibit-timers' its placeholder).
+    (should (plist-get (gethash "w" cc-butler-compact--state) :timer))
+    (should-not (cc-butler-compact--orphaned-p "w" (gethash "w" cc-butler-compact--state)))
+    (should (cc-butler-compact--active-p "w"))))
+
+(ert-deftest cc-butler-compact/stale-but-mid-menu-state-is-never-reaped ()
+  "Old and timerless is not enough on its own either: if the buffer shows a
+menu open (the driver may simply be slow to poll it, or — in production —
+this state is exactly what the send-or-fail fix now prevents from
+persisting) the buffer cross-check refuses to call it abandoned."
+  (cc-butler-compact-test--with-session "w"
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--modal-screen)
+    (cc-butler-compact--set-state
+     "w" :phase 'switching
+     :sent-time (- (float-time) (1+ cc-butler-compact-state-max-age)))
+    (should-not (cc-butler-compact--orphaned-p "w" (gethash "w" cc-butler-compact--state)))
+    (should (cc-butler-compact--active-p "w"))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Guards
 ;;;; ------------------------------------------------------------------

@@ -222,6 +222,17 @@ terminal for `cc-butler-cleanup-sentinel'."
   :type 'integer
   :group 'cc-butler)
 
+(defcustom cc-butler-cleanup-state-max-age 2400
+  "Seconds an in-flight cleanup state entry may sit with no live timer before
+the next access treats it as orphaned rather than merely slow (see
+`cc-butler-cleanup--orphaned-p').  A generous multiple of
+`cc-butler-cleanup-completion-timeout' (600s) — a cleanup actually
+progressing is cleaned up by its own poll long before this ever matters;
+this only fires for an entry whose timer was lost outright (a send that
+threw before `--schedule-poll' was ever reached, cc-butler#18)."
+  :type 'number
+  :group 'cc-butler)
+
 ;;;; --- site extension hooks ------------------------------------------
 
 (defcustom cc-butler-cleanup-after-externalize-functions nil
@@ -608,8 +619,36 @@ Keys: :phase (`externalizing'|`verifying'|`teardown') :tier :force :sent-time
 (defvar cc-butler-cleanup--inhibit-timers nil
   "When non-nil, do not schedule real poll timers (tests drive polls manually).")
 
+(defun cc-butler-cleanup--orphaned-p (dir st)
+  "Non-nil when ST (DIR's in-flight cleanup state) looks abandoned.
+Mirrors `cc-butler-compact--orphaned-p'.  Age alone is refused as a signal
+on purpose — it would happily reap a cleanup genuinely still externalizing.
+Requires ALL of: no `:timer' recorded (a poll is scheduled — real or, under
+`cc-butler-cleanup--inhibit-timers', its test placeholder — means this
+entry is still being watched and will be concluded on its own), old enough
+that a live cleanup would long since have timed out, AND the terminal
+itself corroborates abandonment — the session sitting at an ordinary idle
+waiting point, which a cleanup actually mid-flight (typing, watching for
+the sentinel) would not be."
+  (let ((sent (plist-get st :sent-time)))
+    (and (numberp sent)
+         (not (plist-get st :timer))
+         (> (- (float-time) sent) cc-butler-cleanup-state-max-age)
+         (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
+           (or (not (buffer-live-p buf))
+               (cc-butler--waiting-p dir))))))
+
 (defun cc-butler-cleanup--active-p (dir)
-  "Non-nil when a cleanup is already in flight for DIR."
+  "Non-nil when a cleanup is already in flight for DIR.
+Lazily reaps an orphaned entry first (`cc-butler-cleanup--orphaned-p'), so a
+state stranded with no timer left to ever revisit it does not block this
+session's cleanup forever."
+  (when-let ((st (gethash dir cc-butler-cleanup--state)))
+    (when (cc-butler-cleanup--orphaned-p dir st)
+      (cc-butler--log "cleanup: %s │ orphaned state auto-cleared (stale %ss, no timer, idle buffer)"
+                      (cc-butler--display-name dir)
+                      (round (- (float-time) (plist-get st :sent-time))))
+      (cc-butler-cleanup--end-state dir)))
   (and (gethash dir cc-butler-cleanup--state) t))
 
 (defun cc-butler-cleanup--set-state (dir &rest kvs)
@@ -633,6 +672,43 @@ Keys: :phase (`externalizing'|`verifying'|`teardown') :tier :force :sent-time
     (cc-butler--maybe-refresh)
     (message "cc-butler cleanup: %s — %s" (cc-butler--display-name dir) msg)
     msg))
+
+(defun cc-butler-cleanup--send-or-fail (dir phase text)
+  "Send TEXT to DIR, or conclude PHASE with a loud, un-swallowed failure.
+Return non-nil on success.  Mirrors `cc-butler-compact--send-or-fail'
+(cc-butler#18): every caller here runs after `cc-butler-cleanup--set-state'
+already recorded the cleanup as in flight, so an uncaught send failure would
+strand that lock forever with no timer left to ever revisit it.  Fail
+through `--finish' instead, so the lock always releases and the failure
+always reaches the log."
+  (condition-case err
+      (progn (cc-butler--send-input dir text t) t)
+    (error
+     (cc-butler-cleanup--finish dir "send failed during %s (%s) — %s"
+                                phase text (error-message-string err))
+     nil)))
+
+;;;###autoload
+(defun cc-butler-cleanup-reset (dir)
+  "Forcibly clear DIR's in-flight cleanup state — an operator escape.
+Mirrors `cc-butler-compact-reset' (cc-butler#18): `--send-or-fail' and the
+orphan self-heal in `cc-butler-cleanup--active-p' close the paths this
+project has actually found, but neither is trusted to be the only one —
+this is the always-available last resort, so a full Emacs restart is never
+the ONLY way to regain the ability to clean up DIR again.  Does not touch
+the terminal or the workspace — only forgets the recorded state."
+  (interactive (list (cc-butler--dir-by-name
+                      (completing-read "Force-reset cleanup state: "
+                                       (mapcar #'cc-butler--display-name
+                                               (hash-table-keys cc-butler-cleanup--state))
+                                       nil t))))
+  (when (gethash dir cc-butler-cleanup--state)
+    (cc-butler-cleanup--end-state dir)
+    (cc-butler--log "cleanup: %s │ state force-reset by operator"
+                    (cc-butler--display-name dir))
+    (message "cc-butler cleanup: %s — state force-reset"
+             (cc-butler--display-name dir))
+    t))
 
 ;;;###autoload
 (defun cc-butler-session-cleanup (dir &optional tier force)
@@ -663,20 +739,25 @@ enforced in the core here, not only in the picker."
            (instruction (funcall cc-butler-cleanup-externalize-function session)))
       (cc-butler-cleanup--set-state dir :phase 'externalizing :tier tier
                                     :force force :sent-time (float-time))
-      (cc-butler--send-input dir instruction t)
-      (cc-butler--log "cleanup: %s │ externalizing (tier %s%s)"
-                      (cc-butler--display-name dir) tier
-                      (if force ", FORCE" ""))
-      (cc-butler-cleanup--schedule-poll dir)
-      (message "cc-butler cleanup: %s — externalizing…"
-               (cc-butler--display-name dir)))))
+      (when (cc-butler-cleanup--send-or-fail dir 'externalizing instruction)
+        (cc-butler--log "cleanup: %s │ externalizing (tier %s%s)"
+                        (cc-butler--display-name dir) tier
+                        (if force ", FORCE" ""))
+        (cc-butler-cleanup--schedule-poll dir)
+        (message "cc-butler cleanup: %s — externalizing…"
+                 (cc-butler--display-name dir))))))
 
 (defun cc-butler-cleanup--schedule-poll (dir)
-  "Arrange the next externalization-completion poll for DIR."
-  (unless cc-butler-cleanup--inhibit-timers
-    (cc-butler-cleanup--set-state
-     dir :timer (run-with-timer cc-butler-cleanup-poll-interval nil
-                                #'cc-butler-cleanup--poll dir))))
+  "Arrange the next externalization-completion poll for DIR.
+Always leaves a truthy `:timer' behind — a real timer, or under
+`cc-butler-cleanup--inhibit-timers' a placeholder `t' — so
+`cc-butler-cleanup--orphaned-p' can tell \"still being watched\" from
+\"nothing left to ever revisit this\" the same way in tests as production."
+  (cc-butler-cleanup--set-state
+   dir :timer (or (unless cc-butler-cleanup--inhibit-timers
+                    (run-with-timer cc-butler-cleanup-poll-interval nil
+                                    #'cc-butler-cleanup--poll dir))
+                  t)))
 
 (defun cc-butler-cleanup--poll (dir)
   "One poll tick: advance to verify when done, abort on timeout, else re-poll."
@@ -739,8 +820,8 @@ irreversible and routes through the shared `cc-butler--teardown-workspace' with
 its git-safety audit + explicit human confirmation."
   (pcase tier
     ('clear
-     (cc-butler--send-input dir cc-butler-cleanup-clear-command t)
-     (cc-butler-cleanup--finish dir "externalized, verified, cleared (dir kept)"))
+     (when (cc-butler-cleanup--send-or-fail dir 'teardown cc-butler-cleanup-clear-command)
+       (cc-butler-cleanup--finish dir "externalized, verified, cleared (dir kept)")))
     ('delete-dir
      (let ((topic (plist-get session :topic-dir)))
        ;; Second, independent guarantee: git-clean (the first is verify above).
