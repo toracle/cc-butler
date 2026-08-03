@@ -127,15 +127,24 @@ on every redraw when titles change rapidly.")
 (defun cc-butler--osc-title (buffer)
   "Return the live terminal title of BUFFER (ghostel OSC 2), or nil.
 claude-code-ide disables ghostel's title-based *renaming*, but the
-terminal still tracks the title; read it straight from the term object."
+terminal still tracks the title.  WHERE it keeps it differs by ghostel
+version: some builds expose an accessor `ghostel--get-title' on the term
+object, current ones record it in the buffer-local `ghostel--title' (see
+`ghostel--set-title', which sets that variable before consulting the
+rename hook).  Probe both, because probing only one fails *silently* —
+the activity column just comes out empty, which reads as \"this session
+has no task\" rather than \"cc-butler cannot see the task\"."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (and (boundp 'ghostel--term) ghostel--term
-                 (fboundp 'ghostel--get-title))
-        (let ((title (ignore-errors (ghostel--get-title ghostel--term))))
-          (and (stringp title)
-               (not (string-empty-p (string-trim title)))
-               (string-trim title)))))))
+      (let ((title (or (and (bound-and-true-p ghostel--term)
+                            (fboundp 'ghostel--get-title)
+                            (ignore-errors
+                              (funcall 'ghostel--get-title
+                                       (bound-and-true-p ghostel--term))))
+                       (bound-and-true-p ghostel--title))))
+        (and (stringp title)
+             (not (string-empty-p (string-trim title)))
+             (string-trim title))))))
 
 (defcustom cc-butler-enable-forge t
   "When non-nil, fetch PR info via the `gh' CLI asynchronously."
