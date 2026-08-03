@@ -46,8 +46,34 @@ against.
    that same channel — and that stance is *correct* worker behavior. Stop sending; route the principal's own
    voice. See [[relay-safe-worker-decisions]].
 
+**⚠ Item 5 was right about the diagnosis and wrong about the remedy — proven four days later.** "Stop sending,
+route the principal's own voice" is what the steward did on 08-03, and on **08-04 the worker was still frozen**,
+still holding a stash, an unresumed task, and an untrusted staging token, still saying it awaited *"direct word
+on the authorization question."* The closure had been correct, complete, and on record the entire time. Routing
+a voice **is still a relay hop** — it asks the distrusting party to trust a different messenger, which is the
+one thing its stance exists to refuse. Escalating trust through the untrusted channel cannot work by
+construction.
+
+**The remedy is to stop relaying the claim and hand over a reference the worker can resolve itself.** The
+decision id `20260731T230441-873-0104` is not an assertion about what 정수님 said — it is an address. The
+worker calls `resolve_reference` on it and reads the principal's verbatim answer out of the authenticated
+channel, with no trust in the steward required at any point. A distrust loop does not break on emphasis; it
+breaks on **independent verifiability**. Note the steward must resolve it first too — telling a hardened worker
+to trust a reference you have not opened yourself repeats the original error one level up.
+
+So amend item 5: **when a worker has hardened, send it the ref id, not the news.** Say plainly that it should
+not take your word for it, name the tool, and let it verify. This is why decisions carry resolvable ids at all —
+[[relay-fidelity-provenance]] (verbatim SSoT plus resolvable references) is not documentation hygiene, it is the
+mechanism that makes a closure land on someone who has correctly stopped believing you.
+
+**And note what this costs when missed.** The closure was findable, the id was in the handoff, and the worker
+sat frozen for four days anyway — not because anyone reasoned badly, but because everyone kept trying to *tell*
+it. Cost of the fix: one `resolve_reference` call, by either party, at any point in those four days.
+
 Related: [[subagent-scope-is-not-self-enforcing]] (what remained genuinely open here — post-hoc authorization
-does not make a blown scope sound), [[steward-compaction-erases-worker-memory-of-own-work]].
+does not make a blown scope sound), [[steward-compaction-erases-worker-memory-of-own-work]],
+[[relay-fidelity-provenance]] (the reference mechanism this depends on),
+[[merging-agent-results-must-keep-per-claim-provenance]].
 
 **SPT:** the habit is *before investigating a security report, spend one search asking "has the principal
 already answered this?" — and when you close something, land it where the next agent will trip over it.*
