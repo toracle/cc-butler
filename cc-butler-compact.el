@@ -866,7 +866,7 @@ the same state under test as in production."
                                    (error-message-string err))))))))))
 
 ;;;###autoload
-(defun cc-butler-compact-session (dir)
+(defun cc-butler-compact-session (dir &optional ignore-busy)
   "Compact the context of session DIR, asynchronously.
 
 Switches to `cc-butler-compact-model', answers the prompt-cache
@@ -877,7 +877,14 @@ log and the echo area.
 The butler and the steward ARE valid targets — they are the sessions this
 exists for.  Refuses when the target is busy, has a menu open, or has
 unsubmitted text in its input box (see `cc-butler-compact--blocked-reason'),
-and refuses when the current model cannot be named well enough to restore."
+and refuses when the current model cannot be named well enough to restore.
+
+With IGNORE-BUSY, start even though DIR is mid-turn — the caller is
+vouching this is one of the two cases where waiting is wrong: an
+over-threshold sweep (the session will die anyway if it waits) or an
+operator's explicit \"do it now\".  Every OTHER guard still applies exactly
+as without it — a menu open or unsubmitted input still refuses outright,
+because those do not resolve on their own the way busy does."
   (interactive
    (list (let* ((all (mapcar (lambda (s) (cc-butler--display-name (plist-get s :dir)))
                              (cc-butler--sessions)))
@@ -885,7 +892,7 @@ and refuses when the current model cannot be named well enough to restore."
            (cl-find-if (lambda (d) (equal (cc-butler--display-name d) pick))
                        (mapcar (lambda (s) (plist-get s :dir)) (cc-butler--sessions))))))
   (let ((name (cc-butler--display-name dir)))
-    (when-let ((why (cc-butler-compact--blocked-reason dir)))
+    (when-let ((why (cc-butler-compact--blocked-reason dir ignore-busy)))
       (user-error "Refusing to compact %s: %s" name why))
     ;; Capture the model BEFORE anything is typed — after the switch the
     ;; original is unrecoverable, and an unrestorable session is worse than
@@ -1112,17 +1119,23 @@ The butler and the steward are included — they are the long-lived sessions
 that grow without bound, and excluding them would leave the biggest context
 in the fleet as the one nobody may touch.
 
-Each candidate is guarded independently, so a busy or menu-blocked session
-is skipped with a reason rather than blocking the sweep.  Returns the list
-of dirs actually started."
+Each candidate is guarded independently, so a menu-blocked session or one
+with unsubmitted input is skipped with a reason rather than blocking the
+sweep.  Busy is NOT a reason to skip here: every dir in this sweep is
+already over the compaction threshold by construction
+(`cc-butler-compact-candidates'), so waiting for it to go idle does not
+make it safer — a session that never idles (an attention hook resetting
+its idle window every turn) simply never gets compacted and eventually
+dies of its own context size regardless.  Returns the list of dirs
+actually started."
   (interactive)
   (let (started skipped)
     (dolist (dir (cc-butler-compact-candidates))
-      (let ((why (cc-butler-compact--blocked-reason dir)))
+      (let ((why (cc-butler-compact--blocked-reason dir t)))
         (if why
             (push (format "%s (%s)" (cc-butler--display-name dir) why) skipped)
           (condition-case err
-              (progn (cc-butler-compact-session dir) (push dir started))
+              (progn (cc-butler-compact-session dir t) (push dir started))
             (error
              (push (format "%s (%s)" (cc-butler--display-name dir)
                            (error-message-string err))
@@ -1181,8 +1194,11 @@ see `cc-butler-compact--blocked-reason'."
   (concat
    "- compact_session NAME — shrink one session in place, keeping it alive and working.\n"
    "  Safe to call on a session that is mid-turn: it queues and starts when that turn ends.\n"
+   "  If it never goes idle (a notification hook keeps re-arming its idle window), call it\n"
+   "  again with force=true to ignore busy and start immediately — an explicit \"do it now\".\n"
    "  You may target the butler, the steward, and yourself.\n"
-   "- compact_large_sessions — the same sweep across everything over the threshold.\n"
+   "- compact_large_sessions — the same sweep across everything over the threshold, which\n"
+   "  already ignores busy (an over-threshold session dies waiting either way).\n"
    "- close_topic NAME — for a WORKER whose work is finished and pushed: kills the session\n"
    "  and deletes its workspace outright, reclaiming the whole context rather than shrinking\n"
    "  it. DESTRUCTIVE and gated on a git-safety audit; never the butler or steward.\n"
@@ -1344,18 +1360,29 @@ the ceiling with nobody reading."
               (format "\n\nThreshold: %.0fk. A context figure is what the session's statusline last reported, not a live measurement; \"?\" means the statusline is not installed there."
                       (/ cc-butler-compact-threshold 1000.0))))))
 
-(defun cc-butler-tool-compact-session (name)
-  "MCP tool: compact the session called NAME, waiting for it to go idle."
+(defun cc-butler-tool-compact-session (name &optional force)
+  "MCP tool: compact the session called NAME.
+Without FORCE, waits for a safe idle point before typing anything — the
+routine path, right for a session queueing its own compaction.  With
+FORCE, ignore busy and start immediately: for the case where an operator
+has explicitly said to do this NOW, not whenever the session next idles —
+waiting is the wrong answer when nothing is ever going to make it idle
+(an attention hook re-arming the idle window every turn, for instance)."
   (let ((dir (cc-butler--dir-by-name name)))
     (unless dir
       (error "No live session named %S.  Use session_status for names" name))
-    (pcase (cc-butler-compact-session-when-idle dir)
-      ('started
-       (format "Compaction started for %s — it runs asynchronously (switch to %s, /compact, then restore the original model). Do not send it anything until it finishes; poll session_status to watch the context drop and the model come back."
-               name cc-butler-compact-model))
-      (_
-       (format "Compaction QUEUED for %s — it is mid-turn, so nothing has been typed yet. It will start on its own the moment that turn ends and the session is safely idle, and will give up after %d minutes. If you queued this for YOURSELF, just finish your turn normally: the compaction runs once you stop. Poll session_status to watch it happen."
-               name (round (/ cc-butler-compact-idle-wait 60)))))))
+    (if force
+        (progn
+          (cc-butler-compact-session dir t)
+          (format "Compaction FORCED for %s, ignoring busy — it runs asynchronously (switch to %s, /compact, then restore the original model). Do not send it anything until it finishes; poll session_status to watch the context drop and the model come back."
+                  name cc-butler-compact-model))
+      (pcase (cc-butler-compact-session-when-idle dir)
+        ('started
+         (format "Compaction started for %s — it runs asynchronously (switch to %s, /compact, then restore the original model). Do not send it anything until it finishes; poll session_status to watch the context drop and the model come back."
+                 name cc-butler-compact-model))
+        (_
+         (format "Compaction QUEUED for %s — it is mid-turn, so nothing has been typed yet. It will start on its own the moment that turn ends and the session is safely idle, and will give up after %d minutes. If it never goes idle, call again with force=true rather than waiting indefinitely. If you queued this for YOURSELF, just finish your turn normally: the compaction runs once you stop. Poll session_status to watch it happen."
+                 name (round (/ cc-butler-compact-idle-wait 60))))))))
 
 (defun cc-butler-tool-compact-large-sessions ()
   "MCP tool: compact every session over the threshold, butler/steward included."
@@ -1385,9 +1412,12 @@ the ceiling with nobody reading."
   (claude-code-ide-make-tool
    :function #'cc-butler-tool-compact-session
    :name "compact_session"
-   :description "Compact one session's context: switches it to a cheap model, answers the prompt-cache confirmation, runs /compact, and restores the original model. Driven entirely from elisp — do NOT try to type these commands into a session yourself; each step needs its own submission and the confirmation is a modal. You MAY target the butler, the steward, and YOURSELF: if the target is mid-turn the compaction is queued and starts by itself once that turn ends, so calling this on yourself works — queue it and finish your turn normally. It still refuses outright if a menu is open or someone has genuinely typed something into the input box, since waiting does not fix those."
+   :description "Compact one session's context: switches it to a cheap model, answers the prompt-cache confirmation, runs /compact, and restores the original model. Driven entirely from elisp — do NOT try to type these commands into a session yourself; each step needs its own submission and the confirmation is a modal. You MAY target the butler, the steward, and YOURSELF: if the target is mid-turn the compaction is queued and starts by itself once that turn ends, so calling this on yourself works — queue it and finish your turn normally. It still refuses outright if a menu is open or someone has genuinely typed something into the input box, since waiting does not fix those. Pass force=true ONLY when an operator has explicitly said to compact this session right now, not for the routine case — it ignores busy and starts immediately instead of queuing, which matters for a session whose idle window keeps getting reset by something other than itself (e.g. a notification hook) and so would otherwise never idle."
    :args '((:name "name" :type string
-                  :description "Target session name, as shown by session_status.")))
+                  :description "Target session name, as shown by session_status.")
+           (:name "force" :type boolean
+                  :description "Ignore busy and start immediately, even mid-turn. Only for an operator's explicit \"do it now\" — every other guard (open menu, unsubmitted input, unrestorable model) still refuses outright."
+                  :optional t)))
 
   (claude-code-ide-make-tool
    :function #'cc-butler-tool-compact-large-sessions
