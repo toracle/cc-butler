@@ -337,10 +337,14 @@ Locations are derived from the butler home (the shared operational home)."
                        " operating discipline.\n")
                (abbreviate-file-name mem)))
      (concat "- **operating-principle source of truth:** the cc-butler repo store"
-             " `governance/`\n  (one `.md` per principle, runtime-neutral). The"
-             " shared memory above is a\n  *generated cache* of it — route a new"
-             " operational learning by editing the\n  store + `M-x"
-             " cc-butler-governance-regenerate`, not by hand-editing memory.\n")
+             " `governance/`\n  (one `.md` per principle, runtime-neutral). `M-x"
+             " cc-butler-governance-regenerate`\n  refreshes each note's cached"
+             " *body* from the store, but it does NOT update\n  `MEMORY.md`'s"
+             " index (tracked: cc-butler#36) — a regenerated note that has no"
+             " line\n  in `MEMORY.md` exists on disk but is never recalled."
+             " Route a new operational\n  learning by editing the store, running"
+             " regenerate, AND adding its index line\n  to `MEMORY.md` by hand —"
+             " all three, until #36 closes.\n")
      "\n")))
 
 (defun cc-butler--roles-metaphor (which)
