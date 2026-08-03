@@ -205,6 +205,15 @@ should have to remember."
   (mapcar (lambda (f) (file-name-sans-extension (file-name-nondirectory f)))
           (cc-butler-governance-principles)))
 
+(defun cc-butler-governance--unindexed-names ()
+  "Store slugs that currently have no `MEMORY.md' line.
+Zero here means every store note is actually recallable; non-zero is the
+gap this whole file exists to close (cc-butler#36) — safe to call any time,
+not only right after a regenerate, so a forgotten sync still shows up."
+  (let ((index (cc-butler-governance--memory-index-file)))
+    (seq-remove (lambda (slug) (cc-butler-governance--index-has-slug-p index slug))
+                (cc-butler-governance-names))))
+
 (defun cc-butler-governance--memory-note (slug)
   "Absolute path of the generated memory note for SLUG."
   (expand-file-name (concat cc-butler-governance--name-prefix slug ".md")
@@ -296,13 +305,40 @@ source of truth."
              (string-join (plist-get res :names) ", "))
      "\nTo revise one of these, call this again with that same name — it is overwritten in place.")))
 
+(defun cc-butler-tool-regenerate-governance ()
+  "MCP tool: bare-trigger governance regeneration, no arguments.
+
+For the case `record_principle' doesn't cover: a note written straight to
+the store with Write/Edit (its frontmatter controlled by hand, not via the
+record tool). That write never calls regenerate itself, so the note can sit
+in the store, fully valid, and never reach the cache or the MEMORY.md index
+until something calls this. Call it once after any such direct write.
+
+Also useful with nothing new to sync: it reports how many store notes are
+CURRENTLY un-indexed, so running it any time surfaces a forgotten sync
+instead of staying silent — the same silent-gap failure mode this file
+exists to close (cc-butler#36)."
+  (let* ((before (cc-butler-governance--unindexed-names))
+         (n (cc-butler-governance-regenerate))
+         (after (cc-butler-governance--unindexed-names)))
+    (concat
+     (format "Regenerated %d principle(s) from the store.\n" n)
+     (if before
+         (format "Merged %d previously un-indexed note(s) into MEMORY.md: %s\n"
+                 (length before) (string-join before ", "))
+       "Nothing was missing from the index before this call.\n")
+     (if after
+         (format "STILL %d un-indexed after regenerating: %s — these notes are cached but will not be recalled by any session; investigate cc-butler-governance--sync-index.\n"
+                 (length after) (string-join after ", "))
+       "Index check: 0 un-indexed notes remain.\n"))))
+
 ;; Idempotent registration.
 (when (fboundp 'claude-code-ide-make-tool)
   (setq claude-code-ide-mcp-server-tools
         (seq-remove
          (lambda (spec)
            (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
-                   '("record_principle")))
+                   '("record_principle" "regenerate_governance")))
          claude-code-ide-mcp-server-tools))
   (claude-code-ide-make-tool
    :function #'cc-butler-tool-record-principle
@@ -315,7 +351,12 @@ source of truth."
            (:name "body" :type "string" :required t
             :description "The principle itself, in Markdown. Follow the store's shape: what the rule is, then **Why:** with the concrete incident that motivated it, then **How to apply:**.")
            (:name "type" :type "string" :required nil
-            :description "Frontmatter metadata type. Defaults to feedback, which is what every principle in the store currently uses."))))
+            :description "Frontmatter metadata type. Defaults to feedback, which is what every principle in the store currently uses.")))
+  (claude-code-ide-make-tool
+   :function #'cc-butler-tool-regenerate-governance
+   :name "regenerate_governance"
+   :description "Bare-trigger governance cache/index regeneration, no arguments. Call this once after writing directly to a governance/*.md store file with Write/Edit (i.e. NOT through record_principle) — that direct write is never followed by a regenerate on its own, so the note can sit in the store and never reach the cache or the MEMORY.md index until this is called. Safe to call any time with nothing new, too: it reports exactly how many store notes are currently un-indexed (0 means fully synced), so it also works as a standalone check for a forgotten sync."
+   :args nil))
 
 (provide 'cc-butler-governance)
 ;;; cc-butler-governance.el ends here

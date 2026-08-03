@@ -258,5 +258,40 @@ a placeholder hook instead of crashing the whole regenerate call."
            (text (with-temp-buffer (insert-file-contents index) (buffer-string))))
       (should (string-match-p "\\[raw-rule\\](butler-raw-rule\\.md)" text)))))
 
+;;;; ------------------------------------------------------------------
+;;;; Bare-trigger regeneration for direct writes (cc-butler#36 gap a)
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/regenerate-tool-syncs-a-directly-written-note ()
+  "A note written straight to the store (Write/Edit, bypassing
+record_principle) never calls regenerate itself. This tool is the bare
+trigger an agent calls after that write — it must land the note in BOTH
+the cache and the MEMORY.md index, and say so in its report."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "direct-write-rule.md" store)
+      (insert (cc-butler-governance--render
+               "direct-write-rule" "written directly, not via record_principle"
+               "body" "feedback")))
+    (let ((out (cc-butler-tool-regenerate-governance)))
+      (should (file-exists-p (expand-file-name "butler-direct-write-rule.md" mem)))
+      (let ((index-text (with-temp-buffer
+                          (insert-file-contents (expand-file-name "MEMORY.md" mem))
+                          (buffer-string))))
+        (should (string-match-p "\\[direct-write-rule\\](butler-direct-write-rule\\.md)"
+                                index-text)))
+      (should (string-match-p "direct-write-rule" out)))))
+
+(ert-deftest cc-butler-governance/regenerate-tool-reports-zero-gap-when-current ()
+  "Calling the tool with nothing new to sync must say so plainly (0 remaining),
+not just silently succeed — that visibility is the point: if a caller forgets
+to invoke this after a direct write, running it later still surfaces whether
+a gap exists right now."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
+    (cc-butler-tool-regenerate-governance)
+    (let ((out (cc-butler-tool-regenerate-governance)))
+      (should (string-match-p "0 .*un-indexed" out)))))
+
 (provide 'cc-butler-governance-test)
 ;;; cc-butler-governance-test.el ends here
