@@ -1012,6 +1012,30 @@ neither prompt."
     (should-error (cc-butler-compact-session "w") :type 'user-error)
     (should (equal (length cc-butler-compact-test--sent) 1))))
 
+(ert-deftest cc-butler-compact/ignore-busy-arg-starts-through-a-busy-session ()
+  "cc-butler-compact-session's optional IGNORE-BUSY threads straight into
+`cc-butler-compact--blocked-reason' -- the bypass the sweep and the force
+path both rely on to act on a session whose idle window never comes (an
+attention hook re-arming it every turn, e.g.), rather than waiting for
+something that will not happen."
+  (cc-butler-compact-test--with-session "w"
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (float-time))))   ; wrote just now -> busy
+      (should-error (cc-butler-compact-session "w") :type 'user-error)
+      (should-not cc-butler-compact-test--sent)
+      (cc-butler-compact-session "w" t)
+      (should cc-butler-compact-test--sent)
+      (should (cc-butler-compact--active-p "w")))))
+
+(ert-deftest cc-butler-compact/ignore-busy-does-not-open-the-menu-guard ()
+  "IGNORE-BUSY excuses only busy.  An open menu still refuses outright even
+while forcing through a busy session -- Enter would still answer a wizard
+neither of us intended to answer, and idling (or forcing) never closes it."
+  (cc-butler-compact-test--with-session "w"
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--modal-screen)
+    (should-error (cc-butler-compact-session "w" t) :type 'user-error)
+    (should-not cc-butler-compact-test--sent)))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Fleet sweep
 ;;;; ------------------------------------------------------------------
@@ -1108,21 +1132,47 @@ size is not an excuse to act."
       (should (equal (cc-butler-compact-candidates) '("/b/"))))))
 
 (ert-deftest cc-butler-compact/sweep-skips-blocked-sessions-without-stopping ()
-  "One busy session must not abort the sweep; it is skipped with a reason
-while the others proceed."
+  "One menu-blocked session must not abort the sweep; it is skipped with a
+reason while the others proceed.  (Busy is deliberately NOT the example
+here any more -- see `cc-butler-compact/sweep-ignores-busy-since-candidates-
+are-already-over-threshold' -- since the sweep now ignores busy.)"
   (let ((cc-butler-compact-threshold 100000)
         (started nil))
     (cl-letf (((symbol-function 'cc-butler--sessions)
-               (lambda () '((:dir "/busy/") (:dir "/ok/"))))
+               (lambda () '((:dir "/blocked/") (:dir "/ok/"))))
               ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 450000))
               ((symbol-function 'cc-butler--display-name) (lambda (d) d))
               ((symbol-function 'cc-butler--log) #'ignore)
               ((symbol-function 'cc-butler-compact--blocked-reason)
-               (lambda (d) (and (equal d "/busy/") "session is busy")))
+               (lambda (d &optional _ignore-busy)
+                 (and (equal d "/blocked/") "an interactive menu/wizard is open")))
               ((symbol-function 'cc-butler-compact-session)
-               (lambda (d) (push d started))))
+               (lambda (d &optional _ignore-busy) (push d started))))
       (cc-butler-compact-large-sessions)
       (should (equal started '("/ok/"))))))
+
+(ert-deftest cc-butler-compact/sweep-ignores-busy-since-candidates-are-already-over-threshold ()
+  "Every dir here is over the compaction threshold by construction
+\(`cc-butler-compact-candidates'); waiting for busy to resolve does not make an
+over-threshold session safer -- it just means a session whose idle window
+never comes (an attention hook re-arming it every turn) never gets compacted
+and dies of its own size regardless.  The sweep must pass ignore-busy to both
+the guard check and the start call."
+  (let ((cc-butler-compact-threshold 100000)
+        (started nil))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () '((:dir "/busy/"))))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 450000))
+              ((symbol-function 'cc-butler--display-name) (lambda (d) d))
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler-compact--blocked-reason)
+               (lambda (d &optional ignore-busy)
+                 (and (equal d "/busy/") (not ignore-busy)
+                      "session is busy — transcript active within the idle window")))
+              ((symbol-function 'cc-butler-compact-session)
+               (lambda (d &optional ignore-busy) (when ignore-busy (push d started)))))
+      (cc-butler-compact-large-sessions)
+      (should (equal started '("/busy/"))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; MCP tools
@@ -1194,6 +1244,24 @@ failure and gets retried forever."
     (let ((out (cc-butler-tool-compact-session "butler")))
       (should (string-match-p "QUEUED" out))
       (should (string-match-p "finish your turn" out)))))
+
+(ert-deftest cc-butler-compact/compact-tool-force-bypasses-the-idle-wait ()
+  "force=t is the operator's explicit \"do it now\": it must call
+cc-butler-compact-session directly with ignore-busy, bypassing
+cc-butler-compact-session-when-idle's queue-and-wait entirely -- that queue
+is exactly what fails to resolve when a session's idle window keeps being
+reset by something other than itself (a notification hook, e.g.)."
+  (let (called-when-idle target ignore-busy-arg)
+    (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/w/"))
+              ((symbol-function 'cc-butler-compact-session-when-idle)
+               (lambda (_d) (setq called-when-idle t) 'started))
+              ((symbol-function 'cc-butler-compact-session)
+               (lambda (d &optional ib) (setq target d ignore-busy-arg ib))))
+      (let ((out (cc-butler-tool-compact-session "worker" t)))
+        (should-not called-when-idle)
+        (should (equal target "/w/"))
+        (should ignore-busy-arg)
+        (should (string-match-p "FORCED" out))))))
 
 (ert-deftest cc-butler-compact/compact-tool-errors-on-unknown-name ()
   "An unknown name is an error pointing at the tool that lists valid ones —
