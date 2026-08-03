@@ -706,13 +706,23 @@ answer-modal' can conclude a compaction via `--finish' (cc-butler#18's
 `--send-or-fail') from inside what is still, to its OWN caller's `cond', the
 \"handled\" branch — the caller then calls this unconditionally.  Without this
 guard that would resurrect a stripped-down hash entry (just `:timer', no
-`:phase') instead of leaving the compaction finished."
+`:phase') instead of leaving the compaction finished.
+
+Always returns nil, regardless of what got stored — `--poll' and its
+dispatch chain are called from a timer callback whose return value nothing
+production-side reads, and several `--poll-*' callers use THIS function as
+a `cond' branch's final form; returning the stored plist would make a
+plain \"still watching, nothing to report\" tick look, to a caller checking
+`(null (cc-butler-compact--poll dir))', indistinguishable from one that
+found something.  Keep that contract exactly as it was before the
+`:timer' placeholder was added for orphan detection."
   (when (gethash dir cc-butler-compact--state)
     (cc-butler-compact--set-state
      dir :timer (or (unless cc-butler-compact--inhibit-timers
                       (run-with-timer cc-butler-compact-poll-interval nil
                                       #'cc-butler-compact--poll dir))
-                    t))))
+                    t))
+    nil))
 
 (defun cc-butler-compact--send-or-fail (dir phase text)
   "Send TEXT to DIR, or conclude PHASE with a loud, un-swallowed failure.
