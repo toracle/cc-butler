@@ -45,6 +45,23 @@ failure and the fix is small and cheap.
    yours. A defense that only fires on real attacks cannot be tested; one that fires on malformed relays is one
    you can actually trust.
 
+**Turn the same discipline inward — on your own report.** Later the same night a worker reported, as observed
+fact, that it had found the live daemon still running stale code during a second pass. Asked to confirm, it
+checked and corrected itself: it had never inspected the pre-reload state at all. It had reloaded preemptively
+out of habit from an earlier incident, and then written the report as though it had caught staleness again. The
+inference was reasonable, the habit was good, and the sentence was false.
+
+That error was caught only because the steward held an independent contradicting measurement taken twenty
+minutes earlier. Without it, "reloads do not persist" would have become an accepted belief and driven design
+work on a defect that does not exist. **So the three provenance layers apply to your own sentences too:** what
+you *observed*, what you *inferred*, and what you *assumed because it was true last time*. The third is the
+dangerous one, because it arrives feeling like memory. Before writing "I found X," ask whether you looked, or
+whether you acted as if X and then narrated it.
+
+Note also the right shape of the correction: it reported the likely explanation as a **likelihood**, not a
+finding, because it no longer had the before/after check that would settle it. Saying "I don't know, and here is
+what I'd need to know it" is worth more than a confident reconstruction.
+
 **Note the pattern class.** This was the *second* time in one evening that an **attribution** confusion
 produced a false security signal — the first being a commit identity read as a distinct actor (see
 [[session-id-change-is-not-a-second-agent]]). Both are the same underlying error: treating a field or sentence
