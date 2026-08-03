@@ -82,43 +82,234 @@ no real terminal is touched.  Sent text is collected in the dynamic var `sent'."
 ;;;; ---- default context scrape --------------------------------------
 
 (ert-deftest cc-butler-cleanup/context-scrapes-marker ()
-  "The default context function reads the CTX:<n> marker off the terminal."
+  "The default context function reads the CTX:<n> from the OWN statusline (CTX
+and MODEL on one line, in the bottom chrome below the input box)."
   (cl-letf (((symbol-function 'cc-butler--read-output)
-             (lambda (&rest _) "status bar\nCTX:187342 57%\n")))
+             (lambda (&rest _)
+               (string-join
+                '("status bar"
+                  "──────────────────────────────────────────────"
+                  "❯ "
+                  "──────────────────────────────────────────────"
+                  "  CTX:187342 57% MODEL:Opus-4.8"
+                  "  ⏵⏵ auto mode on")
+                "\n"))))
     (should (= 187342 (cc-butler-cleanup--default-context (list :dir "/d"))))))
+
+(ert-deftest cc-butler-cleanup/context-reads-statusline-below-agent-progress ()
+  "STRUCTURAL anchor, the case a line-count window got wrong: a delegating
+worker renders a sub-agent progress block BELOW the mode hint, pushing the OWN
+statusline to from-end 4+.  With a foreign echo also sitting in scrollback, a
+first-match scrape returns the foreign 371538 and a fixed last-N-lines window
+misses the statusline entirely; the below-the-input-box scan resolves the OWN
+250287."
+  (cl-letf (((symbol-function 'cc-butler--read-output)
+             (lambda (&rest _)
+               (string-join
+                '("scrollback"
+                  "CTX:371538 100% >200k MODEL:Opus-4.8"       ; foreign echo, above
+                  "(more scrollback)"
+                  "──────────────────────────────────────────────"
+                  "❯ "
+                  "──────────────────────────────────────────────"
+                  "  CTX:250287 25% >200k MODEL:Opus-4.8"     ; OWN statusline
+                  "  ⏵⏵ auto mode on (shift+tab to cycle)"     ; mode hint
+                  "⏺ main"
+                  "◯ general-purpose  <task>  2m 43s · ↓ 86.8k tokens")  ; agent
+                "\n"))))
+    (should (= 250287 (cc-butler-cleanup--default-context (list :dir "/d"))))))
 
 (ert-deftest cc-butler-cleanup/context-absent-is-nil ()
   "No marker -> nil context (not an error, not zero)."
   (cl-letf (((symbol-function 'cc-butler--read-output) (lambda (&rest _) "nope")))
     (should (null (cc-butler-cleanup--default-context (list :dir "/d"))))))
 
-(ert-deftest cc-butler-cleanup/context-parses-clear-hint-k ()
-  "The default parse reads the idle \"/clear to save <N>k tokens\" hint."
+(ert-deftest cc-butler-cleanup/context-clear-hint-alone-is-nil ()
+  "After fallback removal: a native \"/clear to save <N>k tokens\" hint is NOT
+the own statusline (not below the input box, no MODEL:), so the anchored reader
+returns an honest nil rather than a scraped number."
   (cl-letf (((symbol-function 'cc-butler--read-output)
              (lambda (&rest _) "  Context left until auto-compact\n\
   /clear to save 152k tokens\n")))
-    (should (= 152000 (cc-butler-cleanup--default-context (list :dir "/d"))))))
+    (should (null (cc-butler-cleanup--default-context (list :dir "/d"))))))
 
-(ert-deftest cc-butler-cleanup/context-parses-clear-hint-m ()
-  "The default parse also handles the M (millions) form of the save hint."
-  (cl-letf (((symbol-function 'cc-butler--read-output)
-             (lambda (&rest _) "/clear to save 1.2M tokens")))
-    (should (= 1200000 (cc-butler-cleanup--default-context (list :dir "/d"))))))
-
-(ert-deftest cc-butler-cleanup/context-parses-percent-used ()
-  "The default parse estimates tokens from \"<N>% context used\" against the
-configured context window."
+(ert-deftest cc-butler-cleanup/context-percent-used-alone-is-nil ()
+  "After fallback removal: a bare \"<N>% context used\" native hint is not the
+own statusline shape either -> honest nil."
   (let ((cc-butler-cleanup-context-window 200000))
     (cl-letf (((symbol-function 'cc-butler--read-output)
                (lambda (&rest _) "45% context used")))
-      (should (= 90000 (cc-butler-cleanup--default-context (list :dir "/d")))))))
+      (should (null (cc-butler-cleanup--default-context (list :dir "/d")))))))
 
 (ert-deftest cc-butler-cleanup/context-marker-wins-over-tui-hints ()
-  "The reliable CTX: marker takes precedence over the default-TUI hints when
-both are present in the scrape."
+  "The OWN statusline (CTX:...MODEL: below the input box) is read; a native TUI
+hint sitting above the input box in scrollback is ignored."
   (cl-letf (((symbol-function 'cc-butler--read-output)
-             (lambda (&rest _) "CTX:187342 57%\n/clear to save 152k tokens")))
+             (lambda (&rest _)
+               (string-join
+                '("/clear to save 152k tokens"
+                  "──────────────────────────────────────────────"
+                  "❯ "
+                  "──────────────────────────────────────────────"
+                  "  CTX:187342 57% MODEL:Opus-4.8")
+                "\n"))))
     (should (= 187342 (cc-butler-cleanup--default-context (list :dir "/d"))))))
+
+;;;; ---- P1: bottom-chrome anchor excludes foreign echoes -------------
+
+(defconst cc-butler-cleanup-test--foreign-echo-screen
+  (string-join
+   '("scrollback line"
+     "CTX:371538 100% >200k MODEL:Opus-4.8"      ; foreign echo, in scrollback
+     "(more scrollback)"
+     "──────────────────────────────────────────────"
+     "❯ "
+     "──────────────────────────────────────────────"
+     "  CTX:139707 14% MODEL:Opus-4.8"           ; OWN statusline (bottom chrome)
+     "  ⏵⏵ auto mode on (shift+tab to cycle)")
+   "\n")
+  "A screen whose bottom chrome carries the OWN statusline while a FOREIGN
+session's statusline is echoed higher up in scrollback.")
+
+(ert-deftest cc-butler-cleanup/context-nil-when-no-own-statusline ()
+  "P1 (b), the case that bit us and the reason the fallbacks had to go: the
+bottom chrome has NO statusline (input box + mode hint only) but scrollback
+holds a foreign CTX:.  The anchored reader must return nil, never the foreign
+number (the legacy first-match fallback would have returned 85437)."
+  (cl-letf (((symbol-function 'cc-butler--read-output)
+             (lambda (&rest _)
+               (string-join
+                '("earlier work"
+                  "CTX:85437 42% MODEL:Opus-4.8"   ; foreign, in scrollback
+                  "some more scrollback"
+                  "──────────────────────────────────────────────"
+                  "❯ "
+                  "──────────────────────────────────────────────"
+                  "  ⏵⏵ auto mode on (shift+tab to cycle)")
+                "\n"))))
+    (should (null (cc-butler-cleanup--default-context (list :dir "/d"))))))
+
+(ert-deftest cc-butler-cleanup/context-reads-own-statusline-not-foreign-echo ()
+  "P1 core: with a foreign CTX echoed ABOVE the own statusline, the anchored
+reader returns the OWN ctx (139707), not the positionally-first foreign 371538."
+  (cl-letf (((symbol-function 'cc-butler--read-output)
+             (lambda (&rest _) cc-butler-cleanup-test--foreign-echo-screen)))
+    (should (= 139707 (cc-butler-cleanup--default-context (list :dir "/d"))))))
+
+(ert-deftest cc-butler-cleanup/model-reads-own-statusline-not-foreign-echo ()
+  "P1 model twin: a foreign MODEL: echoed above the own statusline must not be
+returned; the OWN model (from the bottom-chrome statusline) is."
+  (cl-letf (((symbol-function 'cc-butler--read-output)
+             (lambda (&rest _)
+               (string-join
+                '("scrollback"
+                  "CTX:371538 100% MODEL:claude-sonnet-5"   ; foreign echo
+                  "(more scrollback)"
+                  "──────────────────────────────────────────────"
+                  "❯ "
+                  "──────────────────────────────────────────────"
+                  "  CTX:139707 14% MODEL:claude-opus-4-8"  ; OWN statusline
+                  "  ⏵⏵ auto mode on")
+                "\n"))))
+    (should (equal "claude-opus-4-8"
+                   (cc-butler-cleanup--default-model (list :dir "/d"))))))
+
+(ert-deftest cc-butler-cleanup/statusline-fields-parses-pct ()
+  "The shared parser reports the own statusline's used-percentage as an int."
+  (let ((fields (cc-butler-cleanup--statusline-fields
+                 "──────\n❯ \n──────\n  CTX:139707 37% MODEL:Opus-4.8\n  ⏵⏵ on")))
+    (should (= 139707 (plist-get fields :ctx)))
+    (should (= 37 (plist-get fields :pct)))
+    (should (equal "Opus-4.8" (plist-get fields :model)))))
+
+;;;; ---- narrow window: a truncated statusline ------------------------
+
+;; PROVENANCE: the next constant is the VERBATIM tail captured read-only from a
+;; live session whose window was too narrow to render the whole statusline
+;; (session monocle-mobile-voice, captured 2026-07-31 via read_session_output).
+;; The trailing character is a real U+2026 HORIZONTAL ELLIPSIS written by Claude
+;; Code when it truncates the line to the window width, and `MODEL:' is absent
+;; from the screen text because the terminal cut it off -- those bytes never
+;; existed in the buffer.  It is kept exactly as captured, not retyped from
+;; memory, so this test exercises an observed failure rather than an imagined one.
+(defconst cc-butler-cleanup-test--truncated-tail
+  (string-join
+   '("──────────────────────────────────────────────"
+     "❯ "
+     "──────────────────────────────────────────────"
+     "  CTX:328011 33% >200k…"
+     "  ⏵⏵ auto mode on    ·")
+   "\n")
+  "A real bottom chrome whose statusline was truncated before `MODEL:'.")
+
+(ert-deftest cc-butler-cleanup/statusline-fields-survives-truncated-model ()
+  "A narrow window truncates `MODEL:' off the statusline.  The context reading
+must SURVIVE that: `:ctx' and `:pct' are still the session's own, and `:model'
+is honestly nil.  Requiring both markers on the line made a truncated line
+return nothing at all, which lost the context reading too."
+  (let ((fields (cc-butler-cleanup--statusline-fields
+                 cc-butler-cleanup-test--truncated-tail)))
+    (should (= 328011 (plist-get fields :ctx)))
+    (should (= 33 (plist-get fields :pct)))
+    (should (null (plist-get fields :model)))))
+
+(ert-deftest cc-butler-cleanup/context-survives-truncated-statusline ()
+  "The context reader reports the own size from a truncated statusline."
+  (cl-letf (((symbol-function 'cc-butler--read-output)
+             (lambda (&rest _) cc-butler-cleanup-test--truncated-tail)))
+    (should (= 328011 (cc-butler-cleanup--default-context (list :dir "/d"))))))
+
+(ert-deftest cc-butler-cleanup/anchor-rejects-foreign-line-even-when-relaxed ()
+  "DoD 9 -- relaxing the line shape must NOT weaken the ownership guarantee.
+Ownership is established by the STRUCTURAL anchor (below the last input box),
+never by the line carrying both markers.  Here a complete foreign statusline
+sits in scrollback ABOVE the box and the session's own line below it is
+truncated: the foreign numbers must be ignored even though they are the only
+full-shape line present."
+  (let ((fields (cc-butler-cleanup--statusline-fields
+                 (string-join
+                  '("scrollback from read_session_output:"
+                    "  CTX:371538 100% MODEL:claude-sonnet-5"   ; foreign, complete
+                    "(more scrollback)"
+                    "──────────────────────────────────────────────"
+                    "❯ "
+                    "──────────────────────────────────────────────"
+                    "  CTX:328011 33% >200k…"                   ; OWN, truncated
+                    "  ⏵⏵ auto mode on")
+                  "\n"))))
+    (should (= 328011 (plist-get fields :ctx)))
+    (should (null (plist-get fields :model)))))
+
+(ert-deftest cc-butler-cleanup/statusline-fields-tolerates-model-before-ctx ()
+  "Field ORDER on the line is not part of the contract -- only that the line is
+the session's own.  A layout that puts MODEL: first must parse."
+  (let ((fields (cc-butler-cleanup--statusline-fields
+                 "──────\n❯ \n──────\n  MODEL:Opus-5 CTX:139707 14%")))
+    (should (= 139707 (plist-get fields :ctx)))
+    (should (equal "Opus-5" (plist-get fields :model)))))
+
+(ert-deftest cc-butler-cleanup/truncation-inside-the-number-is-not-a-reading ()
+  "Truncation cuts at a CHARACTER count, not a field boundary, so a window a few
+columns narrower cuts the NUMBER in half: `CTX:32801…' is the first five digits
+of 328011.  Reporting 32801 would understate the session by an order of
+magnitude and nothing downstream could tell.  A number is only a reading when
+the line proves it ended — the ellipsis proves it did not."
+  (let ((fields (cc-butler-cleanup--statusline-fields
+                 "──────\n❯ \n──────\n  CTX:32801…")))
+    (should (null (plist-get fields :ctx)))))
+
+(ert-deftest cc-butler-cleanup/full-shape-line-wins-over-a-truncated-one ()
+  "If any line below the input box carries the whole statusline, it is the
+reading — even when a truncated CTX line appears first.  Matching a superset of
+lines must not make the scan stop EARLIER and discard the model."
+  (let ((fields (cc-butler-cleanup--statusline-fields
+                 (string-join
+                  '("──────" "❯ " "──────"
+                    "  CTX:111 11% >200k…"           ; truncated, appears first
+                    "  CTX:222 22% MODEL:Sonnet-5")  ; complete
+                  "\n"))))
+    (should (= 222 (plist-get fields :ctx)))
+    (should (equal "Sonnet-5" (plist-get fields :model)))))
 
 ;;;; ---- last-known-value persistence (no flicker) -------------------
 
@@ -151,15 +342,29 @@ replaces it."
 ;;;; ---- default model scrape ------------------------------------------
 
 (ert-deftest cc-butler-cleanup/model-scrapes-marker ()
-  "The default model function reads the MODEL:<name> marker off the terminal."
+  "The default model function reads the MODEL:<name> from the OWN statusline
+below the input box."
   (cl-letf (((symbol-function 'cc-butler--read-output)
-             (lambda (&rest _) "CTX:187342 57% MODEL:claude-sonnet-5\n")))
+             (lambda (&rest _)
+               (string-join
+                '("──────────────────────────────────────────────"
+                  "❯ "
+                  "──────────────────────────────────────────────"
+                  "  CTX:187342 57% MODEL:claude-sonnet-5")
+                "\n"))))
     (should (equal "claude-sonnet-5" (cc-butler-cleanup--default-model (list :dir "/d"))))))
 
 (ert-deftest cc-butler-cleanup/model-absent-is-nil ()
-  "No marker -> nil model (not an error, not an empty string)."
+  "No full-shape statusline below the input box -> nil model (a bare CTX with no
+MODEL: on the line is not the own statusline shape)."
   (cl-letf (((symbol-function 'cc-butler--read-output)
-             (lambda (&rest _) "CTX:187342 57%\n")))
+             (lambda (&rest _)
+               (string-join
+                '("──────────────────────────────────────────────"
+                  "❯ "
+                  "──────────────────────────────────────────────"
+                  "  CTX:187342 57%")
+                "\n"))))
     (should (null (cc-butler-cleanup--default-model (list :dir "/d"))))))
 
 ;;;; ---- model feedback tag & last-known-value persistence -------------

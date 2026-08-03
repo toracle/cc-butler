@@ -178,7 +178,7 @@ timeout when the row is already there."
             (insert (make-string 24 cc-butler--border-rule-char)))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
                     (cc-butler-launch-ready-timeout 2))
             (should (progn (cc-butler--wait-for-session-ready "/worker/") t))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
@@ -194,7 +194,7 @@ caller a false-ready session (cc-butler#8)."
           (with-current-buffer term-buf (insert "still starting up...\n"))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
                     (cc-butler-launch-ready-timeout 0.3))
             (should-error (cc-butler--wait-for-session-ready "/worker/"))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
@@ -268,7 +268,7 @@ this is the exact case a genuinely new directory hits."
           (with-current-buffer term-buf (cc-butler-session-test--insert-trust-dialog))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
                     ((symbol-function 'claude-code-ide--terminal-send-return)
                      (lambda ()
                        (cl-incf return-count)
@@ -300,6 +300,744 @@ false-ready session into which a `send_to_session' silently vanishes
             (claude-code-ide-cli-path "/usr/bin/claude"))
         (cc-butler--launch-session "/tmp/some-worker/")))
     (should (equal waited-for (file-name-as-directory (expand-file-name "/tmp/some-worker/"))))))
+
+;;;; ------------------------------------------------------------------
+;;;; PTY minimum size
+;;;; ------------------------------------------------------------------
+
+;; A new session's terminal buffer is never displayed before it is created,
+;; so the size that reaches the pty comes from whatever window it first
+;; lands in — applied with no lower bound.  With the frame split narrow,
+;; sessions have come up at ELEVEN columns: the TUI cannot lay out its input
+;; row, keystrokes go nowhere, and it presents as "input doesn't work"
+;; rather than as a size problem.
+
+(defmacro cc-butler-test--with-pty (rows cols &rest body)
+  "Run BODY with a fake ghostel session buffer sized ROWSxCOLS.
+Binds `sized' to the (ROWS . COLS) passed to `set-process-window-size' and
+`grid' to the (ROWS . COLS) passed to ghostel's own sizer."
+  (declare (indent 2))
+  `(let ((buf (generate-new-buffer " *cc-pty-test*"))
+         (sized nil) (grid nil))
+     (unwind-protect
+         (with-current-buffer buf
+           (setq-local ghostel--term-rows ,rows)
+           (setq-local ghostel--term-cols ,cols)
+           (setq-local ghostel--term 'fake-term)
+           (cl-letf (((symbol-function 'get-buffer-process) (lambda (_b) 'proc))
+                     ((symbol-function 'process-live-p) (lambda (_p) t))
+                     ((symbol-function 'set-process-window-size)
+                      (lambda (_p r c) (setq sized (cons r c))))
+                     ((symbol-function 'ghostel--set-size-with-cell-dims)
+                      (lambda (_t r c) (setq grid (cons r c))))
+                     ((symbol-function 'cc-butler--log) #'ignore)
+                     ((symbol-function 'claude-code-ide--get-buffer-name)
+                      (lambda (_d) (buffer-name buf))))
+             ,@body))
+       (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/pty-floor-raises-a-degenerate-terminal ()
+  "REGRESSION: an 11-column session is raised to the floor, and BOTH the pty
+ioctl and ghostel's grid are corrected — the process and the display have to
+agree about how wide the world is."
+  (cc-butler-test--with-pty 24 11
+    (should (equal (cc-butler--pty-size-floor (current-buffer))
+                   (cons cc-butler-terminal-min-height
+                         cc-butler-terminal-min-width)))
+    (should (equal sized (cons cc-butler-terminal-min-height
+                               cc-butler-terminal-min-width)))
+    (should (equal grid sized))))
+
+(ert-deftest cc-butler-session/pty-floor-never-shrinks-a-healthy-terminal ()
+  "A terminal already at or above the floor is left completely alone — this
+is a floor, not a resize policy, and must not fight the window layout."
+  (cc-butler-test--with-pty 50 200
+    (should-not (cc-butler--pty-size-floor (current-buffer)))
+    (should-not sized)
+    (should-not grid)))
+
+(ert-deftest cc-butler-session/pty-floor-raises-only-the-dimension-below-it ()
+  "Height and width are floored independently; a tall narrow window keeps its
+height."
+  (cc-butler-test--with-pty 60 11
+    (cc-butler--pty-size-floor (current-buffer))
+    (should (equal (car sized) 60))
+    (should (equal (cdr sized) cc-butler-terminal-min-width))))
+
+(ert-deftest cc-butler-session/launch-sizes-the-pty-before-waiting-for-ready ()
+  "Order is load-bearing: the readiness wait watches for the TUI's input row,
+and a terminal eleven columns wide cannot draw one.  Sizing after the wait
+would mean timing out on a session that was only ever too narrow to look
+ready."
+  (let ((orig-featurep (symbol-function 'featurep)) (order nil))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/claude"))
+              ((symbol-function 'featurep)
+               (lambda (f) (or (eq f 'ghostel) (funcall orig-featurep f))))
+              ((symbol-function 'claude-code-ide) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler--configure-session) (lambda (_d) nil))
+              ((symbol-function 'cc-butler--ensure-pty-size)
+               (lambda (_d) (push 'sized order)))
+              ((symbol-function 'cc-butler--wait-for-session-ready)
+               (lambda (_d) (push 'waited order))))
+      (let ((claude-code-ide-terminal-backend 'ghostel)
+            (claude-code-ide-cli-path "/usr/bin/claude"))
+        (cc-butler--launch-session "/tmp/some-worker/")))
+    (should (equal (nreverse order) '(sized waited)))))
+
+(ert-deftest cc-butler-session/resume-also-sizes-the-pty ()
+  "`cc-butler--resume-in' is the OTHER spawn site.  A restore after a restart
+brings every session back at once into whatever layout the frame is in,
+which is the likeliest time to hit this at all."
+  (require 'cc-butler-persist)
+  (let ((order nil))
+    (cl-letf (((symbol-function 'claude-code-ide) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler--ensure-pty-size)
+               (lambda (_d) (push 'sized order)))
+              ((symbol-function 'cc-butler--wait-for-session-ready)
+               (lambda (_d) (push 'waited order))))
+      (cc-butler--resume-in "/tmp/some-worker/"))
+    (should (equal (nreverse order) '(sized waited)))))
+
+(ert-deftest cc-butler-session/refit-reapplies-the-floor ()
+  "A refit is sized from a window, so it can drop back under the floor the
+moment the frame is split narrow.  Without re-applying it there, the
+launch-time guarantee lasts only until the first layout change."
+  (let ((floored nil))
+    (cl-letf (((symbol-function 'derived-mode-p) (lambda (&rest _) t))
+              ((symbol-function 'ghostel--adjust-size) (lambda (_w) nil))
+              ((symbol-function 'window-live-p) (lambda (_w) t))
+              ((symbol-function 'cc-butler--pty-size-floor)
+               (lambda (_b) (setq floored t))))
+      (cc-butler--fit-pty-largest 'window))
+    (should floored)))
+
+;;;; ---- the shared ghost-vs-real predicate (cc-butler#6, 2026-07-24) ----
+;;;; `cc-butler--input-state' is the ONE answer to "is there real typed
+;;;; input in this box".  It lives here, below both callers, because the
+;;;; compaction guard (cc-butler-compact.el) and read_session_output's
+;;;; redaction (cc-butler-orchestrator.el) used to answer it separately and
+;;;; only one of the two was right.  It reports three outcomes and resolves
+;;;; none of them: the callers need opposite fail-safes, so each picks its
+;;;; own direction at its own call site.
+
+(defconst cc-butler-session-test--prompt (concat "❯" (string #x00A0))
+  "`❯' + U+00A0 NO-BREAK SPACE, the prompt Claude Code actually renders.
+Spelled as explicit code points so no editor can normalise the NBSP away —
+a fixture with an ordinary space is what let an earlier miss ship green.")
+
+(defmacro cc-butler-session-test--with-box (fill cursor-needle &rest body)
+  "Run BODY in a buffer painted by FILL, with the terminal cursor reported
+at the end of the first match of CURSOR-NEEDLE (nil = no cursor readable)."
+  (declare (indent 2))
+  `(with-temp-buffer
+     ,fill
+     (let ((cursor (when ,cursor-needle
+                     (goto-char (point-min))
+                     (search-forward ,cursor-needle)
+                     (point))))
+       (cl-letf (((symbol-function 'ghostel-cursor-point) (lambda () cursor)))
+         ,@body))))
+
+(defun cc-butler-session-test--box (text)
+  "Insert a border-framed input box holding TEXT after the prompt."
+  (insert (make-string 24 cc-butler--border-rule-char) "\n")
+  (insert cc-butler-session-test--prompt text "\n")
+  (insert (make-string 24 cc-butler--border-rule-char) "\n"))
+
+(ert-deftest cc-butler-session/input-state-ghost-when-cursor-is-at-the-prompt ()
+  "A painted suggestion leaves the cursor at the prompt because the input
+buffer is genuinely empty — so the box reads GHOST no matter how much text
+is painted into it (measured across eight live sessions 2026-07-23)."
+  (cc-butler-session-test--with-box
+      (cc-butler-session-test--box "네, 꺼내주세요")
+      cc-butler-session-test--prompt
+    (should (equal '(ghost) (cc-butler--input-state)))))
+
+(ert-deftest cc-butler-session/input-state-real-when-cursor-is-past-the-prompt ()
+  "Typed text advances the cursor, and the distance past the prompt IS the
+pending input."
+  (cc-butler-session-test--with-box
+      (cc-butler-session-test--box "abcd")
+      (concat cc-butler-session-test--prompt "abcd")
+    (should (equal '(real . "abcd") (cc-butler--input-state)))))
+
+(ert-deftest cc-butler-session/input-state-is-blind-to-the-face-color ()
+  "The whole point of the redesign: the painted color decides nothing.  The
+same row in this fleet's ghost face (#8686a8/#00005f), in the legacy face
+the deleted constant keyed on (#a7a7a7/#262626), in an accent face, and
+unfaced, all classify identically — by the cursor alone."
+  (dolist (face '((:foreground "#8686a8" :background "#00005f")
+                  (:foreground "#a7a7a7" :background "#262626")
+                  (:foreground "#b1b9f9")
+                  nil))
+    (cc-butler-session-test--with-box
+        (progn (insert (make-string 24 cc-butler--border-rule-char) "\n")
+               (insert cc-butler-session-test--prompt)
+               (let ((start (point)))
+                 (insert "merge PR #72 please")
+                 (when face (put-text-property start (point) 'face face)))
+               (insert "\n")
+               (insert (make-string 24 cc-butler--border-rule-char) "\n"))
+        cc-butler-session-test--prompt
+      (should (equal '(ghost) (cc-butler--input-state))))))
+
+(ert-deftest cc-butler-session/input-state-empty-nbsp-padded-box-is-ghost ()
+  "An empty box trims to a one-character string under `string-trim' because
+the padding is U+00A0, not a space.  `cc-butler--strip-input-pad' knows that;
+losing it made every idle session in the fleet read as \"has text typed\"."
+  (cc-butler-session-test--with-box
+      (cc-butler-session-test--box "")
+      cc-butler-session-test--prompt
+    (should (equal '(ghost) (cc-butler--input-state)))))
+
+(ert-deftest cc-butler-session/input-state-typed-slash-command-is-real ()
+  "A half-typed slash command is the most dangerous pending input there is —
+our own command would be appended to it — and Claude Code renders it in an
+accent face, which a face-based rule read as \"decorated, therefore ghost\"."
+  (cc-butler-session-test--with-box
+      (progn (insert (make-string 24 cc-butler--border-rule-char) "\n")
+             (insert cc-butler-session-test--prompt)
+             (let ((start (point)))
+               (insert "/clear")
+               (put-text-property start (point) 'face '(:foreground "#b1b9f9")))
+             (insert "\n")
+             (insert (make-string 24 cc-butler--border-rule-char) "\n"))
+      (concat cc-butler-session-test--prompt "/clear")
+    (should (equal '(real . "/clear") (cc-butler--input-state)))))
+
+(ert-deftest cc-butler-session/input-state-multi-line-input-is-seen-whole ()
+  "A multi-line box must report everything ahead of the cursor, not just the
+cursor's own row — otherwise a second line looks empty and we type into it."
+  (cc-butler-session-test--with-box
+      (progn (insert (make-string 24 cc-butler--border-rule-char) "\n")
+             (insert cc-butler-session-test--prompt "first line\n")
+             (insert "  second line\n")
+             (insert (make-string 24 cc-butler--border-rule-char) "\n"))
+      "second line"
+    (let ((state (cc-butler--input-state)))
+      (should (eq 'real (car state)))
+      (should (string-match-p "first line" (cdr state)))
+      (should (string-match-p "second line" (cdr state))))))
+
+(ert-deftest cc-butler-session/input-state-unknown-when-no-cursor-is-readable ()
+  "A terminal backend with no readable cursor yields UNKNOWN — never GHOST.
+Reporting an unread box as empty would hand the redaction path a false
+determination and the compaction guard a licence to type."
+  (cc-butler-session-test--with-box
+      (cc-butler-session-test--box "something")
+      nil
+    (should (equal '(unknown) (cc-butler--input-state)))))
+
+(ert-deftest cc-butler-session/input-state-unknown-when-cursor-is-outside-a-box ()
+  "A modal dialog owns the screen and the cursor sits nowhere near an input
+box.  That is UNKNOWN, not GHOST: \"no box at the cursor\" is not evidence
+that the box is empty."
+  (cc-butler-session-test--with-box
+      (progn (insert "❯ 1. yes\n  2. no\n")
+             (cc-butler-session-test--box "leftover"))
+      "1. yes"
+    (should (equal '(unknown) (cc-butler--input-state)))))
+
+(ert-deftest cc-butler-session/input-state-never-resolves-unknown-itself ()
+  "Guard on the design constraint, not on a behaviour: `cc-butler--input-state'
+must keep UNKNOWN as its own outcome.  If it ever collapses UNKNOWN into
+GHOST or REAL, one of the two call sites silently inherits the other's
+fail-safe — and those fail-safes point in opposite directions on purpose
+\(compaction refuses to type; redaction refuses to show)."
+  (should (memq (car (cc-butler-session-test--with-box
+                         (cc-butler-session-test--box "text")
+                         nil
+                       (cc-butler--input-state)))
+                '(unknown)))
+  (should (eq 'ghost (car (cc-butler-session-test--with-box
+                              (cc-butler-session-test--box "text")
+                              cc-butler-session-test--prompt
+                            (cc-butler--input-state))))))
+
+;;;; ------------------------------------------------------------------
+;;;; P2: transcript-based liveness (compaction gate)
+;;;; ------------------------------------------------------------------
+
+(require 'cl-lib)
+
+(ert-deftest cc-butler-session/claude-project-dir-slugs-the-path ()
+  "The per-project dir is ~/.claude/projects/<slug>/ where slug replaces every
+`/' and `.' in the absolute path with `-'."
+  (should (equal (cc-butler--claude-project-dir "/tmp/foo.bar/")
+                 (expand-file-name "-tmp-foo-bar/" "~/.claude/projects/")))
+  (should (null (cc-butler--claude-project-dir nil))))
+
+(ert-deftest cc-butler-session/last-activity-is-max-over-both-globs ()
+  "`cc-butler--session-last-activity' returns the MAX mtime over the main
+transcript glob AND the sub-agent glob."
+  (let ((now (float-time)))
+    (cl-letf (((symbol-function 'file-expand-wildcards)
+               (lambda (pat &optional _full)
+                 (if (string-match-p "subagents" pat)
+                     '("/p/x/subagents/a.jsonl")   ; sub-agent transcript
+                   '("/p/main.jsonl"))))           ; main transcript
+              ((symbol-function 'file-attributes)
+               (lambda (f &rest _)
+                 ;; sub-agent is the FRESHER of the two
+                 (list nil nil nil nil nil
+                       (if (string-match-p "subagents" f)
+                           (seconds-to-time (- now 10))
+                         (seconds-to-time (- now 500)))))))
+      (should (< (abs (- (cc-butler--session-last-activity "/d/") (- now 10)))
+                 1.0)))))
+
+(ert-deftest cc-butler-session/last-activity-degrades-without-subagents ()
+  "Empty sub-agent glob falls back to the main glob; both empty -> nil."
+  (cl-letf (((symbol-function 'file-attributes)
+             (lambda (_f &rest _)
+               (list nil nil nil nil nil (seconds-to-time (- (float-time) 42))))))
+    ;; only main present
+    (cl-letf (((symbol-function 'file-expand-wildcards)
+               (lambda (pat &optional _full)
+                 (unless (string-match-p "subagents" pat) '("/p/main.jsonl")))))
+      (should (numberp (cc-butler--session-last-activity "/d/"))))
+    ;; both empty -> nil
+    (cl-letf (((symbol-function 'file-expand-wildcards) (lambda (&rest _) nil)))
+      (should (null (cc-butler--session-last-activity "/d/"))))))
+
+(ert-deftest cc-butler-session/transcript-idle-p-honours-threshold ()
+  "Idle only once activity is at least the threshold old; unknown activity
+\(nil) is treated as BUSY, the safe default for a destructive op."
+  (let ((cc-butler-idle-threshold 600)
+        (now (float-time)))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (- now 900))))
+      (should (cc-butler--transcript-idle-p "/d/")))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (- now 5))))
+      (should-not (cc-butler--transcript-idle-p "/d/")))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) nil)))
+      (should-not (cc-butler--transcript-idle-p "/d/")))))
+
+;;;; ------------------------------------------------------------------
+;;;; Model of record: the transcript, when the screen cannot say
+;;;; ------------------------------------------------------------------
+
+;; Row shapes below are modelled on real transcripts measured 2026-07-31:
+;; the model lives at .message.model on `"type":"assistant"' rows, and a
+;; `/model' switch writes a `<local-command-stdout>Set model to ...' user row
+;; BEFORE any assistant row exists on the new model.
+
+(defun cc-butler-session-test--transcript (dir name &rest lines)
+  "Write LINES as NAME.jsonl under DIR and return the file."
+  (let ((f (expand-file-name name dir)))
+    (make-directory (file-name-directory f) t)
+    (with-temp-file f (insert (string-join lines "\n") "\n"))
+    f))
+
+(defmacro cc-butler-session-test--with-project (proj &rest body)
+  "Bind PROJ to a fresh temp project dir that `cc-butler--claude-project-dir'
+resolves to, run BODY, then delete it."
+  (declare (indent 1))
+  `(let ((,proj (file-name-as-directory (make-temp-file "ccb-proj" t))))
+     (unwind-protect
+         (cl-letf (((symbol-function 'cc-butler--claude-project-dir)
+                    (lambda (_d) ,proj)))
+           ,@body)
+       (delete-directory ,proj t))))
+
+(ert-deftest cc-butler-session/transcript-model-reads-last-assistant-row ()
+  "With no later switch, the newest assistant row names the model."
+  (cc-butler-session-test--with-project proj
+    (cc-butler-session-test--transcript
+     proj "s.jsonl"
+     "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet-5\"}}"
+     "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"go on\"}}"
+     "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-opus-5\"}}")
+    (should (equal "claude-opus-5" (cc-butler--transcript-model "/d/")))))
+
+(ert-deftest cc-butler-session/transcript-model-prefers-later-set-row ()
+  "THE staleness case.  After `/model', the newest assistant row still names the
+OLD model -- sometimes for days, sometimes forever if the new model never
+answers.  The later `Set model to' row is the one that reflects reality."
+  (cc-butler-session-test--with-project proj
+    (cc-butler-session-test--transcript
+     proj "s.jsonl"
+     "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-sonnet-5\"}}"
+     (concat "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":"
+             "\"<local-command-stdout>Set model to \\u001b[1mOpus 5\\u001b[22m"
+             " and saved as your default for new sessions</local-command-stdout>\"}}"))
+    ;; Assert the EXACT tag, not merely that "opus" occurs somewhere in it.
+    ;; A `Set model to' row reports the display name verbatim — spaces intact —
+    ;; unlike the statusline, which collapses them.  A loose assertion here
+    ;; passes for `Opus 5' and equally for anything else containing "opus", so
+    ;; it silently rests on whatever the consumer happens to tolerate; when the
+    ;; consumer's matching rule changes, this keeps passing while the pipeline
+    ;; breaks.  Pin the shape so the next change to the consumer has to face it.
+    (should (equal "Opus 5" (cc-butler--transcript-model "/d/")))))
+
+(ert-deftest cc-butler-session/transcript-model-ignores-subagent-transcripts ()
+  "Sub-agents run on their OWN model and their transcripts can be the newest
+file in the tree.  Only the main glob counts, and a sidechain row never does."
+  (cc-butler-session-test--with-project proj
+    (cc-butler-session-test--transcript
+     proj "s.jsonl"
+     "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-opus-5\"}}")
+    (cc-butler-session-test--transcript
+     proj "s/subagents/agent-1.jsonl"
+     "{\"type\":\"assistant\",\"isSidechain\":true,\"message\":{\"role\":\"assistant\",\"model\":\"claude-haiku-4-5-20251001\"}}")
+    (should (equal "claude-opus-5" (cc-butler--transcript-model "/d/")))))
+
+(ert-deftest cc-butler-session/transcript-model-skips-synthetic-rows ()
+  "`<synthetic>' marks a locally generated row (interrupt / API error); it is a
+sentinel, not a model."
+  (cc-butler-session-test--with-project proj
+    (cc-butler-session-test--transcript
+     proj "s.jsonl"
+     "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-opus-5\"}}"
+     "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"model\":\"<synthetic>\"}}")
+    (should (equal "claude-opus-5" (cc-butler--transcript-model "/d/")))))
+
+(ert-deftest cc-butler-session/transcript-model-nil-without-signal ()
+  "A young session that has never answered carries no model signal at all --
+return nil so the caller can refuse, rather than guessing."
+  (cc-butler-session-test--with-project proj
+    (cc-butler-session-test--transcript
+     proj "s.jsonl"
+     "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}")
+    (should (null (cc-butler--transcript-model "/d/"))))
+  ;; no transcript at all
+  (cl-letf (((symbol-function 'cc-butler--claude-project-dir) (lambda (_d) nil)))
+    (should (null (cc-butler--transcript-model "/d/")))))
+;;;; A read must be able to report its own failure
+;;;; ------------------------------------------------------------------
+
+;; For a background session buffer, forcing the redraw is the ONLY thing that
+;; ever writes text into it.  When that call failed the error was swallowed and
+;; the caller read the untouched buffer anyway — so a permanently failing
+;; refresh was served as ordinary output, indistinguishable from a live screen.
+;; A stale screen believed to be current is worse than no screen at all.
+
+(ert-deftest cc-butler-session/refresh-reports-a-failed-redraw ()
+  "A redraw that signals must be reported as failure, not swallowed."
+  (let (logged)
+    (cl-letf (((symbol-function 'cc-butler--log)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) logged)))
+              ((symbol-function 'ghostel--redraw)
+               (lambda (&rest _) (error "ReentrantRedraw"))))
+      (with-temp-buffer
+        (setq-local ghostel--term 'fake-term)
+        (should (null (cc-butler--refresh-terminal-text (current-buffer))))
+        ;; and it must say WHY — swallowing the reason is what made this
+        ;; undiagnosable in the first place
+        (should logged)
+        (should (string-match-p "ReentrantRedraw"
+                                (mapconcat #'identity logged " ")))))))
+
+(ert-deftest cc-butler-session/refresh-succeeds-quietly ()
+  "A redraw that works reports success and logs nothing."
+  (let (logged)
+    (cl-letf (((symbol-function 'cc-butler--log)
+               (lambda (&rest args) (push args logged)))
+              ((symbol-function 'ghostel--redraw) (lambda (&rest _) t)))
+      (with-temp-buffer
+        (setq-local ghostel--term 'fake-term)
+        (should (cc-butler--refresh-terminal-text (current-buffer)))
+        (should (null logged))))))
+
+(ert-deftest cc-butler-session/no-terminal-is-not-a-failure ()
+  "A buffer with no ghostel terminal is not a FAILED refresh — its text is
+maintained by something else (another backend, or a plain buffer).  Reporting
+that as failure would blank out every non-ghostel setup."
+  (with-temp-buffer
+    (should (cc-butler--refresh-terminal-text (current-buffer)))))
+
+;;;; ------------------------------------------------------------------
+;;;; The refresh must give the redraw the context it requires
+;;;; ------------------------------------------------------------------
+
+;; Measured 2026-07-31 on a live frozen session: calling the native redraw with
+;; no window binding errors with "Specified window is not displaying the current
+;; buffer" and the buffer does not move (1128 -> 1128 bytes).  Supplying the
+;; binding ghostel's own redraw path uses, the same call returns ok and the
+;; buffer jumps to the live screen (1128 -> 157599).  The grid was current the
+;; whole time; only the hand-off into the Emacs buffer was failing.
+
+(defmacro cc-butler-session-test--recording-redraw (record &rest body)
+  "Run BODY with `ghostel--redraw' stubbed to push a snapshot onto RECORD.
+Each entry is (SELECTED-WINDOW-SHOWS-BUFFER . INHIBIT-REDISPLAY)."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'ghostel--redraw)
+              (lambda (&rest _)
+                (push (cons (eq (window-buffer (selected-window)) (current-buffer))
+                            inhibit-redisplay)
+                      ,record)
+                t)))
+     ,@body))
+
+(ert-deftest cc-butler-session/refresh-gives-the-redraw-a-window ()
+  "The native redraw requires the selected window to be showing the buffer.
+Nothing displays a background session, so one must be lent to it — otherwise
+the redraw errors and the buffer keeps whatever it last rendered."
+  (let ((buf (get-buffer-create " *ccb-refresh-test*")) rec)
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local ghostel--term 'fake-term)
+          (cc-butler-session-test--recording-redraw rec
+            (should (cc-butler--refresh-terminal-text buf)))
+          (should (= 1 (length rec)))
+          (should (car (car rec))))              ; window WAS showing the buffer
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/refresh-suppresses-redisplay-while-borrowing ()
+  "Lending a window must not flash another session's screen at whoever is
+sitting in front of Emacs — the same binding ghostel's own path uses."
+  (let ((buf (get-buffer-create " *ccb-refresh-test2*")) rec)
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local ghostel--term 'fake-term)
+          (cc-butler-session-test--recording-redraw rec
+            (cc-butler--refresh-terminal-text buf))
+          (should (cdr (car rec))))              ; inhibit-redisplay was bound
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/refresh-leaves-the-layout-as-it-found-it ()
+  "Borrowing a window is invisible: afterwards it shows exactly what it did."
+  (let ((buf (get-buffer-create " *ccb-refresh-test3*"))
+        (before (window-buffer (selected-window)))
+        rec)
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local ghostel--term 'fake-term)
+          (cc-butler-session-test--recording-redraw rec
+            (cc-butler--refresh-terminal-text buf))
+          (should (eq before (window-buffer (selected-window)))))
+      (kill-buffer buf))))
+
+;; REGRESSION (2026-07-31, live): the borrow above took the SELECTED window
+;; without asking whether it could be used.  cc-butler dedicates its own
+;; session-list window (`cc-butler-session.el', `set-window-dedicated-p'), so
+;; whenever point rested there `set-window-buffer' signalled "Window is
+;; dedicated to `*claude-sessions*'".  That signal escaped the honest-nil
+;; channel this same change built — it sits outside the `condition-case' in
+;; `cc-butler--redraw-in-window' — so reads AND the compaction probe failed
+;; with a raw Emacs error instead of reporting a refresh they could not do.
+;; Gated on two conditions at once (buffer displayed nowhere AND the selected
+;; window dedicated), which is why it struck intermittently.
+
+(defmacro cc-butler-session-test--with-two-windows (list-buf &rest body)
+  "Run BODY with a fresh two-window layout: LIST-BUF in the selected window,
+a scratch buffer in a second one.  Restores the layout afterwards."
+  (declare (indent 1))
+  `(save-window-excursion
+     (delete-other-windows)
+     (split-window (selected-window) nil 'right)
+     (set-window-buffer (selected-window) ,list-buf)
+     ,@body))
+
+(ert-deftest cc-butler-session/refresh-does-not-borrow-a-dedicated-window ()
+  "A dedicated window cannot be lent — `set-window-buffer' signals on one.
+Another window must be used instead, and the dedicated one left untouched."
+  (let ((buf (get-buffer-create " *ccb-dedicated*"))
+        (listbuf (get-buffer-create " *ccb-fake-list*"))
+        rec)
+    (unwind-protect
+        (cc-butler-session-test--with-two-windows listbuf
+          (set-window-dedicated-p (selected-window) t)
+          ;; the conditions that produced the live failure, both present
+          (should (window-dedicated-p (selected-window)))
+          (should-not (get-buffer-window-list buf nil t))
+          (with-current-buffer buf (setq-local ghostel--term 'fake-term))
+          (cc-butler-session-test--recording-redraw rec
+            (should (cc-butler--refresh-terminal-text buf)))
+          (should (= 1 (length rec)))
+          (should (car (car rec)))      ; it did get a window showing the buffer
+          ;; and the dedicated window is exactly as it was
+          (should (eq listbuf (window-buffer (selected-window))))
+          (should (window-dedicated-p (selected-window))))
+      (kill-buffer buf)
+      (kill-buffer listbuf))))
+
+(ert-deftest cc-butler-session/refresh-refuses-rather-than-rearranging-the-frame ()
+  "With no window that may be borrowed, report the failure and stop.
+Splitting one to make room would let a READ rearrange the frame a human is
+looking at — an observation that alters what it observes.  The honest nil
+costs that session's text until something displays it, which is the cheaper
+mistake, and the caller already renders it as \"could not read\"."
+  (let ((buf (get-buffer-create " *ccb-nowindow*"))
+        (listbuf (get-buffer-create " *ccb-fake-list2*")))
+    (unwind-protect
+        (cc-butler-session-test--with-two-windows listbuf
+          (dolist (w (window-list)) (set-window-dedicated-p w t))
+          (with-current-buffer buf (setq-local ghostel--term 'fake-term))
+          (let ((before (length (window-list))) rec)
+            ;; stub the render too, so a nil here can only mean "no window to
+            ;; borrow" and not "there was no terminal to redraw in the first
+            ;; place" — those are different answers and `no-terminal' is truthy
+            (cc-butler-session-test--recording-redraw rec
+              (should-not (cc-butler--refresh-terminal-text buf))
+              (should-not rec))          ; never got as far as rendering
+            ;; no window was split into existence to get around it
+            (should (= before (length (window-list))))))
+      (kill-buffer buf)
+      (kill-buffer listbuf))))
+
+(ert-deftest cc-butler-session/refresh-reports-an-unborrowable-window-as-failure ()
+  "Dedication is one way acquiring a window can fail; there will be others.
+Every such failure has to leave by the same nil the caller already checks —
+a reporting channel an exception can step around is not a channel.  Pinning
+this to the dedicated case alone would reopen the same hole on the next
+window error nobody predicted."
+  (let ((buf (get-buffer-create " *ccb-borrowfail*")) rec)
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local ghostel--term 'fake-term)
+          (cc-butler-session-test--recording-redraw rec
+            (cl-letf (((symbol-function 'set-window-buffer)
+                       (lambda (&rest _) (error "some other window problem"))))
+              (should-not (cc-butler--refresh-terminal-text buf))))
+          ;; nil because the borrow failed, not because there was nothing to
+          ;; redraw: the render was available and simply never reached
+          (should-not rec))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/refresh-coalesces-a-burst-of-reads ()
+  "A full redraw rebuilds the whole buffer from the grid — up to
+`ghostel-max-scrollback' of it — and one refresh cycle reads every session in
+the fleet.  Repeating that per read, now with a window borrow on top, is how an
+8s I/O timeout gets hit.  Within the coalesce window, reuse the last redraw;
+past it, redraw again."
+  (let ((buf (get-buffer-create " *ccb-refresh-test4*"))
+        (cc-butler-refresh-coalesce-seconds 30)
+        (cc-butler--refresh-times (make-hash-table :test 'eq))
+        rec)
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local ghostel--term 'fake-term)
+          (cc-butler-session-test--recording-redraw rec
+            (should (cc-butler--refresh-terminal-text buf))
+            (should (cc-butler--refresh-terminal-text buf))   ; coalesced
+            (should (= 1 (length rec)))
+            ;; past the window, it redraws again
+            (let ((cc-butler-refresh-coalesce-seconds 0))
+              (should (cc-butler--refresh-terminal-text buf))
+              (should (= 2 (length rec))))))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/refresh-does-not-coalesce-a-failure ()
+  "A failed redraw must not be remembered as a fresh one — otherwise one
+failure would suppress the retries that follow it."
+  (let ((buf (get-buffer-create " *ccb-refresh-test5*"))
+        (cc-butler-refresh-coalesce-seconds 30)
+        (cc-butler--refresh-times (make-hash-table :test 'eq))
+        (calls 0))
+    (unwind-protect
+        (with-current-buffer buf
+          (setq-local ghostel--term 'fake-term)
+          (cl-letf (((symbol-function 'cc-butler--log) #'ignore)
+                    ((symbol-function 'ghostel--redraw)
+                     (lambda (&rest _) (setq calls (1+ calls)) (error "nope"))))
+            (should (null (cc-butler--refresh-terminal-text buf)))
+            (should (null (cc-butler--refresh-terminal-text buf)))
+            (should (= 2 calls))))
+      (kill-buffer buf))))
+
+;;;; ---- a render must not restart inside itself ----------------------
+;;
+;; Observed live 2026-07-31: the session list rendered UPSIDE DOWN — each
+;; session's detail row above its own name row, butler and steward at the
+;; bottom, two orphaned detail rows at the top — and the selection overlay
+;; painted every session instead of one.  `cc-butler--entries' held
+;; 1,36,34,23,21,... : not ascending, so not buffer positions at all, which a
+;; single uninterrupted render cannot produce.
+;;
+;; The render reads each session's ctx/model tag while it draws, and that read
+;; borrows a window (cache TTL is 3s, so nearly every row really reads).  A
+;; refresh arriving during that read starts a SECOND render inside the first:
+;; it erases the buffer, rebuilds it, and leaves point at the top.  The outer
+;; loop then keeps inserting its remaining rows at that point — prepending
+;; them, hence the inversion — labels them with `start' positions that now
+;; point into the inner render's text, and finally stores entries that are no
+;; longer positions in the buffer anyone is looking at.
+
+(defun cc-butler-session-test--render-fixture ()
+  "Three sessions, each with a detail row.
+The detail row matters: a row is drawn in two inserts, and the tearing shows
+up between them.  A fixture with nothing to put on the second line renders in
+one insert per session and hides the defect."
+  (list (list :dir "/a/" :title "a" :osc "" :status "" :branch "main" :forge "")
+        (list :dir "/b/" :title "b" :osc "" :status "" :branch "main" :forge "")
+        (list :dir "/c/" :title "c" :osc "" :status "" :branch "main" :forge "")))
+
+(ert-deftest cc-butler-session/render-does-not-restart-inside-itself ()
+  "A refresh arriving mid-render must not tear the buffer it lands in.
+Reentry is triggered here the way it happens live — from the per-row ctx tag,
+which is what yields — rather than from a timer, so the test is deterministic."
+  (let ((cc-butler--butler nil) (cc-butler--steward nil)
+        (cc-butler--waiting (make-hash-table :test 'equal))
+        (cc-butler-session-test--sessions (cc-butler-session-test--render-fixture))
+        (reentered 0))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               #'cc-butler-session-test--fake-sessions)
+              ((symbol-function 'cc-butler-cleanup-context-tag)
+               (lambda (_dir)
+                 ;; Exactly one reentry, from inside the outer render's loop.
+                 (when (zerop reentered)
+                   (setq reentered 1)
+                   (cc-butler--render))
+                 nil))
+              ((symbol-function 'cc-butler-cleanup-model-tag) (lambda (_dir) nil))
+              ((symbol-function 'cc-butler-cleanup-context-over-threshold-p)
+               (lambda (_dir) nil)))
+      (with-temp-buffer
+        (cc-butler-mode)
+        (cc-butler--render)
+        (should (= 1 reentered))       ; the reentry really happened
+        ;; Assert on what a person sees, not on the text properties: the outer
+        ;; render paints its own dirs OVER the inner render's text, so a
+        ;; property lookup answers correctly about a row that is not there.
+        (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+          ;; Each session is drawn exactly once.  Reentry drew /b/ and /c/
+          ;; twice and left an ownerless detail row at the top.
+          (dolist (name '("● a" "● b" "● c"))
+            (should (= 1 (cl-count-if (lambda (l) (equal l name))
+                                      (split-string text "\n")))))
+          ;; The buffer opens on a session row, not on a stray detail row.
+          (should (string-prefix-p "●" text)))
+        (should (equal '("/a/" "/b/" "/c/") (mapcar #'car cc-butler--entries)))
+        (let ((ps (mapcar #'cdr cc-butler--entries)))
+          (should (equal ps (sort (copy-sequence ps) #'<))))))))
+
+(ert-deftest cc-butler-session/entries-stay-real-buffer-positions ()
+  "Every entry position must be a distinct, ascending position in the buffer.
+`cc-butler--highlight' derives the selected block from entry N's start and
+entry N+1's start, and navigation jumps by the same table, so once these stop
+being real positions the highlight lands somewhere other than the row it
+belongs to.  On screen that read as every session turning yellow at once.
+
+Live, the table held 1,36,34,23,21,...  Reentering on every row (the read
+happens per row, and its cache TTL is 3s, so live it really does) reproduces
+the same class of damage: positions that repeat instead of advancing."
+  (let ((cc-butler--butler nil) (cc-butler--steward nil)
+        (cc-butler--waiting (make-hash-table :test 'equal))
+        (cc-butler-session-test--sessions (cc-butler-session-test--render-fixture))
+        (depth 0))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               #'cc-butler-session-test--fake-sessions)
+              ((symbol-function 'cc-butler-cleanup-context-tag)
+               (lambda (_dir)
+                 (when (= depth 0)
+                   (let ((depth 1)) (cc-butler--render)))
+                 "ctx 9k"))
+              ((symbol-function 'cc-butler-cleanup-model-tag) (lambda (_dir) "Opus-5"))
+              ((symbol-function 'cc-butler-cleanup-context-over-threshold-p)
+               (lambda (_dir) nil)))
+      (with-temp-buffer
+        (cc-butler-mode)
+        (cc-butler--render)
+        (let ((ps (mapcar #'cdr cc-butler--entries)))
+          (should (equal ps (sort (copy-sequence ps) #'<)))
+          (should (equal ps (delete-dups (copy-sequence ps)))))
+        ;; And each recorded position really is where that session's row starts.
+        (dolist (e cc-butler--entries)
+          (should (equal (car e)
+                         (get-text-property (cdr e) 'cc-butler-dir))))))))
 
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here

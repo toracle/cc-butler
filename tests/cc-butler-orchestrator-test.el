@@ -161,15 +161,23 @@ non-hung path."
           (with-current-buffer term-buf (insert "hello from the terminal\n"))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t)))
             (should (equal "hello from the terminal" (cc-butler--read-output "/worker/")))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
-;;;; ---- ghost/autocomplete input-line redaction (2026-07-21, cc-butler#6) --
-;;;; read_session_output used to return ghost-faced input-line text
+;;;; ---- ghost/autocomplete input-line redaction (cc-butler#6) -----------
+;;;; read_session_output used to return a painted ghost suggestion
 ;;;; byte-identical to real typed input (buffer-substring-no-properties
-;;;; strips the one signal that tells them apart). See governance principle
-;;;; butler-ghost-text-not-a-blocker-authorization-or-data.
+;;;; strips every rendering signal). The first fix compared the row's face
+;;;; FOREGROUND against a constant; measured live 2026-07-23, this fleet
+;;;; paints ghost text #8686a8 on #00005f, never the #a7a7a7 that constant
+;;;; held, so the comparison never matched and the "cannot tell -> real"
+;;;; fail-safe promoted every ghost row to real input. Detection is now the
+;;;; terminal cursor (`cc-butler--input-state'), and THE POINT OF THESE
+;;;; TESTS is that the color is irrelevant — proven by running one row
+;;;; through both measured colors and through no face at all and getting an
+;;;; outcome that depends only on where the cursor sits. See governance
+;;;; principle butler-ghost-text-not-a-blocker-authorization-or-data.
 
 (defun cc-butler-orchestrator-test--insert-border-line ()
   "Insert a border-rule line, as Claude Code draws immediately above and
@@ -177,84 +185,205 @@ below the live input row."
   (insert (make-string 24 cc-butler--border-rule-char))
   (insert "\n"))
 
-(defun cc-butler-orchestrator-test--insert-ghost-line (text)
-  "Insert TEXT as the input row — sandwiched between two border-rule
-lines, matching how Claude Code actually renders the live input area —
-with TEXT painted in the ghost/autocomplete face signature. The prompt is
-followed by U+00A0 NO-BREAK SPACE, not an ordinary space — that is what
-Claude Code actually renders (confirmed 2026-07-21, cc-butler#6 second
-miss); using an ordinary space here is what let that miss ship green."
+(defconst cc-butler-orchestrator-test--prompt
+  (concat "❯" (string #x00A0))
+  "The live input prompt as Claude Code actually renders it: `❯' followed by
+U+00A0 NO-BREAK SPACE, not an ordinary space (confirmed 2026-07-21,
+cc-butler#6).  Spelled as an explicit code point so no editor can silently
+normalise it to a plain space — a fixture with an ordinary space is exactly
+what let an earlier miss ship green at 157/157.")
+
+(defconst cc-butler-orchestrator-test--ghost-face-now
+  '(:foreground "#8686a8" :background "#00005f")
+  "The face this fleet actually paints ghost input-line text with, read out
+of the daemon's diagnostic ring on 2026-07-23.")
+
+(defconst cc-butler-orchestrator-test--ghost-face-legacy
+  '(:foreground "#a7a7a7" :background "#262626")
+  "The face the deleted color check keyed on (measured 2026-07-21).
+Kept as a fixture on purpose: the fix must be indifferent to WHICH of these
+a session happens to paint.")
+
+(defun cc-butler-orchestrator-test--insert-input-row (text &optional face)
+  "Insert TEXT as the input row — sandwiched between two border-rule lines,
+matching how Claude Code renders the live input area — painted in FACE, or
+unfaced when FACE is nil."
   (cc-butler-orchestrator-test--insert-border-line)
-  (insert "❯ ")
+  (insert cc-butler-orchestrator-test--prompt)
   (let ((start (point)))
     (insert text)
-    (put-text-property start (point) 'face
-                        (list :foreground cc-butler--ghost-face-fg
-                              :background cc-butler--ghost-face-bg)))
+    (when face (put-text-property start (point) 'face face)))
   (insert "\n")
   (cc-butler-orchestrator-test--insert-border-line))
 
+(defun cc-butler-orchestrator-test--insert-ghost-line (text)
+  "Insert TEXT as a ghost-painted input row (this fleet's measured face)."
+  (cc-butler-orchestrator-test--insert-input-row
+   text cc-butler-orchestrator-test--ghost-face-now))
+
+(defmacro cc-butler-orchestrator-test--with-term (fill cursor-needle &rest body)
+  "Run BODY against a fake session terminal buffer.
+FILL is evaluated in the buffer to paint the screen.  The terminal cursor is
+reported at the END of the first match of CURSOR-NEEDLE; when CURSOR-NEEDLE
+is nil the backend reports NO cursor at all — the unreadable case."
+  (declare (indent 2))
+  `(let ((buf (generate-new-buffer " *cc-butler-test-term*")))
+     (unwind-protect
+         (with-current-buffer buf
+           ,fill
+           (let ((cursor (when ,cursor-needle
+                           (goto-char (point-min))
+                           (search-forward ,cursor-needle)
+                           (point))))
+             (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                        (lambda (_d) (buffer-name buf)))
+                       ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_b) t))
+                       ((symbol-function 'ghostel-cursor-point) (lambda () cursor)))
+               ,@body)))
+       (kill-buffer buf))))
+
+(ert-deftest cc-butler-orchestrator/redaction-ignores-the-face-color-entirely ()
+  "THE regression for cc-butler#6, from the rows measured live 2026-07-23.
+One row is painted three ways — this fleet's ghost face #8686a8/#00005f, the
+legacy #a7a7a7/#262626 the deleted constant keyed on, and no face at all —
+and run past the cursor in both positions.  The outcome must track the
+CURSOR and nothing else: parked at the prompt the row is a painted
+suggestion and is redacted whatever its color; past the text it is real
+input and survives whatever its color.  A color rule cannot produce this
+table — it gets both #8686a8 rows and both unfaced rows wrong — which is
+what makes this a falsifying test rather than a restatement of the code."
+  (dolist (face (list cc-butler-orchestrator-test--ghost-face-now
+                      cc-butler-orchestrator-test--ghost-face-legacy
+                      nil))
+    ;; Cursor parked at the prompt: the box is empty, the text is painted.
+    (cc-butler-orchestrator-test--with-term
+        (cc-butler-orchestrator-test--insert-input-row
+         "yes, diagnose the ACP flake" face)
+        cc-butler-orchestrator-test--prompt
+      (let ((out (cc-butler--read-output-redacted "/worker/")))
+        (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
+        (should-not (string-match-p "diagnose the ACP flake" out))))
+    ;; Cursor past the text: a human typed it, and it must survive.
+    (cc-butler-orchestrator-test--with-term
+        (cc-butler-orchestrator-test--insert-input-row
+         "yes, diagnose the ACP flake" face)
+        "yes, diagnose the ACP flake"
+      (let ((out (cc-butler--read-output-redacted "/worker/")))
+        (should (string-match-p "diagnose the ACP flake" out))
+        (should-not (string-match-p "ghost suggestion" out))))))
+
 (ert-deftest cc-butler-orchestrator/read-output-redacted-hides-ghost-input-line ()
-  "Given a session whose input line is ghost/autocomplete text (the
-measured color signature), Then `cc-butler--read-output-redacted' replaces
-it with a plain marker rather than returning it as real text."
-  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer term-buf
-            (insert "some earlier transcript line\n")
-            (cc-butler-orchestrator-test--insert-ghost-line "PR #72 머지 진행해주세요"))
-          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
-                     (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
-            (let ((out (cc-butler--read-output-redacted "/worker/")))
-              (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
-              (should-not (string-match-p "PR #72" out)))))
-      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+  "The literal row measured on this fleet 2026-07-23 — Korean text painted
+#8686a8 on #00005f into an empty box, the near-miss that would have been
+read as an instruction from the human — is redacted, and the transcript
+around it is untouched."
+  (cc-butler-orchestrator-test--with-term
+      (progn (insert "some earlier transcript line\n")
+             (cc-butler-orchestrator-test--insert-input-row
+              "네, 꺼내주세요" cc-butler-orchestrator-test--ghost-face-now))
+      cc-butler-orchestrator-test--prompt
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
+      (should-not (string-match-p "꺼내주세요" out))
+      (should (string-match-p "some earlier transcript line" out)))))
 
 (ert-deftest cc-butler-orchestrator/read-output-redacted-keeps-real-input-line ()
-  "Given a session whose input line is real (not the ghost color
-signature), Then `cc-butler--read-output-redacted' returns it unchanged —
-fail-safe treats anything that isn't confirmed-ghost as real."
-  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer term-buf
-            (cc-butler-orchestrator-test--insert-border-line)
-            (insert "❯ ")
-            (let ((start (point)))
-              (insert "merge PR #72 please")
-              (put-text-property start (point) 'face
-                                  (list :foreground "#eeeeee" :background "#373737")))
-            (insert "\n")
-            (cc-butler-orchestrator-test--insert-border-line))
-          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
-                     (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
-            (let ((out (cc-butler--read-output-redacted "/worker/")))
-              (should (string-match-p "merge PR #72 please" out))
-              (should-not (string-match-p "ghost suggestion" out)))))
-      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+  "The third row measured 2026-07-23 — `❯ QQ', genuinely typed, carrying NO
+face at all — is returned unchanged.  Under the deleted color rule an unfaced
+row passed as \"not confirmed ghost, therefore real\"; under the cursor rule
+it passes for the right reason."
+  (cc-butler-orchestrator-test--with-term
+      (cc-butler-orchestrator-test--insert-input-row "QQ" nil)
+      (concat cc-butler-orchestrator-test--prompt "QQ")
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "QQ" out))
+      (should-not (string-match-p "ghost suggestion" out)))))
+
+(ert-deftest cc-butler-orchestrator/redaction-unknown-cursor-redacts-and-says-so ()
+  "FAIL-SAFE DIRECTION, read side.  When the cursor cannot be read at all (a
+non-ghostel backend), the row is REDACTED — the opposite of the compaction
+guard, which believes the painted row in exactly this situation.  Showing a
+suggestion as real input is how it becomes a false instruction; withholding
+a real line is visible and recoverable.  And the marker must say UNVERIFIED
+rather than \"ghost\": no determination was made, and a reader must never be
+handed a guess wearing the costume of an answer."
+  (cc-butler-orchestrator-test--with-term
+      (cc-butler-orchestrator-test--insert-input-row "merge PR #72 please" nil)
+      nil                               ; backend reports no cursor at all
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "UNVERIFIED" out))
+      (should-not (string-match-p "merge PR #72" out))
+      (should-not (string-match-p "ghost suggestion, not user input" out)))))
+
+(ert-deftest cc-butler-orchestrator/redaction-unknown-because-cursor-is-outside-any-box ()
+  "The other route to UNKNOWN: a modal dialog owns the screen, so the cursor
+sits nowhere near the input box.  Still redacted, still UNVERIFIED — \"no box
+at the cursor\" is not evidence that the box is empty."
+  (cc-butler-orchestrator-test--with-term
+      (progn (insert "❯ 1. yes\n  2. no\n")
+             (cc-butler-orchestrator-test--insert-input-row "leftover suggestion" nil))
+      "1. yes"
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "UNVERIFIED" out))
+      (should-not (string-match-p "leftover suggestion" out)))))
+
+(ert-deftest cc-butler-orchestrator/redaction-leaves-an-empty-nbsp-padded-box-alone ()
+  "An empty box — `❯' plus U+00A0 padding, cursor at the prompt — holds no
+text that could be misread, so it is left exactly as it is.  A marker here
+would fire on every idle session in the fleet and train readers to ignore
+markers, which is how the next real one gets missed."
+  (cc-butler-orchestrator-test--with-term
+      (cc-butler-orchestrator-test--insert-input-row "" nil)
+      cc-butler-orchestrator-test--prompt
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should-not (string-match-p "ghost suggestion" out))
+      (should-not (string-match-p "UNVERIFIED" out)))))
+
+(ert-deftest cc-butler-orchestrator/redaction-keeps-a-typed-slash-command ()
+  "A typed slash command is real input even though Claude Code renders it in
+an accent color (#b1b9f9 on this fleet) — the case that makes \"decorated,
+therefore ghost\" unusable in either direction."
+  (cc-butler-orchestrator-test--with-term
+      (cc-butler-orchestrator-test--insert-input-row "/compact" '(:foreground "#b1b9f9"))
+      (concat cc-butler-orchestrator-test--prompt "/compact")
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "/compact" out))
+      (should-not (string-match-p "ghost suggestion" out)))))
+
+(ert-deftest cc-butler-orchestrator/redaction-keeps-multi-line-typed-input ()
+  "A multi-line box: the cursor sits on the second row, everything typed
+ahead of it counts as real input, and nothing is redacted."
+  (cc-butler-orchestrator-test--with-term
+      (progn (cc-butler-orchestrator-test--insert-border-line)
+             (insert cc-butler-orchestrator-test--prompt "first line\n")
+             (insert "  second line\n")
+             (cc-butler-orchestrator-test--insert-border-line))
+      "second line"
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "first line" out))
+      (should (string-match-p "second line" out))
+      (should-not (string-match-p "ghost suggestion" out))
+      (should-not (string-match-p "UNVERIFIED" out)))))
 
 (ert-deftest cc-butler-orchestrator/read-output-redacted-passthrough-when-no-input-line ()
-  "Given a session with no \"❯ \"-prefixed line at all (fail-safe case:
-nothing to detect), Then `cc-butler--read-output-redacted' returns the
-plain text unchanged, same as `cc-butler--read-output'."
+  "Given a session with no border-framed input row at all (nothing to
+detect), Then `cc-butler--read-output-redacted' returns the plain text
+unchanged, same as `cc-butler--read-output'."
   (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
     (unwind-protect
         (progn
           (with-current-buffer term-buf (insert "plain transcript output\n"))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t)))
             (should (equal "plain transcript output" (cc-butler--read-output-redacted "/worker/")))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
 (ert-deftest cc-butler-orchestrator/read-output-unfiltered-unaffected-by-redaction ()
-  "Given the same ghost-faced input line, Then the ORIGINAL
-`cc-butler--read-output' (still used by cc-butler-cleanup.el's model/context
-detectors) is completely unaffected by the new redaction path — it keeps
-returning the raw text, properties stripped, exactly as before."
+  "Given the same ghost input line, Then the ORIGINAL `cc-butler--read-output'
+\(still used by cc-butler-cleanup.el's model/context detectors) is completely
+unaffected by the redaction path — it keeps returning the raw text,
+properties stripped, exactly as before."
   (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
     (unwind-protect
         (progn
@@ -262,158 +391,419 @@ returning the raw text, properties stripped, exactly as before."
             (cc-butler-orchestrator-test--insert-ghost-line "PR #72 머지 진행해주세요"))
           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
                      (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t)))
             (should (string-match-p "PR #72" (cc-butler--read-output "/worker/")))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
 (ert-deftest cc-butler-orchestrator/read-output-redacted-not-fooled-by-scrollback-echo ()
   "Given a scrollback echo of a previously SUBMITTED message (\"❯ /compact\",
-unpainted — plain transcript text, not the input row) followed by the
-genuinely empty, border-sandwiched live input row, Then
-`cc-butler--read-output-redacted' does not mistake the echo for the input
-row. This is the actual root cause of the first redesign's live miss
-2026-07-21 (cc-butler#6): a backward text search for \"❯ \" matches
-submitted-message echoes just as easily as the live row, since both share
-the identical marker."
-  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer term-buf
-            (insert "❯ /compact\n")
-            (insert "Compacted.\n")
-            (cc-butler-orchestrator-test--insert-border-line)
-            (insert "❯ \n")
-            (cc-butler-orchestrator-test--insert-border-line))
-          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
-                     (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
-            (let ((out (cc-butler--read-output-redacted "/worker/")))
-              (should (string-match-p "❯ /compact" out))
-              (should-not (string-match-p "ghost suggestion" out)))))
-      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+plain transcript text, not the input row) followed by the genuinely empty,
+border-sandwiched live input row, Then the echo is not mistaken for the input
+row and is not touched.  This is the root cause of the first redesign's live
+miss 2026-07-21 (cc-butler#6): a backward text search for \"❯ \" matches
+submitted-message echoes just as easily as the live row."
+  (cc-butler-orchestrator-test--with-term
+      (progn (insert "❯ /compact\n")
+             (insert "Compacted.\n")
+             (cc-butler-orchestrator-test--insert-input-row "" nil))
+      "❯ /compact"                      ; cursor left in the echo, not in the box
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "❯ /compact" out))
+      (should-not (string-match-p "ghost suggestion" out)))))
+
+(ert-deftest cc-butler-orchestrator/redaction-breaks-echoed-status-markers ()
+  "P1 (c) marker-breaking: read_session_output renders ANOTHER session's
+terminal into the caller's scrollback, where a `CTX:'/`MODEL:' statusline
+echo could be misattributed as the caller's own by a positional scrape.  The
+redaction rewrites the colon form to `=' — the values stay visible
+(CTX=371538, MODEL=Opus-4.8) but the scrapable `CTX:'/`MODEL:' shape is gone."
+  (cc-butler-orchestrator-test--with-term
+      (progn (insert "CTX:371538 20% MODEL:Opus-4.8\n")
+             (cc-butler-orchestrator-test--insert-input-row "" nil))
+      cc-butler-orchestrator-test--prompt   ; empty box, cursor at the prompt
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "CTX=371538" out))
+      (should (string-match-p "MODEL=Opus-4.8" out))
+      (should-not (string-match-p "CTX:371538" out)))))
 
 (ert-deftest cc-butler-orchestrator/border-line-with-embedded-title-still-detected ()
-  "Given a top border line with a title embedded in the middle (Claude
-Code sometimes draws the topic/branch name there, e.g. \"───── some-topic
-──\" — confirmed 2026-07-21 on a real live session), Then the input row
-between it and a plain border below is still found and redacted
-correctly — the border check is framing, not purity."
-  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer term-buf
-            (insert (make-string 10 cc-butler--border-rule-char))
-            (insert " plugin-gateway-routing-audit ")
-            (insert (make-string 4 cc-butler--border-rule-char))
-            (insert "\n")
-            (insert "❯ ")
-            (let ((start (point)))
-              (insert "PR #72 머지 진행해주세요")
-              (put-text-property start (point) 'face
-                                  (list :foreground cc-butler--ghost-face-fg
-                                        :background cc-butler--ghost-face-bg)))
-            (insert "\n")
-            (cc-butler-orchestrator-test--insert-border-line))
-          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
-                     (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
-            (let ((out (cc-butler--read-output-redacted "/worker/")))
-              (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
-              (should-not (string-match-p "PR #72" out)))))
-      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+  "Given a top border line with a title embedded in the middle (Claude Code
+sometimes draws the topic/branch name there, e.g. \"───── some-topic ──\" —
+confirmed 2026-07-21 on a real live session), Then the row between it and a
+plain border below is still found and redacted — the border check is framing,
+not purity, and it is still the rule CHARACTER, never a color."
+  (cc-butler-orchestrator-test--with-term
+      (progn (insert (make-string 10 cc-butler--border-rule-char))
+             (insert " plugin-gateway-routing-audit ")
+             (insert (make-string 4 cc-butler--border-rule-char))
+             (insert "\n")
+             (insert cc-butler-orchestrator-test--prompt)
+             (let ((start (point)))
+               (insert "PR #72 머지 진행해주세요")
+               (put-text-property start (point) 'face
+                                  cc-butler-orchestrator-test--ghost-face-now))
+             (insert "\n")
+             (cc-butler-orchestrator-test--insert-border-line))
+      cc-butler-orchestrator-test--prompt
+    (let ((out (cc-butler--read-output-redacted "/worker/")))
+      (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
+      (should-not (string-match-p "PR #72" out)))))
 
-(ert-deftest cc-butler-orchestrator/read-output-redacted-hides-ghost-with-nbsp-prompt-pad ()
-  "Regression for the SECOND cc-butler#6 miss (2026-07-21): a real live
-phantom (\"move to #7\", the correct next-step guess) passed through
-`cc-butler--read-output-redacted' completely unredacted. Root cause:
-Claude Code pads the prompt with U+00A0 NO-BREAK SPACE after \"❯\", not
-an ordinary space, so the old fixed-offset check (`looking-at-p \"❯ \"'
-with an ordinary space) failed to match, fell back to sampling the
-unfaced \"❯\" glyph itself, and the fail-safe correctly-but-wrongly
-called an unreadable sample \"real\". Built from the ACTUAL captured row
-— \"❯\" + U+00A0 + ghost-faced text — not a synthetic fixture with an
-ordinary space; that is exactly the gap that let the bug ship at
-157/157 green. `cc-butler--line-ghost-p' fixes this by scanning every
-cell in the row instead of trusting one offset to hold it."
-  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
-    (unwind-protect
-        (progn
-          (with-current-buffer term-buf
-            (cc-butler-orchestrator-test--insert-border-line)
-            (insert "❯ ")
-            (let ((start (point)))
-              (insert "move to #7")
-              (put-text-property start (point) 'face
-                                  (list :foreground cc-butler--ghost-face-fg
-                                        :background cc-butler--ghost-face-bg)))
-            (insert "\n")
-            (cc-butler-orchestrator-test--insert-border-line))
-          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
-                     (lambda (_d) (buffer-name term-buf)))
-                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) nil)))
-            (let ((out (cc-butler--read-output-redacted "/worker/")))
-              (should (string-match-p "\\[ghost suggestion, not user input\\]" out))
-              (should-not (string-match-p "move to #7" out)))))
-      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+;;;; ---- type+submit atomicity (2026-07-23) ------------------------------
+;;;; `cc-butler--send-input' writes twice for a submitting send: the text,
+;;;; then the Return. Between them sat a `sleep-for' — the settle delay —
+;;;; and `sleep-for' runs timers. Elisp being single-threaded, that was the
+;;;; ONLY yield point in the sequence, and it was inside it: any other
+;;;; cc-butler timer (mail delivery, the compaction monitor's steward
+;;;; notify, a dispatch, the compaction driver) could fire there and type
+;;;; and submit its own text on the same session, leaving the first
+;;;; writer's Return to land on whatever state the second produced.
+;;;; `cc-butler--settle' keeps the wall-clock wait but spends it without
+;;;; yielding, so the pair is atomic with respect to every timer.
 
-(ert-deftest cc-butler-orchestrator/line-ghost-p-skips-unfaced-prompt-glyph ()
-  "`cc-butler--line-ghost-p' judges on a faced cell, not on offset 0 (the
-prompt glyph, which carries no face at all whether padded with an
-ordinary space or U+00A0) — direct unit coverage of the scan itself,
-independent of the border/redaction machinery around it."
-  (with-temp-buffer
-    (insert "❯ ")
-    (let ((start (point)))
-      (insert "phantom text")
-      (put-text-property start (point) 'face
-                          (list :foreground cc-butler--ghost-face-fg
-                                :background cc-butler--ghost-face-bg)))
-    (should (cc-butler--line-ghost-p (point-min) (point-max)))))
+(defvar cc-butler-orchestrator-test--writes nil
+  "Terminal writes recorded by `cc-butler-orchestrator-test--with-stub-terminal'.
+Newest first; read it through `cc-butler-orchestrator-test--recorded-writes'.")
 
-(ert-deftest cc-butler-orchestrator/line-ghost-p-nil-when-nothing-faced ()
-  "`cc-butler--line-ghost-p' returns nil (fail-safe: treat as real) when no
-cell in the row carries any face at all — the genuinely-empty live input
-row case, not a detection failure."
-  (with-temp-buffer
-    (insert "❯ ")
-    (should-not (cc-butler--line-ghost-p (point-min) (point-max)))))
+(defun cc-butler-orchestrator-test--recorded-writes ()
+  "The recorded terminal writes, oldest first."
+  (reverse cc-butler-orchestrator-test--writes))
 
-(ert-deftest cc-butler-orchestrator/line-ghost-p-detects-ghost-even-when-glyph-is-faced ()
-  "The prompt glyph's own face is NOT constant — sometimes nil (the
-original captured phantom), sometimes a dim #999999/#262626 status style
-(observed live 2026-07-21 on a genuinely-empty row). `cc-butler--line-ghost-p'
-must not resolve on whichever cell comes first in the row; it must find
-the ghost signature wherever it actually is, even when a non-ghost face
-(the glyph's dim style) comes before it. This is the case a
-\"first-faced-cell\" reading of the function would fail — direct
-verification that the actual scan does not have that failure mode."
-  (with-temp-buffer
-    (insert "❯")
-    (put-text-property (1- (point)) (point) 'face
-                        (list :foreground "#999999" :background "#262626"))
-    (insert " ")
-    (put-text-property (1- (point)) (point) 'face
-                        (list :foreground "#999999" :background "#262626"))
-    (let ((start (point)))
-      (insert "some ghost suggestion")
-      (put-text-property start (point) 'face
-                          (list :foreground cc-butler--ghost-face-fg
-                                :background cc-butler--ghost-face-bg)))
-    (should (cc-butler--line-ghost-p (point-min) (point-max)))))
+(defmacro cc-butler-orchestrator-test--with-stub-terminal (&rest body)
+  "Run BODY with session \"/worker/\" backed by a stub terminal.
+`claude-code-ide--terminal-send-string' and
+`claude-code-ide--terminal-send-return' record `(:string TEXT)' and
+`(:return)' entries into `cc-butler-orchestrator-test--writes' instead of
+touching a real terminal, so a send's byte-level shape and ordering can
+be asserted directly."
+  (declare (indent 0))
+  `(let ((cc-butler-session-io-timeout 5)
+         (cc-butler-orchestrator-test--writes nil)
+         (term-buf (get-buffer-create " *cc-butler-test-term*")))
+     (unwind-protect
+         (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                    (lambda (_d) (buffer-name term-buf)))
+                   ((symbol-function 'cc-butler--display-name) (lambda (d) d))
+                   ((symbol-function 'claude-code-ide--terminal-send-string)
+                    (lambda (s) (push (list :string s) cc-butler-orchestrator-test--writes)))
+                   ((symbol-function 'claude-code-ide--terminal-send-return)
+                    (lambda () (push (list :return) cc-butler-orchestrator-test--writes))))
+           ,@body)
+       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
-(ert-deftest cc-butler-orchestrator/line-ghost-p-nil-when-glyph-faced-but-row-otherwise-empty ()
-  "A dim-faced prompt glyph (#999999/#262626, not the ghost signature) on
-an otherwise-empty row must still read as real/empty, not ghost —
-confirms the dim status style near the prompt does not itself trigger a
-false positive."
-  (with-temp-buffer
-    (insert "❯")
-    (put-text-property (1- (point)) (point) 'face
-                        (list :foreground "#999999" :background "#262626"))
-    (insert " ")
-    (put-text-property (1- (point)) (point) 'face
-                        (list :foreground "#999999" :background "#262626"))
-    (should-not (cc-butler--line-ghost-p (point-min) (point-max)))))
+(ert-deftest cc-butler-orchestrator/send-input-is-not-interleaved-by-another-timer ()
+  "Regression for the 2026-07-23 race. Given a second writer pending on a
+timer while a submitting send is mid-sequence (scheduled here from inside
+the first writer's terminal write, exactly as mail delivery or the
+compaction monitor would already be armed), Then the two sends come out
+as two complete, ordered sequences — text then Return, text then Return —
+and are never interleaved. Against the old `sleep-for' settle the pending
+timer fired inside the gap and produced text-A, text-B, Return-B,
+Return-A: writer A's Return submitting writer B's text."
+  (cc-butler-orchestrator-test--with-stub-terminal
+    (let ((cc-butler-submit-delay 0.1)
+          (record (symbol-function 'claude-code-ide--terminal-send-string))
+          (scheduled nil))
+      (cl-letf (((symbol-function 'claude-code-ide--terminal-send-string)
+                 (lambda (s)
+                   (funcall record s)
+                   ;; Arm the interloper once, while the first send is
+                   ;; still between its two writes.
+                   (unless scheduled
+                     (setq scheduled t)
+                     (run-with-timer
+                      0 nil (lambda () (cc-butler--send-input "/worker/" "BBB" t)))))))
+        (cc-butler--send-input "/worker/" "AAA" t)
+        ;; Only now, with the first send complete, give the timer its
+        ;; chance to run.
+        (let ((deadline (+ (float-time) 2)))
+          (while (and (< (length cc-butler-orchestrator-test--writes) 4)
+                      (< (float-time) deadline))
+            (sleep-for 0.01))))
+      (should (equal '((:string "AAA") (:return) (:string "BBB") (:return))
+                     (cc-butler-orchestrator-test--recorded-writes))))))
+
+(ert-deftest cc-butler-orchestrator/send-input-never-yields-between-text-and-return ()
+  "`cc-butler--send-input' must not call `sleep-for', `sit-for' or
+`accept-process-output' anywhere in a submitting send — those are exactly
+the forms that let another timer run between the text and the Return, and
+that is the 2026-07-23 race. All three are stubbed to signal here, so the
+yield cannot be reintroduced later by someone who does not know why the
+settle delay stopped being a `sleep-for'."
+  (cc-butler-orchestrator-test--with-stub-terminal
+    (let ((cc-butler-submit-delay 0.02))
+      (cl-letf (((symbol-function 'sleep-for)
+                 (lambda (&rest _) (error "send-input yielded via sleep-for")))
+                ((symbol-function 'sit-for)
+                 (lambda (&rest _) (error "send-input yielded via sit-for")))
+                ((symbol-function 'accept-process-output)
+                 (lambda (&rest _) (error "send-input yielded via accept-process-output"))))
+        (should (cc-butler--send-input "/worker/" "hello" t))))
+    (should (equal '((:string "hello") (:return))
+                   (cc-butler-orchestrator-test--recorded-writes)))))
+
+(ert-deftest cc-butler-orchestrator/settle-waits-at-least-the-requested-time ()
+  "`cc-butler--settle' still spends the wall clock it is asked for — the
+settle delay is load-bearing (a Return sent too early is dropped before
+the input is processed); only the yielding was removed."
+  (let ((start (float-time)))
+    (cc-butler--settle 0.05)
+    (let ((elapsed (- (float-time) start)))
+      (should (>= elapsed 0.05))
+      (should (< elapsed 1)))))
+
+(ert-deftest cc-butler-orchestrator/settle-is-a-no-op-for-nil-zero-and-negative ()
+  "`cc-butler--settle' returns immediately for nil, 0 and a negative
+duration, so a caller may disable the delay by setting the knob to 0."
+  (dolist (seconds (list nil 0 -1))
+    (let ((start (float-time)))
+      (cc-butler--settle seconds)
+      (should (< (- (float-time) start) 0.02)))))
+
+(ert-deftest cc-butler-orchestrator/send-input-multi-line-is-one-bracketed-paste ()
+  "A multi-line body still goes out as ONE bracketed paste with its
+newlines literal and exactly one Return — the atomicity fix must not
+disturb the paste framing that keeps an embedded LF from submitting."
+  (cc-butler-orchestrator-test--with-stub-terminal
+    (cc-butler--send-input "/worker/" "first line\nsecond line\nthird" t)
+    (should (equal (list (list :string "\e[200~first line\nsecond line\nthird\e[201~")
+                         (list :return))
+                   (cc-butler-orchestrator-test--recorded-writes)))))
+
+(ert-deftest cc-butler-orchestrator/send-input-single-line-is-unwrapped-with-one-return ()
+  "A single-line body goes out unwrapped, followed by exactly one Return."
+  (cc-butler-orchestrator-test--with-stub-terminal
+    (cc-butler--send-input "/worker/" "just one line" t)
+    (should (equal '((:string "just one line") (:return))
+                   (cc-butler-orchestrator-test--recorded-writes)))))
+
+(ert-deftest cc-butler-orchestrator/send-input-without-submit-sends-no-return ()
+  "With SUBMIT nil the text is typed and nothing else — no Return, and no
+settle delay to spend."
+  (cc-butler-orchestrator-test--with-stub-terminal
+    (cc-butler--send-input "/worker/" "typed but not submitted")
+    (should (equal '((:string "typed but not submitted"))
+                   (cc-butler-orchestrator-test--recorded-writes)))))
+
+;;;; ------------------------------------------------------------------
+;;;; A failed refresh must not be served as output
+;;;; ------------------------------------------------------------------
+
+(defmacro cc-butler-orch-test--with-term-buffer (refresh-ok &rest body)
+  "Run BODY with a fake session buffer holding known-stale text.
+REFRESH-OK is what `cc-butler--refresh-terminal-text' reports."
+  (declare (indent 1))
+  `(let ((buf (get-buffer-create " *cc-butler-orch-test-term*")))
+     (unwind-protect
+         (progn
+           (with-current-buffer buf
+             (erase-buffer)
+             (insert "text from an hour ago\nstill the same frame\n"))
+           (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                      (lambda (_d) (buffer-name buf)))
+                     ((symbol-function 'cc-butler--display-name) (lambda (_d) "s"))
+                     ((symbol-function 'cc-butler--refresh-terminal-text)
+                      (lambda (_b) ,refresh-ok)))
+             ,@body))
+       (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest cc-butler-orchestrator/read-refuses-to-serve-a-stale-frame ()
+  "When the refresh failed, the buffer still holds the last frame that DID
+render.  Returning it would present hours-old text as the current screen, and
+a coordinator acting on it (answering a dialog it cannot actually see) is the
+expensive failure.  Honest nil instead."
+  (cc-butler-orch-test--with-term-buffer nil
+    (should (null (cc-butler--read-output "/d/")))))
+
+(ert-deftest cc-butler-orchestrator/read-returns-text-when-refresh-worked ()
+  "The refusal is conditional on the refresh actually failing."
+  (cc-butler-orch-test--with-term-buffer t
+    (should (string-match-p "still the same frame" (cc-butler--read-output "/d/")))))
+
+(ert-deftest cc-butler-orchestrator/read-tool-distinguishes-stale-from-empty ()
+  "\"(no output)\" and \"could not be refreshed\" are different facts and the
+tool must not collapse them: one says the screen is empty, the other says we
+do not know what the screen says."
+  (cc-butler-orch-test--with-term-buffer nil
+    (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/")))
+      (let ((out (cc-butler-tool-read-session "s")))
+        (should-not (equal out "(no output)"))
+        (should (string-match-p "refresh\\|stale\\|could not" out))))))
+;;;; Attribution: the code says who is speaking, not the model
+;;;; ------------------------------------------------------------------
+
+;; Text delivered by `send_to_session' arrives in the target's input box looking
+;; exactly like something a human typed there.  A worker therefore cannot tell a
+;; peer's suggestion from an instruction, and a message carries whatever
+;; authority the reader assumes.  Relying on the sending model to add "this is
+;; from me" is relying on it to remember; the code can simply do it.
+
+(defmacro cc-butler-orch-test--sending (self target &rest body)
+  "Run BODY with the send path stubbed; sent text collects in `sent'."
+  (declare (indent 2))
+  `(let ((sent nil))
+     (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () ,self))
+               ((symbol-function 'cc-butler--dir-by-name) (lambda (_n) ,target))
+               ((symbol-function 'cc-butler--send-input)
+                (lambda (_d text &optional _s) (push text sent) t))
+               ((symbol-function 'cc-butler--clear-waiting) #'ignore)
+               ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+               ((symbol-function 'cc-butler--log) #'ignore)
+               ((symbol-function 'cc-butler--display-name)
+                (lambda (d) (file-name-nondirectory (directory-file-name d))))
+               ((symbol-function 'cc-butler--session-id) (lambda (_d) "sid-1")))
+       ,@body)))
+
+(ert-deftest cc-butler-orchestrator/relayed-text-carries-its-sender ()
+  "The attribution is prepended by the CODE, on its own line, and names the
+sending session — so the receiver can tell a relayed message from typed input."
+  (cc-butler-orch-test--sending "/steward/" "/worker/"
+    (cc-butler-tool-send-session "worker" "Read gh issue #13")
+    (let ((text (car sent)))
+      (should (string-match-p "\\`\\[cc-butler" text))
+      (should (string-match-p "steward" text))
+      (should (string-match-p "worker" text))
+      ;; the message itself is untouched, on its own line below
+      (should (string-match-p "\n Read gh issue #13\\'\\|\nRead gh issue #13\\'" text)))))
+
+(ert-deftest cc-butler-orchestrator/attribution-names-the-session-not-just-the-label ()
+  "Display names can collide (two dirs under one project root flatten to the
+same label), so the attribution carries the session id too."
+  (cc-butler-orch-test--sending "/steward/" "/worker/"
+    (cc-butler-tool-send-session "worker" "hello")
+    (should (string-match-p "sid-1" (car sent)))))
+
+(ert-deftest cc-butler-orchestrator/a-slash-command-is-not-attributed ()
+  "A bare slash command is an OPERATION on the session, not a message to read.
+Prefixing it would put `[cc-butler ...]' at the start of the input, so the line
+would stop being a command at all — `/model opus' would arrive as prose."
+  (cc-butler-orch-test--sending "/steward/" "/worker/"
+    (cc-butler-tool-send-session "worker" "/model opus")
+    (should (equal "/model opus" (car sent)))))
+
+(ert-deftest cc-butler-orchestrator/no-caller-identity-sends-nothing ()
+  "The identity is missing on real paths (no MCP request in scope, a stale or
+unregistered session id).  Today the text is delivered and THEN the formatting
+raises, so the sender is told it failed while the receiver has it — and a
+sender that believes it failed re-sends, delivering the same instruction twice.
+Decide before the side effect, matching report_to_steward."
+  (cc-butler-orch-test--sending nil "/worker/"
+    (should-error (cc-butler-tool-send-session "worker" "hello"))
+    (should (null sent))))
+
+(ert-deftest cc-butler-orchestrator/self-send-is-still-refused ()
+  "The self-send guard still holds, and nothing is typed on the way out.
+It compares identities, so a nil identity used to make it silently false —
+refusing a nil identity earlier is what keeps this guard meaningful."
+  (cc-butler-orch-test--sending "/worker/" "/worker/"
+    (should-error (cc-butler-tool-send-session "worker" "hello"))
+    (should (null sent))))
+
+(ert-deftest cc-butler-orchestrator/driver-commands-are-never-attributed ()
+  "GUARD.  Compaction types `/model sonnet', `/compact' and `1' through
+`cc-butler--send-input' directly.  Attribution must live at the MCP tool layer
+only: prefixing at the send primitive would corrupt every one of them."
+  (let ((sent nil))
+    (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name) (lambda (_d) "nope"))
+              ((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cl-letf (((symbol-function 'claude-code-ide--terminal-send-string)
+                 (lambda (s) (push s sent)))
+                ((symbol-function 'claude-code-ide--terminal-send-return) #'ignore)
+                ((symbol-function 'get-buffer) (lambda (_n) (current-buffer)))
+                ((symbol-function 'buffer-live-p) (lambda (_b) t)))
+        (cc-butler--send-input "/w/" "/model sonnet" t)
+        (should (equal '("/model sonnet") sent))))))
+
+;;;; ------------------------------------------------------------------
+;;;; Draining must not destroy what it has not yet delivered
+;;;; ------------------------------------------------------------------
+
+;; Both queues emptied themselves BETWEEN reading their items and rendering
+;; them, so anything that went wrong while rendering took the items with it.
+;; And "emptied" meant discarded: nothing downstream could recover, or even
+;; tell that a delivery had been lost.
+;;
+;; These are the first tests to touch the drains at all — the existing payload
+;; tests stub them at the function boundary, so they pass regardless of what
+;; the drain does with the queue.
+
+(ert-deftest cc-butler-orchestrator/decision-drain-keeps-items-when-rendering-fails ()
+  "Rendering happens BEFORE the queue is emptied.  A malformed item used to
+signal from inside the formatter, unwinding past a clear that had already
+run — no string was ever returned and the decisions were gone."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--butler-inbox-drained nil)
+        (cc-butler--butler-inbox
+         (list (list :time "not-a-time" :summary "malformed" :name "w"))))
+    (should-error (cc-butler-tool-pending-decisions))
+    ;; still there to try again with
+    (should cc-butler--butler-inbox)))
+
+(ert-deftest cc-butler-orchestrator/event-drain-keeps-items-when-rendering-fails ()
+  "The worker-event queue is the same shape and gets the same guarantee."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--inbox-drained nil)
+        (cc-butler--inbox
+         (list (list :time "not-a-time" :name "w" :body "malformed"))))
+    (should-error (cc-butler-tool-inbox))
+    (should cc-butler--inbox)))
+
+(ert-deftest cc-butler-orchestrator/a-drain-archives-rather-than-discards ()
+  "Emptying the queue must not mean losing its contents.  Delivery can still
+fail after the drain — the hook can be killed at its timeout, `jq' can be
+missing — and the only way to notice, or to recover, is if the drained items
+still exist somewhere.  Mirrors the maildir drain, which renames into
+`archive/' rather than deleting."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--butler-inbox-drained nil)
+        (cc-butler--butler-inbox
+         (list (list :time (current-time) :summary "decide this" :name "w"))))
+    (let ((out (cc-butler-tool-pending-decisions)))
+      (should (string-match-p "decide this" out)))
+    (should (null cc-butler--butler-inbox))          ; not delivered twice
+    (should (= 1 (length cc-butler--butler-inbox-drained)))))
+
+(ert-deftest cc-butler-orchestrator/an-empty-drain-says-whether-anything-was-delivered ()
+  "\"No pending decisions.\" is ambiguous: it means both `nothing was ever
+sent' and `something was sent and already handed to someone else'.  The hook
+drains every turn, so a direct call almost always loses the race and reads the
+second case as the first.  That ambiguity produced a false diagnosis on
+2026-07-31 — two empty drains were reported as a silent non-delivery, and the
+escalation had simply not been sent yet."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--butler-inbox-drained nil)
+        (cc-butler--butler-inbox
+         (list (list :time (current-time) :summary "s" :name "w"))))
+    (cc-butler-tool-pending-decisions)                       ; first consumer wins
+    (let ((second (cc-butler-tool-pending-decisions)))        ; second sees nothing
+      (should (string-match-p "No pending decisions" second))
+      (should (string-match-p "delivered" second)))))
+
+(ert-deftest cc-butler-orchestrator/the-archive-is-bounded ()
+  "It is a recovery window, not a log — it must not grow without limit."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler-drained-keep 3)
+        (cc-butler--butler-inbox-drained nil))
+    (dotimes (i 6)
+      (let ((cc-butler--butler-inbox
+             (list (list :time (current-time) :summary (format "d%d" i) :name "w"))))
+        (cc-butler-tool-pending-decisions)))
+    (should (= 3 (length cc-butler--butler-inbox-drained)))))
+
+(ert-deftest cc-butler-orchestrator/events-payload-does-not-lose-a-drain-to-a-later-failure ()
+  "The events payload computes MORE ingredients after draining, and the fleet
+scan is a larger error surface than the drain itself.  A failure there must not
+take the events with it."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--inbox-drained nil)
+        (cc-butler--inbox
+         (list (list :time (current-time) :name "w" :body "done: PR #42"))))
+    (cl-letf (((symbol-function 'cc-butler--inbox-urgent-block) (lambda (_a) nil))
+              ((symbol-function 'cc-butler--fleet-stale-waiting-summary)
+               (lambda () (error "fleet scan blew up"))))
+      ;; whatever the payload does, the drained events must remain recoverable
+      (ignore-errors (cc-butler--pending-events-hook-payload))
+      (should (or cc-butler--inbox cc-butler--inbox-drained)))))
 
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here

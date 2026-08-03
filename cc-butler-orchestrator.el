@@ -77,13 +77,17 @@ terminal screen, after a force-refresh, or nil if the buffer isn't live.
 Bounded by `cc-butler-session-io-timeout' so a stuck redraw cannot hang
 the caller.  Shared by `cc-butler--read-output' (plain text, properties
 stripped) and `cc-butler--read-output-redacted' (ghost-input-line-aware,
-still needs the live `face' properties BUF carries before they're gone)."
+which needs BUF itself — the terminal cursor lives on the buffer, not in
+any string cut out of it)."
   (with-timeout (cc-butler-session-io-timeout
                  (error "Timed out reading session %s's output after %ss (redraw or buffer access may be stuck)"
                         (cc-butler--display-name dir) cc-butler-session-io-timeout))
     (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
-      (when (buffer-live-p buf)
-        (cc-butler--refresh-terminal-text buf)
+      ;; A failed refresh leaves the last frame that DID render sitting in the
+      ;; buffer.  Serving it would present old text as the current screen, and a
+      ;; caller acting on that — answering a permission dialog it cannot
+      ;; actually see — is the expensive mistake.  Report nothing instead.
+      (when (and (buffer-live-p buf) (cc-butler--refresh-terminal-text buf))
         (with-current-buffer buf
           (let* ((n (max 1 (or lines 40)))
                  (start (save-excursion (goto-char (point-max))
@@ -98,143 +102,136 @@ plain text.  See `cc-butler--output-buffer-and-bounds'."
     (with-current-buffer (car bb)
       (string-trim (buffer-substring-no-properties (cadr bb) (cddr bb))))))
 
-(defconst cc-butler--ghost-face-fg "#a7a7a7"
-  "Foreground color Claude Code renders ghost/autocomplete input-line text
-with (measured 2026-07-21) — see governance principle
-butler-ghost-text-not-a-blocker-authorization-or-data.")
+(defconst cc-butler--ghost-marker "❯ [ghost suggestion, not user input]"
+  "Stand-in for an input row that holds a painted suggestion, not input.")
 
-(defconst cc-butler--ghost-face-bg "#262626"
-  "Background color Claude Code renders ghost/autocomplete input-line text
-with (measured 2026-07-21) — pairs with `cc-butler--ghost-face-fg'.")
-
-(defun cc-butler--ghost-face-p (face)
-  "Return non-nil if FACE (a plist, as ghostel paints terminal cells)
-matches the color signature Claude Code renders ghost/autocomplete text
-with."
-  (and (consp face)
-       (equal (plist-get face :foreground) cc-butler--ghost-face-fg)
-       (equal (plist-get face :background) cc-butler--ghost-face-bg)))
-
-;; --- TEMPORARY diagnostics for cc-butler#6 (silent redaction miss,
-;; 2026-07-21) — remove once the miss is root-caused.  Pure observability:
-;; does not alter `cc-butler--redact-ghost-input-line's return value at all.
-(defvar cc-butler--ghost-redaction-debug nil
-  "TEMPORARY ring of the last few redaction attempts, newest first. Each
-entry: (:time STR :found BOOL :line-text STR :faces ((OFFSET . FACE) ...)).
-Remove along with `cc-butler--ghost-redaction-debug-record' and its call
-site in `cc-butler--redact-ghost-input-line' once cc-butler#6 is
-root-caused.")
-
-(defconst cc-butler--ghost-redaction-debug-max 30
-  "TEMPORARY cap on `cc-butler--ghost-redaction-debug' entries.")
-
-(defun cc-butler--ghost-redaction-debug-record (entry)
-  "TEMPORARY: push ENTRY onto `cc-butler--ghost-redaction-debug', capped."
-  (push entry cc-butler--ghost-redaction-debug)
-  (when (> (length cc-butler--ghost-redaction-debug) cc-butler--ghost-redaction-debug-max)
-    (setq cc-butler--ghost-redaction-debug
-          (seq-take cc-butler--ghost-redaction-debug cc-butler--ghost-redaction-debug-max))))
-
-(defun cc-butler--line-ghost-p (line-beg line-end)
-  "Return non-nil if any character in [LINE-BEG,LINE-END) carries the
-ghost/autocomplete face signature (`cc-butler--ghost-face-p'). Scans
-every cell in the row rather than sampling a single fixed offset — the
-prompt glyph and any padding after it carry no face at all (confirmed
-2026-07-21: Claude Code pads \"❯\" with U+00A0 NO-BREAK SPACE on some
-builds, not an ordinary space, so a fixed offset can land on an unfaced
-cell and wrongly read as real). An entirely unfaced row still yields
-nil — fail-safe: nothing readable to call ghost."
-  (let ((pos line-beg))
-    (catch 'found
-      (while (< pos line-end)
-        (when (cc-butler--ghost-face-p (get-text-property pos 'face))
-          (throw 'found t))
-        (setq pos (1+ pos)))
-      nil)))
+(defconst cc-butler--unreadable-input-marker
+  "❯ [input row UNVERIFIED — could not tell real input from a ghost suggestion; redacted]"
+  "Stand-in for an input row whose ghost-vs-real state could not be read.
+Says so out loud, deliberately.  The alternative to a noisy marker is
+handing a reader a clean-looking line that was actually a guess, and a
+guess that reads as a human instruction is the whole failure mode this
+redaction exists to prevent.  A reader who sees this can go look at the
+session; a reader handed a confident wrong answer cannot know to.")
 
 (defun cc-butler--redact-ghost-input-line (start end)
-  "In the current buffer, return the text between START and END as a
-plain string, with one exception: if the input row — the line
-sandwiched between two consecutive border-rule lines, see
-`cc-butler--find-input-line' — is rendered in the ghost/autocomplete
-color signature (not real input), its content is replaced with a plain
-marker instead of being returned as if it were real.
+  "Return the current buffer's text between START and END, with the live
+input row replaced by a marker unless it holds text a human really typed.
 
-The input row used to be found by a backward search for a literal
-\"❯ \" prefix. That was abandoned 2026-07-21 (cc-butler#6) for two
-independent reasons, either one enough on its own: (1) the prefix is not
-unique to the live row — Claude Code echoes SUBMITTED messages in
-scrollback with the identical \"❯ \" marker, so a text search for it can
-land on a past message instead of the live row, and on an empty live row
-it frequently matches nothing at all in range; (2) a first attempt at
-replacing it with the border rule's own COLOR was also rejected before
-being built on — that color was measured #0891b2 on one session and
-#888888 on five others sampled the same day, so it is theme-dependent,
-same as the ghost signature itself. The row is found instead by the
-border rule's CONTENT (`cc-butler--border-line-p', the U+2500
-box-drawing character repeated) — deliberately not by any color — which
-holds regardless of theme, and regardless of whether the row itself is
-empty, ghost, or real. Do not \"simplify\" this back to a color check on
-the border; that was tried and found fragile before this landed.
+The row is LOCATED by the border rules that frame it
+\(`cc-butler--find-input-line', anchored on the U+2500 rule CHARACTER, never
+on a color).  What is IN it is judged by `cc-butler--input-state' — the
+terminal cursor.  A row that is empty once padding is stripped is left
+alone either way: there is no text in it to be misread, and a marker there
+would be noise on every idle session in the fleet.
 
-Judging ghost-vs-real used to sample ONE fixed offset into the row (just
-past a literal \"❯ \" prefix). That was abandoned 2026-07-21 (cc-butler#6,
-second miss on the same day): a live phantom (\"move to #7\") passed
-through unredacted because Claude Code pads the prompt with U+00A0
-NO-BREAK SPACE after \"❯\", not an ordinary space — the literal prefix
-match failed, the fallback landed on the unfaced \"❯\" glyph itself, and
-the fail-safe correctly-but-wrongly treated an unreadable single sample
-as real. `cc-butler--line-ghost-p' scans every cell in the row instead
-of trusting one offset to be the right one — robust to NBSP padding, to
-a changed prompt glyph, and to the single-point-sample risk at once,
-not just the specific character that broke this time.
+FAIL-SAFE DIRECTION, read_session_output: an UNKNOWN state is treated as
+GHOST and redacted.  What this answer gates is whether to SHOW a row to a
+reader.  A ghost suggestion shown as real input gets read as an instruction
+from the human — on 2026-07-23 a painted sentence very nearly became one —
+and nothing downstream can audit it back to the screen it came from.  A
+real line withheld is withheld VISIBLY: the marker is right there, and the
+reader can open the session.  So the unreadable case is redacted, and it
+carries `cc-butler--unreadable-input-marker' rather than the ghost marker
+so that a guess is never presented as a determination.  The compaction
+guard in `cc-butler-compact--typed-text' gates the opposite thing and takes
+UNKNOWN the opposite way; that is why `cc-butler--input-state' reports
+three outcomes instead of a boolean.
 
-Fail-safe: if no such sandwich is found in range, or no cell in the row
-carries any face at all, the text is returned unchanged — an unreadable
-signal is always treated as real, never optimistically assumed to be
-ghost. See governance principle
-butler-ghost-text-not-a-blocker-authorization-or-data."
+DELETED HERE 2026-07-24 (cc-butler#6): this used to compare the row's face
+FOREGROUND against a constant — #a7a7a7 on #262626.  Measured live on this
+fleet, ghost text is painted #8686a8 on #00005f, so the comparison never
+once matched; and because the old fail-safe leaned the other way (\"cannot
+tell -> real input\"), every ghost row was silently promoted to real input.
+Styling is not state.  Do not reintroduce a color check here — that is the
+third time this codebase has paid for one."
   (save-excursion
     (let* ((line-beg (cc-butler--find-input-line start end))
-           (line-end (and line-beg (save-excursion (goto-char line-beg) (line-end-position)))))
-      ;; TEMPORARY diagnostic capture — see the defvar above. Kept in
-      ;; place until this redesign is confirmed against a real live
-      ;; phantom, not just synthetic input (cc-butler#6).
-      (if (not line-beg)
-          (cc-butler--ghost-redaction-debug-record
-           (list :time (format-time-string "%H:%M:%S") :found nil))
-        (let* ((l-len (- line-end line-beg))
-               (offsets (seq-filter (lambda (o) (< o l-len))
-                                    '(0 1 2 3 4 5 6 8 10 15 20 30 40)))
-               (faces (mapcar (lambda (o) (cons o (get-text-property (+ line-beg o) 'face)))
-                             offsets)))
-          (cc-butler--ghost-redaction-debug-record
-           (list :time (format-time-string "%H:%M:%S") :found t
-                 :line-text (buffer-substring-no-properties line-beg line-end)
-                 :faces faces))))
-      (if (and line-beg (cc-butler--line-ghost-p line-beg line-end))
+           (line-end (and line-beg (save-excursion (goto-char line-beg)
+                                                   (line-end-position))))
+           (painted (and line-beg
+                         (cc-butler--strip-input-pad
+                          (buffer-substring-no-properties line-beg line-end))))
+           (marker (and painted (not (string-empty-p painted))
+                        (pcase (car (cc-butler--input-state))
+                          ('real nil)
+                          ('ghost cc-butler--ghost-marker)
+                          (_ cc-butler--unreadable-input-marker)))))
+      (if marker
           (concat (buffer-substring-no-properties start line-beg)
-                  "❯ [ghost suggestion, not user input]"
+                  marker
                   (buffer-substring-no-properties line-end end))
         (buffer-substring-no-properties start end)))))
 
+(defun cc-butler--break-status-markers (text)
+  "Make any echoed statusline markers in TEXT human-readable but UN-SCRAPABLE.
+`read_session_output' renders ANOTHER session's terminal into the caller's
+scrollback; a `CTX:'/`MODEL:' statusline marker echoed there could be
+misattributed as the caller's OWN by a positional scrape (the 2026-07-27
+misattribution).  Rewriting the colon form to `=' keeps the values fully
+visible for human verification (CTX=371538, MODEL=Opus-4.8 — the numbers are
+NOT stripped) while removing the exact `CTX:'/`MODEL:' shape the statusline
+scrape requires, so a coordinator's scrollback can never poison session_status.
+Defense-in-depth alongside the bottom-chrome anchor in
+`cc-butler-cleanup--statusline-fields'.  Only affects text handed to a reader
+of ANOTHER session; a worker verifying its OWN buffer still sees the real
+CTX:/MODEL: statusline."
+  (replace-regexp-in-string
+   "MODEL:" "MODEL="
+   (replace-regexp-in-string "CTX:" "CTX=" text)))
+
 (defun cc-butler--read-output-redacted (dir &optional lines)
-  "Like `cc-butler--read-output', but a ghost/autocomplete input line is
-replaced with a plain marker instead of being returned as real text —
-used by the `read_session_output' MCP tool so a caller can never mistake
-a phantom for a blocker, an authorization, or data.  See
+  "Like `cc-butler--read-output', but the live input row is replaced with a
+plain marker unless a human really typed into it — used by the
+`read_session_output' MCP tool so a caller can never mistake a painted
+suggestion for a blocker, an authorization, or data.  A row whose state
+cannot be determined is redacted too, and says so.  Echoed `CTX:'/`MODEL:'
+statusline markers are additionally broken to `CTX='/`MODEL=' (still readable,
+no longer scrapable) so another session's marker cannot be misread as the
+caller's own — see `cc-butler--break-status-markers'.  See
 `cc-butler--redact-ghost-input-line' and governance principle
 butler-ghost-text-not-a-blocker-authorization-or-data."
   (when-let ((bb (cc-butler--output-buffer-and-bounds dir lines)))
     (with-current-buffer (car bb)
-      (string-trim (cc-butler--redact-ghost-input-line (cadr bb) (cddr bb))))))
+      (cc-butler--break-status-markers
+       (string-trim (cc-butler--redact-ghost-input-line (cadr bb) (cddr bb)))))))
 
 (defcustom cc-butler-submit-delay 0.1
   "Seconds to wait after sending text before the submitting Return.
 The worker's input must settle before Enter or the Return is dropped and
-nothing submits (the same delay `claude-code-ide-send-prompt' uses)."
+nothing submits (the same delay `claude-code-ide-send-prompt' uses).
+Spent as a non-yielding busy-wait (`cc-butler--settle') so nothing can
+run between the typing and the Return, so Emacs is unresponsive for this
+long on every submitting send — keep it small."
   :type 'number
   :group 'cc-butler)
+
+(defun cc-butler--settle (seconds)
+  "Let SECONDS of wall clock pass WITHOUT yielding to Emacs.
+A no-op when SECONDS is nil or not positive.
+
+The busy-wait is deliberate, and the whole point of this function.
+`sleep-for', `sit-for', `accept-process-output' and `redisplay' all give
+timers a chance to run; Elisp being single-threaded, a stretch of code
+with none of those forms in it is atomic with respect to every cc-butler
+timer.  Used between the two halves of a terminal write (type, then
+Return), a yielding wait is precisely the hole another timer slips
+through to type and submit its own text on the same session — see
+`cc-butler--send-input'.
+
+Waiting without yielding is sufficient here because the thing we are
+waiting on is not Emacs: the bytes we just wrote have already been handed
+to the pty and are consumed by the OS and the worker subprocess, which
+run regardless of what Emacs does.  Only wall-clock time is needed, not
+Emacs attention.  The price is that Emacs is unresponsive for the
+duration, which is why the caller's delay is a fraction of a second
+\(`cc-butler-submit-delay', 0.1s) — cheap next to a dropped Return or a
+corrupted prompt."
+  (when (and (numberp seconds) (> seconds 0))
+    (let ((deadline (+ (float-time) seconds)))
+      (while (< (float-time) deadline)
+        ;; Spin on purpose.  Anything that waits here would run timers.
+        nil))))
 
 (defun cc-butler--send-input (dir text &optional submit)
   "Type TEXT into session DIR's terminal; when SUBMIT, also press Return.
@@ -244,7 +241,17 @@ keeps the embedded newlines literal so only the final Return submits.
 Carriage returns are normalized to LF and stray ESC bytes are stripped so
 the body cannot break out of the paste or submit mid-prompt.  A short
 settle delay precedes the Return so it is not dropped before the input is
-processed."
+processed.
+
+That delay deliberately does NOT yield (`cc-butler--settle', a busy-wait,
+not `sleep-for').  Typing and submitting are two writes that must reach
+the worker as one indivisible act, and a yielding wait between them lets
+another timer — mail delivery, the compaction monitor, a dispatch — call
+this same function on this same session, type and submit its own text,
+and leave our Return to land on whatever state it produced.  That is the
+2026-07-23 race: a command left typed-but-unsubmitted, and stale text
+prepended to the next dispatch.  Keep this sequence free of `sleep-for',
+`sit-for', `accept-process-output' and `redisplay'."
   (with-timeout (cc-butler-session-io-timeout
                  (error "Timed out sending input to session %s after %ss (terminal may be stuck; text may be partially delivered)"
                         (cc-butler--display-name dir) cc-butler-session-io-timeout))
@@ -259,7 +266,7 @@ processed."
             (claude-code-ide--terminal-send-string (concat "\e[200~" body "\e[201~"))
           (claude-code-ide--terminal-send-string body))
         (when submit
-          (sleep-for cc-butler-submit-delay)
+          (cc-butler--settle cc-butler-submit-delay)
           (claude-code-ide--terminal-send-return)))
       t)))
 
@@ -303,13 +310,11 @@ a prior butler home) to reuse its contents."
 
 (defun cc-butler--claude-memory-dir (project-dir)
   "Return the Claude per-project memory directory for PROJECT-DIR, or nil.
-Claude encodes a project path by replacing `/' and `.' with `-'."
-  (when project-dir
-    (expand-file-name
-     (concat (replace-regexp-in-string
-              "[/.]" "-" (directory-file-name (expand-file-name project-dir)))
-             "/memory/")
-     "~/.claude/projects/")))
+The per-project directory (Claude's `/'-and-`.'-to-`-' slug of the path) is the
+shared `cc-butler--claude-project-dir'; the memory dir is its `memory/'
+subdirectory."
+  (when-let ((proj (cc-butler--claude-project-dir project-dir)))
+    (expand-file-name "memory/" proj)))
 
 (defun cc-butler--shared-state-note ()
   "Return a CLAUDE.md section pointing both roles at the shared docs + memory.
@@ -598,7 +603,12 @@ three are empty."
   (let* ((inbox (cc-butler--inbox-urgent-block "steward"))
          (events (cc-butler-tool-inbox))
          (has-events (not (equal events "No pending worker events.")))
-         (stale (cc-butler--fleet-stale-waiting-summary))
+         ;; Guarded like `ceiling' below, and for a sharper reason: this walks
+         ;; every session, so it is a larger error surface than the drain that
+         ;; precedes it — and it runs AFTER that drain.  An unguarded failure
+         ;; here would take the drained events down with it.  A missing nudge
+         ;; is a small loss; a swallowed worker report is not.
+         (stale (ignore-errors (cc-butler--fleet-stale-waiting-summary)))
          ;; cc-butler-compact loads after this module, so reach it late.
          ;; Same bargain as the stale-waiting nudge: elisp reports what is
          ;; over the context ceiling, the steward decides when to act.
@@ -1038,6 +1048,61 @@ is rendered as a document in 정수님's inbox; otherwise it queues for
     (cc-butler--maybe-refresh)
     "Escalated the decision (rendered for 정수님 when the workflow is on, else queued for pending_decisions)."))
 
+;;;; ---- draining without destroying ---------------------------------
+
+;; A drain used to empty its queue BETWEEN reading the items and rendering
+;; them, and "empty" meant discard.  Two consequences, both silent:
+;;
+;;   - anything that went wrong while rendering unwound past a clear that had
+;;     already happened, so the items were gone and no string was ever
+;;     returned;
+;;   - delivery can still fail AFTER the drain — the hook is killed at its
+;;     10s timeout, `jq' is missing, the client drops the context — and
+;;     nothing downstream could recover the items or even notice.
+;;
+;; So: render first, clear last, and keep what was drained.  The maildir
+;; transport already works this way — it renames messages into `archive/'
+;; rather than deleting them — this brings the in-memory queues in line with
+;; the convention rather than inventing one.
+;;
+;; This is a partial remedy and worth naming as such: it turns unrecoverable
+;; silent loss into recoverable silent loss.  Knowing a delivery failed still
+;; requires someone to look.  A full fix needs the consumer to acknowledge
+;; receipt, which means changing the hook script — deliberately out of scope,
+;; because hook templates are written once and never refreshed, so that change
+;; would ship to nobody until each session's home is regenerated by hand.
+
+(defcustom cc-butler-drained-keep 20
+  "How many drained items each queue keeps for recovery.
+A window for answering \"was this delivered?\", not a log."
+  :type 'integer :group 'cc-butler)
+
+(defvar cc-butler--butler-inbox-drained nil
+  "Recently drained decisions, newest last.  See `cc-butler-drained-keep'.")
+
+(defvar cc-butler--inbox-drained nil
+  "Recently drained worker events, newest last.  See `cc-butler-drained-keep'.")
+
+(defun cc-butler--archive-drained (archive items)
+  "Return ARCHIVE with ITEMS appended, trimmed to `cc-butler-drained-keep'."
+  (let ((all (append archive items)))
+    (if (> (length all) cc-butler-drained-keep)
+        (nthcdr (- (length all) cc-butler-drained-keep) all)
+      all)))
+
+(defun cc-butler--nothing-pending (sentinel archive)
+  "SENTINEL, plus what ARCHIVE says was recently handed to someone else.
+An empty queue means either \"nothing was sent\" or \"something was sent and
+another consumer already took it\".  Both drains race — the hook runs every
+turn — so the second case is the common one, and reading it as the first is
+how an ordinary hand-off gets reported as a lost message."
+  (if (null archive)
+      sentinel
+    (format "%s  (%d recently delivered, latest %s)"
+            sentinel (length archive)
+            (format-time-string "%H:%M"
+                                (plist-get (car (last archive)) :time)))))
+
 (defun cc-butler-tool-pending-decisions ()
   "MCP tool (butler): drain the quiet decision queue (steward escalations)."
   (if (eq cc-butler-message-transport 'maildir)
@@ -1050,17 +1115,23 @@ is rendered as a document in 정수님's inbox; otherwise it queues for
                      (if (plist-get m :needs) (format " . needs: %s" (plist-get m :needs)) "")))
            msgs "\n")))
     (if (null cc-butler--butler-inbox)
-        "No pending decisions."
-      (let ((events (reverse cc-butler--butler-inbox)))
+        (cc-butler--nothing-pending "No pending decisions."
+                                    cc-butler--butler-inbox-drained)
+      (let* ((events (reverse cc-butler--butler-inbox))
+             ;; Render BEFORE touching the queue: if this signals, the items
+             ;; are still there to try again with.
+             (text (mapconcat
+                    (lambda (e)
+                      (format "- [%s] %s%s%s"
+                              (format-time-string "%H:%M" (plist-get e :time))
+                              (plist-get e :summary)
+                              (if (plist-get e :name) (format " (from %s)" (plist-get e :name)) "")
+                              (if (plist-get e :needs) (format " . needs: %s" (plist-get e :needs)) "")))
+                    events "\n")))
+        (setq cc-butler--butler-inbox-drained
+              (cc-butler--archive-drained cc-butler--butler-inbox-drained events))
         (setq cc-butler--butler-inbox nil)
-        (mapconcat
-         (lambda (e)
-           (format "- [%s] %s%s%s"
-                   (format-time-string "%H:%M" (plist-get e :time))
-                   (plist-get e :summary)
-                   (if (plist-get e :name) (format " (from %s)" (plist-get e :name)) "")
-                   (if (plist-get e :needs) (format " . needs: %s" (plist-get e :needs)) "")))
-         events "\n")))))
+        text))))
 
 (setq claude-code-ide-mcp-server-tools
       (seq-remove
@@ -1118,26 +1189,87 @@ is rendered as a document in 정수님's inbox; otherwise it queues for
 
 (defun cc-butler-tool-read-session (name &optional lines)
   "MCP tool: return the recent terminal output of session NAME.
-A ghost/autocomplete input-line suggestion is redacted to a plain marker
-rather than returned as if it were real input — see
-`cc-butler--read-output-redacted'."
+An input row holding a ghost/autocomplete suggestion — or one whose state
+could not be read at all — is redacted to a plain marker rather than
+returned as if it were real input.  See `cc-butler--read-output-redacted'."
   (let ((dir (cc-butler--dir-by-name name)))
     (if (not dir)
         (format "No session named %S.  Call list_claude_sessions for names." name)
-      (or (cc-butler--read-output-redacted dir (and lines (truncate lines)))
-          "(no output)"))))
+      (let ((out (cc-butler--read-output-redacted dir (and lines (truncate lines)))))
+        (cond
+         ;; "the screen is empty" and "we do not know what the screen says" are
+         ;; different facts.  Collapsing them into one reassuring string is what
+         ;; let a frozen terminal read as ordinary output for hours.
+         ((null out)
+          (format "(could not read %s's screen: its terminal text could not be refreshed, \
+so it may be stale.  Deliberately not showing the last frame — acting on an old \
+screen is worse than seeing none.  Check the cc-butler log for the refresh error.)"
+                  name))
+         ((string-empty-p out) "(no output)")
+         (t out))))))
+
+(defun cc-butler--relay-command-p (text)
+  "Non-nil when TEXT is a bare slash command rather than a message.
+A command is an OPERATION on the session, not prose for anyone to read, and
+prefixing it would put the attribution at the start of the input — `/model opus'
+would then arrive as text instead of running.  The sender is still logged."
+  (and (stringp text)
+       (string-prefix-p "/" (string-trim-left text))
+       (not (string-search "\n" (string-trim text)))))
+
+(defun cc-butler--relay-attribution (self dir)
+  "Return the line marking a message as relayed from SELF to DIR.
+
+Written by the CODE, never by the sending model.  Text delivered this way lands
+in the target's input box looking exactly like something a human typed, so
+without this a session cannot tell a peer's suggestion from an instruction and a
+message carries whatever authority the reader assumes.  Asking each sender to
+label itself is asking it to remember; this cannot be forgotten.
+
+It attests the CHANNEL, not the origin: it says which session delivered the
+text, not who authored the intent behind it.  A relayed instruction and the
+sender's own opinion are indistinguishable here by design — `From' (the origin
+author, per the provenance SDD §8) is deliberately NOT set, because nothing in
+the code can tell relaying from deciding, and inventing a default would be
+deciding an open policy question in passing.
+
+The identity is trustworthy: a session's id is minted at launch into its own MCP
+config and recovered server-side from the request path, so a session cannot
+claim to be another.  Name AND id, because display names can collide."
+  (format "[cc-butler · %s]"
+          (cc-butler--via-string
+           (list (cc-butler--who-dir self) (cc-butler--display-name dir)))))
 
 (defun cc-butler-tool-send-session (name text)
-  "MCP tool: type TEXT into session NAME and submit it."
+  "MCP tool: type TEXT into session NAME and submit it.
+The text is prefixed with a line naming the sending session — see
+`cc-butler--relay-attribution'."
   (let ((self (cc-butler--caller-dir))
         (dir (cc-butler--dir-by-name name)))
     (cond
      ((not dir)
       (format "No session named %S.  Call list_claude_sessions for names." name))
+     ;; Decide this BEFORE the send.  The identity is legitimately absent on
+     ;; several paths — no MCP request in scope (a timer, a hook, a bare
+     ;; `emacsclient --eval'), or a session id that is stale or was never
+     ;; registered — and it used to be caught only when formatting the log
+     ;; line, AFTER the text had been delivered.  The sender was told it
+     ;; failed while the receiver had the message, and a sender that believes
+     ;; it failed re-sends, delivering the same instruction twice.  A nil
+     ;; identity also silently disables the self-send guard below.
+     ;; Which path produced it in the wild could not be determined from the
+     ;; code; `claude-code-ide-debug' logs the session id on every request and
+     ;; would settle it.  Matches report_to_steward, which already refuses.
+     ((not self)
+      (error "No calling session context for this request"))
      ((equal dir self)
       (error "Refusing to send to the calling session itself"))
      (t
-      (cc-butler--send-input dir text t)
+      (cc-butler--send-input
+       dir (if (cc-butler--relay-command-p text)
+               text
+             (concat (cc-butler--relay-attribution self dir) "\n" text))
+       t)
       (cc-butler--clear-waiting dir)       ; commanding a worker attends to it
       (cc-butler--log "%s → %s │ %s" (cc-butler--who-dir self) (cc-butler--who-dir dir) text)
       (cc-butler--maybe-refresh)
@@ -1200,15 +1332,22 @@ without anything being typed into its input box."
                                (plist-get m :body)))
                      msgs "\n")))
     (if (null cc-butler--inbox)
-        "No pending worker events."
-      (let ((events (reverse cc-butler--inbox)))
+        (cc-butler--nothing-pending "No pending worker events."
+                                    cc-butler--inbox-drained)
+      (let* ((events (reverse cc-butler--inbox))
+             ;; Render BEFORE clearing — same reason as the decision queue,
+             ;; and this payload goes on to compute a fleet scan afterwards,
+             ;; which is a larger error surface than the drain itself.
+             (text (mapconcat (lambda (e)
+                                (format "- [%s] %s: %s"
+                                        (format-time-string "%H:%M" (plist-get e :time))
+                                        (cc-butler--who (plist-get e :name) (plist-get e :id))
+                                        (plist-get e :body)))
+                              events "\n")))
+        (setq cc-butler--inbox-drained
+              (cc-butler--archive-drained cc-butler--inbox-drained events))
         (setq cc-butler--inbox nil)
-        (mapconcat (lambda (e)
-                     (format "- [%s] %s: %s"
-                             (format-time-string "%H:%M" (plist-get e :time))
-                             (cc-butler--who (plist-get e :name) (plist-get e :id))
-                             (plist-get e :body)))
-                   events "\n")))))
+        text))))
 
 ;; Idempotent (re)registration: drop prior copies before adding.
 (setq claude-code-ide-mcp-server-tools
@@ -1267,7 +1406,7 @@ without anything being typed into its input box."
 (claude-code-ide-make-tool
  :function #'cc-butler-tool-read-session
  :name "read_session_output"
- :description "Read the recent terminal screen of another Claude session by name, to see what it is doing or asking. The text is that session's live TUI screen (may include UI chrome). A detected ghost/autocomplete input-line suggestion is replaced with a plain marker rather than returned as real text — it is never the session's actual input."
+ :description "Read the recent terminal screen of another Claude session by name, to see what it is doing or asking. The text is that session's live TUI screen (may include UI chrome). The input row is returned only when the session's terminal cursor shows a human really typed into it; a ghost/autocomplete suggestion painted into an empty box is replaced with a plain marker, and a row whose state cannot be determined is replaced with an UNVERIFIED marker rather than shown as if it were real input."
  :args '((:name "name"
                 :type string
                 :description "Session name from list_claude_sessions (e.g. 'app-billing').")

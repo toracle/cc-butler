@@ -112,7 +112,7 @@ CURSOR-NEEDLE, or at `point-max' when CURSOR-NEEDLE is nil."
                                     (search-forward ,cursor-needle) (point))
                            (point-max))))
              (cl-letf (((symbol-function 'ghostel-cursor-point) (lambda () cursor))
-                       ((symbol-function 'cc-butler--refresh-terminal-text) #'ignore)
+                       ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_b) t))
                        ((symbol-function 'claude-code-ide--get-buffer-name)
                         (lambda (_d) (buffer-name buf))))
                ,@body)))
@@ -194,13 +194,34 @@ must not conclude the box is empty.  Fail safe, back to the painted row."
   "On a terminal backend with no readable cursor, degrade to the old painted
 row check rather than assuming empty."
   (let ((screen (string-join '("─────" "❯ something" "─────") "\n")))
-    (cl-letf (((symbol-function 'cc-butler--refresh-terminal-text) #'ignore)
+    (cl-letf (((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_b) t))
               ((symbol-function 'cc-butler--read-output) (lambda (&rest _) screen))
               ((symbol-function 'claude-code-ide--get-buffer-name)
                (lambda (_d) (buffer-name (current-buffer)))))
       (with-temp-buffer
         (fmakunbound 'ghostel-cursor-point)
         (should (equal (cc-butler-compact--typed-text "d") "something"))))))
+
+(ert-deftest cc-butler-compact/unknown-cursor-is-treated-as-real-input ()
+  "FAIL-SAFE DIRECTION, compaction guard — the deliberate OPPOSITE of
+`cc-butler-orchestrator/redaction-unknown-cursor-redacts-and-says-so'.
+Both call sites ask `cc-butler--input-state' the same question and get the
+same UNKNOWN back; this one resolves it toward REAL INPUT and refuses to
+compact, because typing over a sentence a human is composing corrupts their
+input and submits something neither of us wrote, while a skipped compaction
+costs one sweep.  The read side resolves it the other way, because showing a
+suggestion as real input is how it becomes a false instruction.  That is why
+the shared predicate reports three outcomes instead of a boolean."
+  (let ((screen (string-join '("─────" "❯ half-typed sentence" "─────") "\n")))
+    (cl-letf (((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_b) t))
+              ((symbol-function 'cc-butler--read-output) (lambda (&rest _) screen))
+              ((symbol-function 'claude-code-ide--get-buffer-name)
+               (lambda (_d) (buffer-name (current-buffer))))
+              ((symbol-function 'ghostel-cursor-point) (lambda () nil)))
+      (with-temp-buffer
+        (insert screen)
+        (should (equal (cc-butler-compact--typed-text "d") "half-typed sentence"))
+        (should (cc-butler-compact--pending-input-p "d"))))))
 
 (ert-deftest cc-butler-compact/prose-numbered-lists-are-not-menus ()
   "REGRESSION (live, 2026-07-22): reading 40 lines pulls in scrollback, and
@@ -230,9 +251,9 @@ up is history, not something waiting on a keypress."
 (ert-deftest cc-butler-compact/model-arg-maps-display-name-to-alias ()
   "A statusline MODEL: tag is a display name, not a /model argument; it must
 be mapped back to the family alias before it can restore anything."
-  (should (equal (cc-butler-compact--model-arg "Opus-4.8") "opus"))
-  (should (equal (cc-butler-compact--model-arg "Sonnet-5") "sonnet"))
-  (should (equal (cc-butler-compact--model-arg "claude-haiku-4-5") "haiku")))
+  (should (equal (cc-butler-compact--model-arg "Opus-4.8") "claude-opus-4-8"))
+  (should (equal (cc-butler-compact--model-arg "Sonnet-5") "claude-sonnet-5"))
+  (should (equal (cc-butler-compact--model-arg "claude-haiku-4-5") "claude-haiku-4-5")))
 
 (ert-deftest cc-butler-compact/unnameable-model-yields-nil ()
   "An unrecognized model returns nil so the caller refuses to switch at all —
@@ -270,6 +291,11 @@ argument that was sent."
          (cc-butler-compact-test--ctx 400000))
      (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d))
                ((symbol-function 'cc-butler--waiting-p) (lambda (_d) (float-time)))
+               ;; idle by transcript activity: newest write is ancient, so the
+               ;; real `cc-butler--transcript-idle-p' reports idle without any
+               ;; filesystem access.  Busy tests override this to a fresh time.
+               ((symbol-function 'cc-butler--session-last-activity)
+                (lambda (_d) (- (float-time) 100000)))
                ((symbol-function 'cc-butler--log) #'ignore)
                ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
                ((symbol-function 'claude-code-ide--get-buffer-name)
@@ -308,7 +334,8 @@ state change rather than on elapsed time."
     (cc-butler-compact--poll "w")
     (should (equal (cc-butler-compact-test--sent-in-order)
                    '("/model sonnet" "1")))
-    ;; A second tick while the modal is still rendering must NOT answer twice.
+    ;; A second tick while the modal is still rendering must NOT answer twice:
+    ;; the screen is a frame, and the modal may already be gone.
     (cc-butler-compact--poll "w")
     (should (equal (cc-butler-compact-test--sent-in-order)
                    '("/model sonnet" "1")))
@@ -325,7 +352,7 @@ state change rather than on elapsed time."
     (setq cc-butler-compact-test--ctx 90000)
     (cc-butler-compact--poll "w")
     (should (equal (cc-butler-compact-test--sent-in-order)
-                   '("/model sonnet" "1" "/compact" "/model opus")))
+                   '("/model sonnet" "1" "/compact" "/model claude-opus-4-8")))
     ;; Original model returns; the machine finishes and releases the lock.
     (setq cc-butler-compact-test--model "Opus-4.8")
     (cc-butler-compact--poll "w")
@@ -365,7 +392,7 @@ silent downgrade nobody notices."
     (cc-butler-compact--set-state
      "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
     (cc-butler-compact--poll "w")
-    (should (equal (car cc-butler-compact-test--sent) "/model opus"))))
+    (should (equal (car cc-butler-compact-test--sent) "/model claude-opus-4-8"))))
 
 (ert-deftest cc-butler-compact/switch-timeout-with-model-unchanged-just-aborts ()
   "A switch that never happened needs no restore: the session is still on its
@@ -397,7 +424,7 @@ state that would otherwise strand a session on the cheap model."
                               (funcall real d)))))
       (cc-butler-compact--poll "w"))
     (should (equal (cc-butler-compact-test--sent-in-order)
-                   '("/model sonnet" "/model opus")))))
+                   '("/model sonnet" "/model claude-opus-4-8")))))
 
 (ert-deftest cc-butler-compact/restore-failure-is-reported-not-swallowed ()
   "If the model does not come back, the driver finishes with an explicit
@@ -408,8 +435,15 @@ failure naming both the actual and the wanted model."
     (cc-butler-compact--poll "w")            ; -> /compact
     (setq cc-butler-compact-test--ctx 90000)
     (cc-butler-compact--poll "w")            ; -> /model opus
+    ;; the exact id times out -> falls back to the family rather than giving up
     (cc-butler-compact--set-state
      "w" :sent-time (- (float-time) (1+ cc-butler-compact-step-timeout)))
+    (should (null (cc-butler-compact--poll "w")))
+    (should (equal "opus" (plist-get (gethash "w" cc-butler-compact--state) :orig-arg)))
+    ;; only once every candidate is spent is the failure reported
+    (cc-butler-compact--set-state
+     "w" :phase 'restoring
+     :sent-time (- (float-time) (1+ cc-butler-compact-step-timeout)))
     (let ((msg (cc-butler-compact--poll "w")))
       (should (string-match-p "NOT restored" msg))
       (should (string-match-p "Sonnet-5" msg)))))
@@ -522,14 +556,255 @@ persisting) the buffer cross-check refuses to call it abandoned."
     (should (cc-butler-compact--active-p "w"))))
 
 ;;;; ------------------------------------------------------------------
+;;;; The restore modal — the 2026-07-23 freeze
+;;;; ------------------------------------------------------------------
+
+;; Switching back to the original model raises the SAME confirmation modal as
+;; switching away.  On 2026-07-23 a live compaction of this very session left
+;; it parked on that modal for two and a half hours.  The restore phase did
+;; have a modal branch, so the failure was never "no handling" — it was that
+;; the modal arrived outside the window anything was watching.  These cover
+;; the three separate defects that produced it.
+
+(ert-deftest cc-butler-compact/restore-modal-is-answered ()
+  "The confirmation modal on the way BACK is answered, exactly as the one on
+the way out.  Both switches raise it; only one of them used to survive it."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")            ; -> /compact
+    (setq cc-butler-compact-test--ctx 90000)
+    (cc-butler-compact--poll "w")            ; -> /model opus
+    (should (equal (car cc-butler-compact-test--sent) "/model claude-opus-4-8"))
+    ;; Restoring raises the modal too.
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--modal-screen)
+    (cc-butler-compact--poll "w")
+    (should (equal (cc-butler-compact-test--sent-in-order)
+                   '("/model sonnet" "/compact" "/model claude-opus-4-8" "1")))
+    ;; Answered, the switch lands and the machine finishes cleanly.
+    (setq cc-butler-compact-test--model "Opus-4.8"
+          cc-butler-compact-test--screen cc-butler-compact-test--idle-screen)
+    (cc-butler-compact--poll "w")
+    (should-not (cc-butler-compact--active-p "w"))))
+
+(ert-deftest cc-butler-compact/restore-modal-is-retried-after-a-cooldown ()
+  "One answer can land before the modal has finished rendering and select
+nothing.  A latch would then never try again — which is how a session ends
+up sitting on a dialog nobody answers.  Retry, but only after the cooldown,
+so a stale frame cannot draw a stray answer onto the screen behind it."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")
+    (setq cc-butler-compact-test--ctx 90000)
+    (cc-butler-compact--poll "w")            ; -> /model opus
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--modal-screen)
+    (cc-butler-compact--poll "w")            ; answer #1
+    (should (equal (car cc-butler-compact-test--sent) "1"))
+    ;; Immediately after: no second answer, the frame may simply be stale.
+    (cc-butler-compact--poll "w")
+    (should (equal (length cc-butler-compact-test--sent) 4))
+    ;; Cooldown elapses and the modal is still genuinely up: answer again.
+    (cc-butler-compact--set-state
+     "w" :answered-at (- (float-time) (1+ (cc-butler-compact--answer-cooldown))))
+    (cc-butler-compact--poll "w")
+    (should (equal (cc-butler-compact-test--sent-in-order)
+                   '("/model sonnet" "/compact" "/model claude-opus-4-8" "1" "1")))))
+
+(ert-deftest cc-butler-compact/restore-is-held-until-the-session-is-idle ()
+  "REGRESSION (2026-07-23): the compact phase gave up watching while /compact
+was STILL RUNNING and typed /model opus into a busy session.  The modal
+appeared long after the restore step's own 90s clock had expired, so nothing
+was polling by the time it came up.  The restore must not be typed at all
+until the session is at a waiting point."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")            ; -> /compact
+    ;; /compact overruns its timeout and the session is still working.
+    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+      (cc-butler-compact--set-state
+       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+      (cc-butler-compact--poll "w")
+      ;; Nothing typed: the restore is held, not fired into a busy session.
+      (should (equal (cc-butler-compact-test--sent-in-order)
+                     '("/model sonnet" "/compact")))
+      (should (cc-butler-compact--active-p "w"))
+      (cc-butler-compact--poll "w")
+      (should (equal (length cc-butler-compact-test--sent) 2)))
+    ;; The turn ends; now the restore goes out, inside a watched window.
+    (cc-butler-compact--poll "w")
+    (should (equal (cc-butler-compact-test--sent-in-order)
+                   '("/model sonnet" "/compact" "/model claude-opus-4-8")))))
+
+(ert-deftest cc-butler-compact/held-restore-still-gives-up-eventually ()
+  "Holding for idle must not become its own way to hang: a session that never
+reaches a waiting point ends the compaction with an explicit failure."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")
+    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+      (cc-butler-compact--set-state
+       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+      (cc-butler-compact--poll "w")          ; -> held in restore-wait
+      (cc-butler-compact--set-state
+       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+      (let ((msg (cc-butler-compact--poll "w")))
+        (should (string-match-p "NOT restored" msg))
+        (should (string-match-p "waiting point" msg)))
+      (should-not (cc-butler-compact--active-p "w")))))
+
+(ert-deftest cc-butler-compact/never-walks-away-from-a-standing-modal ()
+  "REGRESSION (2026-07-23): giving up is recoverable; abandoning a session
+parked on a modal the driver itself opened is not — that session is stopped
+dead until a human notices.  Every terminating path clears the screen first."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")            ; -> /compact
+    (setq cc-butler-compact-test--ctx 90000)
+    (cc-butler-compact--poll "w")            ; -> /model opus
+    ;; The restore times out with the modal still standing.
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--modal-screen)
+    (cc-butler-compact--set-state
+     "w" :answers cc-butler-compact-modal-answers  ; retries exhausted
+     ;; last remaining candidate, so this timeout terminates rather than
+     ;; falling back — the terminating path is what this test is about
+     :orig-args '("claude-opus-4-8")
+     :sent-time (- (float-time) (1+ cc-butler-compact-step-timeout)))
+    (let ((msg (cc-butler-compact--poll "w")))
+      (should (string-match-p "NOT restored" msg)))
+    ;; It still cleared the dialog on the way out.
+    (should (equal (car cc-butler-compact-test--sent) "1"))
+    (should-not (cc-butler-compact--active-p "w"))))
+
+;;;; ------------------------------------------------------------------
+;;;; The restore that never submitted — the 2026-07-23 residual race
+;;;; ------------------------------------------------------------------
+
+;; Typing and submitting are two terminal writes with a gap between them.  A
+;; worker notification arriving in that gap starts the session's turn, so the
+;; Return lands on a session no longer sitting at its input box.  The command
+;; stays typed but unsubmitted: the session is stranded on the cheap model,
+;; and the stale text waits in the box to prepend itself to the next dispatch.
+;; #15 fixed the modal; this is the send underneath it.
+
+(defmacro cc-butler-compact-test--with-unsubmitted (text &rest body)
+  "Run BODY with TEXT sitting unsubmitted in the session's input box."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'cc-butler-compact--typed-text)
+              (lambda (_d) ,text))
+             ((symbol-function 'cc-butler-compact--send-raw)
+              (lambda (_d s) (push (concat "RAW:" s) cc-butler-compact-test--sent) t))
+             ((symbol-function 'cc-butler-compact--send-return)
+              (lambda (_d) (push "RETURN" cc-butler-compact-test--sent) t)))
+     ,@body))
+
+(defun cc-butler-compact-test--to-restore (dir)
+  "Drive DIR to the point where /model opus has just been sent."
+  (cc-butler-compact-session dir)
+  (setq cc-butler-compact-test--model "Sonnet-5")
+  (cc-butler-compact--poll dir)            ; -> /compact
+  (setq cc-butler-compact-test--ctx 90000)
+  (cc-butler-compact--poll dir))           ; -> /model opus
+
+(ert-deftest cc-butler-compact/unsubmitted-restore-is-resent ()
+  "REGRESSION (2026-07-23): the restore was typed but the Return was lost to a
+notification, leaving the session on the cheap model with the command sitting
+in its box.  Waiting cannot fix it — nothing is in flight — so it must be
+sent again once the session is idle."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-test--to-restore "w")
+    (should (equal (car cc-butler-compact-test--sent) "/model claude-opus-4-8"))
+    (cc-butler-compact-test--with-unsubmitted "/model claude-opus-4-8"
+      ;; Seen sitting there: back to waiting for idle rather than timing out.
+      (cc-butler-compact--poll "w")
+      (should (cc-butler-compact--active-p "w"))
+      (should (equal (plist-get (gethash "w" cc-butler-compact--state) :phase)
+                     'restore-wait))
+      ;; Idle again — the text is already there, so only the Return is needed.
+      (cc-butler-compact--poll "w")
+      (should (equal (car cc-butler-compact-test--sent) "RETURN")))))
+
+(ert-deftest cc-butler-compact/an-already-typed-restore-is-not-typed-twice ()
+  "Retyping a command that is already in the box appends to it and produces
+`/model opus/model opus'.  The text is right; only the Return was lost."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-test--to-restore "w")
+    (cc-butler-compact-test--with-unsubmitted "/model claude-opus-4-8"
+      (cc-butler-compact--poll "w")        ; -> restore-wait
+      (cc-butler-compact--poll "w")        ; -> submit
+      (should (= 1 (seq-count (lambda (s) (equal s "/model claude-opus-4-8"))
+                              cc-butler-compact-test--sent)))
+      (should (equal (cc-butler-compact-test--sent-in-order)
+                     '("/model sonnet" "/compact" "/model claude-opus-4-8" "RETURN"))))))
+
+(ert-deftest cc-butler-compact/unsubmitted-restore-retries-are-bounded ()
+  "Re-sending is bounded in the same spirit as the modal retry: a send that
+never takes must end as an explicit failure, not an endless loop."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-test--to-restore "w")
+    (cc-butler-compact-test--with-unsubmitted "/model claude-opus-4-8"
+      (let ((msg nil))
+        (dotimes (_ (* 2 (1+ cc-butler-compact-restore-retries)))
+          (when (cc-butler-compact--active-p "w")
+            (setq msg (or (cc-butler-compact--poll "w") msg))))
+        (should-not (cc-butler-compact--active-p "w"))
+        (should (string-match-p "never submitted" msg))
+        (should (string-match-p "NOT restored" msg))))))
+
+(ert-deftest cc-butler-compact/self-left-text-is-cleared-on-every-exit ()
+  "The input-box analogue of #15's ensure-no-modal.  An abandoned `/model
+opus' does not fail quietly — it waits in the box and prepends itself to
+whatever is dispatched next, which is how a compaction failure becomes a
+corrupted instruction to an unrelated session later."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-test--to-restore "w")
+    (cc-butler-compact-test--with-unsubmitted "/model claude-opus-4-8"
+      (cc-butler-compact--set-state
+       "w" :restore-tries cc-butler-compact-restore-retries)
+      (cc-butler-compact--poll "w")        ; retries exhausted -> finish
+      (should-not (cc-butler-compact--active-p "w"))
+      ;; C-u went out on the way past.
+      (should (member "RAW:\C-u" cc-butler-compact-test--sent)))))
+
+(ert-deftest cc-butler-compact/operator-input-is-never-cleared ()
+  "The clear only ever removes OUR text.  Genuinely typed operator input is
+the thing this driver exists to protect; touching it would be worse than any
+failure it is cleaning up after."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-test--to-restore "w")
+    (cc-butler-compact-test--with-unsubmitted "please stop and check the logs"
+      (let ((st (gethash "w" cc-butler-compact--state)))
+        (should-not (cc-butler-compact--own-input "w" st))
+        (should-not (cc-butler-compact--clear-own-input "w" st)))
+      (cc-butler-compact--set-state
+       "w" :orig-args '("claude-opus-4-8")   ; last candidate -> this ends it
+       :sent-time (- (float-time) (1+ cc-butler-compact-step-timeout)))
+      (cc-butler-compact--poll "w")        ; times out and finishes
+      (should-not (cc-butler-compact--active-p "w"))
+      (should-not (member "RAW:\C-u" cc-butler-compact-test--sent)))))
+
+(ert-deftest cc-butler-compact/a-partial-send-still-counts-as-ours ()
+  "The interruption can land partway through the string, not only between the
+string and the Return, so a prefix of what we sent is still ours to clean."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-test--to-restore "w")
+    (cc-butler-compact-test--with-unsubmitted "/model claude-op"
+      (let ((st (gethash "w" cc-butler-compact--state)))
+        (should (equal (cc-butler-compact--own-input "w" st) "/model claude-op"))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Guards
 ;;;; ------------------------------------------------------------------
 
 (ert-deftest cc-butler-compact/refuses-a-busy-session ()
-  "A session that is not at a waiting point is refused: our Enter would land
-in the middle of its work."
+  "A session whose transcript is active within the idle window is refused: our
+Enter would land in the middle of its work."
   (cc-butler-compact-test--with-session "w"
-    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (float-time))))   ; wrote just now -> busy
       (should (string-match-p "busy" (cc-butler-compact--blocked-reason "w")))
       (should-error (cc-butler-compact-session "w") :type 'user-error))
     (should-not cc-butler-compact-test--sent)))
@@ -538,12 +813,53 @@ in the middle of its work."
   "The idle-waiting caller needs to test the blockers that will STILL apply
 once the session goes idle, without busy masking them."
   (cc-butler-compact-test--with-session "w"
-    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (float-time))))   ; transcript fresh -> busy
       (should (cc-butler-compact--blocked-reason "w"))
       (should-not (cc-butler-compact--blocked-reason "w" t))
-      ;; a menu is not excused by ignore-busy — waiting does not close it
+      ;; a menu is not excused by ignore-busy — idling does not close it
       (setq cc-butler-compact-test--screen cc-butler-compact-test--modal-screen)
       (should (string-match-p "menu" (cc-butler-compact--blocked-reason "w" t))))))
+
+;;;; ------------------------------------------------------------------
+;;;; P2: the busy gate is transcript activity, not the waiting flag
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/idle-by-transcript-is-compactable ()
+  "Repro A (fails under the old waiting-flag gate): the notification flag says
+NOT waiting, but the newest transcript write was 900s ago (> the 600s idle
+window), so the session is genuinely idle and compactable.  The old gate keyed
+on the flag and would have refused it as busy."
+  (cc-butler-compact-test--with-session "w"
+    (let ((cc-butler-idle-threshold 600))
+      (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+                ((symbol-function 'cc-butler--session-last-activity)
+                 (lambda (_d) (- (float-time) 900))))
+        (should (null (cc-butler-compact--blocked-reason "w")))))))
+
+(ert-deftest cc-butler-compact/fresh-transcript-is-busy-despite-idle-flag ()
+  "Repro B (fails under the old gate): the waiting flag says idle, but a
+transcript was written 5s ago.  The transcript gate correctly reports busy;
+the old flag gate would have called it idle and compacted underneath it — the
+exact defect."
+  (cc-butler-compact-test--with-session "w"
+    (let ((cc-butler-idle-threshold 600))
+      (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) (float-time)))
+                ((symbol-function 'cc-butler--session-last-activity)
+                 (lambda (_d) (- (float-time) 5))))
+        (should (string-match-p "busy" (cc-butler-compact--blocked-reason "w")))))))
+
+(ert-deftest cc-butler-compact/live-subagent-keeps-session-busy ()
+  "Repro C: the main transcript may be cold while a sub-agent is still writing.
+`cc-butler--session-last-activity' returns the MAX over both, so a fresh
+sub-agent write (modelled here as a fresh last-activity) keeps the session busy
+even with the waiting flag set idle."
+  (cc-butler-compact-test--with-session "w"
+    (let ((cc-butler-idle-threshold 600))
+      (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) (float-time)))
+                ((symbol-function 'cc-butler--session-last-activity)
+                 (lambda (_d) (- (float-time) 3))))   ; fresh sub-agent write
+        (should (string-match-p "busy" (cc-butler-compact--blocked-reason "w")))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Self-compaction: the butler must be able to target ITSELF
@@ -571,8 +887,9 @@ is typed while it waits."
   "The queued compaction begins on its own the moment the turn ends."
   (cc-butler-compact-test--with-session "w"
     (let ((busy t))
-      (cl-letf (((symbol-function 'cc-butler--waiting-p)
-                 (lambda (_d) (if busy nil (float-time)))))
+      ;; "mid-turn" now means an active transcript (the gate the driver uses).
+      (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+                 (lambda (_d) (if busy (float-time) (- (float-time) 100000)))))
         (cc-butler-compact-session-when-idle "w")
         ;; still mid-turn: poll changes nothing
         (cc-butler-compact--idle-poll "w" (+ (float-time) 600))
@@ -592,6 +909,53 @@ and must still have had nothing typed into it."
       (should-not cc-butler-compact-test--sent)
       (should-not (cc-butler-compact-waiting-p "w")))))
 
+(ert-deftest cc-butler-compact/a-throwing-idle-poll-keeps-the-compaction-queued ()
+  "REGRESSION (2026-07-31): the poll drops the queue entry FIRST and only then
+asks whether it is safe to start.  When that question signalled — as it did on
+a dedicated window — the re-queue below was never reached, so the compaction
+vanished outright: no retry, no deadline message, and `waiting-p' went false,
+so it stopped even showing as queued.  A destructive step taken before the
+thing it feeds has succeeded, the same shape as draining a queue before its
+delivery is assembled.
+
+Failing to determine safety is also not permission to proceed: the gate errs
+toward BUSY everywhere else, and compaction is destructive."
+  (cc-butler-compact-test--with-session "w"
+    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+      (cc-butler-compact-session-when-idle "w")
+      (should (cc-butler-compact-waiting-p "w"))
+      (cl-letf (((symbol-function 'cc-butler-compact--blocked-reason)
+                 (lambda (&rest _) (error "window trouble"))))
+        (cc-butler-compact--idle-poll "w" (+ (float-time) 600)))
+      (should (cc-butler-compact-waiting-p "w"))   ; still queued, will retry
+      (should-not cc-butler-compact-test--sent))))  ; and did not start blind
+
+(ert-deftest cc-butler-compact/the-safety-probe-survives-a-dedicated-window ()
+  "The compaction probe reads the session's screen, so it inherited the
+window-borrow failure verbatim — observed 2026-07-31 under exactly these two
+conditions at once.  Guarded here as well as at the source: this is the path
+that was seen to break, and it reaches the borrow through a different caller
+than `read_session_output' does."
+  (let ((buf (get-buffer-create " *ccb-compact-probe*"))
+        (listbuf (get-buffer-create " *ccb-compact-list*")))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (split-window (selected-window) nil 'right)
+          (set-window-buffer (selected-window) listbuf)
+          (set-window-dedicated-p (selected-window) t)
+          (with-current-buffer buf
+            (setq-local ghostel--term 'fake-term)
+            (insert "a screen\n"))
+          (should-not (get-buffer-window-list buf nil t))
+          (cl-letf (((symbol-function 'ghostel--redraw) (lambda (&rest _) t))
+                    ((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (&rest _) (buffer-name buf))))
+            ;; the assertion is that this RETURNS rather than signalling
+            (should-not (cc-butler-compact--typed-text "d"))))
+      (kill-buffer buf)
+      (kill-buffer listbuf))))
+
 (ert-deftest cc-butler-compact/queueing-still-refuses-what-waiting-cannot-fix ()
   "An open menu or genuinely typed input is refused up front rather than
 queued — idling does not clear either, so queueing would just defer a
@@ -605,7 +969,10 @@ failure by half an hour."
 (ert-deftest cc-butler-compact/queued-compaction-can-be-cancelled ()
   "A queued compaction is cancellable before it types anything."
   (cc-butler-compact-test--with-session "w"
-    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+    ;; busy = active transcript, so a stray idle-poll after cancel keeps waiting
+    ;; rather than starting and typing.
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (float-time))))
       (cc-butler-compact-session-when-idle "w")
       (should (cc-butler-compact-cancel "w"))
       (should-not (cc-butler-compact-waiting-p "w"))
@@ -649,6 +1016,62 @@ neither prompt."
 ;;;; Fleet sweep
 ;;;; ------------------------------------------------------------------
 
+;;;; ------------------------------------------------------------------
+;;;; P3: percentage-first hybrid threshold
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/over-threshold-37pct-not-flagged ()
+  "A session at 37%% of its window is NOT a candidate even when its absolute
+token count (371538) is well past the old 300k floor: the percentage is the
+honest signal across differently-sized windows."
+  (let ((cc-butler-compact-threshold-fraction 0.60))
+    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx 371538 :pct 37 :model "Opus-4.8"))))
+      (should-not (cc-butler-compact--over-threshold-p "/d/")))))
+
+(ert-deftest cc-butler-compact/over-threshold-65pct-flagged ()
+  "At 65%% (>= the 0.60 fraction) the session is a candidate."
+  (let ((cc-butler-compact-threshold-fraction 0.60))
+    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx 130000 :pct 65 :model "Opus-4.8"))))
+      (should (cc-butler-compact--over-threshold-p "/d/")))))
+
+(ert-deftest cc-butler-compact/over-threshold-falls-back-to-ctx-when-no-pct ()
+  "With no percentage on the statusline, fall back to CTX against the window:
+just over window*fraction is a candidate, just under is not."
+  (let ((cc-butler-compact-threshold-fraction 0.60)
+        (cc-butler-cleanup-context-window 200000))   ; * 0.60 = 120000
+    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx nil :pct nil :model "Opus-4.8"))))
+      (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 130000)))
+        (should (cc-butler-compact--over-threshold-p "/d/")))
+      (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 110000)))
+        (should-not (cc-butler-compact--over-threshold-p "/d/"))))))
+
+(ert-deftest cc-butler-compact/over-threshold-is-window-adaptive ()
+  "The SAME ctx yields opposite verdicts under different context windows —
+the point of a fraction rather than an absolute floor."
+  (let ((cc-butler-compact-threshold-fraction 0.60))
+    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx nil :pct nil :model "m")))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 150000)))
+      (let ((cc-butler-cleanup-context-window 200000))   ; *0.6 = 120000 -> over
+        (should (cc-butler-compact--over-threshold-p "/d/")))
+      (let ((cc-butler-cleanup-context-window 300000))   ; *0.6 = 180000 -> under
+        (should-not (cc-butler-compact--over-threshold-p "/d/"))))))
+
+(ert-deftest cc-butler-compact/candidates-use-percentage-not-absolute ()
+  "The sweep gate is the percentage: a session at 37%% is not swept even though
+its 371538 tokens exceed the old absolute 300k threshold (which would have
+listed it)."
+  (let ((cc-butler-compact-threshold-fraction 0.60)
+        (cc-butler-compact-threshold 300000))
+    (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () '((:dir "/d/"))))
+              ((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx 371538 :pct 37 :model "Opus-4.8")))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 371538)))
+      (should (null (cc-butler-compact-candidates))))))
+
 (ert-deftest cc-butler-compact/sweep-includes-butler-and-steward ()
   "The whole point: the butler and steward are candidates like anyone else.
 Excluding them would leave the largest context in the fleet untouchable."
@@ -659,7 +1082,7 @@ Excluding them would leave the largest context in the fleet untouchable."
               ((symbol-function 'cc-butler-cleanup-context-for)
                (lambda (d) (cond ((equal d "/b/") 471792)
                                  ((equal d "/s/") 361689)
-                                 (t 203356)))))
+                                 (t 90000)))))   ; worker well under the fraction
       (should (equal (cc-butler-compact-candidates) '("/b/" "/s/"))))))
 
 (ert-deftest cc-butler-compact/sweep-orders-largest-first ()
@@ -813,7 +1236,7 @@ never a silent no-op that reads as success."
 (ert-deftest cc-butler-compact/fleet-summary-lists-only-what-is-over ()
   "The report is arithmetic — over the threshold or not — and says what the
 steward can do about each one."
-  (cc-butler-compact-test--with-fleet '(("/butler/" . 514000) ("/w/" . 152000))
+  (cc-butler-compact-test--with-fleet '(("/butler/" . 514000) ("/w/" . 90000))
     (let ((out (cc-butler-compact-fleet-summary)))
       (should (string-match-p "/butler/" out))
       (should (string-match-p "514k" out))
@@ -927,6 +1350,176 @@ still gets through, so a blocked steward is not left uninformed."
         (cc-butler-compact--monitor-scan)
         (should cc-butler--inbox)        ; still reported to the queue
         (should-not sent)))))            ; but nothing typed
+
+;;;; ------------------------------------------------------------------
+;;;; Restoring a model without a closed list of families
+;;;; ------------------------------------------------------------------
+
+;; The allowlist was opus/sonnet/haiku.  The installed CLI already ships `fable'
+;; as a family and a `claude-mythos-5' whose family has no alias at all, so the
+;; day a new family breaks compaction has already passed — it just has not been
+;; run here yet.  Derive the argument from the tag instead of matching a list.
+
+(ert-deftest cc-butler-compact/model-args-derives-the-exact-id-then-the-family ()
+  "Best first: the exact model, then the family as a fallback."
+  (should (equal '("claude-opus-4-8" "opus")
+                 (cc-butler-compact--model-args "Opus-4.8")))
+  (should (equal '("claude-sonnet-5" "sonnet")
+                 (cc-butler-compact--model-args "Sonnet-5"))))
+
+(ert-deftest cc-butler-compact/model-args-handles-families-it-has-never-heard-of ()
+  "The point of dropping the list: a family nobody hardcoded still resolves.
+`mythos' has no bare alias in the CLI, so the family candidate will not work —
+but the exact id will, and it is tried first."
+  (should (equal '("claude-fable-5" "fable")
+                 (cc-butler-compact--model-args "Fable-5")))
+  (should (equal '("claude-mythos-5" "mythos")
+                 (cc-butler-compact--model-args "Mythos-5"))))
+
+(ert-deftest cc-butler-compact/model-args-passes-an-id-shaped-tag-through ()
+  "The statusline emits `display_name' OR `id'; both shapes must resolve."
+  (should (equal '("claude-sonnet-5" "sonnet")
+                 (cc-butler-compact--model-args "claude-sonnet-5")))
+  (should (equal '("claude-haiku-4-5" "haiku")
+                 (cc-butler-compact--model-args "Haiku-4-5"))))
+
+(ert-deftest cc-butler-compact/model-args-unversioned-tag-uses-the-family-only ()
+  "A tag with no version (observed: a bare \"Opus\") cannot name an exact model
+— `claude-opus' is not an id — so do not offer it as a candidate."
+  (should (equal '("opus") (cc-butler-compact--model-args "Opus")))
+  (should (null (cc-butler-compact--model-args nil)))
+  (should (null (cc-butler-compact--model-args ""))))
+
+(ert-deftest cc-butler-compact/model-args-handles-a-spaced-display-name ()
+  "A tag can carry SPACES, not just collapsed punctuation.  The statusline
+collapses `Opus 4.8' to `Opus-4.8', but a transcript `/model' confirmation
+reports the display name verbatim — `Opus 5' — and that is the higher-priority
+source, since it catches a switch the screen missed.  Splitting on dots alone
+would yield `claude-opus 5', which `/model' rejects; the driver would fall back
+to `opus 5', which it also rejects, and the session would be left on the cheap
+compaction model — the exact outcome this file exists to prevent."
+  (should (equal '("claude-opus-5" "opus")
+                 (cc-butler-compact--model-args "Opus 5")))
+  (should (equal '("claude-opus-4-8" "opus")
+                 (cc-butler-compact--model-args "Opus 4.8")))
+  ;; the collapsed forms keep working unchanged
+  (should (equal '("claude-opus-4-8" "opus")
+                 (cc-butler-compact--model-args "Opus-4.8"))))
+
+(ert-deftest cc-butler-compact/model-args-covers-every-observed-tag ()
+  "Regression floor: every MODEL: tag actually seen in the wild must resolve.
+All of these work today via the family list; none may stop working."
+  (dolist (tag '("Opus-4.8" "Opus-5" "Sonnet-5" "claude-sonnet-5"
+                 "claude-opus-4-8" "Opus" "Haiku-4-5" "Sonnet"))
+    (should (cc-butler-compact--model-args tag))
+    (should (cc-butler-compact--model-arg tag))))
+
+(ert-deftest cc-butler-compact/model-is-p-compares-in-the-same-space ()
+  "THE quiet breakage.  The landing check substring-matched the argument inside
+the tag, which worked only because the argument was a bare family.  With an
+exact id as the argument, `claude-opus-4-8' does not appear inside `Opus-4.8',
+so a restore that SUCCEEDED would never be confirmed and would time out."
+  (should (cc-butler-compact--model-is-p "Opus-4.8" "claude-opus-4-8"))
+  (should (cc-butler-compact--model-is-p "claude-opus-4-8" "claude-opus-4-8")))
+
+(ert-deftest cc-butler-compact/model-is-p-still-accepts-a-family-alias ()
+  "The fallback argument is a bare family, and it must still confirm — this is
+also how the switch TO the cheap model is detected."
+  (should (cc-butler-compact--model-is-p "Sonnet-5" "sonnet"))
+  (should (cc-butler-compact--model-is-p "claude-sonnet-5" "sonnet")))
+
+(ert-deftest cc-butler-compact/model-is-p-does-not-confuse-versions ()
+  "An exact argument must not be satisfied by a different model of the same
+family — that is precisely the silent version drift being removed."
+  (should-not (cc-butler-compact--model-is-p "Opus-5" "claude-opus-4-8"))
+  (should-not (cc-butler-compact--model-is-p "Sonnet-5" "opus")))
+
+(ert-deftest cc-butler-compact/restore-falls-back-to-the-family-on-timeout ()
+  "If the exact id is refused the model simply does not change, and the session
+would sit on the cheap model — the silent downgrade this is meant to prevent.
+When the exact candidate times out, move to the family and try again rather
+than giving up."
+  (let ((cc-butler-compact--state (make-hash-table :test 'equal))
+        (cc-butler-compact-step-timeout 0)
+        (finished nil))
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (_d) "s"))
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler-compact--schedule-poll) #'ignore)
+              ((symbol-function 'cc-butler-compact--answer-modal) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler-compact--own-input) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler-compact--model-now) (lambda (_d) "Sonnet-5"))
+              ((symbol-function 'cc-butler-compact--finish)
+               (lambda (&rest args) (setq finished args))))
+      (cc-butler-compact--set-state "/d/" :orig-args '("claude-opus-4-8" "opus")
+                                    :orig-arg "claude-opus-4-8")
+      (cc-butler-compact--poll-restore
+       "/d/" (gethash "/d/" cc-butler-compact--state) 0)
+      ;; not given up on: moved to the family candidate
+      (should (null finished))
+      (let ((st (gethash "/d/" cc-butler-compact--state)))
+        (should (equal "opus" (plist-get st :orig-arg)))
+        (should (equal '("opus") (plist-get st :orig-args))))
+      ;; with the last candidate exhausted it does report failure
+      (cc-butler-compact--poll-restore
+       "/d/" (gethash "/d/" cc-butler-compact--state) 0)
+      (should finished))))
+;;;; Two callers, two freshness policies
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/model-now-still-bypasses-the-cache ()
+  "GUARD -- do not \"fix\" this away.  The polling loop asks repeatedly whether
+the `/model' switch has landed, and it polls faster than the cache TTL, so it
+MUST see the screen and not a remembered value.  This contract is the reason
+the pre-flight read had to become a separate caller instead."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (calls 0))
+    (puthash "/d/" (cons (float-time) "Stale-Model") cc-butler-cleanup--model-cache)
+    (let ((cc-butler-cleanup-model-function
+           (lambda (_s) (setq calls (1+ calls)) "Opus-5")))
+      ;; even though a fresh cache entry exists, the screen is re-read
+      (should (equal "Opus-5" (cc-butler-compact--model-now "/d/")))
+      (should (= 1 calls)))))
+
+(ert-deftest cc-butler-compact/restore-model-falls-back-to-transcript ()
+  "Cases 1-4: the screen cannot say (mid-turn, just restarted, or a window too
+narrow to render MODEL:).  The pre-flight read wants AVAILABILITY, so it falls
+through to the transcript rather than refusing."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-function (lambda (_s) nil)))   ; screen blank
+    (cl-letf (((symbol-function 'cc-butler--transcript-model)
+               (lambda (_d) "claude-opus-5")))
+      (should (equal "claude-opus-5"
+                     (cc-butler-compact--model-for-restore "/d/")))
+      ;; and it resolves to something /model actually accepts.  The expected
+      ;; value is now the EXACT id rather than the family alias: restoring by
+      ;; family silently moved a session to whatever was newest in it, and the
+      ;; derivation was changed to name the model the session was actually on.
+      (should (equal "claude-opus-5"
+                     (cc-butler-compact--model-arg
+                      (cc-butler-compact--model-for-restore "/d/")))))))
+
+(ert-deftest cc-butler-compact/restore-model-prefers-the-screen ()
+  "The screen is the freshest truth when it is legible; the transcript is the
+floor beneath it, not a replacement for it."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-function (lambda (_s) "Sonnet-5")))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model)
+               (lambda (_d) "claude-opus-5")))
+      (should (equal "Sonnet-5" (cc-butler-compact--model-for-restore "/d/"))))))
+
+(ert-deftest cc-butler-compact/restore-model-uses-last-known-as-floor ()
+  "Screen blank AND no transcript signal: the cached last-known value is better
+than refusing.  With nothing at all, nil -- the driver then refuses, which is
+the behaviour we want to keep for a genuinely unknown model."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-function (lambda (_s) nil)))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model) (lambda (_d) nil)))
+      ;; a value was known once, before the window narrowed
+      (puthash "/d/" (cons (float-time) "Opus-4.8") cc-butler-cleanup--model-cache)
+      (should (equal "Opus-4.8" (cc-butler-compact--model-for-restore "/d/")))
+      ;; nothing ever known -> nil -> the driver refuses
+      (clrhash cc-butler-cleanup--model-cache)
+      (should (null (cc-butler-compact--model-for-restore "/e/"))))))
 
 (provide 'cc-butler-compact-test)
 ;;; cc-butler-compact-test.el ends here

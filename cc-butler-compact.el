@@ -60,6 +60,19 @@ surfaces a worker for cleanup (externalize and tear down), this one is the
 cheaper in-place remedy that also applies to the butler itself."
   :type 'integer :group 'cc-butler)
 
+(defcustom cc-butler-compact-threshold-fraction 0.60
+  "Fraction of the model context window at/above which a session is a compaction
+candidate.  The PREFERRED signal is the statusline's own used-percentage
+\(the `<pct>%' in CTX:<n> <pct>% MODEL:...); when that percentage is absent it
+falls back to CTX / `cc-butler-cleanup-context-window'.
+
+This is the primary gate, replacing the absolute `cc-butler-compact-threshold':
+an absolute token count mis-scales across models with different context windows
+— a large-window model at 37%% of its window is not a compaction candidate even
+though it is well past a fixed 300k — so the percentage is the honest signal.
+`cc-butler-compact-threshold' is kept for compatibility but no longer gates."
+  :type 'number :group 'cc-butler)
+
 (defcustom cc-butler-compact-model "sonnet"
   "Model to switch a session to before compacting it.
 Compaction re-reads the whole transcript, so it is the single most expensive
@@ -108,6 +121,25 @@ cache).  Discarding the cache is exactly what we want: `/compact' rewrites
 the context wholesale, so the cache is about to be worthless regardless."
   :type 'string :group 'cc-butler)
 
+(defcustom cc-butler-compact-restore-retries 3
+  "How many times the restore command may be re-sent before failing.
+
+Typing and submitting are two separate terminal writes with a gap between
+them (`cc-butler-submit-delay').  A worker notification arriving in that gap
+starts the session's turn, and the Return lands on a session that is no
+longer at its input box — so the command sits there typed but unsubmitted.
+The session stays on the cheap model, and the stale text collides with
+whatever is dispatched next."
+  :type 'integer :group 'cc-butler)
+
+(defcustom cc-butler-compact-modal-answers 3
+  "How many times one step may answer a confirmation modal before failing.
+The modal is re-answered, not latched after one try.  A single attempt can
+land while the modal is still rendering and select nothing, and a latch
+would then never try again — leaving the session sitting on an unanswered
+dialog until a human clears it.  That is the 2026-07-23 freeze."
+  :type 'integer :group 'cc-butler)
+
 ;;;; ------------------------------------------------------------------
 ;;;; Screen reading — pure functions over terminal text
 ;;;; ------------------------------------------------------------------
@@ -115,24 +147,18 @@ the context wholesale, so the cache is about to be worthless regardless."
 (defconst cc-butler-compact--rule-regexp "\\`[ \t]*───"
   "Match a horizontal rule — the top or bottom edge of the input box.")
 
-(defconst cc-butler-compact--blank "[ \t ​]"
-  "One character of input-box padding.
-Not the same set as ordinary whitespace: Claude Code pads the `❯' prompt
-with U+00A0 NO-BREAK SPACE on some builds (measured on this fleet
-2026-07-22; upstream hit the same thing in cc-butler#6).  `string-trim'
-leaves NBSP in place, so an empty box trims to a one-character string and
-every idle session in the fleet reads as \"has text typed in it\".")
-
 (defun cc-butler-compact--rule-p (line)
   "Non-nil when LINE is an input-box rule."
   (and (stringp line) (string-match-p cc-butler-compact--rule-regexp line)))
 
-(defun cc-butler-compact--strip (s)
-  "Strip the prompt glyph and padding — NBSP included — from both ends of S."
-  (replace-regexp-in-string
-   (concat "\\`\\(?:" cc-butler-compact--blank "\\|[❯>]\\)+"
-           "\\|" cc-butler-compact--blank "+\\'")
-   "" (or s "")))
+;; The prompt/padding vocabulary — the NBSP-aware `cc-butler--input-pad'
+;; character class and this stripper — moved down to cc-butler-session.el on
+;; 2026-07-24 with the ghost-vs-real decision it serves (cc-butler#6), so the
+;; redaction path in the orchestrator shares one definition of it rather than
+;; growing a second.  The compaction-local name stays as an alias: it reads
+;; better in `cc-butler-compact--input-line' below, and it is one definition
+;; either way.
+(defalias 'cc-butler-compact--strip 'cc-butler--strip-input-pad)
 
 (defcustom cc-butler-compact-menu-lines 25
   "How many lines up from the bottom count as the live screen.
@@ -157,11 +183,11 @@ Used two ways: as a pre-flight refusal, and — after `/model' — as the
 signal that the prompt-cache confirmation is up and waiting for a choice."
   (let* ((all (split-string (or screen "") "\n"))
          (lines (last all (min (length all) cc-butler-compact-menu-lines)))
-         (marked (concat "\\`" cc-butler-compact--blank "*❯"
-                         cc-butler-compact--blank "*[0-9]+\\."
-                         cc-butler-compact--blank "*[^ \t ]"))
-         (option (concat "\\`" cc-butler-compact--blank "*[0-9]+\\."
-                         cc-butler-compact--blank "*[^ \t ]")))
+         (marked (concat "\\`" cc-butler--input-pad "*❯"
+                         cc-butler--input-pad "*[0-9]+\\."
+                         cc-butler--input-pad "*[^ \t ]"))
+         (option (concat "\\`" cc-butler--input-pad "*[0-9]+\\."
+                         cc-butler--input-pad "*[^ \t ]")))
     (and (cl-some (lambda (l) (string-match-p marked l)) lines)
          (cl-some (lambda (l) (string-match-p option l)) lines)
          t)))
@@ -183,81 +209,35 @@ its padding are stripped."
       (let ((s (cc-butler-compact--strip found)))
         (unless (string-empty-p s) s)))))
 
-(defconst cc-butler-compact--box-scan-lines 12
-  "How far from the cursor to look for the input box's rules.
-Bounds the search for a multi-line input box, without letting a cursor
-parked somewhere unrelated be mistaken for one.")
-
-(defun cc-butler-compact--box-region-at (pos)
-  "Return (BEG . END) of the input-box text preceding POS, or nil.
-BEG is just after the box's opening rule and END is POS, so the result
-covers everything typed ahead of the cursor — multi-line input included."
-  (save-excursion
-    (goto-char pos)
-    (let ((cursor-bol (line-beginning-position))
-          top bottom (n 0))
-      (unless (save-excursion (goto-char cursor-bol) (looking-at "[ \t]*───"))
-        (save-excursion
-          (goto-char cursor-bol)
-          (while (and (not top) (< n cc-butler-compact--box-scan-lines)
-                      (zerop (forward-line -1)))
-            (setq n (1+ n))
-            (when (looking-at "[ \t]*───") (setq top (line-end-position)))))
-        (setq n 0)
-        (save-excursion
-          (goto-char cursor-bol)
-          (while (and (not bottom) (< n cc-butler-compact--box-scan-lines)
-                      (zerop (forward-line 1)))
-            (setq n (1+ n))
-            (when (looking-at "[ \t]*───") (setq bottom t))))
-        (when (and top bottom) (cons (1+ top) pos))))))
-
 (defun cc-butler-compact--typed-text (dir)
   "Return the text actually TYPED into DIR's input box, or nil if empty.
 
-Reads the terminal CURSOR, not the painted row.  Claude Code paints a
-dimmed suggestion — a previous prompt, or a `Try \"...\"' placeholder — into
-an EMPTY input box.  That suggestion is decoration: the terminal's input
-buffer holds nothing and the cursor stays at the prompt.  Type one
-character and the suggestion vanishes and the cursor advances.  So the
-cursor's distance past the prompt IS the length of the pending input, and
-the painted text is evidence of nothing at all.
+Ghost-vs-real is decided by `cc-butler--input-state' — the terminal cursor,
+not the painted row.  See that docstring for why no color check can do this
+job, and for the live measurements behind it.
 
-Measured across the live fleet 2026-07-23: eight sessions; every empty or
-suggestion-showing box had its cursor at column 2, immediately after `❯ ' —
-including one painting a full sentence of dimmed Korean — while a session
-with `abcd' genuinely typed had it at column 6.
+FAIL-SAFE DIRECTION, compaction guard: an UNKNOWN state is treated as REAL
+INPUT.  What this answer gates is whether the driver may TYPE INTO the
+session.  Appending `/compact' to the end of a half-finished sentence a
+human is composing corrupts their input and then submits something neither
+of us wrote; declining a compaction that could safely have run costs one
+sweep, and the session comes back around on the next one.  The two mistakes
+are not the same size, so when the cursor is unreadable we fall back to the
+painted row and believe whatever is painted there.
 
-This replaced a face-color test, which cannot be made to work.  Real input
-is not reliably unfaced: a typed slash command renders in an accent color
-\(#b1b9f9 on this fleet).  The suggestion color is theme-dependent
-\(#8686a8 here; the constants upstream keys on say #a7a7a7, which is why
-`cc-butler--ghost-face-p' still carries diagnostics for an unresolved miss,
-cc-butler#6).  Telling `dim' from `accent' apart by hex is exactly the check
-this codebase has been burned by three times.  The cursor is state, styling
-is not — and reading styling as state is the same error that had the butler
-repeatedly judging its own delivered sends to be unsubmitted.
-
-Fail-safe: if the cursor cannot be read (a non-ghostel terminal backend) or
-does not sit inside an input box, fall back to the painted row and treat
-whatever is painted there as real."
+The redaction in `cc-butler--redact-ghost-input-line' gates the opposite
+thing — whether to SHOW a row to a reader — meets the opposite asymmetry,
+and therefore takes UNKNOWN the other way.  That divergence is precisely
+why `cc-butler--input-state' reports three outcomes instead of resolving to
+a boolean on its callers' behalf."
   (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
     (when (buffer-live-p buf)
       (cc-butler--refresh-terminal-text buf)
-      (with-current-buffer buf
-        (let ((cursor (and (fboundp 'ghostel-cursor-point)
-                           (ignore-errors (ghostel-cursor-point)))))
-          (if (not cursor)
-              (cc-butler-compact--input-line (cc-butler--read-output dir 40))
-            (let ((region (cc-butler-compact--box-region-at cursor)))
-              (if (not region)
-                  ;; The cursor is not inside an input box — a dialog may own
-                  ;; the screen.  Do not conclude the box is empty.
-                  (cc-butler-compact--input-line (cc-butler--read-output dir 40))
-                (let ((typed (cc-butler-compact--strip
-                              (buffer-substring-no-properties
-                               (car region) (cdr region)))))
-                  (unless (string-empty-p typed) typed))))))))))
+      (pcase (with-current-buffer buf (cc-butler--input-state))
+        (`(real . ,typed) typed)
+        (`(ghost . ,_) nil)
+        ;; UNKNOWN -> assume real; see the fail-safe note above.
+        (_ (cc-butler-compact--input-line (cc-butler--read-output dir 40)))))))
 
 (defun cc-butler-compact--pending-input-p (dir)
   "Non-nil when DIR's input box holds text the operator actually typed.
@@ -268,8 +248,92 @@ A dimmed suggestion is not input — see `cc-butler-compact--typed-text'."
 ;;;; Model names
 ;;;; ------------------------------------------------------------------
 
-(defconst cc-butler-compact--families '("opus" "sonnet" "haiku")
-  "Model families `/model' accepts as a bare alias.")
+;; There used to be a hardcoded list of families here.  A closed list is wrong
+;; for this: the CLI already ships a `fable' family, and a `claude-mythos-5'
+;; whose family has no bare alias at all, so the day a new family stalls every
+;; compaction has already passed — this fleet simply has not run one yet.
+;;
+;; Nothing needs a list.  The statusline emits either the model's id
+;; (`claude-sonnet-5') or its display name with punctuation collapsed
+;; (`Opus 4.8' -> `Opus-4.8'), and the id form is recoverable from either.  The
+;; family is then just the id's first segment, so families nobody has heard of
+;; resolve on their own.
+
+(defconst cc-butler-compact--bare-aliases
+  '("opus" "sonnet" "haiku" "fable" "best" "opusplan" "default")
+  "Aliases `/model' accepts with no version attached.
+Used ONLY to resolve a tag that carries no version of its own, where shape
+cannot tell a real model from noise.  Deliberately not the gate on which
+families are supported — a versioned tag resolves without consulting this.")
+
+(defun cc-butler-compact--model-id (tag)
+  "Return the model id TAG names, or nil.
+`Opus-4.8' -> `claude-opus-4-8'; an id-shaped tag is returned as-is.  The
+result is a well-formed id, not a promise that the model exists."
+  (when (and (stringp tag) (not (string-empty-p tag)))
+    (let ((low (downcase tag)))
+      (if (string-prefix-p "claude-" low)
+          low
+        ;; Dots AND whitespace: the statusline collapses punctuation for us
+        ;; (`Opus 4.8' arrives as `Opus-4.8'), but a transcript `/model'
+        ;; confirmation reports the display name verbatim — spaces and all.
+        ;; Splitting on dots alone would yield `claude-opus 5', which `/model'
+        ;; rejects, and the fallback `opus 5' with it, stranding the session on
+        ;; the cheap compaction model — the outcome this file exists to prevent.
+        (concat "claude-" (replace-regexp-in-string "[.[:space:]]+" "-" low))))))
+
+(defun cc-butler-compact--model-family (tag)
+  "Return the family TAG belongs to (`opus', `fable', ...), or nil.
+The family is the id's first segment after the `claude-' prefix, so this
+works for families that did not exist when this was written."
+  (when-let ((id (cc-butler-compact--model-id tag)))
+    (let ((rest (substring id (length "claude-"))))
+      (car (split-string rest "-" t)))))
+
+(defun cc-butler-compact--model-args (tag)
+  "Return the `/model' arguments that restore TAG, best first.
+
+Two candidates, and the order is the point.  The exact id restores the model
+the session was actually on: compaction is meant to hand a session back as it
+found it, and restoring by family alias silently moves it to whatever is
+newest in that family — a change nobody asked for.  The family alias follows
+as a fallback, because an id can be refused (deprecated, renamed, or a display
+name whose shape this maps wrongly — see the untested `[1m]' variants), and a
+refused argument leaves the session sitting on the cheap compaction model.
+Falling back to the family means the worst case is \"restored to the latest in
+the right family\" rather than \"quietly left on the cheap model\".
+
+A tag with no version (a bare `Opus' does occur) cannot name an exact model —
+`claude-opus' is not an id — so only the family is offered.
+
+On what a refused argument does: reading the installed CLI (2.1.220), an
+argument that is not a known alias is probed against the API and, if the probe
+fails, reported as an error with the model LEFT UNCHANGED — there is no fuzzy
+matching, so a wrong model cannot be selected by accident.  Documentation for
+releases before 2.1.200 describes a different, less safe behaviour (the value
+was kept and failed on the next request).  That is not a path this takes, since
+every argument here is derived from a tag the session itself displayed, and an
+unresolvable tag is refused before anything is typed.  Neither behaviour was
+confirmed by experiment — deliberately not tested against a live session."
+  (when (stringp tag)
+    (let* ((id (cc-butler-compact--model-id tag))
+           (versioned (and id (string-match-p "[0-9]" id) id))
+           (family (cc-butler-compact--model-family tag)))
+      (delete-dups
+       (delq nil
+             (list versioned
+                   ;; The family is only trustworthy if it came from something
+                   ;; that looks like a real model.  A tag carrying no version
+                   ;; is indistinguishable from noise by shape alone —
+                   ;; "Some-Future-Model" would otherwise yield "some" — so an
+                   ;; unversioned tag is resolved only when it IS a known bare
+                   ;; alias.  Note what this list is NOT: it is not the gate on
+                   ;; new families, which is what made the old allowlist fail.
+                   ;; A versioned tag from a family nobody listed still
+                   ;; resolves above, without consulting this at all.
+                   (when (or versioned
+                             (member (downcase tag) cc-butler-compact--bare-aliases))
+                     family)))))))
 
 (defun cc-butler-compact--model-arg (tag)
   "Return the `/model' argument that restores model TAG, or nil.
@@ -279,29 +343,105 @@ Display names are not valid `/model' arguments, so map back to the family
 alias.  Returning nil is load-bearing: a model we cannot name is a model we
 cannot restore, and the driver refuses to switch away from it at all rather
 than strand a session on the wrong model."
-  (when (stringp tag)
-    (let ((low (downcase tag)))
-      (cl-find-if (lambda (f) (string-match-p (regexp-quote f) low))
-                  cc-butler-compact--families))))
+  (car (cc-butler-compact--model-args tag)))
 
 (defun cc-butler-compact--model-is-p (tag arg)
-  "Non-nil when statusline TAG denotes the model named by `/model' ARG."
+  "Non-nil when statusline TAG denotes the model named by `/model' ARG.
+
+Both sides are normalised to ids before comparing.  This used to substring-match
+ARG inside TAG, which worked only while ARG was always a bare family: with an
+exact id as the argument, `claude-opus-4-8' does not appear anywhere inside
+`Opus-4.8', so a restore that SUCCEEDED would never be confirmed and would time
+out.  Deriving the argument and checking that it landed have to happen in the
+same space.
+
+A bare family argument still matches any model of that family — that is how the
+switch to the cheap model is detected, and what makes the fallback confirmable."
   (and (stringp tag) (stringp arg)
-       (string-match-p (regexp-quote (downcase arg)) (downcase tag))))
+       (let ((tag-id (cc-butler-compact--model-id tag)))
+         (and tag-id
+              (or (equal tag-id (cc-butler-compact--model-id arg))
+                  (equal (downcase arg) (cc-butler-compact--model-family tag)))))))
+
+;; Two callers read the model, and they want OPPOSITE things from it.  Serving
+;; both from one function is what made compaction refuse so often: the polling
+;; loop's demand for freshness was silently imposed on the pre-flight capture,
+;; where it is exactly wrong.  Keep them separate, and keep both rationales
+;; written down — the reasoning is easy to mistake for an accident and delete.
 
 (defun cc-butler-compact--model-now (dir)
-  "Read DIR's current model tag, bypassing the cleanup layer's TTL cache.
-The cache is right for a status display and wrong for a state machine that
-polls faster than the TTL and must see the switch the moment it lands."
+  "Read DIR's current model tag FRESH, bypassing the cleanup layer's TTL cache.
+For the state machine, which polls faster than the TTL and must see the `/model'
+switch the moment it lands; a remembered value would make it act on a model the
+session has already left.
+
+FRESHNESS OVER AVAILABILITY, deliberately.  Do not add a fallback here — nil
+means \"the screen does not say so right now\", which is the honest answer to
+\"has the switch landed yet?\".  If you want an answer that survives an
+illegible screen, you want `cc-butler-compact--model-for-restore'."
   (when (boundp 'cc-butler-cleanup--model-cache)
     (remhash dir cc-butler-cleanup--model-cache))
   (cc-butler-cleanup-model-for dir))
+
+(defun cc-butler-compact--model-for-restore (dir)
+  "Return the model to put DIR back on after compaction, or nil if unknowable.
+
+AVAILABILITY OVER FRESHNESS, deliberately — the mirror of
+`cc-butler-compact--model-now', and the reason these are two functions.  This
+is asked ONCE, before anything is switched, and the question is \"what was this
+session on?\".  A momentarily illegible screen is not evidence that the answer
+changed, so treating it as unknown — and refusing to compact — punished exactly
+the sessions that most needed compacting: the busy ones (mid-turn, so the chrome
+is covered) and the large ones.  Worst of all, a window too narrow to render
+`MODEL:' made a session PERMANENTLY un-compactable, since no retry can recover
+characters the terminal never wrote.
+
+Three sources, best first:
+  1. the screen, read fresh — the live truth whenever it is legible;
+  2. the transcript — a record rather than a rendering, so it answers when the
+     screen cannot, and it also catches a `/model' switch the screen missed;
+  3. the last-known cached value — a remembered screen, better than nothing.
+Still nil when nothing knows: the driver then refuses, which stays correct.  A
+model we cannot name is a model we cannot restore, and refusing beats stranding
+a session on the wrong one."
+  ;; Read the remembered value FIRST: `--model-now' evicts the entry before it
+  ;; re-reads, so by the time the screen has come back nil there is nothing left
+  ;; to fall back to.  Eviction is correct for the polling caller and must stay
+  ;; — so this caller takes its copy before triggering it.
+  (let ((remembered (and (boundp 'cc-butler-cleanup--model-cache)
+                         (cdr (gethash dir cc-butler-cleanup--model-cache)))))
+    (or (cc-butler-compact--model-now dir)
+        (cc-butler--transcript-model dir)
+        remembered)))
 
 (defun cc-butler-compact--context-now (dir)
   "Read DIR's current context size, bypassing the TTL cache.  See above."
   (when (boundp 'cc-butler-cleanup--context-cache)
     (remhash dir cc-butler-cleanup--context-cache))
   (cc-butler-cleanup-context-for dir))
+
+(defun cc-butler-compact--statusline-fields-now (dir)
+  "Parse DIR's OWN statusline fields from a fresh terminal read, or nil.
+Anchored to the bottom chrome via `cc-butler-cleanup--statusline-fields', so it
+reads only this session's statusline, not an echo in scrollback."
+  (when-let ((out (cc-butler--read-output dir cc-butler-cleanup-read-lines)))
+    (cc-butler-cleanup--statusline-fields out)))
+
+(defun cc-butler-compact--over-threshold-p (dir)
+  "Non-nil when DIR is at/above the compaction threshold (hybrid signal).
+Prefers the statusline's own used-percentage (at/above
+`cc-butler-compact-threshold-fraction' of the window); when the percentage is
+absent, falls back to the context-token
+figure against `cc-butler-cleanup-context-window'.  Returns nil when neither is
+known — an unknown size is not a candidate (honest, never a guess)."
+  (let ((pct (plist-get (cc-butler-compact--statusline-fields-now dir) :pct))
+        (frac cc-butler-compact-threshold-fraction))
+    (if (integerp pct)
+        (>= pct (* 100 frac))
+      (let ((ctx (cc-butler-cleanup-context-for dir)))
+        (and (integerp ctx)
+             (> cc-butler-cleanup-context-window 0)
+             (> ctx (* cc-butler-cleanup-context-window frac)))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Pre-flight guards
@@ -325,8 +465,8 @@ on its own."
      ((not (let ((b (get-buffer (claude-code-ide--get-buffer-name dir))))
              (and b (buffer-live-p b))))
       "no live terminal")
-     ((and (not ignore-busy) (not (cc-butler--waiting-p dir)))
-      "session is busy — not at a safe waiting point")
+     ((and (not ignore-busy) (not (cc-butler--transcript-idle-p dir)))
+      "session is busy — transcript active within the idle window")
      ((cc-butler-compact--menu-p (cc-butler--read-output dir 40))
       "an interactive menu/wizard is open — Enter would answer it")
      ((cc-butler-compact--pending-input-p dir)
@@ -395,8 +535,135 @@ without waiting for a human to run `cc-butler-compact-reset'."
     (when (timerp (plist-get st :timer)) (cancel-timer (plist-get st :timer))))
   (remhash dir cc-butler-compact--state))
 
+(defun cc-butler-compact--answer-cooldown ()
+  "Seconds to leave between two answers of the same modal.
+Two poll intervals: long enough for the terminal to have repainted, so a
+retry is a response to a modal that is really still up rather than to a
+stale frame."
+  (* 2 cc-butler-compact-poll-interval))
+
+(defun cc-butler-compact--answer-modal (dir st what)
+  "Answer a confirmation modal on DIR's screen if one is up.
+ST is the compaction state; WHAT names the step, for the log.  Returns
+non-nil when an answer was sent, so a caller can use this directly as a
+`cond' branch.
+
+Both model switches raise the same modal — the one into
+`cc-butler-compact-model' and the one back to the original — so both go
+through here rather than each open-coding its own handling.
+
+`cc-butler--send-input' with SUBMIT is the mechanism that actually selects
+an entry.  A bare Return does not, and `claude-code-ide--terminal-send-string'
+alone reaches the modal without selecting anything; confirmed by hand on
+2026-07-23 while clearing this modal from a frozen session.
+
+Answering is retried up to `cc-butler-compact-modal-answers' times rather
+than latched after one attempt: the first answer can arrive before the
+modal has finished rendering and select nothing at all.
+
+Retries are spaced by `cc-butler-compact--answer-cooldown' seconds.  The
+screen this reads is a frame, so an answered modal can still be painted on
+the next tick; answering again immediately would drop a stray \"1\" into the
+input box of whatever screen followed.  Waiting a couple of poll intervals
+means a modal still visible after the cooldown is one that genuinely did
+not take.
+
+A send that throws here (cc-butler#18: a wedged terminal, `cc-butler-session-io-timeout'
+firing) is routed through `cc-butler-compact--send-or-fail', which concludes the whole
+compaction via `--finish' rather than leaving the lock stranded with no timer left to
+revisit it.  Still returns non-nil in that case — a menu WAS found, so the caller's
+`cond' must treat this as \"handled\" rather than fall through to a timeout/idle branch
+that would read stale locals from an entry `--finish' already removed;
+`cc-butler-compact--schedule-poll' is itself a safe no-op against a missing entry, so
+this resolves to nothing further happening, not a resurrected state."
+  (let ((tries (or (plist-get st :answers) 0))
+        (last (plist-get st :answered-at)))
+    (when (and (< tries cc-butler-compact-modal-answers)
+               (or (null last)
+                   (> (- (float-time) last) (cc-butler-compact--answer-cooldown)))
+               (cc-butler-compact--menu-p (cc-butler--read-output dir 40)))
+      (cc-butler-compact--set-state dir :answers (1+ tries)
+                                    :answered-at (float-time))
+      (when (cc-butler-compact--send-or-fail dir what cc-butler-compact-modal-answer)
+        (cc-butler--log "compact: %s │ answered %s modal with %s (attempt %d)"
+                        (cc-butler--display-name dir) what
+                        cc-butler-compact-modal-answer (1+ tries)))
+      t)))
+
+(defun cc-butler-compact--ensure-no-modal (dir)
+  "Answer a confirmation modal still standing on DIR, if there is one.
+Called from `cc-butler-compact--finish', so every way this driver can stop
+— success, timeout, abort — passes through here first.
+
+Giving up on a compaction is recoverable; walking away from a session
+parked on a modal the driver itself opened is not.  That session is stopped
+dead until a human notices, which on 2026-07-23 took two and a half hours."
+  (ignore-errors
+    (when (and (get-buffer (claude-code-ide--get-buffer-name dir))
+               (cc-butler-compact--menu-p (cc-butler--read-output dir 40)))
+      (cc-butler--send-input dir cc-butler-compact-modal-answer t)
+      (cc-butler--log "compact: %s │ cleared a modal left standing at finish"
+                      (cc-butler--display-name dir))
+      t)))
+
+(defun cc-butler-compact--send-raw (dir string)
+  "Write STRING into DIR's terminal — no Return, no paste wrapping.
+`cc-butler--send-input' is the call for text; this is for the control
+characters it does not carry.  Like it, the write happens inside the session
+buffer, because the terminal primitives act on the current buffer and take
+no session argument."
+  (when-let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
+    (with-current-buffer buf
+      (claude-code-ide--terminal-send-string string))
+    t))
+
+(defun cc-butler-compact--send-return (dir)
+  "Press Return in DIR's terminal without typing anything first.
+Used to submit a command already sitting in the input box."
+  (when-let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
+    (with-current-buffer buf
+      (claude-code-ide--terminal-send-return))
+    t))
+
+(defun cc-butler-compact--own-input (dir st)
+  "Return the text WE left unsubmitted in DIR's input box, or nil.
+
+Only ever our own.  What is in the box is compared against the last thing
+this driver typed, so genuinely typed operator input — the thing the whole
+guard exists to protect — is never mistaken for ours and never touched.  A
+prefix counts: the send can be interrupted partway through the string, not
+only between the string and the Return."
+  (let ((sent (plist-get st :last-sent)))
+    (when sent
+      (let ((typed (ignore-errors (cc-butler-compact--typed-text dir))))
+        (and typed (string-prefix-p typed sent) typed)))))
+
+(defun cc-butler-compact--clear-own-input (dir st)
+  "Remove text this driver left sitting in DIR's input box.
+
+The input-box analogue of `cc-butler-compact--ensure-no-modal', and for the
+same reason: an abandoned `/model opus' does not just fail quietly, it waits
+in the box and prepends itself to whatever is dispatched next.  That is how
+a compaction failure turns into a corrupted instruction to an unrelated
+session later.
+
+C-u is the kill-to-start the input box responds to.  Verified afterwards —
+if the box is still not clear this says so in the log rather than reporting
+a tidy finish over a dirty screen."
+  (ignore-errors
+    (when-let ((mine (cc-butler-compact--own-input dir st)))
+      (cc-butler-compact--send-raw dir "\C-u")
+      (let ((left (cc-butler-compact--own-input dir st)))
+        (cc-butler--log "compact: %s │ %s unsubmitted %S from the input box"
+                        (cc-butler--display-name dir)
+                        (if left "FAILED to clear" "cleared") mine)
+        (not left)))))
+
 (defun cc-butler-compact--finish (dir fmt &rest args)
   "Conclude the compaction of DIR with a message/log built from FMT/ARGS."
+  (cc-butler-compact--ensure-no-modal dir)
+  (when-let ((st (gethash dir cc-butler-compact--state)))
+    (cc-butler-compact--clear-own-input dir st))
   (cc-butler-compact--end-state dir)
   (let ((msg (apply #'format fmt args)))
     (cc-butler--log "compact: %s │ %s" (cc-butler--display-name dir) msg)
@@ -432,12 +699,20 @@ Always leaves a truthy `:timer' behind — a real timer, or under
 `cc-butler-compact--inhibit-timers' a placeholder `t' — so
 `cc-butler-compact--orphaned-p' can tell \"still being watched\" from
 \"nothing left to ever revisit this\" the same way in tests as in
-production (mirrors `cc-butler-compact--queue-idle-poll')."
-  (cc-butler-compact--set-state
-   dir :timer (or (unless cc-butler-compact--inhibit-timers
-                    (run-with-timer cc-butler-compact-poll-interval nil
-                                    #'cc-butler-compact--poll dir))
-                  t)))
+production (mirrors `cc-butler-compact--queue-idle-poll').
+
+Refuses to act when DIR has no existing state entry.  `cc-butler-compact--
+answer-modal' can conclude a compaction via `--finish' (cc-butler#18's
+`--send-or-fail') from inside what is still, to its OWN caller's `cond', the
+\"handled\" branch — the caller then calls this unconditionally.  Without this
+guard that would resurrect a stripped-down hash entry (just `:timer', no
+`:phase') instead of leaving the compaction finished."
+  (when (gethash dir cc-butler-compact--state)
+    (cc-butler-compact--set-state
+     dir :timer (or (unless cc-butler-compact--inhibit-timers
+                      (run-with-timer cc-butler-compact-poll-interval nil
+                                      #'cc-butler-compact--poll dir))
+                    t))))
 
 (defun cc-butler-compact--send-or-fail (dir phase text)
   "Send TEXT to DIR, or conclude PHASE with a loud, un-swallowed failure.
@@ -460,7 +735,7 @@ failure always reaches the log, not just the caller's `condition-case'."
 (defun cc-butler-compact--step (dir phase text)
   "Send TEXT to DIR, enter PHASE, and re-arm the clock."
   (cc-butler-compact--set-state dir :phase phase :sent-time (float-time)
-                                :answered nil)
+                                :answers 0 :last-sent text)
   (when (cc-butler-compact--send-or-fail dir phase text)
     (cc-butler--log "compact: %s │ %s (sent %s)"
                     (cc-butler--display-name dir) phase text)
@@ -559,14 +834,26 @@ the same state under test as in production."
      ((> (float-time) deadline)
       (cc-butler--log "compact: %s │ gave up waiting for idle (nothing typed)" name)
       (message "cc-butler compact: %s — gave up waiting for a safe idle point" name))
-     ((cc-butler-compact--blocked-reason dir)
-      ;; Still busy, or something new is in the way; keep waiting.
-      (cc-butler-compact--queue-idle-poll dir deadline))
      (t
-      (condition-case err
-          (cc-butler-compact-session dir)
-        (error (cc-butler--log "compact: %s │ queued start failed: %s" name
-                               (error-message-string err))))))))
+      ;; The queue entry was already dropped above, so anything that throws
+      ;; between there and the re-queue below loses the compaction outright —
+      ;; no retry, no deadline notice, and `cc-butler-compact-waiting-p' goes
+      ;; false, so it stops even showing as queued.  Failing to DETERMINE
+      ;; whether starting is safe is not permission to start: every other gate
+      ;; here errs toward BUSY, because compaction is destructive.
+      (let ((why (condition-case err
+                     (cc-butler-compact--blocked-reason dir)
+                   (error
+                    (cc-butler--log "compact: %s │ could not tell whether it is safe to start (%s) — keeping it queued"
+                                    name (error-message-string err))
+                    "could not determine whether it is safe"))))
+        (if why
+            ;; Still busy, or something new is in the way; keep waiting.
+            (cc-butler-compact--queue-idle-poll dir deadline)
+          (condition-case err
+              (cc-butler-compact-session dir)
+            (error (cc-butler--log "compact: %s │ queued start failed: %s" name
+                                   (error-message-string err))))))))))
 
 ;;;###autoload
 (defun cc-butler-compact-session (dir)
@@ -593,13 +880,20 @@ and refuses when the current model cannot be named well enough to restore."
     ;; Capture the model BEFORE anything is typed — after the switch the
     ;; original is unrecoverable, and an unrestorable session is worse than
     ;; an uncompacted one.
-    (let* ((tag (cc-butler-compact--model-now dir))
-           (arg (cc-butler-compact--model-arg tag))
+    ;; Both halves matter: the TAG comes from three sources (screen, then
+    ;; transcript, then last-known), and the ARGUMENTS derived from it are a
+    ;; candidate list (exact id first, family alias as fallback).  Taking
+    ;; either alone is wrong -- without the first, a session whose screen is
+    ;; illegible cannot be compacted at all; without the second, an unlisted
+    ;; model family cannot be restored.
+    (let* ((tag (cc-butler-compact--model-for-restore dir))
+           (args (cc-butler-compact--model-args tag))
+           (arg (car args))
            (ctx (cc-butler-compact--context-now dir)))
       (unless arg
-        (user-error "Refusing to compact %s: cannot determine a restorable model (statusline says %s)"
+        (user-error "Refusing to compact %s: cannot determine a restorable model (screen, transcript and last-known all say %s)"
                     name (or tag "nothing")))
-      (cc-butler-compact--set-state dir :orig-model tag :orig-arg arg
+      (cc-butler-compact--set-state dir :orig-model tag :orig-args args :orig-arg arg
                                     :orig-ctx ctx :note nil)
       (cc-butler--log "compact: %s │ start (ctx %s, model %s)"
                       name (or ctx "?") tag)
@@ -622,6 +916,8 @@ and refuses when the current model cannot be named well enough to restore."
         (cc-butler-compact--finish dir "session vanished mid-compaction — aborted"))
        ((eq phase 'switching)   (cc-butler-compact--poll-switch dir st sent))
        ((eq phase 'compacting)  (cc-butler-compact--poll-compact dir st sent))
+       ((eq phase 'restore-wait)
+        (cc-butler-compact--poll-restore-wait dir st sent))
        ((eq phase 'restoring)   (cc-butler-compact--poll-restore dir st sent))
        (t (cc-butler-compact--finish dir "unknown phase %S — stopped" phase))))))
 
@@ -631,15 +927,8 @@ and refuses when the current model cannot be named well enough to restore."
     (cond
      ((cc-butler-compact--model-is-p tag cc-butler-compact-model)
       (cc-butler-compact--step dir 'compacting "/compact"))
-     ;; The modal is answered at most once: a slow render must not draw a
-     ;; second Return onto whatever screen follows.
-     ((and (not (plist-get st :answered))
-           (cc-butler-compact--menu-p (cc-butler--read-output dir 40)))
-      (cc-butler-compact--set-state dir :answered t)
-      (when (cc-butler-compact--send-or-fail dir 'switching cc-butler-compact-modal-answer)
-        (cc-butler--log "compact: %s │ answered switch modal with %s"
-                        (cc-butler--display-name dir) cc-butler-compact-modal-answer)
-        (cc-butler-compact--schedule-poll dir)))
+     ((cc-butler-compact--answer-modal dir st "model switch")
+      (cc-butler-compact--schedule-poll dir))
      ((> (- (float-time) sent) cc-butler-compact-step-timeout)
       (cc-butler-compact--abort dir "model switch timed out"))
      (t (cc-butler-compact--schedule-poll dir)))))
@@ -669,7 +958,64 @@ and refuses when the current model cannot be named well enough to restore."
     (if (not arg)
         (cc-butler-compact--finish dir "compacted (%s); model unchanged"
                                    (or (plist-get st :note) "no delta observed"))
-      (cc-butler-compact--step dir 'restoring (format "/model %s" arg)))))
+      ;; Do not type yet — hold until the session is at a waiting point.
+      (cc-butler-compact--set-state dir :phase 'restore-wait
+                                    :sent-time (float-time) :answers 0)
+      (cc-butler-compact--poll-restore-wait
+       dir (gethash dir cc-butler-compact--state) (float-time)))))
+
+(defun cc-butler-compact--send-restore (dir st arg)
+  "Put the restore command into DIR, retrying a send that never submitted.
+
+If our command is already sitting in the box, only the Return was lost —
+submit what is there rather than typing it again, which would append to it
+and produce `/model opus/model opus'.  Otherwise send it fresh.
+
+`cc-butler-compact--send-return' is not `cc-butler--send-input' and so is
+not covered by `cc-butler-compact--send-or-fail' — guarded directly here
+for the same reason (cc-butler#18): a throw after the lock is (re)set to
+`restoring' must still conclude through `--finish' rather than strand it."
+  (if (cc-butler-compact--own-input dir st)
+      (progn
+        (cc-butler-compact--set-state dir :phase 'restoring
+                                      :sent-time (float-time) :answers 0)
+        (condition-case err
+            (progn
+              (cc-butler-compact--send-return dir)
+              (cc-butler--log "compact: %s │ restoring (submitted the command already typed)"
+                              (cc-butler--display-name dir))
+              (cc-butler-compact--schedule-poll dir))
+          (error
+           (cc-butler-compact--finish
+            dir "send failed while restoring (submitting the already-typed /model %s) — %s"
+            arg (error-message-string err)))))
+    (cc-butler-compact--step dir 'restoring (format "/model %s" arg))))
+
+(defun cc-butler-compact--poll-restore-wait (dir st sent)
+  "Hold the model restore until DIR is idle, then send it.
+
+`/compact' can still be running when the compact phase stops watching, and
+typing `/model' into a session that is mid-work is what caused the
+2026-07-23 freeze: the restore was sent while the compaction ran on, so the
+confirmation modal appeared long after the restore step's own timeout had
+fired and stopped polling.  Nothing was left watching, and the session sat
+on an unanswered dialog for two and a half hours.
+
+Sending only from a waiting point keeps the modal inside the window that is
+actually being watched.  The wait is bounded by `cc-butler-compact-timeout'
+and answers any modal that is already up while it waits."
+  (let ((arg (plist-get st :orig-arg)))
+    (cond
+     ((cc-butler-compact--answer-modal dir st "pre-restore")
+      (cc-butler-compact--schedule-poll dir))
+     ((cc-butler--waiting-p dir)
+      (cc-butler-compact--send-restore dir st arg))
+     ((> (- (float-time) sent) cc-butler-compact-timeout)
+      (cc-butler-compact--finish
+       dir "compacted (%s) but model NOT restored — session never reached a waiting point; still on %s, wanted %s"
+       (or (plist-get st :note) "no delta observed")
+       (or (cc-butler-compact--model-now dir) "?") arg))
+     (t (cc-butler-compact--schedule-poll dir)))))
 
 (defun cc-butler-compact--poll-restore (dir st sent)
   "Wait for the original model to come back, answering the modal."
@@ -679,15 +1025,43 @@ and refuses when the current model cannot be named well enough to restore."
      ((cc-butler-compact--model-is-p tag arg)
       (cc-butler-compact--finish dir "compacted (%s); model restored to %s"
                                  (or (plist-get st :note) "no delta observed") tag))
-     ((and (not (plist-get st :answered))
-           (cc-butler-compact--menu-p (cc-butler--read-output dir 40)))
-      (cc-butler-compact--set-state dir :answered t)
-      (when (cc-butler-compact--send-or-fail dir 'restoring cc-butler-compact-modal-answer)
-        (cc-butler-compact--schedule-poll dir)))
+     ((cc-butler-compact--answer-modal dir st "model restore")
+      (cc-butler-compact--schedule-poll dir))
+     ;; The command is still sitting in the box: typed, never submitted.
+     ;; A notification landed in the gap between the string and the Return
+     ;; and started the turn, so the Return went to a session that was no
+     ;; longer at its input box.  Waiting cannot fix this — nothing is in
+     ;; flight — so go back and send it again once the session is idle.
+     ((cc-butler-compact--own-input dir st)
+      (let ((tries (or (plist-get st :restore-tries) 0)))
+        (if (>= tries cc-butler-compact-restore-retries)
+            (cc-butler-compact--finish
+             dir "compacted (%s) but model NOT restored — the restore never submitted after %d attempts; session left on %s, wanted %s"
+             (or (plist-get st :note) "no delta observed")
+             (1+ tries) (or tag "?") arg)
+          (cc-butler-compact--set-state dir :restore-tries (1+ tries))
+          (cc-butler--log "compact: %s │ restore never submitted (attempt %d) — waiting for idle to retry"
+                          (cc-butler--display-name dir) (1+ tries))
+          (cc-butler-compact--set-state dir :phase 'restore-wait
+                                        :sent-time (float-time))
+          (cc-butler-compact--schedule-poll dir))))
      ((> (- (float-time) sent) cc-butler-compact-step-timeout)
-      (cc-butler-compact--finish
-       dir "compacted (%s) but model NOT restored — session is on %s, wanted %s"
-       (or (plist-get st :note) "no delta observed") (or tag "?") arg))
+      ;; The exact id may simply have been refused, in which case `/model' left
+      ;; the session unchanged — still on the cheap compaction model.  That is
+      ;; the silent downgrade this is meant to avoid, so try the next candidate
+      ;; (the family alias) before reporting failure.
+      (let ((rest (cdr (plist-get st :orig-args))))
+        (if rest
+            (progn
+              (cc-butler--log "compact: %s │ %s did not land — falling back to %s"
+                              (cc-butler--display-name dir) arg (car rest))
+              (cc-butler-compact--set-state dir :orig-args rest :orig-arg (car rest)
+                                            :phase 'restore-wait
+                                            :sent-time (float-time) :answers 0)
+              (cc-butler-compact--schedule-poll dir))
+          (cc-butler-compact--finish
+           dir "compacted (%s) but model NOT restored — session is on %s, wanted %s"
+           (or (plist-get st :note) "no delta observed") (or tag "?") arg))))
      (t (cc-butler-compact--schedule-poll dir)))))
 
 (defun cc-butler-compact--abort (dir why)
@@ -698,7 +1072,9 @@ and refuses when the current model cannot be named well enough to restore."
     (if (and arg (not (cc-butler-compact--model-is-p
                        (cc-butler-compact--model-now dir) arg)))
         (progn (cc-butler-compact--set-state dir :note (format "aborted: %s" why))
-               (cc-butler-compact--step dir 'restoring (format "/model %s" arg)))
+               ;; Same held restore as the success path — an abort is if
+               ;; anything MORE likely to leave the session mid-work.
+               (cc-butler-compact--restore dir))
       (cc-butler-compact--finish dir "aborted: %s" why))))
 
 ;;;; ------------------------------------------------------------------
@@ -706,14 +1082,16 @@ and refuses when the current model cannot be named well enough to restore."
 ;;;; ------------------------------------------------------------------
 
 (defun cc-butler-compact-candidates ()
-  "Return dirs of sessions over `cc-butler-compact-threshold', largest first.
-Includes the butler and the steward by design."
+  "Return dirs of sessions over the compaction threshold, largest first.
+Candidacy is `cc-butler-compact--over-threshold-p' (the percentage-first hybrid
+gate); ordering is by context-token size so an interrupted sweep did the most
+important work first.  Includes the butler and the steward by design."
   (let (out)
     (dolist (s (cc-butler--sessions))
       (let* ((dir (plist-get s :dir))
              (ctx (cc-butler-cleanup-context-for dir)))
-        (when (and (integerp ctx) (> ctx cc-butler-compact-threshold))
-          (push (cons dir ctx) out))))
+        (when (cc-butler-compact--over-threshold-p dir)
+          (push (cons dir (or ctx 0)) out))))
     (mapcar #'car (sort out (lambda (a b) (> (cdr a) (cdr b)))))))
 
 ;;;###autoload
@@ -939,12 +1317,11 @@ the ceiling with nobody reading."
             (if (integerp ctx) (format "%.0fk" (/ ctx 1000.0)) "?")
             (or model "?")
             (if (cc-butler--waiting-p dir) "WAITING" "running")
-            (cond ((and (integerp ctx) (> ctx cc-butler-compact-threshold) (not why))
-                   "OVER THRESHOLD — compactable now")
-                  ((and (integerp ctx) (> ctx cc-butler-compact-threshold))
-                   (format "OVER THRESHOLD — blocked: %s" why))
-                  (why (format "blocked: %s" why))
-                  (t "ok")))))
+            (let ((over (cc-butler-compact--over-threshold-p dir)))
+              (cond ((and over (not why)) "OVER THRESHOLD — compactable now")
+                    (over (format "OVER THRESHOLD — blocked: %s" why))
+                    (why (format "blocked: %s" why))
+                    (t "ok"))))))
 
 (defun cc-butler-tool-session-status ()
   "MCP tool: per-session context size, model, and compaction readiness."
