@@ -987,10 +987,16 @@ output, and unfalsifiable, since nothing recorded that a refresh had failed.  A
 read that cannot report its own failure is not a read.
 
 A buffer with no ghostel terminal is NOT a failure: its text belongs to some
-other backend, and calling that stale would blank out every non-ghostel setup."
+other backend, and calling that stale would blank out every non-ghostel setup.
+This fleet is ghostel-backed exclusively (README), so this branch firing on a
+session buffer at all is itself unexpected — logged (2026-08-03) so the NEXT
+occurrence of a live session reading as empty leaves a trace of which branch
+served it, rather than requiring `*Messages*'/timeline archaeology again."
   (with-current-buffer buffer
     (cond
      ((not (and (boundp 'ghostel--term) ghostel--term (fboundp 'ghostel--redraw)))
+      (cc-butler--log "read: %s │ no ghostel--term bound — trusting buffer text as-is (dir %s)"
+                      (buffer-name buffer) default-directory)
       'no-terminal)                     ; not ours to refresh; trust it as-is
      ((cc-butler--refresh-recent-p buffer) 'recent)
      (t (cc-butler--redraw-with-window buffer)))))
