@@ -184,5 +184,79 @@ argument would reintroduce it one call at a time."
                                                 (plist-get a :name)))
                               args))))))
 
+;;;; ------------------------------------------------------------------
+;;;; Syncing the MEMORY.md index (cc-butler#36 gap b)
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/regenerate-adds-missing-notes-to-the-index ()
+  "The whole point of this fix: a note that lands in the cache but never gets
+an index line is invisible to every future session — regenerate must add one,
+pulling the hook text from the note's own frontmatter description."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "verify-delivery.md" store)
+      (insert (cc-butler-governance--render
+               "verify-delivery" "Confirm it landed" "Body." "feedback")))
+    (cc-butler-governance-regenerate)
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (should (file-exists-p index))
+      (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        (should (string-match-p "\\[verify-delivery\\](butler-verify-delivery\\.md)" text))
+        (should (string-match-p "Confirm it landed" text))))))
+
+(ert-deftest cc-butler-governance/regenerate-index-merge-preserves-hand-written-lines ()
+  "MEMORY.md is hand-maintained and carries entries this store doesn't own
+(steward notes, unrelated links). Regenerate must merge additively — never
+overwrite or drop a line it didn't add."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem))
+          (hand-written "- [steward-only-note](steward-only-note.md) — hand-authored, no matching store file\n"))
+      (with-temp-file index (insert hand-written))
+      (with-temp-file (expand-file-name "a-rule.md" store)
+        (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
+      (cc-butler-governance-regenerate)
+      (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        (should (string-match-p (regexp-quote hand-written) text))
+        (should (string-match-p "\\[a-rule\\](butler-a-rule\\.md)" text))))))
+
+(ert-deftest cc-butler-governance/regenerate-index-merge-is-idempotent ()
+  "Running regenerate twice must not duplicate an already-indexed note's line."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
+    (cc-butler-governance-regenerate)
+    (cc-butler-governance-regenerate)
+    (let* ((index (expand-file-name "MEMORY.md" mem))
+           (text (with-temp-buffer (insert-file-contents index) (buffer-string)))
+           (count 0) (start 0))
+      (while (string-match "\\[a-rule\\](butler-a-rule\\.md)" text start)
+        (setq count (1+ count) start (match-end 0)))
+      (should (= count 1)))))
+
+(ert-deftest cc-butler-governance/regenerate-does-not-duplicate-an-already-curated-entry ()
+  "If a slug already has a hand-curated line (worded differently from the
+frontmatter description), regenerate must not add a second, auto-generated
+line for the same note — that would produce two competing entries for one slug."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem))
+          (curated "- [a-rule](butler-a-rule.md) — a human's own curated wording, not the frontmatter description\n"))
+      (with-temp-file index (insert curated))
+      (with-temp-file (expand-file-name "a-rule.md" store)
+        (insert (cc-butler-governance--render
+                 "a-rule" "totally different auto description" "body" "feedback")))
+      (cc-butler-governance-regenerate)
+      (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        (should (string-match-p (regexp-quote curated) text))
+        (should-not (string-match-p "totally different auto description" text))))))
+
+(ert-deftest cc-butler-governance/regenerate-index-falls-back-when-no-description ()
+  "A store note somehow missing/malformed frontmatter still gets indexed, with
+a placeholder hook instead of crashing the whole regenerate call."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "raw-rule.md" store) (insert "no frontmatter here"))
+    (cc-butler-governance-regenerate)
+    (let* ((index (expand-file-name "MEMORY.md" mem))
+           (text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+      (should (string-match-p "\\[raw-rule\\](butler-raw-rule\\.md)" text)))))
+
 (provide 'cc-butler-governance-test)
 ;;; cc-butler-governance-test.el ends here

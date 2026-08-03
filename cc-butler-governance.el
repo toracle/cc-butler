@@ -91,18 +91,80 @@ overrides the built-in of that name, so you can specialize a built-in privately.
           (lambda (a b) (string< (file-name-nondirectory a)
                                  (file-name-nondirectory b))))))
 
+(defun cc-butler-governance--memory-index-file ()
+  "Absolute path of `MEMORY.md' — the hand-maintained index every session
+actually loads.  A note's body can be regenerated perfectly and still never be
+recalled if this file has no line pointing at it (cc-butler#36)."
+  (expand-file-name "MEMORY.md" cc-butler-governance-memory-dir))
+
+(defun cc-butler-governance--frontmatter-description (path)
+  "PATH's frontmatter `description:' value, or nil if unreadable/absent."
+  (when (file-readable-p path)
+    (with-temp-buffer
+      (insert-file-contents path)
+      (goto-char (point-min))
+      (let ((frontmatter-end (save-excursion
+                               (forward-line 1)
+                               (and (re-search-forward "^---$" nil t) (point)))))
+        (when (and frontmatter-end
+                   (re-search-forward "^description: \"\\(.*\\)\"$" frontmatter-end t))
+          (match-string 1))))))
+
+(defun cc-butler-governance--index-line (slug)
+  "Render the `MEMORY.md' line for SLUG, using the note's own description."
+  (let* ((note (expand-file-name (concat "butler-" slug ".md")
+                                 cc-butler-governance-memory-dir))
+         (desc (or (cc-butler-governance--frontmatter-description note)
+                   "(no description in store)")))
+    (format "- [%s](butler-%s.md) — %s\n" slug slug desc)))
+
+(defun cc-butler-governance--index-has-slug-p (index slug)
+  "Non-nil when INDEX (a file that may not exist yet) already links SLUG's note."
+  (and (file-readable-p index)
+       (with-temp-buffer
+         (insert-file-contents index)
+         (goto-char (point-min))
+         (search-forward (format "(butler-%s.md)" slug) nil t))))
+
+(defun cc-butler-governance--sync-index (slugs)
+  "Add-only merge of SLUGS into `MEMORY.md': append a line for any slug that
+has none yet; never touch or remove an existing line.
+
+`MEMORY.md' is hand-maintained and carries entries this store does not own
+(steward notes, unrelated links) — overwriting it wholesale, the way note
+bodies are overwritten, would be data loss rather than a refresh.  That
+asymmetry is deliberate: bodies are fully generated and safe to replace in
+full; the index is partly human-authored and is not.  Returns the slugs
+actually appended."
+  (let* ((index (cc-butler-governance--memory-index-file))
+         (missing (seq-remove
+                   (lambda (slug) (cc-butler-governance--index-has-slug-p index slug))
+                   slugs)))
+    (when missing
+      (with-temp-buffer
+        (when (file-readable-p index) (insert-file-contents index))
+        (goto-char (point-max))
+        (unless (or (bobp) (bolp)) (insert "\n"))
+        (dolist (slug missing) (insert (cc-butler-governance--index-line slug)))
+        (write-region (point-min) (point-max) index nil 'quiet)))
+    missing))
+
 ;;;###autoload
 (defun cc-butler-governance-regenerate ()
   "Regenerate the Claude Code memory cache from the neutral store — the store is
-the source of truth; the memory is derived.  Returns the count written."
+the source of truth; the memory is derived.  Also merges any note missing from
+`MEMORY.md's index into it (add-only — see `cc-butler-governance--sync-index').
+Returns the count of principles written."
   (interactive)
   (make-directory cc-butler-governance-memory-dir t)
-  (let ((n 0))
+  (let ((n 0) (slugs nil))
     (dolist (f (cc-butler-governance-principles))
       (copy-file f (expand-file-name (concat "butler-" (file-name-nondirectory f))
                                      cc-butler-governance-memory-dir)
                  t)
+      (push (file-name-sans-extension (file-name-nondirectory f)) slugs)
       (setq n (1+ n)))
+    (cc-butler-governance--sync-index (nreverse slugs))
     (when (called-interactively-p 'interactive)
       (message "cc-butler: regenerated %d principle(s) from the store" n))
     n))
@@ -149,9 +211,11 @@ should have to remember."
                     cc-butler-governance-memory-dir))
 
 (defun cc-butler-governance--note-count ()
-  "How many generated notes are in the memory dir right now."
+  "How many generated notes (butler-*.md) are in the memory dir right now.
+Matches only the `butler-' prefix regenerate writes, not every `.md' file in
+the dir — `MEMORY.md' lives there too (cc-butler#36) and is not a note."
   (length (ignore-errors
-            (directory-files cc-butler-governance-memory-dir nil "\\`[^.].*\\.md\\'"))))
+            (directory-files cc-butler-governance-memory-dir nil "\\`butler-.*\\.md\\'"))))
 
 (defun cc-butler-governance--render (slug description body type)
   "The full file text for a principle, frontmatter included.
