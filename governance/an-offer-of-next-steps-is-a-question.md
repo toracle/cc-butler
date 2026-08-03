@@ -40,10 +40,23 @@ call. **The better the worker's report, the more likely its request gets filed a
 5. **Own the miss out loud when you dispatch late.** Both workers were behaving correctly; the omission was the
    dispatcher's. Saying so keeps the worker offering next time, which is the behaviour you want.
 
+**A third instance the same night, and the subtlest — "it's their decision" is not "we asked them."** A worker
+sat in standby on a production promotion. Every record said *"prod promotion is the principal's gate"*, and
+every agent that read it — including the one who wrote it — treated the matter as settled. It was: the *policy*
+was settled. **The question had never been put to anyone.** "This requires their approval" describes a
+constraint; it does not create a request. Nobody notices the difference, because the sentence sounds like a
+disposition rather than a to-do.
+
+Worse, this one survives the fix above. The worker's standby was *genuinely* clean when checked — instructed,
+acknowledged, no offer left hanging. Asking "is this worker waiting on us?" gets you "no, it's waiting on the
+principal," which sounds like someone else's problem. It isn't: **the gap was in the queue, not in the worker.**
+So extend the check one hop — *for anything recorded as gated on the principal, verify a request actually
+exists in their queue.* A gate with nothing queued behind it is not a gate, it is a worker parked forever.
+
 **The general shape.** Idleness is easy to instrument and is the *wrong* signal — it catches the cheap case (a
 worker with nothing to do, costing nothing) and misses the expensive one (a worker blocked on a one-sentence
 answer, looking fine). Instrument the thing you actually care about: **unanswered asks**, whatever grammatical
-form they arrived in.
+form they arrived in — including the ask you decided was needed and never made.
 
 Related: [[search-for-the-existing-decision-first]] (the closure that never landed — same night, and the answer
 jarvice-1130 was frozen on already existed), [[report-up-is-a-push]] (the reporting direction; this note is the
