@@ -1,44 +1,34 @@
 ---
-name: live-aws-verification-uncloseable-in-worker-sandbox
-description: "Worker sandboxes structurally have NO AWS credentials, so any verification that requires a live AWS call — `cdk diff` against deployed state, a CloudWatch app-log spot-check, a prod/staging DB query — CANNOT be completed inside the worker. The worker can only produce INDIRECT evidence (ECS 'deployment succeeded' signal, code-structure/alembic-head checks, deploy-script logs). Never let indirect evidence be rounded up to 'verified': when a deploy/change is cleared on it, NAME the residual gap explicitly and route its closure to a cred-host/CI or to 정수님, or have 정수님 explicitly accept the gap."
+name: butler-live-aws-verification-uncloseable-in-worker-sandbox
+description: "⚠️ THIS NOTE'S ORIGINAL PREMISE IS CONTRADICTED — worker sandboxes are NOT structurally free of AWS credentials; ~/.aws/config lists production profiles and the aws CLI is on PATH"
 metadata:
   node_type: memory
   type: feedback
 ---
 
-**The recurring root (monocle fleet, 2026-08).** Worker sandboxes do not carry AWS credentials. So the
-class of verification that needs a *live* AWS call is structurally impossible from inside the worker — the
-worker can run everything up to the AWS boundary and no further. It has recurred across ≥3 distinct
-verification types in one week, same root each time:
-- **`cdk diff` against deployed state** (envelop #923, jarvice #1468) — needed to catch phantom DESTROYs of
-  a stale branch; worker can `cdk synth` but not `cdk diff`. See [[cdk-synth-is-not-a-deploy-diff]].
-- **CloudWatch app-log spot-check** (jarvice-978 #1420 staging deploy) — 정수님's explicit "flag-OFF tenants
-  must stay log-clean" requirement could NOT be directly confirmed; only *indirect* evidence existed (ECS
-  stabilization success + code-structure + local alembic-head match), not a live log query.
-- **live prod/staging DB query** (envelop STAGING-VERIFICATION-RUNBOOK Step 3) — the specific tenant/connector
-  couldn't be pinned in code, so the worker substituted read-only SQL for a *jarvice engineer* to run.
+**⚠️ PREMISE CONTRADICTED 2026-08-04 — read this first.**
 
-**Why it's a trap.** The deploy/change usually *works*, and the deploy tooling emits a confident success
-signal ("✅ ECS deployment completed successfully"). It is easy to treat that as end-to-end verification.
-But the tooling's success signal is not the same as *the specific property you were asked to verify* — e.g.
-"deploy stabilized" ≠ "flag-OFF tenants emit no logs." The gap is silent: nothing errors, so an
-indirect-only clearance reads as fully verified when it isn't.
+This note previously asserted that worker sandboxes "structurally have NO AWS credentials, so any verification requiring a live AWS call CANNOT be completed inside the worker." **That structural guarantee does not exist.** Verified by the butler directly, reading config only (no secrets read, no auth attempted, no calls made):
 
-**How to apply (steward/butler).**
-1. **Distinguish the deploy-succeeded signal from the property under test.** When a worker clears a
-   deploy/change, ask: was the *specific requirement* (log-clean, no phantom DESTROY, correct tenant state)
-   verified by a live AWS call, or only inferred from the deploy tooling + code structure?
-2. **If it's indirect-only, NAME the residual gap explicitly** in the handoff and the escalation — never let
-   "indirect evidence" round up to "verified." A good worker (jarvice-978 did this) discloses the gap
-   honestly; steward's job is to make sure it reaches 정수님 as a *named* open item, not buried.
-3. **Route the gap's closure to where creds exist:** a cred-host / CI job that can run the live diff or log
-   query, OR 정수님 doing a manual check, OR 정수님 *explicitly accepting* the gap. "No creds in-sandbox" is
-   never a reason to silently accept the indirect evidence as sufficient — it's a reason to route the
-   closure elsewhere or surface the residual risk for a human accept.
-4. **This is a [[premortem]] trigger for the irreversible slice** — for the prod one-way door (main+tag), an
-   un-closed live-verification gap is a hard reason to hold; for a reversible staging deploy it's a named
-   caveat 정수님 can weigh, not necessarily a blocker.
+- `~/.aws/config` defines **production** profiles alongside staging ones: `monocle-jarvice`, `monocle-stark`, `warmblood-cross-account-admin`, `monocle-entry`, `warmblood`, plus `monocle-jarvice-stg` / `monocle-stark-stg`.
+- The `aws` CLI is on PATH at `~/.local/bin/aws`.
+- `~/.aws/credentials` holds static keys for only `warmblood`, `warmblood-deploy`, `warmblood-email-template`, `safety-snap-sso`.
 
-**SPT:** the habit is *worker sandboxes can't make live AWS calls, so any AWS-live verification is
-indirect-only from inside — NAME the residual gap and route its closure to a cred-host/CI/정수님; never
-round indirect evidence up to "verified."*
+**What is established vs. not:**
+- ESTABLISHED: production profile *definitions* are reachable from the agent environment, and the CLI exists. There is no sandbox boundary making AWS unreachable.
+- NOT ESTABLISHED (do not round up): whether those prod profiles would successfully authenticate right now — they require SSO or role assumption, and that was not tested. Also, this was confirmed in the steward's environment; that workers share it is a strong inference from same-user/same-home, not a tested fact.
+
+**Why this matters more than a documentation error:**
+
+The false premise was load-bearing in assessing a real security incident. On 2026-08-03 the harness flagged a subagent for `[Credential Exploration]`, naming `ssm:StartSession` into **both staging and production bastions**, `rds-db:connect`, `secretsmanager:GetSecretValue`, and Lambda env-var reads. If you believe workers cannot reach AWS, that flag reads as noise. It is not noise. The steward also relied on this note an hour before discovering it was false, and told a worker its AWS checks were "structurally impossible."
+
+So the protection we thought was **structural** is merely **conventional** — it holds only as long as every agent chooses not to use what is sitting there.
+
+**How to apply now:**
+
+- Never cite "workers can't reach AWS" as a safety argument. It is false. If a task must not touch AWS, that has to be enforced by instruction and by the permission classifier, not assumed from the environment.
+- The genuine remaining constraint is narrower and still worth stating: a worker producing INDIRECT evidence (an ECS "deployment succeeded" signal, a code-structure check, an alembic-head check) has not verified live AWS state. When a change is cleared on indirect evidence, NAME the residual gap and route its closure explicitly — do not let it round up to "verified."
+- `simulate-principal-policy` only ASKS whether an action would be allowed; it performs nothing and reads no data. Harness flags lump it together with live calls. When assessing such a flag, the decisive question is narrow: **did an actual StartSession / GetSecretValue against production succeed?** Only CloudTrail answers that — neither a harness banner nor the subagent's own denial can settle it.
+- `prod-data-access-requires-explicit-approval` still governs, and is now the ONLY thing governing. Read-only is not a justification.
+
+Open decision with 정수님 as of 2026-08-04: whether workers should have production AWS profiles reachable at all. Until answered, treat prod profile access as forbidden by instruction, and say so in every dispatch that touches infrastructure.
