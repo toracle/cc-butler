@@ -1,10 +1,9 @@
 ---
 name: butler-verify-delivery
-description: "Surfaced ≠ delivered — a decision is not delivered until the human actually receives/acknowledges it; don't trust an agent's rosy 'everything surfaced / clean checkpoint' self-report, verify against the human's real receipt; the butler is the reliable ACTIVE-delivery channel, passive badges/inboxes are not"
-metadata: 
+description: "Surfaced ≠ delivered — a decision is not delivered until the human actually receives/acknowledges it; don't trust an agent's rosy 'everything surfaced / clean checkpoint' self-report, verify against the human's real receipt; the butler is the reliable ACTIVE-delivery channel, passive badges/inboxes are not. Also: when verifying a send_to_session landed, read far enough to see the transcript echo — the status-line context figure LAGS and is not a delivery signal."
+metadata:
   node_type: memory
   type: feedback
-  originSessionId: 24305c3a-429a-4449-800d-2bf67f660d4b
 ---
 
 Recurring failure (2026-07-04): 정수님 waited an hour and received NOTHING, while the steward
@@ -36,5 +35,24 @@ found **9 decision docs piled in 정수님's inbox, answered:0** — rendered to
    independent of any agent turn. Passive badges/inboxes are pull, not delivery. (Same principle as
    "arrival is the daemon's job": the host handles arrival, not a paced agent.)
 
+6. **Verifying a `send_to_session` landed: read far enough to see the transcript ECHO, and do not
+   use the status-line context figure as the signal.** (2026-08-04, three occurrences in one
+   afternoon.) The mechanics: a short `read_session_output` (10–14 lines) frequently returns only
+   the task-list overlay, a spinner and the `❯` prompt row, with the collapsed "paste again to
+   expand" marker — which looks exactly like a message that was never delivered. Twice I nearly
+   filed a false non-delivery; a 40–45 line read showed the full text had been there all along.
+   Worse, I briefly used the `CTX=` figure as a proxy — reasoning that a received message must
+   raise it — and on monocle-jarvice-1130 it read *identically* before and after a successful send,
+   because **the status line only refreshes when a turn completes**. It is a lagging indicator and
+   proves nothing either way.
+   So: verify with a read long enough to contain your own opening words, and treat "no echo in a
+   short read" as INCONCLUSIVE rather than as failure. This is the delivery-side instance of
+   [[butler-absence-of-evidence-needs-a-control-and-an-evidence-class]] — the positive control is
+   your own text appearing in the transcript, and the context figure is not an evidence class that
+   records what you are asking it. Note also the genuinely useful signals that DO work: a thinking
+   spinner or a new tool call appearing after your send, and best of all the worker acting on the
+   content.
+
 Ties to [[butler-institutionalize-learning]], [[butler-relay-fidelity-provenance]],
-[[butler-state-desync]]. A standing butler/steward duty; runtime-neutral home owed.
+[[butler-state-desync]], [[butler-relay-safe-worker-decisions]]. A standing butler/steward duty;
+runtime-neutral home owed.
