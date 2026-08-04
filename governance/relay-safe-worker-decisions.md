@@ -46,6 +46,27 @@ literal and unambiguous. Never the second — see
 position is the thing to avoid, and prefer surfacing the wedge
 ([[butler-channel-wedge-fallback-visibility]]) when no answer exists to relay.
 
+**BUT A DIGIT ONLY AIMS AT A MENU THAT IS STILL OPEN — RE-CHECK IMMEDIATELY
+BEFORE SENDING.** The same 2026-08-04 relay demonstrated the failure: by the time
+the butler's `2` arrived, 정수님 had already answered `monocle-jarvice-978`
+directly (picking option 1), so the menu was gone and the digit landed as a
+**context-free token in the worker's input**. Harmless only because the worker
+refused to interpret it — it reported "got a bare `2` from the butler with no
+context I can connect to anything, not acting on it since I can't tell what it
+refers to."
+
+That is the right behaviour and it is worth naming as a general rule: **an
+unanchored digit is dangerous precisely because it is so easily resolvable into a
+plausible action** — "option 2 of something." A worker that helpfully guesses
+which menu it belonged to would act on an instruction nobody gave. Same shape as
+[[butler-never-reconstruct-a-truncated-instruction]]: treat an ambiguous input as
+ambiguous, do not resolve it into the most likely meaning.
+
+So: `read_session_output` immediately before relaying a digit and confirm the menu
+is still on screen; a human answering the worker directly can close it between
+your read and your send. And if you sent one that may have missed, say so to the
+worker rather than leaving a stray token for it to puzzle over.
+
 **The fix — workers under fleet orchestration use text-based decision
 requests, not interactive ones.** A worker is "under fleet orchestration"
 when it was spawned/dispatched by the steward (or, in single mode, the
