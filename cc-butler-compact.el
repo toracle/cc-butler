@@ -447,6 +447,22 @@ known — an unknown size is not a candidate (honest, never a guess)."
 ;;;; Pre-flight guards
 ;;;; ------------------------------------------------------------------
 
+(defun cc-butler-compact--menu-block-reason (dir)
+  "Return a blocking reason when DIR's screen shows an open menu, OR when
+the screen could not be read at all.  `cc-butler--read-output' returns nil
+on a failed refresh and a string (possibly empty) on a successful one —
+`cc-butler-compact--menu-p' alone cannot tell those apart, since it takes
+a screen already coerced to a string.  Collapsing 'unreadable' into 'no
+menu' would let a compaction fire its Enter into a wizard sitting on a
+screen we simply failed to see.  Return nil only when the screen was read
+successfully and genuinely shows no menu."
+  (let ((screen (cc-butler--read-output dir 40)))
+    (cond
+     ((null screen)
+      "the screen could not be read — refusing rather than risk answering an unseen menu")
+     ((cc-butler-compact--menu-p screen)
+      "an interactive menu/wizard is open — Enter would answer it"))))
+
 (defun cc-butler-compact--blocked-reason (dir &optional ignore-busy)
   "Return a string explaining why DIR must not be compacted now, else nil.
 Every branch guards the same failure: a Return landing somewhere we did not
@@ -467,8 +483,7 @@ on its own."
       "no live terminal")
      ((and (not ignore-busy) (not (cc-butler--transcript-idle-p dir)))
       "session is busy — transcript active within the idle window")
-     ((cc-butler-compact--menu-p (cc-butler--read-output dir 40))
-      "an interactive menu/wizard is open — Enter would answer it")
+     ((cc-butler-compact--menu-block-reason dir))
      ((cc-butler-compact--pending-input-p dir)
       "unsubmitted text is sitting in the input box")
      (t nil))))
@@ -505,7 +520,7 @@ be showing."
          (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
            (or (not (buffer-live-p buf))
                (and (cc-butler--waiting-p dir)
-                    (not (cc-butler-compact--menu-p (cc-butler--read-output dir 40)))
+                    (not (cc-butler-compact--menu-block-reason dir))
                     (not (cc-butler-compact--pending-input-p dir))))))))
 
 (defun cc-butler-compact--active-p (dir)
@@ -894,6 +909,13 @@ because those do not resolve on their own the way busy does."
   (let ((name (cc-butler--display-name dir)))
     (when-let ((why (cc-butler-compact--blocked-reason dir ignore-busy)))
       (user-error "Refusing to compact %s: %s" name why))
+    ;; A compaction starting for DIR makes any earlier queued-idle-wait
+    ;; entry for the SAME dir moot — left alone, that timer survives this
+    ;; call (the routine idle-triggered path already removed itself before
+    ;; reaching here; a forced call never went through the queue at all)
+    ;; and can fire a second, independent compaction once this one finishes
+    ;; and the deadline hasn't yet passed.  A no-op when nothing was queued.
+    (cc-butler-compact-cancel dir)
     ;; Capture the model BEFORE anything is typed — after the switch the
     ;; original is unrecoverable, and an unrestorable session is worse than
     ;; an uncompacted one.
