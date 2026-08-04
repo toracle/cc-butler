@@ -1,6 +1,6 @@
 ---
 name: butler-relay-safe-worker-decisions
-description: "AskUserQuestion assumes a human is at the terminal typing directly; it does not compose with fleet orchestration, where the steward drives workers via send_to_session (text + one Enter at the end). Workers under fleet orchestration should prefer report_to_steward/escalate_to_butler over AskUserQuestion for human-decision requests. Also covers the MIXED state: when the human joins a fleet-driven session mid-flight, a dialog is correct for the worker but locks the steward out."
+description: "AskUserQuestion assumes a human at the terminal; it does not compose with fleet orchestration, where the steward drives workers via send_to_session (text + one Enter at the end). Workers under fleet orchestration should prefer report_to_steward/escalate_to_butler. Covers the MIXED state (human joins a fleet-driven session) and the PROSE-vs-BARE-DIGIT split: prose is discarded and Enter hits the highlighted default, but a bare digit DOES aim correctly at a menu."
 metadata:
   node_type: memory
   type: feedback
@@ -19,6 +19,32 @@ instructions, the worker believes it received an answer to its question, and
 neither is true. This is exactly the failure class [[butler-relay-fidelity-provenance]]
 and the wider relay-safety concern already warn about — but `AskUserQuestion`
 is the recurring, concrete *trigger surface* for it, not a rare edge case.
+
+**PROSE vs BARE DIGIT — do not treat all sends as unaimable.** (Added
+2026-08-04, correcting an over-broad claim the steward made twice the same day.)
+These are two different cases and conflating them costs a real capability:
+- **PROSE into an open menu is unaimable and destructive.** The text is
+  discarded and the Enter lands on whatever is highlighted. You are not choosing
+  an option, you are pressing Enter and taking whatever the cursor happens to sit
+  on. Never do this.
+- **A BARE DIGIT ("2") DOES aim correctly** at these menus. Verified by the
+  butler on the usage-limit choosers and confirmed by reading the screen back.
+
+So a steward/butler CAN faithfully relay a human's own menu answer when the human
+replied in prose to the wrong surface — which happens often, because a human
+answers the person who asked, not the widget. On 2026-08-04 정수님 answered the
+butler directly ("일요일 삼은 UI가 없는 백앤드 변경 이군요. 네 오케이 그러면은 뭐
+스크린샷 필요 없습니다") while `monocle-jarvice-978` held an open menu whose
+option 2 was the literal match for "no screenshot needed". Pressing `2` was
+**relaying his answer, not deciding for him.**
+
+The distinction that governs it: relaying a human's OWN stated answer into a menu
+is faithful transcription; picking an option the human never expressed is
+deciding on their behalf. Do the first freely, and only when the mapping is
+literal and unambiguous. Never the second — see
+[[butler-relayed-authority-cannot-self-certify]] on why inventing the human's
+position is the thing to avoid, and prefer surfacing the wedge
+([[butler-channel-wedge-fallback-visibility]]) when no answer exists to relay.
 
 **The fix — workers under fleet orchestration use text-based decision
 requests, not interactive ones.** A worker is "under fleet orchestration"
@@ -48,22 +74,18 @@ have made the right behaviour wrong. State the preference as *conditional on
 who is driving*, not as an absolute, or workers will route a live human's
 question through a queue that human is not reading.
 
-But the mixed state costs the steward something, and it must be recognised:
-1. **While that dialog is open, the steward CANNOT reach the session at all.**
-   Any `send_to_session` would land its one Enter on the highlighted option and
-   answer on the human's behalf — potentially selecting a choice the human was
-   still considering. The correct steward behaviour is total hands-off: no
-   dispatches, and **no `compact_session` either**, since compaction interrupts
-   whatever the session does next.
+Costs of the mixed state, to be recognised:
+1. **While a dialog is open, do not send PROSE and do not `compact_session`** —
+   compaction interrupts whatever the session does next. A bare digit relaying
+   the human's own answer is the exception (above).
 2. **If the human walks away mid-dialog, the session is wedged** — unreachable
-   by the steward and waiting on a keystroke nobody will press. Recognise this
-   by an unanswered menu persisting across several checks.
-3. So a worker should open a dialog only for a question the human will plausibly
-   answer *in the same sitting*. For anything the human may not return to, the
-   pull-based channels are still correct even with a human present.
+   by prose and waiting on a keystroke nobody will press. Recognise it by an
+   unanswered menu persisting across several checks; surface it rather than
+   absorbing it silently.
+3. A worker should open a dialog only for a question the human will plausibly
+   answer *in the same sitting*.
 4. When a human takes over a session, their instructions SUPERSEDE the steward's
-   standing holds for that track — do not countermand them. Log the supersession
-   rather than re-imposing the hold.
+   standing holds for that track — do not countermand them; log the supersession.
 
 **How to apply.** [as steward, and as butler in single mode] Every dispatch
 or check-in to a worker states this preference explicitly — the same
