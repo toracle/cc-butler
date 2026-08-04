@@ -394,6 +394,55 @@ silent downgrade nobody notices."
     (cc-butler-compact--poll "w")
     (should (equal (car cc-butler-compact-test--sent) "/model claude-opus-4-8"))))
 
+(ert-deftest cc-butler-compact/before-zero-completes-immediately-not-after-timeout ()
+  "A session that starts a compaction cycle already at ctx 0 (e.g. re-queued
+from a stale cache after a prior compaction already emptied it) has nothing
+left to shrink — the ratio check can never fire for it, since that would
+require reading a negative context.  It must not ride out the full timeout
+waiting for an impossible condition."
+  (cc-butler-compact-test--with-session "w"
+    (setq cc-butler-compact-test--ctx 0)
+    (cc-butler-compact-session "w")            ; -> /model sonnet, orig-ctx captured as 0
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")              ; switch lands -> /compact
+    (cc-butler-compact--poll "w")              ; a single tick, well under the timeout
+    (should (equal (cc-butler-compact-test--sent-in-order)
+                   '("/model sonnet" "/compact" "/model claude-opus-4-8")))
+    (should (string-match-p "nothing to shrink"
+                            (plist-get (gethash "w" cc-butler-compact--state) :note)))))
+
+(ert-deftest cc-butler-compact/timeout-note-distinguishes-unreadable-from-confirmed-still-large ()
+  "A timeout where the terminal could not be read at all (context reads nil,
+e.g. because the session stayed busy every time we polled) is a different
+finding from a timeout where we successfully read a context that just never
+dropped far enough — the note must say which one actually happened, not
+imply the second when only the first was observed."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")            ; -> /compact
+    (setq cc-butler-compact-test--ctx nil)   ; every read from here on fails
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (cc-butler-compact--poll "w")
+    (should (string-match-p "context unreadable at last check"
+                            (plist-get (gethash "w" cc-butler-compact--state) :note)))))
+
+(ert-deftest cc-butler-compact/timeout-note-reports-last-observed-ctx-when-readable ()
+  "When the context WAS readable right up to the timeout but simply never
+shrank past the drop ratio, the note should say so with the actual numbers
+observed, not the generic unreadable wording used when the read fails."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")             ; -> /compact, orig-ctx 400000
+    (setq cc-butler-compact-test--ctx 380000) ; read fine, just not enough of a drop
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (cc-butler-compact--poll "w")
+    (should (string-match-p "ctx 400000 -> 380000 at last check"
+                            (plist-get (gethash "w" cc-butler-compact--state) :note)))))
+
 (ert-deftest cc-butler-compact/switch-timeout-with-model-unchanged-just-aborts ()
   "A switch that never happened needs no restore: the session is still on its
 original model, so /compact is never sent and nothing further is typed."
