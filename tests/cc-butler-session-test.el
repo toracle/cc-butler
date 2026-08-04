@@ -555,6 +555,46 @@ fail-safe — and those fail-safes point in opposite directions on purpose
                             (cc-butler--input-state))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; OSC terminal title
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-session/osc-title-reads-the-title-variable ()
+  "The installed ghostel has no `ghostel--get-title' function — it only ever
+stores the OSC 0/2 title in the buffer-local `ghostel--title' variable.  Read
+that directly rather than returning nil because a function that does not
+exist could not be called."
+  (with-temp-buffer
+    (setq-local ghostel--term 'fake-term)
+    (setq-local ghostel--title "  building the widget  ")
+    (should (equal (cc-butler--osc-title (current-buffer))
+                   "building the widget"))))
+
+(ert-deftest cc-butler-session/osc-title-prefers-the-function-if-it-exists ()
+  "A future ghostel that adds `ghostel--get-title' must win over the variable
+fallback, so this does not silently regress once that function exists."
+  (with-temp-buffer
+    (setq-local ghostel--term 'fake-term)
+    (setq-local ghostel--title "stale variable value")
+    (cl-letf (((symbol-function 'ghostel--get-title)
+               (lambda (_term) "fresh from the function")))
+      (should (equal (cc-butler--osc-title (current-buffer))
+                     "fresh from the function")))))
+
+(ert-deftest cc-butler-session/osc-title-nil-without-a-ghostel-term ()
+  "No ghostel terminal in this buffer at all (a non-ghostel backend, or a
+buffer that never became one) — nil, not an error from reading unbound
+variables."
+  (with-temp-buffer
+    (should-not (cc-butler--osc-title (current-buffer)))))
+
+(ert-deftest cc-butler-session/osc-title-nil-on-blank-title ()
+  "An empty or all-whitespace title is treated the same as no title."
+  (with-temp-buffer
+    (setq-local ghostel--term 'fake-term)
+    (setq-local ghostel--title "   ")
+    (should-not (cc-butler--osc-title (current-buffer)))))
+
+;;;; ------------------------------------------------------------------
 ;;;; P2: transcript-based liveness (compaction gate)
 ;;;; ------------------------------------------------------------------
 
