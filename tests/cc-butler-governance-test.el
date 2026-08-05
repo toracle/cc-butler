@@ -293,5 +293,89 @@ a gap exists right now."
     (let ((out (cc-butler-tool-regenerate-governance)))
       (should (string-match-p "0 .*un-indexed" out)))))
 
+;;;; ------------------------------------------------------------------
+;;;; Bidirectional index validation (2026-08-05, steward-reported)
+;;;;
+;;;; regenerate_governance checked store -> index only (missing entries).
+;;;; Reproduced live: recording a principle, merging it into a duplicate,
+;;;; then deleting the original's store file + memory note left a dangling
+;;;; MEMORY.md line behind, and separately an in-place description update
+;;;; left the OLD wording sitting in the index -- in both cases the tool
+;;;; reported "0 un-indexed" / "Nothing was missing from the index".
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/regenerate-prunes-a-dangling-index-link ()
+  "REGRESSION (2026-08-05): a principle recorded, then merged into a
+duplicate and deleted by hand (store file AND memory note both removed),
+left its MEMORY.md line behind. Index -> store was never checked, so the
+dangling line survived every regenerate. A line whose slug no longer names
+a store principle must be pruned."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
+    (cc-butler-governance-regenerate)
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (should (string-match-p "\\[a-rule\\](butler-a-rule\\.md)"
+                              (with-temp-buffer (insert-file-contents index) (buffer-string))))
+      ;; Simulate the hand-cleanup: the principle is gone from the store
+      ;; and its generated note is gone from memory, but nobody touched
+      ;; MEMORY.md.
+      (delete-file (expand-file-name "a-rule.md" store))
+      (delete-file (expand-file-name "butler-a-rule.md" mem))
+      (cc-butler-governance-regenerate)
+      (should-not (string-match-p "\\[a-rule\\](butler-a-rule\\.md)"
+                                  (with-temp-buffer (insert-file-contents index) (buffer-string)))))))
+
+(ert-deftest cc-butler-governance/prune-never-touches-a-non-generated-line ()
+  "Pruning must only ever remove lines shaped exactly like this store's own
+generated entries (`- [slug](butler-slug.md) -- ...'). A hand-written entry
+in any other shape -- even one pointing at a file that does not exist -- is
+none of this store's business and must survive untouched."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem))
+          (hand-written "- [steward-only-note](steward-only-note.md) — points at nothing, on purpose\n"))
+      (with-temp-file index (insert hand-written))
+      (cc-butler-governance-regenerate)
+      (should (string-match-p (regexp-quote hand-written)
+                              (with-temp-buffer (insert-file-contents index) (buffer-string)))))))
+
+(ert-deftest cc-butler-governance/regenerate-tool-reports-pruned-dangling-links ()
+  "The tool's report text must say what it actually checked and found -- not
+just \"0 un-indexed\", which reads as if index->store were also verified
+when it was not."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
+    (cc-butler-tool-regenerate-governance)
+    (delete-file (expand-file-name "a-rule.md" store))
+    (delete-file (expand-file-name "butler-a-rule.md" mem))
+    (let ((out (cc-butler-tool-regenerate-governance)))
+      (should (string-match-p "dangling" out))
+      (should (string-match-p "a-rule" out)))))
+
+(ert-deftest cc-butler-governance/regenerate-tool-reports-stale-descriptions ()
+  "REGRESSION (2026-08-05): a principle's description was updated in place
+\(as `record_principle' does\) -- the store note and generated memory note
+both got the new wording, but the MEMORY.md index line, never touched by
+the add-only sync, kept the OLD description. `regenerate_governance' must
+surface this drift instead of reporting a clean index. The line itself is
+NOT rewritten automatically: on disk, drift from an update is
+indistinguishable from a human's deliberate curation of that line (see
+`cc-butler-governance/regenerate-does-not-duplicate-an-already-curated-entry'),
+so this is report-only, never an auto-edit."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "original description" "body" "feedback")))
+    (cc-butler-governance-regenerate)
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "revised description" "body" "feedback")))
+    (let ((out (cc-butler-tool-regenerate-governance)))
+      (should (string-match-p "a-rule" out))
+      (should (string-match-p "no longer match\\|stale\\|drift" out))
+      (should (string-match-p "original description"
+                              (with-temp-buffer
+                                (insert-file-contents (expand-file-name "MEMORY.md" mem))
+                                (buffer-string)))))))
+
 (provide 'cc-butler-governance-test)
 ;;; cc-butler-governance-test.el ends here
