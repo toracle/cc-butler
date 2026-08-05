@@ -55,7 +55,12 @@ told apart from ours after the fact. Today that second race is only
 suppressed by discipline (batch non-urgent reports, check the screen
 before sending), which lowers its odds without removing it. If A ships, it
 closes the machine-vs-machine half only; it should not be read or reported
-as "input gets destroyed" being solved.
+as "input gets destroyed" being solved. The specific, currently-active
+source of this writer-vs-human race is `cc-butler--forward-to-ops`
+(`cc-butler-orchestrator.el:975-989`), which calls this same
+`cc-butler--send-input` unconditionally with `cc-butler-forward` defaulting
+to `'submit` — see `cc-butler-steward-inbox-design.md` for that forwarder's
+own diagnosis and proposed fix.
 
 ## Approaches
 
