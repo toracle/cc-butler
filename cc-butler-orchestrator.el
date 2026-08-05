@@ -71,6 +71,90 @@ direct read_session_output/send_to_session calls."
   :type 'number
   :group 'cc-butler)
 
+;;;; Wedge monitor — diagnostic instrumentation for cc-butler#46
+;;
+;; #46 is a caller-scoped hang in read_session_output/send_to_session with no
+;; confirmed root cause yet: reproduction requires a caller session old/loaded
+;; enough to trigger it, which may take hours to accumulate and outlive
+;; whoever is watching.  This periodically snapshots the live MCP web
+;; server's internal request queue (the same `ws-requests' slot inspected by
+;; hand during the 2026-08-04 investigation) so a growth curve is on record
+;; instead of only a point-in-time read.  Observation only — never mutates
+;; the queue, never touches a session's terminal, and a failure in the
+;; snapshot itself is swallowed so it can never be the thing that hangs.
+
+(defcustom cc-butler-wedge-monitor-interval 20
+  "Seconds between wedge-monitor snapshots of the MCP server's request queue.
+See the commentary above `cc-butler-wedge-monitor-start'."
+  :type 'number
+  :group 'cc-butler)
+
+(defvar cc-butler--wedge-monitor-timer nil
+  "The wedge monitor's repeating timer, or nil if not running.")
+
+(defvar cc-butler--wedge-monitor-seen nil
+  "Hash of client-process names already logged as newly parked, so a
+struct that stays parked across many ticks is reported once, not every tick.")
+
+(defun cc-butler--wedge-monitor-tick ()
+  "One wedge-monitor snapshot: log the live request queue's size grouped by
+calling session, and log any entry newly seen in the PARKED state — active
+(dispatch entered and never returned) with its client already disconnected.
+Never signals: a bug here must not become a second thing that hangs the
+Emacs process on top of whatever #46 turns out to be."
+  (condition-case err
+      (when-let* ((server-proc (and (boundp 'claude-code-ide-mcp-http-server--server)
+                                     claude-code-ide-mcp-http-server--server
+                                     (ignore-errors (ws-process claude-code-ide-mcp-http-server--server))))
+                  (server (plist-get (process-plist server-proc) :server))
+                  (reqs (ws-requests server)))
+        (let ((by-caller (make-hash-table :test 'equal))
+              (parked-count 0))
+          (dolist (r reqs)
+            (let* ((cproc (ws-process r))
+                   (pname (process-name cproc))
+                   (pending (or (ignore-errors (oref r pending)) ""))
+                   (caller (if (string-match "POST /mcp/\\([^ ]+\\) HTTP" pending)
+                               (match-string 1 pending)
+                             "(unparsed)"))
+                   (active (ws-active r))
+                   (parked (and active (eq (process-status cproc) 'closed))))
+              (puthash caller (1+ (gethash caller by-caller 0)) by-caller)
+              (when parked
+                (setq parked-count (1+ parked-count))
+                (unless (gethash pname cc-butler--wedge-monitor-seen)
+                  (puthash pname t cc-butler--wedge-monitor-seen)
+                  (cc-butler--log "wedge-monitor: NEW parked request %s caller=%s (dispatch active, client closed — cc-butler#46)"
+                                   pname caller)))))
+          (when (> (length reqs) 0)
+            (let (parts)
+              (maphash (lambda (k v) (push (format "%s=%d" k v) parts)) by-caller)
+              (cc-butler--log "wedge-monitor: queue=%d parked=%d by-caller: %s"
+                               (length reqs) parked-count (mapconcat #'identity parts " "))))))
+    (error (cc-butler--log "wedge-monitor: tick error (ignored): %S" err))))
+
+(defun cc-butler-wedge-monitor-start ()
+  "Start periodic snapshots of the MCP request queue for cc-butler#46.
+Idempotent — calling it again while already running is a no-op, so this is
+safe to leave at top level and re-run across `reload_butler_code'."
+  (interactive)
+  (unless (timerp cc-butler--wedge-monitor-timer)
+    (setq cc-butler--wedge-monitor-seen (make-hash-table :test 'equal))
+    (setq cc-butler--wedge-monitor-timer
+          (run-with-timer 0 cc-butler-wedge-monitor-interval #'cc-butler--wedge-monitor-tick))
+    (cc-butler--log "wedge-monitor: started, interval=%ds" cc-butler-wedge-monitor-interval)))
+
+(defun cc-butler-wedge-monitor-stop ()
+  "Stop the wedge monitor started by `cc-butler-wedge-monitor-start'."
+  (interactive)
+  (when (timerp cc-butler--wedge-monitor-timer)
+    (cancel-timer cc-butler--wedge-monitor-timer)
+    (setq cc-butler--wedge-monitor-timer nil)
+    (cc-butler--log "wedge-monitor: stopped")))
+
+(unless (timerp cc-butler--wedge-monitor-timer)
+  (cc-butler-wedge-monitor-start))
+
 (defun cc-butler--output-buffer-and-bounds (dir &optional lines)
   "Return (BUF START . END) for the last LINES (default 40) of DIR's
 terminal screen, after a force-refresh, or nil if the buffer isn't live.
