@@ -973,20 +973,36 @@ because those do not resolve on their own the way busy does."
      (t (cc-butler-compact--schedule-poll dir)))))
 
 (defun cc-butler-compact--poll-compact (dir st sent)
-  "Wait for `/compact' to shrink the context, then restore the model."
+  "Wait for `/compact' to shrink the context, then restore the model.
+
+BEFORE reaching zero (a genuine reading, not a missing one) means there
+was nothing to shrink in the first place — e.g. a candidate re-queued
+from a stale cache that already sat at 0 — so the ratio check below can
+never fire for it (it would require NOW < 0) and this cycle would
+otherwise ride the full timeout for no reason.  Treat it as already
+done instead of guessing at a threshold."
   (let* ((before (plist-get st :orig-ctx))
          (now (cc-butler-compact--context-now dir))
-         (done (and (integerp before) (integerp now)
-                    (< now (* cc-butler-compact-drop-ratio before)))))
+         (shrunk (and (integerp before) (integerp now)
+                      (< now (* cc-butler-compact-drop-ratio before))))
+         (done (or shrunk (and (integerp before) (<= before 0)))))
     (cond
      (done
       (cc-butler-compact--set-state
-       dir :note (format "ctx %s -> %s" before now))
+       dir :note (if shrunk
+                     (format "ctx %s -> %s" before now)
+                   (format "ctx already %s at start — nothing to shrink" before)))
       (cc-butler-compact--restore dir))
      ((> (- (float-time) sent) cc-butler-compact-timeout)
       ;; The compaction may still be running; we stop watching, but the model
-      ;; must go back regardless.
-      (cc-butler-compact--set-state dir :note "compaction not observed to finish")
+      ;; must go back regardless.  Say plainly whether the last check could
+      ;; even read a context size — a silent read failure and a confirmed
+      ;; "still above threshold" are different findings, not the same one.
+      (cc-butler-compact--set-state
+       dir :note (if (integerp now)
+                     (format "compaction not observed to finish — ctx %s -> %s at last check"
+                             before now)
+                   "compaction not observed to finish — context unreadable at last check"))
       (cc-butler-compact--restore dir))
      (t (cc-butler-compact--schedule-poll dir)))))
 
