@@ -581,6 +581,13 @@ longer positions in the buffer anyone is looking at.")
 preserving the cursor's current session across the redraw when possible
 (falls back to point-min only if that session is no longer present).
 
+Builds the new listing in a scratch buffer and merges it into the live
+one with `replace-buffer-contents' instead of erasing and reinserting
+everything — an erase+reinsert flashes the whole buffer and resets window
+scroll on every redraw, which stands out when refreshes are frequent (see
+`cc-butler-refresh-throttle-seconds'); diffing touches only the rows that
+actually changed, so untouched rows keep their window position untouched.
+
 A refresh that arrives while this is already drawing is DEFERRED, not run:
 see `cc-butler--rendering'.  Nothing is lost by deferring — the request is
 handed to the same debounced refresh every other caller uses, so the newer
@@ -588,11 +595,12 @@ state is drawn a moment later by a redraw that starts from a whole buffer."
   (if cc-butler--rendering
       (progn (cc-butler--schedule-refresh) nil)
     (let ((cc-butler--rendering t)
-          (inhibit-read-only t)
+          (target (current-buffer))
           (dir (cc-butler--dir-at-point))
           (sessions (cc-butler--ordered (cc-butler--sessions)))
           entries)
-      (erase-buffer)
+      (with-temp-buffer
+        (let ((scratch (current-buffer)))
     (if (null sessions)
         (insert (propertize "No active Claude sessions.\n\n" 'face 'shadow)
                 (propertize "c" 'face 'bold) " start   "
@@ -659,11 +667,15 @@ state is drawn a moment later by a redraw that starts from a whole buffer."
               (insert "   " (mapconcat #'identity segments "   ") "\n")))
           (insert "\n")
           (put-text-property start (point) 'cc-butler-dir (plist-get s :dir)))))
-      (setq cc-butler--entries (nreverse entries))
-      (if-let ((e (and dir (assoc dir cc-butler--entries))))
-          (goto-char (cdr e))
-        (goto-char (point-min)))
-      (cc-butler--highlight))))
+        (with-current-buffer target
+          (let ((inhibit-read-only t))
+            (replace-buffer-contents scratch)))))
+      (with-current-buffer target
+        (setq cc-butler--entries (nreverse entries))
+        (if-let ((e (and dir (assoc dir cc-butler--entries))))
+            (goto-char (cdr e))
+          (goto-char (point-min)))
+        (cc-butler--highlight)))))
 
 (defun cc-butler--list-buffer ()
   "Return the session-list buffer, (re)rendering its contents."
@@ -710,10 +722,42 @@ the selected session when possible."
     (with-current-buffer buf
       (cc-butler--render))))
 
+(defcustom cc-butler-refresh-throttle-seconds 7
+  "Minimum seconds between automatic session-list re-renders.
+`cc-butler--maybe-refresh' is called from roughly a dozen sites across the
+whole fleet — after every send/report/notification/cleanup completion —
+so without a floor the list buffer redraws several times a second under
+normal fleet activity.  A call within the window schedules exactly one
+pending redraw for when it elapses, rather than dropping it, so the list
+never lags an active session by more than this many seconds."
+  :type 'number
+  :group 'cc-butler)
+
+(defvar cc-butler--last-refresh-time nil
+  "Time `cc-butler--maybe-refresh' last actually redrew the list.")
+
+(defvar cc-butler--refresh-pending-timer nil
+  "Timer for a throttled redraw already scheduled, or nil.")
+
 (defun cc-butler--maybe-refresh ()
-  "Re-render the list if its buffer exists (safe to call from anywhere)."
+  "Re-render the list if its buffer exists, throttled to at most once every
+`cc-butler-refresh-throttle-seconds' (safe to call from anywhere)."
   (when (get-buffer cc-butler--list-buffer-name)
-    (cc-butler--reprint)))
+    (let ((elapsed (if cc-butler--last-refresh-time
+                        (- (float-time) cc-butler--last-refresh-time)
+                      cc-butler-refresh-throttle-seconds)))
+      (if (>= elapsed cc-butler-refresh-throttle-seconds)
+          (progn (setq cc-butler--last-refresh-time (float-time))
+                 (cc-butler--reprint))
+        (unless (timerp cc-butler--refresh-pending-timer)
+          (setq cc-butler--refresh-pending-timer
+                (run-with-timer
+                 (- cc-butler-refresh-throttle-seconds elapsed) nil
+                 (lambda ()
+                   (setq cc-butler--refresh-pending-timer nil)
+                   (when (get-buffer cc-butler--list-buffer-name)
+                     (setq cc-butler--last-refresh-time (float-time))
+                     (cc-butler--reprint))))))))))
 
 ;;;; Live updates from terminal title changes
 
