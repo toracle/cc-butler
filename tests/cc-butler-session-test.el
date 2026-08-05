@@ -785,8 +785,25 @@ return nil so the caller can refuse, rather than guessing."
   "A buffer with no ghostel terminal is not a FAILED refresh — its text is
 maintained by something else (another backend, or a plain buffer).  Reporting
 that as failure would blank out every non-ghostel setup."
-  (with-temp-buffer
-    (should (cc-butler--refresh-terminal-text (current-buffer)))))
+  (cl-letf (((symbol-function 'cc-butler--log) #'ignore))
+    (with-temp-buffer
+      (should (cc-butler--refresh-terminal-text (current-buffer))))))
+
+(ert-deftest cc-butler-session/no-terminal-leaves-a-trace ()
+  "This fleet is ghostel-backed exclusively, so hitting the no-terminal branch
+on a session buffer at all is unexpected — unlike a plain scratch buffer, it
+must not fire silently.  A recurrence of a live session reading as empty
+should show up as a log line naming the buffer and directory, not require
+*Messages*/timeline archaeology to even locate which branch served it."
+  (let (logged)
+    (cl-letf (((symbol-function 'cc-butler--log)
+               (lambda (&rest args) (push args logged))))
+      (with-temp-buffer
+        (let ((default-directory "/tmp/some-session/"))
+          (should (cc-butler--refresh-terminal-text (current-buffer)))
+          (should logged)
+          (should (string-match-p "no ghostel--term" (apply #'format (car logged))))
+          (should (string-match-p "/tmp/some-session/" (apply #'format (car logged)))))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; The refresh must give the redraw the context it requires

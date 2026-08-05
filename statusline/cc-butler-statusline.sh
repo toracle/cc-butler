@@ -31,15 +31,22 @@ except Exception:
     print("CTX:? MODEL:?"); sys.exit(0)
 cw = d.get("context_window") or {}
 tot = cw.get("total_input_tokens")
+have_reading = tot is not None
 if tot is None:
     cu = cw.get("current_usage") or {}
-    tot = sum(v for v in (cu.get("input_tokens"),
-                          cu.get("cache_creation_input_tokens"),
-                          cu.get("cache_read_input_tokens"))
-              if isinstance(v, (int, float)))
+    parts = [v for v in (cu.get("input_tokens"),
+                        cu.get("cache_creation_input_tokens"),
+                        cu.get("cache_read_input_tokens"))
+             if isinstance(v, (int, float))]
+    # "no field present to sum" is not the same fact as "summed to zero" — the
+    # former means no reading was taken at all, and reporting it as CTX:0 made
+    # a session with no data indistinguishable from one genuinely idle at 0.
+    if parts:
+        have_reading = True
+        tot = sum(parts)
 pct = cw.get("used_percentage")
 over = d.get("exceeds_200k_tokens")
-mark = ("CTX:%d" % int(tot)) if isinstance(tot, (int, float)) else "CTX:?"
+mark = ("CTX:%d" % int(tot)) if (have_reading and isinstance(tot, (int, float))) else "CTX:?"
 extra = ""
 if isinstance(pct, (int, float)):
     extra += " %d%%" % int(pct)
@@ -52,7 +59,7 @@ print(mark + extra + " MODEL:" + mtag)
 '
 elif command -v jq >/dev/null 2>&1; then
   printf '%s' "$input" | jq -r '
-    "CTX:\(.context_window.total_input_tokens // 0)"
+    "CTX:" + (if .context_window.total_input_tokens == null then "?" else (.context_window.total_input_tokens|tostring) end)
     + (if .context_window.used_percentage
          then " \(.context_window.used_percentage | floor)%" else "" end)
     + (if .exceeds_200k_tokens then " >200k" else "" end)
