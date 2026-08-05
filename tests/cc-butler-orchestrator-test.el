@@ -165,6 +165,27 @@ non-hung path."
             (should (equal "hello from the terminal" (cc-butler--read-output "/worker/")))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
+(ert-deftest cc-butler-orchestrator/read-output-skips-trailing-blank-grid-padding ()
+  "A terminal grid redraw pads unused rows below the actual content as
+blank lines all the way to point-max — e.g. right after a screen clear,
+when the cursor sits near the top of a grid much taller than the visible
+content (cc-butler#39).  Taking the literal last N lines by line count
+then lands entirely inside that blank padding and reports nothing, even
+though real content is sitting higher up in the very same buffer.
+`cc-butler--read-output' must look at the tail of the REAL content, not
+the tail of the buffer."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-term*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (insert "❯\n")
+            (insert (make-string 50 ?\n)))   ; 50 blank grid rows below the prompt
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t)))
+            (should (equal "❯" (cc-butler--read-output "/worker/" 40)))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
 ;;;; ---- ghost/autocomplete input-line redaction (cc-butler#6) -----------
 ;;;; read_session_output used to return a painted ghost suggestion
 ;;;; byte-identical to real typed input (buffer-substring-no-properties

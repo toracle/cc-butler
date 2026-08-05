@@ -78,7 +78,14 @@ Bounded by `cc-butler-session-io-timeout' so a stuck redraw cannot hang
 the caller.  Shared by `cc-butler--read-output' (plain text, properties
 stripped) and `cc-butler--read-output-redacted' (ghost-input-line-aware,
 which needs BUF itself — the terminal cursor lives on the buffer, not in
-any string cut out of it)."
+any string cut out of it).
+
+The window is anchored on the tail of the buffer's REAL content, not on
+`point-max' — a grid redraw pads unused rows below the actual content
+with blank lines all the way to `point-max' (e.g. right after a screen
+clear, when the cursor sits near the top of a grid much taller than the
+visible content), and a literal last-LINES-by-count window would then
+land entirely inside that padding and report nothing (cc-butler#39)."
   (with-timeout (cc-butler-session-io-timeout
                  (error "Timed out reading session %s's output after %ss (redraw or buffer access may be stuck)"
                         (cc-butler--display-name dir) cc-butler-session-io-timeout))
@@ -90,10 +97,23 @@ any string cut out of it)."
       (when (and (buffer-live-p buf) (cc-butler--refresh-terminal-text buf))
         (with-current-buffer buf
           (let* ((n (max 1 (or lines 40)))
-                 (start (save-excursion (goto-char (point-max))
+                 ;; A grid redraw pads unused rows below the actual content
+                 ;; with blank lines all the way to `point-max' — e.g. right
+                 ;; after a screen clear, when the cursor sits near the top
+                 ;; of a grid much taller than the visible content
+                 ;; (cc-butler#39).  Anchor on the tail of the REAL content,
+                 ;; not the tail of the buffer, so that padding doesn't push
+                 ;; the actual last N lines out of the window entirely.  A
+                 ;; buffer that is blank throughout falls back to
+                 ;; `point-max' unchanged — still, correctly, "no output".
+                 (end (save-excursion
+                        (goto-char (point-max))
+                        (skip-chars-backward " \t\n")
+                        (if (bobp) (point-max) (line-end-position))))
+                 (start (save-excursion (goto-char end)
                                         (forward-line (- n))
                                         (line-beginning-position))))
-            (cons buf (cons start (point-max)))))))))
+            (cons buf (cons start end))))))))
 
 (defun cc-butler--read-output (dir &optional lines)
   "Return the last LINES (default 40) of session DIR's terminal screen, as

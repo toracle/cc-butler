@@ -555,6 +555,20 @@ persisting) the buffer cross-check refuses to call it abandoned."
     (should-not (cc-butler-compact--orphaned-p "w" (gethash "w" cc-butler-compact--state)))
     (should (cc-butler-compact--active-p "w"))))
 
+(ert-deftest cc-butler-compact/stale-but-unreadable-screen-is-never-reaped ()
+  "An unreadable screen (`cc-butler--read-output' returning nil, distinct
+from a genuinely blank string) must not be read as confirmation that no
+menu is open — same fail-safe direction as `--blocked-reason'.  Reaping
+this state as orphaned would let a second compaction start believing the
+buffer is clean when it was never actually checked."
+  (cc-butler-compact-test--with-session "w"
+    (setq cc-butler-compact-test--screen nil)
+    (cc-butler-compact--set-state
+     "w" :phase 'switching
+     :sent-time (- (float-time) (1+ cc-butler-compact-state-max-age)))
+    (should-not (cc-butler-compact--orphaned-p "w" (gethash "w" cc-butler-compact--state)))
+    (should (cc-butler-compact--active-p "w"))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; The restore modal — the 2026-07-23 freeze
 ;;;; ------------------------------------------------------------------
@@ -979,6 +993,22 @@ failure by half an hour."
       (cc-butler-compact--idle-poll "w" (+ (float-time) 600))
       (should-not cc-butler-compact-test--sent))))
 
+(ert-deftest cc-butler-compact/force-compact-invalidates-a-pending-queue-entry ()
+  "A session already queued for its own idle-triggered compaction, then
+force-compacted directly by an operator, must not be left with the old
+queue entry still armed — left alone, that entry survives the forced call
+untouched and would fire its own independent compaction once the forced
+one finishes and the original deadline has not yet passed (cc-butler#38's
+duplicate-cycle repro: force worked, but the earlier queue entry fired
+anyway as a second no-op cycle)."
+  (cc-butler-compact-test--with-session "w"
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (float-time))))   ; busy -> queues rather than starting
+      (should (eq (cc-butler-compact-session-when-idle "w") 'queued))
+      (should (cc-butler-compact-waiting-p "w")))
+    (cc-butler-compact-session "w" t)   ; operator forces it right now
+    (should-not (cc-butler-compact-waiting-p "w"))))
+
 (ert-deftest cc-butler-compact/refuses-when-a-menu-is-open ()
   "An open wizard/menu is refused — the submit-Enter would answer it."
   (cc-butler-compact-test--with-session "w"
@@ -986,6 +1016,25 @@ failure by half an hour."
     (should (string-match-p "menu" (cc-butler-compact--blocked-reason "w")))
     (should-error (cc-butler-compact-session "w") :type 'user-error)
     (should-not cc-butler-compact-test--sent)))
+
+(ert-deftest cc-butler-compact/refuses-when-the-screen-cannot-be-read ()
+  "An unreadable screen must not be treated as an empty one — a real menu
+could be sitting on it unseen.  `cc-butler--read-output' returns nil when
+the underlying refresh failed (see orchestrator.el), distinct from the
+empty string it returns for a screen that was read and is genuinely blank."
+  (cc-butler-compact-test--with-session "w"
+    (setq cc-butler-compact-test--screen nil)
+    (should (cc-butler-compact--blocked-reason "w"))
+    (should-error (cc-butler-compact-session "w") :type 'user-error)
+    (should-not cc-butler-compact-test--sent)))
+
+(ert-deftest cc-butler-compact/a-genuinely-blank-screen-is-still-compactable ()
+  "The unreadable-screen fix must not overreach: a screen that was read
+successfully and is simply empty (as opposed to a nil, failed read) is not
+a menu and does not block compaction on its own."
+  (cc-butler-compact-test--with-session "w"
+    (setq cc-butler-compact-test--screen "")
+    (should-not (cc-butler-compact--blocked-reason "w"))))
 
 (ert-deftest cc-butler-compact/refuses-when-text-is-pending-in-the-input-box ()
   "Unsubmitted text would be concatenated with our slash command, producing
