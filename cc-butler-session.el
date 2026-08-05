@@ -127,12 +127,21 @@ on every redraw when titles change rapidly.")
 (defun cc-butler--osc-title (buffer)
   "Return the live terminal title of BUFFER (ghostel OSC 2), or nil.
 claude-code-ide disables ghostel's title-based *renaming*, but the
-terminal still tracks the title; read it straight from the term object."
+terminal still tracks the title.  WHERE it keeps the title differs by
+ghostel version: some builds expose an accessor `ghostel--get-title' on
+the term object; the currently installed one has no such accessor and
+keeps it only in the buffer-local `ghostel--title', which
+`ghostel--set-title' sets BEFORE consulting the rename hook -- so
+disabling the rename does not stop the variable from tracking.  Probe
+both, accessor first, so a future ghostel that adds the accessor is
+covered too."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
-      (when (and (boundp 'ghostel--term) ghostel--term
-                 (fboundp 'ghostel--get-title))
-        (let ((title (ignore-errors (ghostel--get-title ghostel--term))))
+      (when (and (boundp 'ghostel--term) ghostel--term)
+        (let ((title (ignore-errors
+                       (if (fboundp 'ghostel--get-title)
+                           (ghostel--get-title ghostel--term)
+                         (and (boundp 'ghostel--title) ghostel--title)))))
           (and (stringp title)
                (not (string-empty-p (string-trim title)))
                (string-trim title)))))))
