@@ -162,22 +162,42 @@ Bounded by `cc-butler-session-io-timeout' so a stuck redraw cannot hang
 the caller.  Shared by `cc-butler--read-output' (plain text, properties
 stripped) and `cc-butler--read-output-redacted' (ghost-input-line-aware,
 which needs BUF itself — the terminal cursor lives on the buffer, not in
-any string cut out of it)."
-  (with-timeout (cc-butler-session-io-timeout
-                 (error "Timed out reading session %s's output after %ss (redraw or buffer access may be stuck)"
-                        (cc-butler--display-name dir) cc-butler-session-io-timeout))
-    (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
-      ;; A failed refresh leaves the last frame that DID render sitting in the
-      ;; buffer.  Serving it would present old text as the current screen, and a
-      ;; caller acting on that — answering a permission dialog it cannot
-      ;; actually see — is the expensive mistake.  Report nothing instead.
-      (when (and (buffer-live-p buf) (cc-butler--refresh-terminal-text buf))
-        (with-current-buffer buf
-          (let* ((n (max 1 (or lines 40)))
-                 (start (save-excursion (goto-char (point-max))
-                                        (forward-line (- n))
-                                        (line-beginning-position))))
-            (cons buf (cons start (point-max)))))))))
+any string cut out of it).
+
+Logs entry/return/timeout for cc-butler#46 (2026-08-04/05): a caller-scoped
+hang was observed running 120s+ with neither a timeout error nor any log
+line past MCP request dispatch, which should be impossible if this
+function's `with-timeout' bound is actually in effect.  These three log
+lines settle which of the two remaining explanations it is, the next time
+it happens: no \"enter\" line means the stall is upstream of this function
+entirely (dispatch never got here); an \"enter\" with neither \"return\" nor
+\"TIMEOUT\" means `with-timeout' itself failed to fire despite the wall
+clock exceeding `cc-butler-session-io-timeout' — a real Emacs limitation
+when the body doesn't yield to the timer.  Remove once #46's mechanism is
+confirmed either way; see the issue for the removal note."
+  (let ((name (cc-butler--display-name dir)))
+    (cc-butler--log "read-output: enter dir=%s" name)
+    (prog1
+        (with-timeout (cc-butler-session-io-timeout
+                       (progn
+                         (cc-butler--log "read-output: TIMEOUT dir=%s after %ss"
+                                          name cc-butler-session-io-timeout)
+                         (error "Timed out reading session %s's output after %ss (redraw or buffer access may be stuck)"
+                                name cc-butler-session-io-timeout)))
+          (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
+            ;; A failed refresh leaves the last frame that DID render sitting in
+            ;; the buffer.  Serving it would present old text as the current
+            ;; screen, and a caller acting on that — answering a permission
+            ;; dialog it cannot actually see — is the expensive mistake.
+            ;; Report nothing instead.
+            (when (and (buffer-live-p buf) (cc-butler--refresh-terminal-text buf))
+              (with-current-buffer buf
+                (let* ((n (max 1 (or lines 40)))
+                       (start (save-excursion (goto-char (point-max))
+                                              (forward-line (- n))
+                                              (line-beginning-position))))
+                  (cons buf (cons start (point-max))))))))
+      (cc-butler--log "read-output: return dir=%s" name))))
 
 (defun cc-butler--read-output (dir &optional lines)
   "Return the last LINES (default 40) of session DIR's terminal screen, as
