@@ -1580,6 +1580,32 @@ than giving up."
       (cc-butler-compact--poll-restore
        "/d/" (gethash "/d/" cc-butler-compact--state) 0)
       (should finished))))
+
+(ert-deftest cc-butler-compact/fallback-log-does-not-assert-rejection ()
+  "All we have observed at this point is that the model change was not
+detected within the step timeout — not that the id was refused (a live
+investigation on 2026-08-04 found the same wording driving readers to
+assume rejection before the alternative, a slow-to-render confirmation
+modal, had been ruled out).  The logged message must describe what was
+observed, not what caused it."
+  (let ((cc-butler-compact--state (make-hash-table :test 'equal))
+        (cc-butler-compact-step-timeout 0)
+        (logged nil))
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (_d) "s"))
+              ((symbol-function 'cc-butler--log)
+               (lambda (fmt &rest args) (setq logged (apply #'format fmt args))))
+              ((symbol-function 'cc-butler-compact--schedule-poll) #'ignore)
+              ((symbol-function 'cc-butler-compact--answer-modal) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler-compact--own-input) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler-compact--model-now) (lambda (_d) "Sonnet-5"))
+              ((symbol-function 'cc-butler-compact--finish) #'ignore))
+      (cc-butler-compact--set-state "/d/" :orig-args '("claude-opus-4-8" "opus")
+                                    :orig-arg "claude-opus-4-8")
+      (cc-butler-compact--poll-restore
+       "/d/" (gethash "/d/" cc-butler-compact--state) 0)
+      (should logged)
+      (should-not (string-match-p "did not land" logged))
+      (should (string-match-p "not observed to take effect" logged)))))
 ;;;; Two callers, two freshness policies
 ;;;; ------------------------------------------------------------------
 

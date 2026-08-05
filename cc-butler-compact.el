@@ -1092,8 +1092,8 @@ and answers any modal that is already up while it waits."
       (let ((rest (cdr (plist-get st :orig-args))))
         (if rest
             (progn
-              (cc-butler--log "compact: %s │ %s did not land — falling back to %s"
-                              (cc-butler--display-name dir) arg (car rest))
+              (cc-butler--log "compact: %s │ %s not observed to take effect within %ds — falling back to %s"
+                              (cc-butler--display-name dir) arg cc-butler-compact-step-timeout (car rest))
               (cc-butler-compact--set-state dir :orig-args rest :orig-arg (car rest)
                                             :phase 'restore-wait
                                             :sent-time (float-time) :answers 0)
