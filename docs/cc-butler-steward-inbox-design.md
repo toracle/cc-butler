@@ -317,18 +317,113 @@ covered in `send-input-atomicity-proposal.md` — this design's debounce/gate
 around the forwarder does not fix it, and the two documents should be read
 together rather than either being closed as if it covered the other.
 
-## Open questions for a human decision
+## Open questions — decision sheet (consolidated 2026-08-10)
 
-1. Should the monitor's periodic over-threshold report
-   (`cc-butler-compact--report-to-ops`) be upgraded to auto-invoke
-   `compact_large_sessions` directly for coordinators, now that `force=true`
-   makes it safe to ignore busy? This is now purely a matter of removing a
-   human-in-the-loop step, not a mechanism gap.
-2. What backstop interval is acceptable as the worst-case latency for a
-   genuine escalation that arrives while the steward is busy — 900s (reuse
-   the compaction monitor's existing timer/value) or something shorter and
-   separately configured?
-3. Whether `report-up-is-a-push.md` needs any wording change at all — on
-   the corrected diagnosis it was not the cause and stays correct for the
-   dispatch-acknowledgment case it documents; demoted from "revise" to
-   "leave as-is unless a separate reason turns up."
+Q1–Q3 carry over from this document's first draft; Q4–Q6 were surfaced by a
+re-read of the full design on 2026-08-10. Options are laid out with their
+tradeoffs; none is chosen here — every item goes up for a decision.
+
+### Q1 — should the 900s monitor auto-invoke compaction, or keep reporting only?
+
+Today `cc-butler-compact--report-to-ops` (`cc-butler-compact.el:1267-1291`)
+only *reports* an over-threshold candidate; nothing invokes
+`compact_large_sessions` unprompted. `force=true` (PR #35) removed the
+mechanical blocker, so this is now purely a human-in-the-loop question.
+
+- **A. Status quo (report-only).** A human sees every coordinator compaction
+  before it happens. Cost: an over-threshold session sits at 400k+ until
+  someone acts — the exact pressure class behind the 2026-08-09 host
+  resource crisis — and the report itself is one more steward interrupt.
+- **B. Auto-invoke for everything over threshold.** Ceiling enforcement gets
+  a bounded worst case with no human latency. Cost: compaction is lossy, and
+  a timer — not a person — picks the moment a mid-investigation coordinator
+  loses its nuance; per the #39 constraint above, post-compact
+  reconstruction from a screen is unreliable, so this option *upgrades the
+  brief's optional third axis (fleet state in files) from nice-to-have to
+  prerequisite.*
+- **C. Auto for workers, report-only for butler/steward.** Limits blast
+  radius to sessions whose state is more often externalized (PRs, files,
+  reports). Cost: `compact_large_sessions`'s own docstring deliberately
+  refuses to exempt coordinators (`:453-455`, `:1122-1129`) — C quietly
+  reintroduces the exemption that decision removed, and coordinators are
+  precisely the sessions that grow largest.
+
+### Q2 — backstop interval: reuse 900s, or a separate shorter knob?
+
+The one named tradeoff of the whole design: a wake-worthy event arriving
+while the steward is busy waits up to one backstop interval.
+
+- **A. Reuse `cc-butler-compact-monitor-interval` (900s).** Zero new knobs.
+  Cost: a genuine escalation can wait 15 minutes worst-case, and the two
+  timers become silently coupled — retuning the compaction monitor later
+  would retune escalation latency as a side effect nobody asked for.
+- **B. Separate defcustom, shorter (e.g. 120–300s).** Bounded latency close
+  to today's per-event behavior under congestion; decoupled from compaction
+  tuning. Cost: one more tunable, and more empty-inbox timer wakeups.
+- The coupling argument in A cuts toward a separate knob *regardless of the
+  value chosen* — but the value itself is the number the human should set
+  deliberately (per "What gets dropped" above).
+
+### Q3 — `report-up-is-a-push.md`: confirm leave-as-is, or add a pointer?
+
+Effectively resolved by premise 0 (the policy was not the cause and stays
+correct for the dispatch-acknowledgment case it documents). Residual choice:
+
+- **A. Close as-is.** No churn.
+- **B. Add one cross-reference line** pointing at `cc-butler--forward-to-ops`
+  / `cc-butler-forward` as the actual per-event interrupt lever. Cost: a
+  policy doc edit; benefit: the next reader doesn't repeat the misdiagnosis
+  this document's own first draft made.
+
+### Q4 — wake classification for raw notification events (design gap, not a tuning knob)
+
+The wake/no-wake boundary is fully specified for `report_to_steward` traffic
+(the `needs` argument) but only gestured at for the *notification hook* path
+("the event's own `:body`/`:title` plist keys"). Claude Code notifications
+include at least: permission requests, idle-waiting, task completion. Which
+of those are wake-worthy, and where does that mapping live?
+
+- **A. All raw notifications are no-wake; only an explicit non-empty `needs`
+  wakes.** Simplest rule, no string matching. **Cost — and this is the one
+  place this design could silently regress today's behavior:** a worker
+  stuck on a permission prompt cannot call `report_to_steward` at all (it is
+  blocked at the harness level, before any tool call), so under A the case
+  that most needs a wake never generates one. Today's unconditional
+  forwarder, whatever its faults, does wake for it.
+- **B. Classify by notification type/title allowlist** (permission-request →
+  wake; idle/finished → no-wake). Cost: couples the gate to strings the
+  harness emits, which can drift across Claude Code versions. It is,
+  however, structured event metadata — not a screen read — so it stays
+  within the #39 constraint.
+
+### Q5 — sequencing against the `send-input` atomicity fix
+
+The gated forwarder still writes through `cc-butler--send-input`, whose
+type-then-submit interleaving defect is documented separately
+(`send-input-atomicity-proposal.md`). Landing order is a real choice:
+
+- **A. Atomicity fix first.** The gate's batched push is exactly the kind of
+  long, multi-line send most exposed to mid-sequence interleaving; building
+  the gate on the fixed primitive avoids validating it twice.
+- **B. Inbox gate first.** The gate reduces send *frequency*, shrinking the
+  race surface even with the primitive unfixed; the atomicity fix's scope is
+  unchanged either way.
+- **C. Same branch.** One review pass, no intermediate state. Cost: couples
+  two independently-reviewable changes — against this project's baby-step
+  discipline, and a revert of one drags the other.
+
+### Q6 — scope of the durability-first rule
+
+"Write durably, then push" is stated above for items *aimed at the steward*.
+Undecided: does the rule cover **all** `send_to_session`-based escalations
+(any session → any session), or only the butler→steward path that produced
+the relay-loss incident?
+
+- **A. Steward-bound traffic only.** Minimal change matching the observed
+  failure. Cost: worker→worker or steward→worker sends keep the
+  fire-and-forget failure mode, waiting for their own incident.
+- **B. Every escalation-class send.** One rule, no per-path exceptions.
+  Cost: needs a durable inbox equivalent *per recipient class* — workers
+  don't currently have one, so B implies new storage, which starts to brush
+  against the brief's "don't add layers" boundary (new structures, though
+  not new sessions).
