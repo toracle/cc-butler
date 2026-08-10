@@ -1,8 +1,25 @@
 # Making type+submit interruption-safe in `cc-butler--send-input`
 
-Status: **proposal, no code written.** For a boss decision before anything is built.
-Context: surfaced by PR #17 (2026-07-23). #17 repairs the damage in the compaction
-driver only; this is the root the whole race class grows from.
+Status: **IMPLEMENTED — this document's status line was stale.** Verified
+2026-08-10: commit 64fb964 ("Make type+submit atomic so no timer can write
+between them", 2026-07-23 — the same night this proposal was surfaced)
+landed the recommended Approach A in `origin/main`, as the conservative
+variant this document's own fallback describes: the settle delay is kept
+(wall-clock unchanged) but spent in `cc-butler--settle`, a deliberate
+non-yielding busy-wait, so no timer can run between the typing and the
+Return. The proposal's test strategy exists in
+`tests/cc-butler-orchestrator-test.el` (interleaving regression, no-yield
+structural test, bracketed-paste integrity — 8/8 green on 2026-08-10), and
+the running fleet image was verified live the same day to define
+`cc-butler--settle` (loaded from the installed copy), so the fix is not
+merely on disk. The delay-can-be-zero experiment (test strategy item 3)
+was never needed: keeping the delay while removing the yield made the
+measurement moot. The writer-vs-human race scoped out below remains real
+and unfixed.
+
+Original context, kept for the record: surfaced by PR #17 (2026-07-23).
+#17 repairs the damage in the compaction driver only; this is the root the
+whole race class grows from.
 
 ## The defect
 

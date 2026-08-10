@@ -410,13 +410,16 @@ session loss, is required at any point.
 
 ## Related defect in the primitive this forwarder calls
 
-`cc-butler--forward-to-ops` writes through `cc-butler--send-input`
-(`cc-butler-orchestrator.el:236-271`), which has its own, separate atomicity
-defect: a `sleep-for` yield between typing and submitting lets another
-cc-butler timer interleave mid-sequence. That defect and its fix are
-covered in `send-input-atomicity-proposal.md` — this design's debounce/gate
-around the forwarder does not fix it, and the two documents should be read
-together rather than either being closed as if it covered the other.
+`cc-butler--forward-to-ops` writes through `cc-butler--send-input`, which
+*had* its own, separate atomicity defect: a `sleep-for` yield between
+typing and submitting let another cc-butler timer interleave mid-sequence.
+**Corrected 2026-08-10: that defect is already fixed** — commit 64fb964
+(2026-07-23) replaced the yield with a non-yielding busy-wait
+(`cc-butler--settle`), it is in main with its regression tests green, and
+the running fleet image was verified to have it loaded. See
+`send-input-atomicity-proposal.md`'s updated status header for the
+evidence. The writer-vs-human race described there remains open and is
+still this forwarder's problem.
 
 ## Open questions — decision sheet (consolidated 2026-08-10)
 
@@ -431,7 +434,10 @@ as-is plus one cross-reference line — applied, see
 classification" section above. Q5 → decided (A: atomicity fix lands first;
 C explicitly rejected as a baby-step violation, and a gate landed first
 would be validated on a non-atomic send, so a gate failure could not be
-attributed). Q1, Q2, Q6 → escalated to 정수님, pending (Q2 carries the
+attributed) — **and then found already satisfied**: the atomicity fix
+turned out to have landed on 2026-07-23 (64fb964) and to be live in the
+running image (verified 2026-08-10; see "Related defect" below), so Q4's
+implementation has its prerequisite met whenever it is approved. Q1, Q2, Q6 → escalated to 정수님, pending (Q2 carries the
 steward's endorsement of the decoupling argument: reusing 900s silently
 couples escalation latency to compaction tuning, so a separate knob is
 right regardless of the value chosen).
