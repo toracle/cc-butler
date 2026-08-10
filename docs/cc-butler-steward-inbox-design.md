@@ -162,6 +162,107 @@ Per the brief's requirement 1, almost verbatim:
   `needs` vs. a real one) — this design proposes *acting* on that
   distinction, not inventing it.
 
+The paragraph above covers **tool-reported** traffic only. Events arriving
+on the raw notification hook are classified by the next section — decided
+separately (Q4), because the `needs` rule structurally cannot reach them.
+
+### Raw-event wake classification — decided design (2026-08-10)
+
+**Decision (steward, 2026-08-10): raw events are never blanket no-wake.
+Classification is an allowlist of explicitly-harmless no-wake types; every
+raw event not on it wakes.** Rationale as decided: a worker blocked on a
+permission prompt cannot call any tool — `report_to_steward` is unreachable
+from exactly the state that most needs a wake — so any rule of the form
+"only tool-reported `needs` wakes" silences the most dangerous case. A
+denylist ages with every new risk and its failure is silent; an allowlist
+excludes the unknown by default, and in this gap the silent side is the
+dangerous side.
+
+**What the classifier actually has to key on.** The event path is: Claude
+Code emits an OSC 9 / OSC 777 terminal notification → ghostel's native
+parser (`ghostel--handle-notification`) → `cc-butler--on-ghostel-notification`
+(`cc-butler-notifications.el:64-81`) → the EVENT plist
+(`:title`/`:body`/`:buffer`/`:session`/`:name`). Claude Code's
+notifications are OSC 9-style, which carries **no separate title** —
+ghostel passes the message as `body` with an empty title
+(`ghostel-default-notify`'s docstring records this). So the only
+classification keys that exist at this layer are **the body string and the
+session identity**; there is no event-type enum anywhere in the path.
+Every classifier is therefore string matching on harness-emitted text,
+which can drift across Claude Code versions — and this is the second
+reason the allowlist direction is right: **default-wake makes string drift
+fail-visible.** A changed string falls out of the allowlist and produces
+extra wakes (noise that announces itself and prompts an allowlist update);
+under a denylist the same drift silences events, and nothing announces
+that.
+
+**Observed inventory (2026-08-10, ~10-worker fleet, steward's live
+observation — recorded here as the empirical basis, per the decision):**
+
+| Raw event body | Observed | Worker state | Disposition |
+|---|---|---|---|
+| "Claude needs your permission to use …" | permission prompts | fully blocked, cannot call tools | **wake** — the motivating case |
+| "Claude is waiting for your input" | dozens/day | ambiguous — see below | **deferred wake** |
+| turn-finished / done-type bodies | routine | free; can call `report_to_steward` if anything is actually needed | **no-wake** (allowlist) |
+| anything unrecognized | — | unknown | **wake** (by construction) |
+
+The initial no-wake allowlist is exactly the done-type bodies: the only
+events where the worker is both not blocked and able to use the tool path
+for anything real. The allowlist lives in one inspectable defcustom — a
+list of body patterns with a disposition each (`no-wake` / `wake` /
+`deferred`), defaulting conservative (empty list = everything wakes).
+Events with `:session nil` (unmanaged buffers) keep today's behavior and
+are out of scope.
+
+**"Claude is waiting for your input" — the one genuinely ambiguous type.**
+The steward's live observation: of the dozens received on 2026-08-10, a
+large share were harmless idle — a worker waiting on its own background
+subagent, where the harness emits the idle notification even though the
+session is mid-orchestration — and some were genuine waiting-for-a-reply.
+Telling them apart today required reading each session's screen: a
+per-event cost paid every few minutes, and precisely the degraded
+screen-read path the #39 constraint forbids this design from building on.
+So this classification problem is not hypothetical; it is a cost being
+paid on every fleet turn right now.
+
+Under a plain allowlist this type must wake (ambiguous is not harmless) —
+but dozens of mostly-harmless wakes per day reproduces the interrupt storm
+this design exists to kill. Proposed disposition: **deferred wake.**
+
+- On arrival: land in the inbox as always (durable, visible), no push;
+  start or refresh a per-session deferral clock.
+- The two meanings differ in what happens *next*, and that difference is
+  visible in structured data: a worker idling on its own subagent resumes
+  by itself — its transcript advances when the subagent completes. A
+  worker genuinely waiting for a reply stays static until someone answers.
+  So: if the session's transcript mtime (the same file-based read
+  `cc-butler--transcript-idle-p` already uses — a file stat, not a screen
+  read) shows no progress for a deferral window W, escalate to wake.
+- **Stated honestly: this does not fully separate the two meanings.** A
+  worker waiting W-plus minutes on one long-running subagent looks, in
+  transcript mtime, identical to one waiting for a human — its main
+  transcript is static until the subagent completes. The deferral
+  therefore errs toward wake (the safe direction), and what it buys is a
+  bound, not a resolution: dozens of immediate interrupts become at most
+  one deferred wake per session per window, coalesced further by the
+  busy-gate's batching. Known caveat, already documented on branch
+  `fix/status-context-liveness-threshold`: transcript mtime tracks file
+  writes, not turns — advancing mtime proves activity; static mtime is
+  what W interprets.
+- Rejected alternative: inferring "has live background tasks" by reading
+  the harness's own task/session files on disk. Possible, but couples the
+  gate to undocumented harness-internal layout — a worse version of the
+  string-matching fragility above, without the fail-visible property.
+
+**Unclassifiable residue — the honest answer to "does any type remain?":
+yes, this one, partially.** The idle event's two meanings cannot be
+separated by any structured signal available at this layer (body, session,
+file mtimes); deferred wake bounds the cost of the ambiguity without
+resolving it. Resolving it for real requires the emitter to say *why* it
+is waiting — Claude Code currently emits the same body string whether or
+not background tasks are running when the turn ends. That is an upstream
+observation worth filing, not something this design can fix from below.
+
 ### How "ten queued costs one turn" is actually guaranteed
 
 The concrete intervention point is `cc-butler--forward-to-ops`
@@ -321,7 +422,19 @@ together rather than either being closed as if it covered the other.
 
 Q1–Q3 carry over from this document's first draft; Q4–Q6 were surfaced by a
 re-read of the full design on 2026-08-10. Options are laid out with their
-tradeoffs; none is chosen here — every item goes up for a decision.
+tradeoffs; none was chosen by this document's author — every item went up.
+
+**Status after the steward's 2026-08-10 ruling:** Q3 → decided (B: leave
+as-is plus one cross-reference line — applied, see
+`governance/report-up-is-a-push.md`). Q4 → decided in direction
+(allowlist, default-wake) — the worked-out design is the "Raw-event wake
+classification" section above. Q5 → decided (A: atomicity fix lands first;
+C explicitly rejected as a baby-step violation, and a gate landed first
+would be validated on a non-atomic send, so a gate failure could not be
+attributed). Q1, Q2, Q6 → escalated to 정수님, pending (Q2 carries the
+steward's endorsement of the decoupling argument: reusing 900s silently
+couples escalation latency to compaction tuning, so a separate knob is
+right regardless of the value chosen).
 
 ### Q1 — should the 900s monitor auto-invoke compaction, or keep reporting only?
 
