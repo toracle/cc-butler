@@ -826,5 +826,160 @@ take the events with it."
       (ignore-errors (cc-butler--pending-events-hook-payload))
       (should (or cc-butler--inbox cc-butler--inbox-drained)))))
 
+;;;; ------------------------------------------------------------------
+;;;; The gated forwarder: ten queued worker events must cost one turn
+;;;; ------------------------------------------------------------------
+;;;; `cc-butler--forward-to-ops' used to type one interrupt into the ops
+;;;; terminal per worker notification, unconditionally. The gated path
+;;;; classifies raw events by an ALLOWLIST (unmatched wakes, by
+;;;; construction — a worker blocked on a permission prompt cannot call
+;;;; any MCP tool, so the unknown must never default to silence), pushes
+;;;; through an idle gate, defers the one genuinely ambiguous event type,
+;;;; and backstops the whole thing with a bounded periodic sweep.
+
+(defmacro cc-butler-orchestrator-test--with-forward-fixture (&rest body)
+  "Run BODY inside the stub terminal with the gated forwarder set up.
+Ops session is \"/ops/\"; `activity' is a hash of dir -> last-activity
+float-time consulted by the stubbed `cc-butler--session-last-activity'
+(missing dir -> nil, the cannot-confirm case)."
+  (declare (indent 0))
+  `(cc-butler-orchestrator-test--with-stub-terminal
+     (let ((activity (make-hash-table :test #'equal))
+           (cc-butler--butler "/ops/")
+           (cc-butler--steward nil)
+           (cc-butler--inbox nil)
+           (cc-butler--forward-deferred (make-hash-table :test #'equal))
+           (cc-butler--forward-last-push nil)
+           (cc-butler-forward 'submit)
+           (cc-butler-forward-gate t)
+           (cc-butler-forward-idle-threshold 60)
+           (cc-butler-message-transport 'memory)
+           (cc-butler-submit-delay 0.01))
+       (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+                  (lambda (d) (gethash d activity)))
+                 ((symbol-function 'cc-butler--who-dir) (lambda (d) d)))
+         (ignore activity)
+         ,@body))))
+
+(defun cc-butler-orchestrator-test--sent-strings ()
+  "Just the :string payloads of the recorded writes, oldest first."
+  (delq nil (mapcar (lambda (w) (and (eq (car w) :string) (cadr w)))
+                    (cc-butler-orchestrator-test--recorded-writes))))
+
+(defun cc-butler-orchestrator-test--event (body)
+  "A worker notification EVENT plist with BODY, from session \"/worker/\"."
+  (list :type 'notification :title "" :body body
+        :session "/worker/" :name "worker"))
+
+(ert-deftest cc-butler-orchestrator/forward-classify-unmatched-is-wake ()
+  "The allowlist names the harmless; everything else wakes by construction.
+A permission prompt (or any string the harness starts emitting tomorrow)
+must classify `wake' without anyone having listed it."
+  (let ((cc-butler-forward-classify-alist
+         '(("waiting for your input" . deferred)
+           ("^Turn finished$" . no-wake))))
+    (should (eq 'wake (cc-butler--forward-classify
+                       (list :body "Claude needs your permission to use Bash"))))
+    (should (eq 'wake (cc-butler--forward-classify (list :body "brand new string"))))
+    (should (eq 'deferred (cc-butler--forward-classify
+                           (list :body "Claude is waiting for your input"))))
+    (should (eq 'no-wake (cc-butler--forward-classify (list :body "Turn finished"))))
+    ;; Empty body falls back to the title.
+    (should (eq 'no-wake (cc-butler--forward-classify
+                          (list :body nil :title "Turn finished"))))))
+
+(ert-deftest cc-butler-orchestrator/forward-no-wake-never-touches-the-terminal ()
+  "An allowlisted no-wake event rests in the durable inbox and types nothing."
+  (cc-butler-orchestrator-test--with-forward-fixture
+    (let ((cc-butler-forward-classify-alist '(("^Turn finished$" . no-wake))))
+      (cc-butler--forward-to-ops (cc-butler-orchestrator-test--event "Turn finished"))
+      (should (null (cc-butler-orchestrator-test--recorded-writes))))))
+
+(ert-deftest cc-butler-orchestrator/forward-wake-pushes-one-batched-summary ()
+  "Given ops free and a backlog of 3, a wake event costs ONE send whose
+text carries the backlog size — never one send per queued event."
+  (cc-butler-orchestrator-test--with-forward-fixture
+    (puthash "/ops/" (- (float-time) 120) activity) ; free
+    (setq cc-butler--inbox '((:body "a") (:body "b") (:body "c")))
+    (cc-butler--forward-to-ops (cc-butler-orchestrator-test--event "worker died"))
+    (let ((sent (cc-butler-orchestrator-test--sent-strings)))
+      (should (= 1 (length sent)))
+      (should (string-match-p "needs attention: worker died" (car sent)))
+      (should (string-match-p "\\+2 more pending" (car sent)))
+      (should (string-match-p "pending_events" (car sent))))))
+
+(ert-deftest cc-butler-orchestrator/forward-wake-holds-when-ops-busy ()
+  "Given ops mid-turn (fresh transcript write), a wake event types nothing
+— it waits in the durable inbox for the next organic drain or the
+backstop. Ditto when ops activity cannot be confirmed at all: a session
+whose state is unknown must not be typed into."
+  (cc-butler-orchestrator-test--with-forward-fixture
+    (puthash "/ops/" (float-time) activity) ; busy
+    (cc-butler--forward-to-ops (cc-butler-orchestrator-test--event "worker died"))
+    (should (null (cc-butler-orchestrator-test--recorded-writes)))
+    (remhash "/ops/" activity)              ; unknown
+    (cc-butler--forward-to-ops (cc-butler-orchestrator-test--event "worker died"))
+    (should (null (cc-butler-orchestrator-test--recorded-writes)))))
+
+(ert-deftest cc-butler-orchestrator/forward-deferred-self-resolves-on-progress ()
+  "An idle notification whose session then progresses (its sub-agent
+completed, a turn ran) resolves silently — no push, entry dropped."
+  (cc-butler-orchestrator-test--with-forward-fixture
+    (puthash "/ops/" (- (float-time) 120) activity)
+    (cc-butler--forward-to-ops
+     (cc-butler-orchestrator-test--event "Claude is waiting for your input"))
+    (should (gethash "/worker/" cc-butler--forward-deferred))
+    (should (null (cc-butler-orchestrator-test--recorded-writes)))
+    ;; The worker's transcript advances past the deferral's :since.
+    (puthash "/worker/" (+ (float-time) 1) activity)
+    (cc-butler--forward-defer-check "/ops/" "/worker/")
+    (should (null (cc-butler-orchestrator-test--recorded-writes)))
+    (should (null (gethash "/worker/" cc-butler--forward-deferred)))))
+
+(ert-deftest cc-butler-orchestrator/forward-deferred-escalates-when-static ()
+  "An idle notification whose session stays static past the window
+escalates to a wake — the error goes toward wake on purpose (a long
+sub-agent wait is indistinguishable from a genuine wait-for-reply in
+every structured signal this layer has; the deferral bounds the cost of
+that ambiguity, it does not resolve it)."
+  (cc-butler-orchestrator-test--with-forward-fixture
+    (puthash "/ops/" (- (float-time) 120) activity)
+    (puthash "/worker/" (- (float-time) 900) activity) ; static since before the event
+    (cc-butler--forward-to-ops
+     (cc-butler-orchestrator-test--event "Claude is waiting for your input"))
+    (cc-butler--forward-defer-check "/ops/" "/worker/")
+    (let ((sent (cc-butler-orchestrator-test--sent-strings)))
+      (should (= 1 (length sent)))
+      (should (string-match-p "no progress" (car sent))))
+    (should (null (gethash "/worker/" cc-butler--forward-deferred)))))
+
+(ert-deftest cc-butler-orchestrator/forward-backstop-pushes-once-per-interval ()
+  "Given undrained events and a free ops session, the backstop fires ONE
+push, and a second sweep inside the same interval fires none. An empty
+inbox fires none at all — the backstop wakes nobody for nothing."
+  (cc-butler-orchestrator-test--with-forward-fixture
+    (puthash "/ops/" (- (float-time) 120) activity)
+    (cc-butler--forward-backstop)          ; empty inbox
+    (should (null (cc-butler-orchestrator-test--recorded-writes)))
+    (setq cc-butler--inbox '((:body "a") (:body "b")))
+    (cc-butler--forward-backstop)
+    (should (= 1 (length (cc-butler-orchestrator-test--sent-strings))))
+    (should (string-match-p "2 worker events pending"
+                            (car (cc-butler-orchestrator-test--sent-strings))))
+    (cc-butler--forward-backstop)          ; same interval: hold
+    (should (= 1 (length (cc-butler-orchestrator-test--sent-strings))))))
+
+(ert-deftest cc-butler-orchestrator/forward-gate-off-restores-legacy-behavior ()
+  "`cc-butler-forward-gate' nil is the live-rollback lever: per-event
+unconditional forwarding, ops busy or not, in the legacy format."
+  (cc-butler-orchestrator-test--with-forward-fixture
+    (setq cc-butler-forward-gate nil)
+    (puthash "/ops/" (float-time) activity) ; busy — legacy path ignores it
+    (cc-butler--forward-to-ops (cc-butler-orchestrator-test--event "e1"))
+    (cc-butler--forward-to-ops (cc-butler-orchestrator-test--event "e2"))
+    (let ((sent (cc-butler-orchestrator-test--sent-strings)))
+      (should (= 2 (length sent)))
+      (should (string-match-p "Worker /worker/ needs attention: e1" (car sent))))))
+
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here

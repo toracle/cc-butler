@@ -992,8 +992,213 @@ The steward when one is designated, else the butler (single mode)."
   "Return non-nil when a distinct steward session is designated (split mode)."
   (and cc-butler--steward (not (equal cc-butler--steward cc-butler--butler))))
 
+(defcustom cc-butler-forward-gate t
+  "When non-nil, worker notifications go through the batched, gated
+forwarder (classification + idle gate + backstop) instead of being typed
+into the ops terminal one interrupt per event.  nil restores the legacy
+unconditional per-event forward — the live-rollback lever: flipping this
+variable changes behavior immediately, no reload required.
+See docs/cc-butler-steward-inbox-design.md."
+  :type 'boolean :group 'cc-butler)
+
+(defcustom cc-butler-forward-classify-alist
+  '(("waiting for your input" . deferred))
+  "Allowlist classifying raw notification events by body (title fallback).
+Each entry is (REGEXP . DISPOSITION); the first match wins.  DISPOSITION:
+
+  no-wake  -> inbox only; never actively pushed.
+  deferred -> inbox now; pushed only if the session then stays static
+              for `cc-butler-forward-defer-window' (see
+              `cc-butler--forward-defer').
+  wake     -> gated push now (`cc-butler--forward-wake').
+
+An event matching NO entry is `wake' BY CONSTRUCTION — this list names
+what is known-harmless, never what is dangerous.  A denylist ages with
+every new risk and its failure is silent; this direction makes drift in
+the harness's notification strings fail-visible instead (an unmatched
+string produces extra wakes, which announce themselves), and it keeps
+the one case that can never speak for itself — a worker blocked on a
+permission prompt cannot call any MCP tool — waking by default.
+
+The initial no-wake set is deliberately EMPTY: add an entry only for a
+body string actually observed from a session that was verifiably free
+(e.g. turn-finished notifications), not for one assumed to exist."
+  :type '(alist :key-type regexp
+                :value-type (choice (const no-wake) (const deferred) (const wake)))
+  :group 'cc-butler)
+
+(defcustom cc-butler-forward-idle-threshold 60
+  "Seconds since the ops session's newest transcript write below which the
+live push is withheld (the event stays in the durable inbox for the
+backstop or the ops session's own next turn).  Deliberately a SEPARATE
+knob from `cc-butler-idle-threshold' (600s): that window answers \"is it
+safe to destroy this session's context\", this one answers \"is the ops
+session mid-turn right now\" — coupling them would make escalation
+latency a silent side effect of compaction tuning (the same argument
+that split `cc-butler-forward-backstop-interval' from the compaction
+monitor's interval)."
+  :type 'number :group 'cc-butler)
+
+(defcustom cc-butler-forward-defer-window 600
+  "Seconds a `deferred' event waits before it may escalate to a push.
+Starting point, not a settled constant — tune in operation."
+  :type 'number :group 'cc-butler)
+
+(defcustom cc-butler-forward-backstop-interval 3600
+  "Seconds between backstop sweeps (`cc-butler--forward-backstop'), the
+bounded worst-case latency for a wake-worthy event that arrived while
+the ops session was busy.  Initial value 3600s is an operating STARTING
+POINT (decided 2026-08-10), expected to be tuned in operation — it is a
+separate defcustom precisely so tuning it never silently retunes the
+compaction monitor, and vice versa."
+  :type 'number :group 'cc-butler)
+
+(defvar cc-butler--forward-deferred (make-hash-table :test #'equal)
+  "dir -> plist (:since FLOAT-TIME :body STRING :timer TIMER) for events
+classified `deferred' and not yet resolved or escalated.")
+
+(defvar cc-butler--forward-last-push nil
+  "`float-time' of the last live push into the ops terminal, or nil.")
+
+(defvar cc-butler--forward-backstop-timer nil
+  "The repeating backstop timer, or nil.")
+
+(defun cc-butler--forward-classify (event)
+  "Classify EVENT via `cc-butler-forward-classify-alist'.
+Returns `no-wake', `deferred' or `wake'; unmatched is `wake' by
+construction (see the alist's docstring).  Keys off the event's own
+:body/:title strings — never a fresh read of the reporting session's
+screen, which may itself be degraded (cc-butler#39)."
+  (let ((text (or (plist-get event :body) (plist-get event :title) "")))
+    (or (cdr (assoc text cc-butler-forward-classify-alist
+                    (lambda (re s) (string-match-p re s))))
+        'wake)))
+
+(defun cc-butler--forward-ops-free-p (ops)
+  "Non-nil when OPS looks free enough to type into right now.
+nil when its newest transcript write is fresher than
+`cc-butler-forward-idle-threshold' — or when no transcript can be found
+at all, since a session whose state cannot be confirmed must not be
+typed into (same fail-safe direction as the compaction gate)."
+  (let ((last (cc-butler--session-last-activity ops)))
+    (and last (>= (- (float-time) last) cc-butler-forward-idle-threshold))))
+
+(defun cc-butler--forward-pending-count ()
+  "How many worker events are sitting undrained for the ops session.
+Under the maildir transport the in-memory `cc-butler--inbox' is not the
+authority, so count the ops box's new/ files instead."
+  (if (and (boundp 'cc-butler-message-transport)
+           (eq cc-butler-message-transport 'maildir)
+           (fboundp 'cc-butler--mail-box))
+      (let ((new (expand-file-name
+                  "new" (cc-butler--mail-box
+                         (if (cc-butler--split-p) "steward" "butler")))))
+        (if (file-directory-p new)
+            (length (directory-files new nil "^[^.]"))
+          0))
+    (length cc-butler--inbox)))
+
+(defun cc-butler--forward-push-batched (ops trigger)
+  "Type ONE batched summary into OPS: TRIGGER plus the pending backlog size.
+This is the single live-push primitive of the gated forwarder — every
+push summarizes everything currently pending, never just the triggering
+event, so ten queued events cost one turn.  The push is an accelerant
+over the durable inbox, never the only copy: the event already landed
+there via `cc-butler--queue-on-notification' before this runs."
+  (let ((n (cc-butler--forward-pending-count)))
+    (cc-butler--send-input
+     ops
+     (format "[cc-butler] %s%s — drain with pending_events"
+             trigger
+             (if (> n 1) (format " (+%d more pending)" (1- n)) ""))
+     (eq cc-butler-forward 'submit))
+    (setq cc-butler--forward-last-push (float-time))))
+
+(defun cc-butler--forward-wake (ops dir text)
+  "Gated push for a wake-worthy event from DIR with TEXT.
+Pushes immediately when OPS is free (single genuine escalations keep
+today's low latency); otherwise leaves the event to the durable inbox —
+absorbed for free on the ops session's next organic turn via the
+UserPromptSubmit drain, or pushed by the backstop within one
+`cc-butler-forward-backstop-interval'."
+  (if (cc-butler--forward-ops-free-p ops)
+      (cc-butler--forward-push-batched
+       ops (format "Worker %s needs attention: %s"
+                   (cc-butler--who-dir dir) text))
+    (cc-butler--log "forward: ops busy, %s queued for backstop │ %s"
+                    (cc-butler--who-dir dir) text)))
+
+(defun cc-butler--forward-defer (ops dir text)
+  "Register a `deferred' event from DIR and (re)arm its check timer.
+
+HONEST LIMIT — do not read this as disambiguation: an idle notification
+from a worker waiting on its own background sub-agent and one from a
+worker genuinely waiting for a reply are indistinguishable in every
+structured signal available at this layer (body, session, file mtimes).
+The deferral BOUNDS THE COST of that ambiguity, it does not resolve it:
+a session static past the window escalates, so a long sub-agent wait
+does wake the ops session — the error goes toward wake on purpose, and
+dozens of immediate interrupts become at most one deferred wake per
+session per window.  Transcript mtime tracks file writes, not turns
+(see `cc-butler--session-last-activity')."
+  (let* ((prev (gethash dir cc-butler--forward-deferred))
+         (old-timer (plist-get prev :timer)))
+    (when (timerp old-timer) (cancel-timer old-timer))
+    (puthash dir
+             (list :since (float-time) :body text
+                   :timer (run-with-timer cc-butler-forward-defer-window nil
+                                          #'cc-butler--forward-defer-check
+                                          ops dir))
+             cc-butler--forward-deferred)))
+
+(defun cc-butler--forward-defer-check (ops dir)
+  "Escalate DIR's deferred event if the session never progressed.
+Progress = any transcript write since the event was recorded (the
+session resumed by itself — a sub-agent completed, a turn ran); such an
+event resolves silently.  A session still static after the window
+escalates through the normal wake gate.  Either way the entry is
+dropped: the durable inbox still holds the event, so nothing is lost."
+  (when-let ((entry (gethash dir cc-butler--forward-deferred)))
+    (remhash dir cc-butler--forward-deferred)
+    (let ((last (cc-butler--session-last-activity dir)))
+      (if (and last (> last (plist-get entry :since)))
+          (cc-butler--log "forward: deferred %s self-resolved"
+                          (cc-butler--who-dir dir))
+        (cc-butler--forward-wake ops dir
+                                 (format "%s (idle %ss, no progress)"
+                                         (plist-get entry :body)
+                                         cc-butler-forward-defer-window))))))
+
+(defun cc-butler--forward-backstop ()
+  "Periodic sweep: push once if events sit undrained and nothing woke ops.
+This is the other half of the gate — without it, turning off per-event
+forwarding would just recreate \"nobody wakes the steward, it sleeps
+forever\" in a new form.  Fires at most one push per interval, only when
+the inbox is non-empty (a drain empties it, so pending>0 means no
+organic drain happened), no live push happened within the interval, and
+ops is free to be typed into (a busy ops session absorbs the backlog on
+its own next turn via the UserPromptSubmit drain instead)."
+  (when-let* ((cc-butler-forward)
+              (cc-butler-forward-gate)
+              (ops (cc-butler--ops-dir))
+              (mbuf (get-buffer (claude-code-ide--get-buffer-name ops)))
+              ((buffer-live-p mbuf))
+              ((> (cc-butler--forward-pending-count) 0))
+              ((or (null cc-butler--forward-last-push)
+                   (>= (- (float-time) cc-butler--forward-last-push)
+                       cc-butler-forward-backstop-interval)))
+              ((cc-butler--forward-ops-free-p ops)))
+    (cc-butler--forward-push-batched
+     ops (format "%d worker events pending, none delivered for a while"
+                 (cc-butler--forward-pending-count)))))
+
 (defun cc-butler--forward-to-ops (event)
-  "Forward a worker EVENT into the ops (steward, else butler) terminal.
+  "Forward a worker EVENT toward the ops (steward, else butler) session.
+With `cc-butler-forward-gate' non-nil this is the batched, gated path:
+classify (`cc-butler--forward-classify'), then no-wake events rest in
+the durable inbox, deferred events arm a window, and wake events push
+through the idle gate.  With the gate nil this is the legacy behavior —
+one typed interrupt per event, unconditionally.
 The user-facing butler is never nudged in split mode; only the steward is."
   (when-let* ((mode cc-butler-forward)
               (ops (cc-butler--ops-dir))
@@ -1001,12 +1206,29 @@ The user-facing butler is never nudged in split mode; only the steward is."
               ((not (equal dir ops)))
               (mbuf (get-buffer (claude-code-ide--get-buffer-name ops)))
               ((buffer-live-p mbuf)))
-    (cc-butler--send-input
-     ops
-     (format "[cc-butler] Worker %s needs attention: %s"
-             (cc-butler--who-dir dir)
-             (or (plist-get event :body) (plist-get event :title) ""))
-     (eq mode 'submit))))
+    (let ((text (or (plist-get event :body) (plist-get event :title) "")))
+      (if (not cc-butler-forward-gate)
+          (cc-butler--send-input
+           ops
+           (format "[cc-butler] Worker %s needs attention: %s"
+                   (cc-butler--who-dir dir) text)
+           (eq mode 'submit))
+        (pcase (cc-butler--forward-classify event)
+          ('no-wake (cc-butler--log "forward: no-wake %s │ %s"
+                                    (cc-butler--who-dir dir) text))
+          ('deferred (cc-butler--forward-defer ops dir text))
+          (_ (cc-butler--forward-wake ops dir text)))))))
+
+(defun cc-butler--forward-backstop-ensure-timer ()
+  "(Re)register the backstop timer; idempotent for hot reloads."
+  (when (timerp cc-butler--forward-backstop-timer)
+    (cancel-timer cc-butler--forward-backstop-timer))
+  (setq cc-butler--forward-backstop-timer
+        (run-with-timer cc-butler-forward-backstop-interval
+                        cc-butler-forward-backstop-interval
+                        #'cc-butler--forward-backstop)))
+
+(cc-butler--forward-backstop-ensure-timer)
 
 ;; Swap the old single-target forwarder for the ops-aware one (idempotent on
 ;; reload; the old symbol is simply removed from the hook if present).
