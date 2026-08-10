@@ -1,6 +1,6 @@
 ---
 name: fixing-one-instrument-flaw-does-not-validate-the-instrument
-description: "One DNS probe produced four different measurement artifacts in a single night — a timeout ceiling, a second ceiling, sequential ordering bias, a wrong-target code path, and a wait-reap ordering bug. Each fix revealed the next, and each artifact was subtler and more convincing than the last. The most persuasive-looking result of all — two resolvers with 6x-different budgets agreeing to 3ms — was pure instrument. After one artifact, suspect the instrument before the world on every later surprise."
+description: "One DNS probe produced four different measurement artifacts in a single night — a timeout ceiling, a second ceiling, sequential ordering bias, a wrong-target code path, and a wait-reap ordering bug. Each fix revealed the next, and each artifact was subtler and more convincing than the last. The most persuasive-looking result of all — two resolvers with 6x-different budgets agreeing to 3ms — was pure instrument. After one artifact, suspect the instrument before the world on every later surprise. A later instance: an unverified mic-routing trace nearly overruled a human's direct observation — keep at least one pre-registered acceptance criterion that does not read any instrument."
 metadata:
   node_type: memory
   type: feedback
@@ -99,10 +99,47 @@ time" is not. Likewise a purely **textual** finding — a dropped trigger tag `r
 corpus prompt reading *"Track down the root cause"* — is a fact about two strings and needs no working
 instrument at all. When an instrument collapses, sort claims by what actually rested on it.
 
+**A seventh instance, on a third instrument — the only one where the instrument nearly overruled a direct
+observation of the world (2026-08-03).** A mobile app's Bluetooth mic-routing fix was verified on a real
+device. The human tester reported the headset mic working. The app's own input-device trace field said
+"Built-in microphone" for every turn of the test. Both reviewers sided with the trace and were about to record
+a *working* fix as failed. What settled it was an experimental condition, not a log: the tester had been **ten
+metres from the phone** — a distance at which the built-in mic physically cannot pick up speech. No log was
+read to reach that verdict. (The trace was wrong twice over: it read the *first* recording configuration on
+the system rather than the app's own, and it read it at turn start, returning early before ever reaching the
+branch that would have answered "Bluetooth".)
+
+Two reasoning failures stacked, and both are worth naming:
+- "The corrected instrumentation commit is in this build" was treated as "therefore the instrumentation is
+  correct." Confirming *which* implementation is running says nothing about whether that implementation is
+  right.
+- "The old implementation over-reported; the symptom is under-reporting; so the old bug doesn't explain it —
+  **therefore the new one is correct**." That last step has no support: it ruled out one known defect and never
+  put "the new implementation is independently wrong" on the candidate list.
+
+And pre-registration made it worse rather than better. The registered acceptance criterion was
+`input_device == Bluetooth` — a criterion that **reads the instrument**. So when the instrument lied,
+pre-registration did not catch the error; it *lent the error authority*, because "the acceptance criterion we
+fixed in advance failed" is a hard sentence to argue with.
+
+**Three lessons specific to this instance:**
+1. **An unverified instrument cannot outrank a direct observation.** A log line, a trace field, a status probe
+   is not evidence — it is an instrument that *produces* evidence. Until the instrument itself has been
+   verified, its readings cannot overrule a direct observation of the world; when the two disagree, the first
+   suspect is the instrument, not the world.
+2. **Every pre-registered criteria set gets at least one instrument-independent member** — one a person can
+   adjudicate without reading any output the system produced about itself. Ten metres. The app is on screen.
+   The file exists. If every criterion reads an instrument, the instrument has quietly become the judge, and
+   nobody is judging the judge.
+3. **Do not adjudicate the disagreement from the armchair — ask what the human actually did.** The
+   experimental conditions are usually the missing variable. And once the world and the instrument disagree
+   and the world wins, the instrument becomes the bug, and it outranks the original task: every verdict built
+   on it is now suspect.
+
 Related: [[suspiciously-uniform-is-the-instruments-fingerprint]] (the first of these, and the narrower rule),
 [[a-test-that-cannot-fail-is-not-evidence]] (a check that could not have come out differently),
 [[a-stop-that-reports-success-is-not-a-stop]] (a status answering a different question than the one asked),
 [[merging-agent-results-must-keep-per-claim-provenance]] (mark *observed* vs *inferred* in your own sentences).
 
-**SPT:** the habit is *once an instrument has fooled you, audit it before every surprising result — and treat its
-most convincing output as its most suspect.*
+**SPT:** the habit is *once an instrument has fooled you, audit it before every surprising result — treat its
+most convincing output as its most suspect, and never let an unverified instrument outrank a direct observation.*
