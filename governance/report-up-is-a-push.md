@@ -41,6 +41,11 @@ here, `pending_decisions` + dashboard/log ≠ a report to the butler.
    your Enter is dangerous — [[butler-relay-safe-worker-decisions]]) and afterward
    verify it landed ([[butler-verify-delivery]]).
 
+Scope note (2026-08-10): this policy governs explicitly-acknowledged dispatches; it is
+NOT the source of the ambient per-notification interrupt — that lever is
+`cc-butler--forward-to-ops` / `cc-butler-forward` (see
+`docs/cc-butler-steward-inbox-design.md`, premise 0).
+
 **How to apply:** [as steward] when the butler dispatches a task, confirm receipt to the
 butler immediately, push progress + the final result via `send_to_session`, and note that
 decisions are in `pending_decisions` for it to drain — do NOT treat escalate + dashboard as
