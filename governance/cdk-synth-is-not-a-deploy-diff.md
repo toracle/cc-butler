@@ -49,7 +49,7 @@ merged to the base after it forked.
    A current branch off the up-to-date base does not show the phantom DESTROYs.
 
 **Amplifier — shared-account setups (jarvice, confirmed 2026-08-01).** jarvice's staging and prod live in
-the **same AWS account** (019809347031); environments are separated by **stack name only** (`--context
+the **same AWS account** (`<AWS_ACCOUNT_ID>`); environments are separated by **stack name only** (`--context
 env=stg|prd` → `...StackStg` vs `...StackPrd`), NOT by account isolation. So every "staging-only, prod
 untouched" claim rests entirely on correct `--context`/stack-name targeting *within one account* — there
 is no account boundary to catch a mistargeted stack. This makes the live-diff-before-deploy bar MORE

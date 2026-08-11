@@ -27,7 +27,7 @@ repo does). Only a sibling that provably shares the resource is evidence about t
 steward inspected a single jarvice run — the *deploy* run — saw `ubuntu-latest` / GitHub-hosted, and
 generalized it to the whole repo: "jarvice never touches the self-hosted runner." That was **false**.
 A repo's workflows do not share a runner policy: jarvice's deploy ran GitHub-hosted while its **PR check
-jobs** (`Frontend Unit Tests`, `Format & Build Frontend`) ran on `warmblood-x600-desktop-runner-3`,
+jobs** (`Frontend Unit Tests`, `Format & Build Frontend`) ran on `<RUNNER_HOSTNAME>`,
 `labels: ["self-hosted","Linux"]` — the very resource in question. The owner's original premise ("the repos
 share a runner") had been correct, and the steward had told the butler it was false, who relayed it upward.
 **Resource identity must be established for the SAME KIND OF JOB that is failing, not for the repo.** One
