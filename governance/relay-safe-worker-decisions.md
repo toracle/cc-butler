@@ -126,6 +126,41 @@ open — treat the pending Enter as live and dangerous, not routine. Read
 enough lines to see the menu AND whether a human's own typed rows appear above
 it; see [[butler-verify-delivery]] lesson 6 on short reads being inconclusive.
 
+**STATUS LABELS ARE NOT EVIDENCE — only `read_session_output` is.** (Added
+2026-08-11.) The "check first" rule above says to read the screen before
+texting. It does not yet say what *not* to trust instead: the state label a
+monitor, notification, or hook attaches to a session — `waiting`,
+`mid-turn`, `running`, `idle`. These labels can be wrong relative to what is
+actually on screen, and the gap is exactly wide enough to hide an open
+wizard.
+
+Observed 2026-08-11: the fleet monitor reported `butler (151k) — mid-turn:
+compact_session queues it and it starts when the turn ends` — a label that
+reads as "no open dialog, safe to queue work." `read_session_output` at the
+same moment showed an `AskUserQuestion` wizard that had been open for 1.5
+hours (since 07:41, 정수님 not yet answered), with "1. 생성 시 고정
+(Recommended)" sitting highlighted. Had the steward trusted the label and
+sent free-form text, the submit-Enter would have picked the highlighted
+default — recording a product decision 정수님 never made, in his name. This
+is not a worker mistake to absorb; it is a human's decision being
+fabricated.
+
+Extend the scope explicitly to **the butler, not only workers**: the
+"prefer report_to_steward/escalate_to_butler over AskUserQuestion" fix above
+applies to workers under fleet orchestration, but the butler faces an actual
+human, so its use of `AskUserQuestion` is *correct*, not a bug to route
+around — the wizard cannot be designed away on that side. Which means the
+steward's pre-send screen check is the *only* defense on the other end, and
+it must not be short-circuited by a status label that claims the coast is
+clear.
+
+The failure is asymmetric on purpose: skipping the check saves one
+`read_session_output` call; not skipping it is the only thing standing
+between a live wizard and a fabricated human decision. When a label and a
+screen read would disagree, the screen read is the one that gets to be
+right — the label is a convenience for triage, never a relay-safety
+citation.
+
 **Known gap.** This principle was written down (2026-07-06) after the
 `AskUserQuestion`/relay-safety failure recurred, steward included — a rule
 stated once and expected to be remembered is exactly what erodes under load
