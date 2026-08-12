@@ -1096,5 +1096,160 @@ the same class of damage: positions that repeat instead of advancing."
           (should (equal (car e)
                          (get-text-property (cdr e) 'cc-butler-dir))))))))
 
+(ert-deftest cc-butler-session/render-preserves-window-scroll-position ()
+  "A redraw with unchanged content must not snap the window back to
+wherever point happens to land — that visible jump is the jiggle a
+`erase-buffer'-based redraw causes if the old scroll position isn't
+restored afterwards."
+  (let ((cc-butler--butler nil) (cc-butler--steward nil)
+        (cc-butler--waiting (make-hash-table :test 'equal))
+        (cc-butler-session-test--sessions (cc-butler-session-test--render-fixture))
+        (buf (get-buffer-create " *ccb-scroll-test*")))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               #'cc-butler-session-test--fake-sessions))
+      (unwind-protect
+          (save-window-excursion
+            (delete-other-windows)
+            (set-window-buffer (selected-window) buf)
+            (with-current-buffer buf
+              (cc-butler-mode)
+              (cc-butler--render)
+              (let ((mid (/ (point-max) 2)))
+                (set-window-start (selected-window) mid t)
+                (should (= (window-start (selected-window)) mid))
+                ;; same fixture, same output length -> the scroll position
+                ;; from before this redraw must still hold after it.
+                (cc-butler--render)
+                (should (= (window-start (selected-window)) mid)))))
+        (kill-buffer buf)))))
+
+(ert-deftest cc-butler-session/render-is-a-noop-when-content-is-unchanged ()
+  "A tick can mark a session dirty without its drawn text actually differing
+\(e.g. a title event that renders to the same string).  Redrawing anyway means
+`erase-buffer' + reinsert on a visible window every tick a session is active,
+which reads as the list jiggling even though nothing on screen is different.
+Nothing in the buffer should be touched when the new content is identical."
+  (let ((cc-butler--butler nil) (cc-butler--steward nil)
+        (cc-butler--waiting (make-hash-table :test 'equal))
+        (cc-butler-session-test--sessions (cc-butler-session-test--render-fixture)))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               #'cc-butler-session-test--fake-sessions))
+      (with-temp-buffer
+        (cc-butler-mode)
+        (cc-butler--render)
+        (let ((tick (buffer-chars-modified-tick)))
+          (cc-butler--render)
+          (should (= tick (buffer-chars-modified-tick))))))))
+
+(ert-deftest cc-butler-session/render-clamps-scroll-to-a-shorter-buffer ()
+  "If the redraw produces less text than before, the restored scroll
+position must not land past the new end — `set-window-start' on an
+out-of-range position is exactly the kind of edge a shrinking session
+list can hit (a session exits between two ticks)."
+  (let ((cc-butler--butler nil) (cc-butler--steward nil)
+        (cc-butler--waiting (make-hash-table :test 'equal))
+        (cc-butler-session-test--sessions (cc-butler-session-test--render-fixture))
+        (buf (get-buffer-create " *ccb-scroll-test2*")))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               #'cc-butler-session-test--fake-sessions))
+      (unwind-protect
+          (save-window-excursion
+            (delete-other-windows)
+            (set-window-buffer (selected-window) buf)
+            (with-current-buffer buf
+              (cc-butler-mode)
+              (cc-butler--render)
+              (set-window-start (selected-window) (point-max) t)
+              (setq cc-butler-session-test--sessions
+                    (list (car (cc-butler-session-test--render-fixture))))
+              (cc-butler--render)
+              (should (<= (window-start (selected-window)) (point-max)))))
+        (kill-buffer buf)))))
+
+;;;; Interval-based refresh with per-session dirty flags
+
+(defmacro cc-butler-session-test--with-visible-list-buffer (&rest body)
+  "Run BODY with a real window showing the `*claude-sessions*' buffer,
+so `get-buffer-window' sees it as visible the way the live tick does."
+  (declare (indent 0))
+  `(let ((buf (get-buffer-create cc-butler--list-buffer-name)))
+     (unwind-protect
+         (save-window-excursion
+           (delete-other-windows)
+           (set-window-buffer (selected-window) buf)
+           ,@body)
+       (kill-buffer buf))))
+
+(defmacro cc-butler-session-test--recording-reprint (record &rest body)
+  "Run BODY with `cc-butler--reprint' stubbed to increment RECORD."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'cc-butler--reprint)
+              (lambda () (cl-incf ,record))))
+     ,@body))
+
+(ert-deftest cc-butler-session/tick-noop-when-nothing-dirty ()
+  "Nothing changed since the last draw: the tick must not redraw."
+  (let ((cc-butler--dirty-dirs (make-hash-table :test 'equal))
+        (cc-butler--force-redraw nil)
+        (calls 0))
+    (cc-butler-session-test--with-visible-list-buffer
+      (cc-butler-session-test--recording-reprint calls
+        (cc-butler--tick-refresh))
+      (should (= calls 0)))))
+
+(ert-deftest cc-butler-session/tick-redraws-and-clears-dirty-set ()
+  "A dirty session gets exactly one redraw, and the flag is consumed."
+  (let ((cc-butler--dirty-dirs (make-hash-table :test 'equal))
+        (cc-butler--force-redraw nil)
+        (calls 0))
+    (cc-butler--mark-dirty "/some/session/")
+    (cc-butler-session-test--with-visible-list-buffer
+      (cc-butler-session-test--recording-reprint calls
+        (cc-butler--tick-refresh))
+      (should (= calls 1))
+      (should (= 0 (hash-table-count cc-butler--dirty-dirs))))))
+
+(ert-deftest cc-butler-session/tick-noop-when-buffer-not-visible ()
+  "Dirty, but nobody is looking at the list — no redraw is scheduled or run."
+  (let ((cc-butler--dirty-dirs (make-hash-table :test 'equal))
+        (cc-butler--force-redraw nil)
+        (calls 0))
+    (cc-butler--mark-dirty "/some/session/")
+    (cc-butler-session-test--recording-reprint calls
+      (cc-butler--tick-refresh))
+    (should (= calls 0))
+    ;; still dirty — an invisible buffer is not "caught up"
+    (should (= 1 (hash-table-count cc-butler--dirty-dirs)))))
+
+(ert-deftest cc-butler-session/tick-honours-force-redraw-with-nothing-dirty ()
+  "Session add/remove and mid-render deferrals redraw even with an empty
+dirty set, via the force flag, and the flag is consumed same as dirty dirs."
+  (let ((cc-butler--dirty-dirs (make-hash-table :test 'equal))
+        (cc-butler--force-redraw t)
+        (calls 0))
+    (cc-butler-session-test--with-visible-list-buffer
+      (cc-butler-session-test--recording-reprint calls
+        (cc-butler--tick-refresh))
+      (should (= calls 1))
+      (should-not cc-butler--force-redraw))))
+
+(ert-deftest cc-butler-session/on-title-change-marks-only-that-sessions-dir ()
+  "The advice must resolve the terminal buffer that changed to its session
+dir — not redraw everything, not guess."
+  (let ((cc-butler--dirty-dirs (make-hash-table :test 'equal)))
+    (cl-letf (((symbol-function 'cc-butler--dir-for-buffer)
+               (lambda (_buf) "/the/right/session/")))
+      (cc-butler--on-title-change))
+    (should (gethash "/the/right/session/" cc-butler--dirty-dirs))
+    (should (= 1 (hash-table-count cc-butler--dirty-dirs)))))
+
+(ert-deftest cc-butler-session/on-title-change-is-a-noop-off-a-managed-terminal ()
+  "A title change on a buffer `cc-butler--dir-for-buffer' can't place
+(nil) must not fabricate a dirty entry."
+  (let ((cc-butler--dirty-dirs (make-hash-table :test 'equal)))
+    (cl-letf (((symbol-function 'cc-butler--dir-for-buffer) (lambda (_buf) nil)))
+      (cc-butler--on-title-change))
+    (should (= 0 (hash-table-count cc-butler--dirty-dirs)))))
+
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here
