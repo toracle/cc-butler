@@ -585,23 +585,11 @@ it under the outer one's feet, leaving the outer loop inserting its remaining
 rows wherever the inner one left point and recording positions that are no
 longer positions in the buffer anyone is looking at.")
 
-(defun cc-butler--render ()
-  "Render all live sessions as multi-line blocks in the current buffer,
-preserving the cursor's current session across the redraw when possible
-(falls back to point-min only if that session is no longer present).
-
-A refresh that arrives while this is already drawing is DEFERRED, not run:
-see `cc-butler--rendering'.  Nothing is lost by deferring — the request is
-handed to the same debounced refresh every other caller uses, so the newer
-state is drawn a moment later by a redraw that starts from a whole buffer."
-  (if cc-butler--rendering
-      (progn (cc-butler--schedule-refresh) nil)
-    (let ((cc-butler--rendering t)
-          (inhibit-read-only t)
-          (dir (cc-butler--dir-at-point))
-          (sessions (cc-butler--ordered (cc-butler--sessions)))
-          entries)
-      (erase-buffer)
+(defun cc-butler--render-rows (sessions)
+  "Insert SESSIONS as multi-line blocks into the current buffer.
+Returns an alist mapping each session's dir to the buffer position
+where its block starts."
+  (let (entries)
     (if (null sessions)
         (insert (propertize "No active Claude sessions.\n\n" 'face 'shadow)
                 (propertize "c" 'face 'bold) " start   "
@@ -668,11 +656,61 @@ state is drawn a moment later by a redraw that starts from a whole buffer."
               (insert "   " (mapconcat #'identity segments "   ") "\n")))
           (insert "\n")
           (put-text-property start (point) 'cc-butler-dir (plist-get s :dir)))))
-      (setq cc-butler--entries (nreverse entries))
-      (if-let ((e (and dir (assoc dir cc-butler--entries))))
-          (goto-char (cdr e))
-        (goto-char (point-min)))
-      (cc-butler--highlight))))
+    (nreverse entries)))
+
+(defun cc-butler--render ()
+  "Render all live sessions as multi-line blocks in the current buffer,
+preserving the cursor's current session across the redraw when possible
+(falls back to point-min only if that session is no longer present), and
+preserving every displayed window's scroll position (`window-start').
+
+A tick can mark a session dirty without its rendered block actually
+changing (e.g. a title update that renders to the same text).  The new
+content is built in a scratch buffer first and compared against what is
+already on screen — if the two are `equal-including-properties', the real
+buffer is left untouched entirely: a session list with an active
+session in it would otherwise redraw (and visibly flash) every tick even
+when nothing displayed is different.
+
+A refresh that arrives while this is already drawing is DEFERRED, not run:
+see `cc-butler--rendering'.  Nothing is lost by deferring — it forces a
+redraw on the next interval tick (`cc-butler--request-redraw'), so the
+newer state is drawn a moment later by a redraw that starts from a whole
+buffer."
+  (if cc-butler--rendering
+      (progn (cc-butler--request-redraw) nil)
+    (let* ((cc-butler--rendering t)
+           (dir (cc-butler--dir-at-point))
+           (sessions (cc-butler--ordered (cc-butler--sessions)))
+           (built (with-temp-buffer
+                    (let ((entries (cc-butler--render-rows sessions)))
+                      (cons (buffer-string) entries))))
+           (new-content (car built))
+           (entries (cdr built)))
+      (unless (equal-including-properties new-content (buffer-string))
+        (let ((inhibit-read-only t)
+              (starts (mapcar (lambda (w) (cons w (window-start w)))
+                               (get-buffer-window-list (current-buffer) nil t))))
+          (erase-buffer)
+          (insert new-content)
+          (setq cc-butler--entries entries)
+          (if-let ((e (and dir (assoc dir entries))))
+              (goto-char (cdr e))
+            (goto-char (point-min)))
+          (cc-butler--highlight)
+          ;; erase-buffer discards the old text, but not the window's memory of
+          ;; where it was scrolled to — left alone, every redraw snaps back to
+          ;; wherever point landed, which reads as the list jiggling/jumping
+          ;; even when the visible rows didn't actually change.  Put each
+          ;; window back where it was, clamped to the new (possibly shorter)
+          ;; buffer.  NOFORCE must be nil here: non-nil means "abandon POS and
+          ;; let redisplay pick its own start if point isn't visible there" —
+          ;; the exact recentering this is meant to prevent.  With nil, POS
+          ;; wins and point silently relocates within the window instead of
+          ;; the window jumping to point.
+          (dolist (ws starts)
+            (when (window-live-p (car ws))
+              (set-window-start (car ws) (min (cdr ws) (point-max)) nil))))))))
 
 (defun cc-butler--list-buffer ()
   "Return the session-list buffer, (re)rendering its contents."
@@ -681,6 +719,7 @@ state is drawn a moment later by a redraw that starts from a whole buffer."
       (unless (derived-mode-p 'cc-butler-mode)
         (cc-butler-mode))
       (cc-butler--render))
+    (cc-butler--ensure-interval-timer)
     buf))
 
 (defun cc-butler--dir-at-point ()
@@ -726,22 +765,57 @@ the selected session when possible."
 
 ;;;; Live updates from terminal title changes
 
-(defvar cc-butler--refresh-timer nil
-  "Debounce timer for live refreshes triggered by terminal title changes.")
+(defcustom cc-butler-refresh-interval 2.0
+  "Seconds between redraws of the session list while something is dirty.
+A title change marks its session dirty immediately (cheap, no timer); the
+actual redraw happens on this fixed cadence instead of once per change, so
+a busy fleet emitting many title updates a second does not repaint the
+whole list that often."
+  :type 'number
+  :group 'cc-butler)
 
-(defun cc-butler--schedule-refresh ()
-  "Debounced reprint, only while the list window is visible."
-  (when (get-buffer-window cc-butler--list-buffer-name)
-    (when (timerp cc-butler--refresh-timer)
-      (cancel-timer cc-butler--refresh-timer))
-    (setq cc-butler--refresh-timer
-          (run-with-idle-timer 0.3 nil #'cc-butler--reprint))))
+(defvar cc-butler--dirty-dirs (make-hash-table :test 'equal)
+  "Set (dir -> t) of sessions that changed since the last redraw.
+Consulted and cleared by `cc-butler--tick-refresh'.")
+
+(defvar cc-butler--force-redraw nil
+  "Non-nil when the next tick must redraw regardless of `cc-butler--dirty-dirs'.
+Set when a session is added/removed, or when a render deferred because
+another render was already in flight — neither names a single dirty dir.")
+
+(defvar cc-butler--interval-timer nil
+  "Repeating timer driving `cc-butler--tick-refresh', or nil before first use.")
+
+(defun cc-butler--mark-dirty (dir)
+  "Record that session DIR changed since the last redraw."
+  (when dir (puthash dir t cc-butler--dirty-dirs)))
+
+(defun cc-butler--request-redraw ()
+  "Ask for a full redraw on the next tick, independent of any single session."
+  (setq cc-butler--force-redraw t))
+
+(defun cc-butler--tick-refresh ()
+  "Redraw the session list if it is visible and something is dirty."
+  (when (and (or cc-butler--force-redraw
+                 (> (hash-table-count cc-butler--dirty-dirs) 0))
+             (get-buffer-window cc-butler--list-buffer-name))
+    (clrhash cc-butler--dirty-dirs)
+    (setq cc-butler--force-redraw nil)
+    (cc-butler--reprint)))
+
+(defun cc-butler--ensure-interval-timer ()
+  "Start the interval-refresh timer if it is not already running."
+  (unless (timerp cc-butler--interval-timer)
+    (setq cc-butler--interval-timer
+          (run-with-timer cc-butler-refresh-interval cc-butler-refresh-interval
+                           #'cc-butler--tick-refresh))))
 
 (defun cc-butler--on-title-change (&rest _)
-  "Advice on `ghostel--set-title': nudge the manager to refresh live.
+  "Advice on `ghostel--set-title': mark the session dirty for the next tick.
 Claude emits an OSC 2 title as it works; the module funcalls
-`ghostel--set-title' on each change, which we ride to update the list."
-  (cc-butler--schedule-refresh))
+`ghostel--set-title' on each change with the terminal buffer current, which
+`cc-butler--dir-for-buffer' maps back to the session it belongs to."
+  (cc-butler--mark-dirty (cc-butler--dir-for-buffer (current-buffer))))
 
 (with-eval-after-load 'ghostel
   (when (fboundp 'ghostel--set-title)
@@ -750,11 +824,12 @@ Claude emits an OSC 2 title as it works; the module funcalls
 ;;;; Reflect session start / stop in the manager
 
 (defun cc-butler--on-session-change (&rest _)
-  "Advice: refresh the manager when a session is registered or torn down.
+  "Advice: redraw the manager when a session is registered or torn down.
 `claude-code-ide--set-process' adds a session to the registry (the point
 at which it becomes enumerable), and `claude-code-ide--cleanup-on-exit'
-removes it."
-  (cc-butler--schedule-refresh))
+removes it.  A row appearing/disappearing isn't one dirty dir, so this
+forces a full redraw on the next tick rather than marking dirty."
+  (cc-butler--request-redraw))
 
 (advice-add 'claude-code-ide--set-process :after #'cc-butler--on-session-change)
 (advice-add 'claude-code-ide--cleanup-on-exit :after #'cc-butler--on-session-change)
