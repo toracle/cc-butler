@@ -23,11 +23,18 @@
 (require 'cc-butler-orchestrator)
 
 (defcustom cc-butler-north-star-file
-  (expand-file-name "north-star.org" "~/projects/cc-butler-governance/")
+  (expand-file-name "north-star.org"
+                     "~/obsidian/warmble-jumble/3-resources/cc-butler-governance/")
   "Org file listing active goals and their Definition of Done.
 Lives in the private governance store, not the public `toracle/cc-butler'
 checkout — goal descriptions routinely name real projects and people, the
-same reason the governance store itself was moved out of a public repo."
+same reason the governance store itself was moved out of a public repo.
+
+The governance store's canonical location is the warmble-jumble vault's
+~/obsidian clone specifically — there are two local clones of that repo
+on this machine and only ~/obsidian/warmble-jumble is what the vault's
+own tooling (vault_paths.py, push-vault.sh, the Stop hook) treats as
+canonical; see `cc-butler-governance-dir'."
   :type 'file
   :group 'cc-butler)
 
