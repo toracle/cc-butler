@@ -23,16 +23,17 @@
 (require 'cc-butler-orchestrator)
 (require 'cc-butler-governance)
 
-(defcustom cc-butler-fleet-name "monocle"
+(defcustom cc-butler-fleet-name "x600"
   "Identity of THIS cc-butler fleet, as opposed to some other fleet.
 The governance store (`cc-butler-governance-store') is shared across
 possibly-multiple cc-butler fleets — 정수님, 2026-08-13 — so anything
 fleet-specific must be namespaced by this rather than assuming the
-store is this fleet's alone.  No dedicated fleet-identity variable
-existed before this; \"monocle\" is the closest existing identity in
-config (the private topic template of that name), even though this
-fleet is not monocle-exclusive (it also runs dealmatch/cc-butler work)
-— it is a placeholder default, not a claim that this fleet IS monocle."
+store is this fleet's alone.  Named per MACHINE/INSTANCE (this one is
+the Desk Mini X600), not per client project: an earlier \"monocle\"
+default was wrong for exactly the reason this variable exists — other
+fleets ALSO work on monocle, so a project name can't distinguish
+fleets; 정수님's own words, 2026-08-13, independently reaching the
+same conclusion this docstring already flagged."
   :type 'string
   :group 'cc-butler)
 
