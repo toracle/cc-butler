@@ -171,11 +171,18 @@ answerable; `note'/`relay' render a read-only notification."
 
 (defun cc-butler--decision-render (msg &optional dir)
   "Render decision MSG to a timestamped file in DIR; return the path.
-DIR defaults to open/."
+DIR defaults to open/.  For any `:kind' other than `decision' the
+filename gets a `.KIND' suffix before `.org' (e.g. `ID.note.org'), so
+`cc-butler--decision-file-kind' can classify open/ documents -- e.g.
+to exclude a note/relay from the answer-required backlog count -- from
+the filename alone, with no file content read."
   (let* ((id (or (plist-get msg :id) (cc-butler--mail-id)))
          (msg (plist-put msg :id id))
-         (file (expand-file-name (format "%s.org" id)
-                                 (or dir (cc-butler--decision-open-dir)))))
+         (kind (or (plist-get msg :kind) 'decision))
+         (file (expand-file-name
+                (if (eq kind 'decision) (format "%s.org" id)
+                  (format "%s.%s.org" id kind))
+                (or dir (cc-butler--decision-open-dir)))))
     (with-temp-file file (insert (cc-butler--decision-doc-string msg)))
     file))
 
@@ -653,10 +660,17 @@ Leaving this nil is what protects an answer-in-progress from being interrupted."
 (defvar cc-butler--decision-watch nil
   "The `file-notify' descriptor for 정수님's inbox, or nil.")
 
-(defun cc-butler--decision-open-count ()
-  (length (ignore-errors
-            (directory-files (cc-butler--decision-open-dir) nil
-                             cc-butler--decision-org-re))))
+(defun cc-butler--decision-file-kind (filename)
+  "Return the `:kind' symbol encoded in FILENAME, defaulting to `decision'.
+Reads the `.KIND.org' suffix `cc-butler--decision-render' writes for any
+non-`decision' kind -- from the name alone, no file content read.  A
+plain `ID.org', including every file written before this encoding
+existed, is `decision' -- correct, since all of those really were
+decisions (see governance
+escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes)."
+  (if (string-match "\\.\\(note\\|relay\\|briefing\\)\\.org\\'" filename)
+      (intern (match-string 1 filename))
+    'decision))
 
 (defun cc-butler--decision-file-time (filename)
   "Parse FILENAME's leading id timestamp into a float-time, or nil if it
@@ -683,11 +697,22 @@ filename is written once, at creation, and never rewritten."
         (t (format "%dd" (round (/ seconds 86400))))))
 
 (defun cc-butler--decision-open-files-and-oldest ()
-  "Return (FILES . OLDEST-FLOAT-TIME-OR-NIL) for the open/ dir, one
-`directory-files' call shared by the indicator and the backlog line
-below so neither re-lists the directory the other just listed."
-  (let ((files (ignore-errors (directory-files (cc-butler--decision-open-dir) nil
-                                                cc-butler--decision-org-re))))
+  "Return (FILES . OLDEST-FLOAT-TIME-OR-NIL) for `decision'-kind documents
+in the open/ dir -- the answer-required subset -- one `directory-files'
+call shared by the indicator and the backlog line below so neither
+re-lists the directory the other just listed.
+
+A `note'/`relay'/`briefing' document renders read-only in this same
+open/ directory (see `cc-butler--decision-render') but needs no answer,
+so counting it here would reproduce, under a new label, the exact
+backlog-inflation this counting feature exists to fix -- see governance
+escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes.
+Classification reads the FILENAME only (`cc-butler--decision-file-kind'),
+never file content, so this stays cheap even at hundreds of files and on
+every arrival, where `cc-butler--decision-update-indicator' calls it."
+  (let ((files (delq nil (mapcar (lambda (f) (and (eq (cc-butler--decision-file-kind f) 'decision) f))
+                                  (ignore-errors (directory-files (cc-butler--decision-open-dir) nil
+                                                                   cc-butler--decision-org-re))))))
     (cons files
           (let ((times (delq nil (mapcar #'cc-butler--decision-file-time files))))
             (and times (apply #'min times))))))
@@ -950,7 +975,9 @@ touched; end early with `cc-butler-decision-demo-end'."
                     (string-trim cc-butler--decision-indicator))
             "   The decision opened in a side window — org highlighting, and read-only\n"
             "   everywhere except the answer region (the integrity guarantee).\n"
-            "   (The `note' message did NOT queue — it went straight to done/.)\n\n"
+            "   (The `note' message rendered read-only in open/ too, but the ⚖ count\n"
+            "   above only counts answer-required decisions -- it's excluded. `r' closes\n"
+            "   it to done/, same mechanism as a decision, just no answer required.)\n\n"
             "2. ANSWER (your turn — the conversation half):\n"
             "   In the decision buffer:\n"
             "     a. tick an option:  - [ ] A   →   - [X] A\n"

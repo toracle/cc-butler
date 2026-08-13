@@ -1293,9 +1293,14 @@ this is a notification, not a decision — see governance
 escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes
 for why getting this wrong silently manufactures a backlog that looks
 like neglect but is really miscategorization. A notification renders
-read-only through the same delivery pipeline as a decision (the
-watcher, the mode-line indicator) but is never answerable and does not
-sit in the answer-required queue.
+read-only through the same delivery pipeline as a decision, into the
+SAME open/ directory -- it does not land in done/ on arrival, and
+closing it (open/ -> done/) still takes a manual `r' (mark-read), same
+as a decision. What actually differs: it is never answerable, and it
+is excluded from the ⚖ mode-line count and the pending_decisions
+backlog line (`cc-butler--decision-open-files-and-oldest' classifies
+by filename, not by directory), so it does not inflate the
+answer-required number the way a real decision would.
 
 When the decision workflow is active, both kinds render as a document
 in 정수님's inbox; otherwise (workflow off) this always queues for
@@ -1443,7 +1448,7 @@ only says how many and how stale the oldest is."
 (claude-code-ide-make-tool
  :function #'cc-butler-tool-escalate-to-butler
  :name "escalate_to_butler"
- :description "Steward only: raise a DECISION or send a NOTIFICATION to the user-facing butler's quiet queue. A decision needs a human answer (a choice, an approval, missing info) — use it for that, not routine progress. A notification (kind='notification') is for status that only needs to be READ — a correction, a completion, a 'you should know this' — and renders read-only; it never sits in the answer-required queue. Ask yourself first: would anything the human could say change what happens next? If not, send it as a notification. Getting this wrong (sending status as a decision) silently accumulates as a backlog that looks like neglect but is really miscategorized FYIs. The butler drains decisions via pending_decisions and relays the answer back to you with send_to_session; a notification has nothing to relay back."
+ :description "Steward only: raise a DECISION or send a NOTIFICATION to the user-facing butler's quiet queue. A decision needs a human answer (a choice, an approval, missing info) — use it for that, not routine progress. A notification (kind='notification') is for status that only needs to be READ — a correction, a completion, a 'you should know this' — and renders read-only, same as a decision, in the same open/ location; it is never answerable, and it does not count toward the ⚖ answer-required backlog (indicator or pending_decisions), but a human still closes it with one keypress (r) rather than it disappearing on its own. Ask yourself first: would anything the human could say change what happens next? If not, send it as a notification. Getting this wrong (sending status as a decision) silently accumulates as a backlog that looks like neglect but is really miscategorized FYIs. The butler drains decisions via pending_decisions and relays the answer back to you with send_to_session; a notification has nothing to relay back."
  :args '((:name "summary"
                 :type string
                 :description "The decision or status, stated plainly (e.g. 'billing worker: use Stripe or Paddle?' or 'retracting my earlier mixin hypothesis — it was wrong').")
