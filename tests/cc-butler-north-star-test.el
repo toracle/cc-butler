@@ -63,7 +63,7 @@ already exists."
                      (cc-butler-north-star-test--recorded-writes)))))
 
 (ert-deftest cc-butler-north-star/fire-noop-when-butler-busy ()
-  "A butler mid-turn must not be typed into — a 2-hour housekeeping ping
+  "A butler mid-turn must not be typed into — an hourly housekeeping ping
 landing mid-generation could scramble whatever it is doing."
   (cc-butler-north-star-test--with-stub-terminal
     (cl-letf (((symbol-function 'cc-butler--session-last-activity)

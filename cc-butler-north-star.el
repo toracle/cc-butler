@@ -31,7 +31,7 @@ same reason the governance store itself was moved out of a public repo."
   :type 'file
   :group 'cc-butler)
 
-(defcustom cc-butler-north-star-interval (* 2 60 60)
+(defcustom cc-butler-north-star-interval (* 1 60 60)
   "Seconds between North Star self-check nudges to the butler."
   :type 'number
   :group 'cc-butler)
@@ -78,7 +78,7 @@ is exactly the kind of thing nobody notices until the file is unusable."
   "Nudge the butler to self-check active North Stars against their DoD.
 Mirrors `cc-butler--forward-backstop': only types into the butler's
 terminal when it looks idle (`cc-butler--forward-ops-free-p'), so a
-2-hour housekeeping ping cannot land mid-turn and scramble whatever the
+hourly housekeeping ping cannot land mid-turn and scramble whatever the
 butler is actually doing."
   (when-let* ((butler cc-butler--butler)
               (buf (get-buffer (claude-code-ide--get-buffer-name butler)))
