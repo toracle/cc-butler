@@ -68,7 +68,7 @@
   "
  _n_ext  _p_rev  _RET_ open  _SPC_ preview  _g_ refresh  _q_ quit
  _c_ new session   _N_ew topic   _K_ close topic   _h_ doctor   _l_og
- _B_utler   _S_teward   _b_ set butler   _i_nbox
+ _B_utler   _S_teward   _b_ set butler   _i_nbox   _*_ north star check
  doc panel:  _d_ toggle  _o_pen  _v_ reopen  _D_ remove
 "
   ("n" cc-butler-next)
@@ -85,6 +85,7 @@
   ("S" cc-butler-start-steward)
   ("b" cc-butler-set-butler)
   ("i" cc-butler-inbox)
+  ("*" cc-butler-north-star-check)
   ("d" cc-butler-doc-toggle)
   ("o" cc-butler-doc-open)
   ("v" cc-butler-doc-reopen)
