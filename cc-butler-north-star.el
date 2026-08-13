@@ -25,9 +25,20 @@
 (defcustom cc-butler-north-star-file
   (expand-file-name "north-star.org" "~/projects/cc-butler-governance/")
   "Org file listing active goals and their Definition of Done.
-Lives in the private governance store, not the public `toracle/cc-butler'
-checkout — goal descriptions routinely name real projects and people, the
-same reason the governance store itself was moved out of a public repo."
+This default lives in the private governance store, not the public
+`toracle/cc-butler' checkout — goal descriptions routinely name real
+projects and people, the same reason the governance store itself was
+moved out of a public repo. NOTE (2026-08-13): governance principles now
+live in a shared org vault (multiple cc-butler fleets merge into one
+principle store there), but North Star goals do NOT merge — each fleet's
+active goals are that fleet's own. A fleet that migrates its principles
+into the shared vault should therefore pin this variable explicitly
+(e.g. in custom.el, NOT by editing this default) to a
+fleet-namespaced filename inside that vault, such as
+\"north-star-<fleet-id>.org\", so it sits alongside other fleets' files
+without colliding. This default value is intentionally left pointing at
+the private local store — see the live pin for what a given machine
+actually uses; do not infer the running value from this default."
   :type 'file
   :group 'cc-butler)
 
