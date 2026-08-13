@@ -35,7 +35,7 @@
 (declare-function cc-butler-mail-up-decision "cc-butler-mail" (from-dir summary needs))
 (declare-function cc-butler-mail-up-drain "cc-butler-mail" (agent-dir))
 (declare-function cc-butler--check-inbox-drain-as "cc-butler-mail" (agent-name))
-(declare-function cc-butler-decision-create "cc-butler-decision" (from-dir summary needs options))
+(declare-function cc-butler-decision-create "cc-butler-decision" (from-dir summary needs options &optional kind))
 (declare-function cc-butler--decision-parse-options "cc-butler-decision" (s))
 (declare-function cc-butler-docs--auto-log "cc-butler-docs" (dir body))
 (defvar cc-butler-decision-workflow)
@@ -1265,23 +1265,55 @@ butler only ever sees decisions, drained via `pending_decisions'.")
                  (format "  needs: %s\n" (string-trim needs))))
        nil file t 'silent))))
 
-(defun cc-butler-tool-escalate-to-butler (summary &optional needs options)
-  "MCP tool (steward -> butler): raise a decision for the human to answer.
-SUMMARY is the question, NEEDS what is needed, and OPTIONS an optional string
-of choices (one `Label — tradeoff' per line) for a pick-one answer.  Types
-NOTHING into any terminal.  When the decision workflow is active the decision
-is rendered as a document in 정수님's inbox; otherwise it queues for
-`pending_decisions'.  Either way it is appended to the shared `decisions.org'."
+(defun cc-butler--escalate-kind (kind)
+  "Normalize an `escalate_to_butler' KIND string to `decision' or `note'.
+Anything other than exactly \"notification\" (trimmed, case-insensitive)
+-- including nil, a typo, or garbage -- falls back to `decision'. That
+is the safe direction: a real decision silently downgraded to a
+read-only notification could go unanswered without anyone noticing,
+while a notification that stays answerable is only today's status quo,
+not a new failure. See governance
+escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes."
+  (if (and kind (stringp kind)
+           (string-equal (downcase (string-trim kind)) "notification"))
+      'note
+    'decision))
+
+(defun cc-butler-tool-escalate-to-butler (summary &optional needs options kind)
+  "MCP tool (steward -> butler): raise a DECISION or a NOTIFICATION for
+the butler to relay to the human.
+SUMMARY is the question or status, NEEDS is what is needed (decisions
+only), OPTIONS an optional string of choices (one `Label — tradeoff'
+per line) for a pick-one answer, and KIND \"decision\" (default) or
+\"notification\". Types NOTHING into any terminal.
+
+KIND governs whether this needs an answer at all. Ask before calling:
+would anything the human could say change what happens next? If not,
+this is a notification, not a decision — see governance
+escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes
+for why getting this wrong silently manufactures a backlog that looks
+like neglect but is really miscategorization. A notification renders
+read-only through the same delivery pipeline as a decision (the
+watcher, the mode-line indicator) but is never answerable and does not
+sit in the answer-required queue.
+
+When the decision workflow is active, both kinds render as a document
+in 정수님's inbox; otherwise (workflow off) this always queues for
+`pending_decisions' as a plain entry regardless of KIND — that legacy
+path has no notion of a read-only item, so KIND only has teeth once
+the workflow is on. Either way it is appended to the shared
+`decisions.org'."
   (unless (and summary (stringp summary) (not (string-empty-p (string-trim summary))))
     (error "A decision summary is required"))
   (let* ((self (cc-butler--caller-dir))
          (s (string-trim summary))
          (n (and needs (stringp needs)
-                 (not (string-empty-p (string-trim needs))) (string-trim needs))))
+                 (not (string-empty-p (string-trim needs))) (string-trim needs)))
+         (k (cc-butler--escalate-kind kind)))
     (cond
-     ;; human adapter create-path: decision → 정수님's inbox (the watcher renders it)
+     ;; human adapter create-path: decision/note → 정수님's inbox (the watcher renders it)
      ((bound-and-true-p cc-butler-decision-workflow)
-      (cc-butler-decision-create self s n (cc-butler--decision-parse-options options)))
+      (cc-butler-decision-create self s n (cc-butler--decision-parse-options options) k))
      ;; durable agent path: butler's maildir inbox
      ((eq cc-butler-message-transport 'maildir)
       (cc-butler-mail-up-decision self s n))
@@ -1291,10 +1323,12 @@ is rendered as a document in 정수님's inbox; otherwise it queues for
                     :summary s :needs n)
               cc-butler--butler-inbox)))
     (cc-butler--append-decision self s needs)   ; decisions.org audit doc, all paths
-    (cc-butler--log "%s -> butler [decision] | %s"
-                    (if self (cc-butler--who-dir self) "steward") s)
+    (cc-butler--log "%s -> butler [%s] | %s"
+                    (if self (cc-butler--who-dir self) "steward") k s)
     (cc-butler--maybe-refresh)
-    "Escalated the decision (rendered for 정수님 when the workflow is on, else queued for pending_decisions)."))
+    (if (eq k 'note)
+        "Sent as a notification (read-only; no answer expected)."
+      "Escalated the decision (rendered for 정수님 when the workflow is on, else queued for pending_decisions).")))
 
 ;;;; ---- draining without destroying ---------------------------------
 
@@ -1391,17 +1425,21 @@ how an ordinary hand-off gets reported as a lost message."
 (claude-code-ide-make-tool
  :function #'cc-butler-tool-escalate-to-butler
  :name "escalate_to_butler"
- :description "Steward only: raise a DECISION to the user-facing butler's quiet queue, for the butler to present to the human. Use it when something genuinely needs a human decision or input (not routine progress — that stays with you). The butler drains this via pending_decisions and relays the answer back to you with send_to_session. State the decision plainly in `summary' and exactly what is needed in `needs'."
+ :description "Steward only: raise a DECISION or send a NOTIFICATION to the user-facing butler's quiet queue. A decision needs a human answer (a choice, an approval, missing info) — use it for that, not routine progress. A notification (kind='notification') is for status that only needs to be READ — a correction, a completion, a 'you should know this' — and renders read-only; it never sits in the answer-required queue. Ask yourself first: would anything the human could say change what happens next? If not, send it as a notification. Getting this wrong (sending status as a decision) silently accumulates as a backlog that looks like neglect but is really miscategorized FYIs. The butler drains decisions via pending_decisions and relays the answer back to you with send_to_session; a notification has nothing to relay back."
  :args '((:name "summary"
                 :type string
-                :description "The decision to be made, stated plainly (e.g. 'billing worker: use Stripe or Paddle?').")
+                :description "The decision or status, stated plainly (e.g. 'billing worker: use Stripe or Paddle?' or 'retracting my earlier mixin hypothesis — it was wrong').")
          (:name "needs"
                 :type string
-                :description "Exactly what you need from the human (a choice, an approval, missing info). Optional."
+                :description "Decisions only: exactly what you need from the human (a choice, an approval, missing info). Leave empty for a notification — there is nothing to need."
                 :optional t)
          (:name "options"
                 :type string
-                :description "Optional choices for a pick-one answer, one per line as 'Label — tradeoff' (tradeoff optional), e.g. 'Stripe — lower fees\\nPaddle — handles VAT'. Rendered as selectable options in the decision document."
+                :description "Decisions only: choices for a pick-one answer, one per line as 'Label — tradeoff' (tradeoff optional), e.g. 'Stripe — lower fees\\nPaddle — handles VAT'. Rendered as selectable options in the decision document. Ignored for a notification."
+                :optional t)
+         (:name "kind"
+                :type string
+                :description "'decision' (default) if this needs a pick-one/approve answer; 'notification' if it's status only and should be READ, not answered. Anything other than exactly 'notification' is treated as a decision — when unsure, the default is the safe choice."
                 :optional t)))
 
 (claude-code-ide-make-tool

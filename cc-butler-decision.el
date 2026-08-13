@@ -210,16 +210,20 @@ One option per line, `Label — tradeoff' (the tradeoff, after - or —, optiona
                    (list :label l)))))
            (split-string s "\n")))))
 
-(defun cc-butler-decision-create (from-dir summary needs options)
-  "Deliver a decision to 정수님's inbox (the human-adapter create-path).
-FROM-DIR is the escalating session; 정수님's answer returns to it via the
-correlation.  OPTIONS is a list of (:label :tradeoff).  Returns the id.
+(defun cc-butler-decision-create (from-dir summary needs options &optional kind)
+  "Deliver a decision, or (KIND `note') a read-only notification, to
+정수님's inbox (the human-adapter create-path).
+FROM-DIR is the escalating session; for a decision, 정수님's answer
+returns to it via the correlation -- a note has no answer to
+correlate, but FROM-DIR is still shown as the sender. OPTIONS is a
+list of (:label :tradeoff), meaningful only for a decision. KIND
+defaults to `decision'. Returns the id.
 The arrival watcher renders it when the workflow is active."
   (let ((id (cc-butler--mail-id))
         (from (and from-dir (cc-butler--display-name from-dir))))
     (cc-butler--ch-deliver
      cc-butler-human-agent
-     (list :id id :kind 'decision :from from :reply-to from
+     (list :id id :kind (or kind 'decision) :from from :reply-to from
            :summary summary :needs needs :options options))
     id))
 
