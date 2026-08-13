@@ -21,9 +21,24 @@
 ;;; Code:
 
 (require 'cc-butler-orchestrator)
+(require 'cc-butler-governance)
+
+(defcustom cc-butler-fleet-name "monocle"
+  "Identity of THIS cc-butler fleet, as opposed to some other fleet.
+The governance store (`cc-butler-governance-store') is shared across
+possibly-multiple cc-butler fleets — 정수님, 2026-08-13 — so anything
+fleet-specific must be namespaced by this rather than assuming the
+store is this fleet's alone.  No dedicated fleet-identity variable
+existed before this; \"monocle\" is the closest existing identity in
+config (the private topic template of that name), even though this
+fleet is not monocle-exclusive (it also runs dealmatch/cc-butler work)
+— it is a placeholder default, not a claim that this fleet IS monocle."
+  :type 'string
+  :group 'cc-butler)
 
 (defcustom cc-butler-north-star-file
-  (expand-file-name "north-star.org" "~/projects/cc-butler-governance/")
+  (expand-file-name (format "north-star-%s.org" cc-butler-fleet-name)
+                     (cc-butler-governance-store))
   "Org file listing active goals and their Definition of Done.
 This default lives in the private governance store, not the public
 `toracle/cc-butler' checkout — goal descriptions routinely name real
