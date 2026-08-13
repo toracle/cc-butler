@@ -1352,34 +1352,52 @@ how an ordinary hand-off gets reported as a lost message."
                                 (plist-get (car (last archive)) :time)))))
 
 (defun cc-butler-tool-pending-decisions ()
-  "MCP tool (butler): drain the quiet decision queue (steward escalations)."
-  (if (eq cc-butler-message-transport 'maildir)
-      (let ((msgs (cc-butler-mail-up-drain (cc-butler--caller-dir))))
-        (if (null msgs) "No pending decisions."
-          (mapconcat
-           (lambda (m)
-             (format "- %s%s%s" (plist-get m :summary)
-                     (if (plist-get m :from) (format " (from %s)" (plist-get m :from)) "")
-                     (if (plist-get m :needs) (format " . needs: %s" (plist-get m :needs)) "")))
-           msgs "\n")))
-    (if (null cc-butler--butler-inbox)
-        (cc-butler--nothing-pending "No pending decisions."
-                                    cc-butler--butler-inbox-drained)
-      (let* ((events (reverse cc-butler--butler-inbox))
-             ;; Render BEFORE touching the queue: if this signals, the items
-             ;; are still there to try again with.
-             (text (mapconcat
-                    (lambda (e)
-                      (format "- [%s] %s%s%s"
-                              (format-time-string "%H:%M" (plist-get e :time))
-                              (plist-get e :summary)
-                              (if (plist-get e :name) (format " (from %s)" (plist-get e :name)) "")
-                              (if (plist-get e :needs) (format " . needs: %s" (plist-get e :needs)) "")))
-                    events "\n")))
-        (setq cc-butler--butler-inbox-drained
-              (cc-butler--archive-drained cc-butler--butler-inbox-drained events))
-        (setq cc-butler--butler-inbox nil)
-        text))))
+  "MCP tool (butler): drain the quiet decision queue (steward escalations).
+
+When `cc-butler-decision-workflow' is active, `escalate_to_butler' routes
+decisions entirely to the human-adapter's answerable org documents
+(`open/'), never to this drain -- see `cc-butler-decision-workflow''s own
+KNOWN-GAP docstring in cc-butler-decision.el. That made this function
+able to say \"No pending decisions\" while hundreds sat unaddressed in
+open/, asserting a falsehood rather than reporting nothing. A read-only,
+non-destructive backlog line (`cc-butler--decision-open-backlog-line')
+is appended below when that workflow is on, so this tool stops lying by
+omission -- it still does not list or drain those documents individually,
+only says how many and how stale the oldest is."
+  (let ((drained
+         (if (eq cc-butler-message-transport 'maildir)
+             (let ((msgs (cc-butler-mail-up-drain (cc-butler--caller-dir))))
+               (if (null msgs) "No pending decisions."
+                 (mapconcat
+                  (lambda (m)
+                    (format "- %s%s%s" (plist-get m :summary)
+                            (if (plist-get m :from) (format " (from %s)" (plist-get m :from)) "")
+                            (if (plist-get m :needs) (format " . needs: %s" (plist-get m :needs)) "")))
+                  msgs "\n")))
+           (if (null cc-butler--butler-inbox)
+               (cc-butler--nothing-pending "No pending decisions."
+                                           cc-butler--butler-inbox-drained)
+             (let* ((events (reverse cc-butler--butler-inbox))
+                    ;; Render BEFORE touching the queue: if this signals, the items
+                    ;; are still there to try again with.
+                    (text (mapconcat
+                           (lambda (e)
+                             (format "- [%s] %s%s%s"
+                                     (format-time-string "%H:%M" (plist-get e :time))
+                                     (plist-get e :summary)
+                                     (if (plist-get e :name) (format " (from %s)" (plist-get e :name)) "")
+                                     (if (plist-get e :needs) (format " . needs: %s" (plist-get e :needs)) "")))
+                           events "\n")))
+               (setq cc-butler--butler-inbox-drained
+                     (cc-butler--archive-drained cc-butler--butler-inbox-drained events))
+               (setq cc-butler--butler-inbox nil)
+               text))))
+        (backlog (and (bound-and-true-p cc-butler-decision-workflow)
+                      (fboundp 'cc-butler--decision-open-backlog-line)
+                      (ignore-errors (cc-butler--decision-open-backlog-line)))))
+    (cond ((null backlog) drained)
+          ((equal drained "No pending decisions.") backlog)
+          (t (concat drained "\n\n" backlog)))))
 
 (setq claude-code-ide-mcp-server-tools
       (seq-remove

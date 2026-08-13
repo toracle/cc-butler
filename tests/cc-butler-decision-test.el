@@ -176,6 +176,75 @@ counted by the indicator — it stays visible until `r' closes it."
       (should (= 0 (length (directory-files (cc-butler--decision-done-dir) nil "\\`[^.].*\\.org\\'"))))
       (should (equal " ⚖1" cc-butler--decision-indicator)))))
 
+;;;; ---- open/ backlog staleness (count + oldest age) ------------------
+;;;; The existing arrival tests above use fake ids ("d9"/"n9") that don't
+;;;; match the timestamp format, so they never exercise the age-parsing
+;;;; path at all -- `oldest' stays nil and the indicator degrades to the
+;;;; old bare-count string.  These tests use real `cc-butler--mail-id'-
+;;;; shaped filenames specifically to hit that path.
+
+(ert-deftest cc-butler-decision/file-time-parses-real-id ()
+  "A real id's leading timestamp parses to the matching float-time."
+  (should (equal (cc-butler--decision-file-time "20260704T145334-1585617-0019.org")
+                  (float-time (encode-time 0 53 14 4 7 2026)))))
+
+(ert-deftest cc-butler-decision/file-time-nil-for-non-timestamp-name ()
+  "A filename not starting with the id timestamp shape (e.g. a test's
+hand-picked short id) returns nil, not a wrong guess."
+  (should (null (cc-butler--decision-file-time "d9.org")))
+  (should (null (cc-butler--decision-file-time "not-a-decision-file.org"))))
+
+(ert-deftest cc-butler-decision/format-age-boundaries ()
+  "Minutes under an hour, hours under a day, days at and beyond."
+  (should (equal "1m" (cc-butler--decision-format-age 1)))     ; rounds up, never \"0m\"
+  (should (equal "5m" (cc-butler--decision-format-age 300)))
+  (should (equal "2h" (cc-butler--decision-format-age 7200)))
+  (should (equal "41d" (cc-butler--decision-format-age (* 41 86400)))))
+
+(ert-deftest cc-butler-decision/indicator-shows-oldest-age-for-real-timestamp ()
+  "Given an open/ file with a real id timestamp, Then the mode-line
+indicator appends its age -- the whole point of PR's enrichment, and
+the one path the fake-id arrival tests above cannot reach."
+  (cc-butler-decision-test--with-arrival
+    (let* ((old-time (- (float-time) (* 3 86400)))
+           (id (format-time-string "%Y%m%dT%H%M%S-test-0001" old-time)))
+      (with-temp-file (expand-file-name (format "%s.org" id) (cc-butler--decision-open-dir))
+        (insert "* Decision\nplaceholder\n"))
+      (cc-butler--decision-update-indicator)
+      (should (equal " ⚖1 (oldest 3d)" cc-butler--decision-indicator)))))
+
+(ert-deftest cc-butler-decision/indicator-omits-age-when-no-timestamp-parses ()
+  "Given open/ files whose names don't carry a parseable timestamp
+(mirrors the existing fake-id arrival tests), Then the indicator falls
+back to the bare count -- no crash, no fabricated age."
+  (cc-butler-decision-test--with-arrival
+    (with-temp-file (expand-file-name "d9.org" (cc-butler--decision-open-dir))
+      (insert "* Decision\nplaceholder\n"))
+    (cc-butler--decision-update-indicator)
+    (should (equal " ⚖1" cc-butler--decision-indicator))))
+
+(ert-deftest cc-butler-decision/backlog-line-nil-when-open-dir-empty ()
+  "No open/ files -> no backlog line, not an empty-but-truthy string."
+  (cc-butler-decision-test--with-arrival
+    (should (null (cc-butler--decision-open-backlog-line)))))
+
+(ert-deftest cc-butler-decision/backlog-line-reports-count-and-oldest-age ()
+  "Given two open/ files of different ages, Then the backlog line reports
+the total count and the OLDEST one's age, not the newest or an average."
+  (cc-butler-decision-test--with-arrival
+    (let ((older (- (float-time) (* 10 86400)))
+          (newer (- (float-time) 3600)))
+      (dolist (pair (list (cons older "0001") (cons newer "0002")))
+        (with-temp-file (expand-file-name
+                         (format "%s-test-%s.org"
+                                 (format-time-string "%Y%m%dT%H%M%S" (car pair))
+                                 (cdr pair))
+                         (cc-butler--decision-open-dir))
+          (insert "* Decision\nplaceholder\n"))))
+    (let ((line (cc-butler--decision-open-backlog-line)))
+      (should (string-match-p "\\`⚖ 2 decision(s)" line))
+      (should (string-match-p "oldest 10d ago" line)))))
+
 ;;;; ---- create-path (escalate :options) + full flow -----------------
 
 (ert-deftest cc-butler-decision/parse-options ()
