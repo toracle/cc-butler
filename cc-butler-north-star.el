@@ -21,13 +21,32 @@
 ;;; Code:
 
 (require 'cc-butler-orchestrator)
+(require 'cc-butler-governance)
+
+(defcustom cc-butler-fleet-name "x600"
+  "Identity of THIS cc-butler fleet, as opposed to some other fleet.
+The governance store (`cc-butler-governance-store') is shared across
+possibly-multiple cc-butler fleets — 정수님, 2026-08-13 — so anything
+fleet-specific must be namespaced by this rather than assuming the
+store is this fleet's alone.  Named per MACHINE/INSTANCE (this one is
+the Desk Mini X600), not per client project: an earlier \"monocle\"
+default was wrong for exactly the reason this variable exists — other
+fleets ALSO work on monocle, so a project name can't distinguish
+fleets; 정수님's own words, 2026-08-13, independently reaching the
+same conclusion this docstring already flagged."
+  :type 'string
+  :group 'cc-butler)
 
 (defcustom cc-butler-north-star-file
-  (expand-file-name "north-star.org" "~/projects/cc-butler-governance/")
+  (expand-file-name (format "north-star-%s.org" cc-butler-fleet-name)
+                     (cc-butler-governance-store))
   "Org file listing active goals and their Definition of Done.
 Lives in the private governance store, not the public `toracle/cc-butler'
 checkout — goal descriptions routinely name real projects and people, the
-same reason the governance store itself was moved out of a public repo."
+same reason the governance store itself was moved out of a public repo.
+
+Named per `cc-butler-fleet-name' because the governance store is shared
+across fleets but goals are not — see that variable's docstring."
   :type 'file
   :group 'cc-butler)
 
