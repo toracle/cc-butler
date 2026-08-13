@@ -15,6 +15,12 @@
 
 (require 'ert)
 (require 'cc-butler-orchestrator)
+;; Needed only so `cc-butler-decision-workflow' is a properly-declared
+;; (defcustom-special) dynamic variable before the backlog-append tests
+;; below `let'-bind it -- under lexical-binding, `let' on an undeclared
+;; symbol binds lexically, invisibly to `cc-butler-tool-pending-decisions'
+;; compiled in cc-butler-orchestrator.el's own lexical scope.
+(require 'cc-butler-decision)
 
 ;;;; ---- fleet stale-waiting summary -----------------------------------
 
@@ -799,6 +805,68 @@ escalation had simply not been sent yet."
     (let ((second (cc-butler-tool-pending-decisions)))        ; second sees nothing
       (should (string-match-p "No pending decisions" second))
       (should (string-match-p "delivered" second)))))
+
+;;;; ---- pending_decisions: the decision-workflow open/ backlog line -----
+;;;; escalate_to_butler routes to open/ entirely when `cc-butler-decision-
+;;;; workflow' is on, bypassing `cc-butler--butler-inbox'/maildir -- so this
+;;;; drain used to say "No pending decisions" while hundreds of documents
+;;;; sat unaddressed. `cc-butler--decision-open-backlog-line' is stubbed
+;;;; here (its own real behavior is covered in cc-butler-decision-test.el)
+;;;; so these stay pure combining-logic tests per the file header.
+
+(ert-deftest cc-butler-orchestrator/pending-decisions-appends-backlog-when-workflow-on ()
+  "Given the decision workflow is on and open/ has a backlog, Then the
+backlog line is appended to whatever the ordinary drain returned."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler-decision-workflow t)
+        (cc-butler--butler-inbox-drained nil)
+        (cc-butler--butler-inbox
+         (list (list :time (current-time) :summary "decide this" :name "w"))))
+    (cl-letf (((symbol-function 'cc-butler--decision-open-backlog-line)
+               (lambda () "⚖ 477 decision(s) queued in the open/ workflow (not this drain) — oldest 41d ago; see decisions/open/ or the mode-line ⚖ indicator")))
+      (let ((out (cc-butler-tool-pending-decisions)))
+        (should (string-match-p "decide this" out))
+        (should (string-match-p "477 decision(s) queued" out))))))
+
+(ert-deftest cc-butler-orchestrator/pending-decisions-backlog-alone-when-drain-empty ()
+  "Given nothing in the ordinary drain but a real open/ backlog, Then the
+output is the backlog line alone -- not \"No pending decisions.\" glued
+in front of it, which would read as a contradiction in the same string."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler-decision-workflow t)
+        (cc-butler--butler-inbox-drained nil)
+        (cc-butler--butler-inbox nil))
+    (cl-letf (((symbol-function 'cc-butler--decision-open-backlog-line)
+               (lambda () "⚖ 3 decision(s) queued in the open/ workflow (not this drain) — oldest 2h ago; see decisions/open/ or the mode-line ⚖ indicator")))
+      (let ((out (cc-butler-tool-pending-decisions)))
+        (should (equal "⚖ 3 decision(s) queued in the open/ workflow (not this drain) — oldest 2h ago; see decisions/open/ or the mode-line ⚖ indicator" out))
+        (should-not (string-match-p "No pending decisions" out))))))
+
+(ert-deftest cc-butler-orchestrator/pending-decisions-unchanged-when-workflow-off ()
+  "Given the decision workflow is off, Then behavior is byte-for-byte what
+it was before this change -- this is the KNOWN GAP's dormant case, and it
+must stay dormant rather than start guessing at an open/ directory nobody
+is using."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler-decision-workflow nil)
+        (cc-butler--butler-inbox-drained nil)
+        (cc-butler--butler-inbox nil))
+    (cl-letf (((symbol-function 'cc-butler--decision-open-backlog-line)
+               (lambda () (error "must not be called when the workflow is off"))))
+      (should (equal "No pending decisions." (cc-butler-tool-pending-decisions))))))
+
+(ert-deftest cc-butler-orchestrator/pending-decisions-unchanged-when-backlog-nil ()
+  "Given the workflow is on but open/ is empty, Then the backlog line is
+nil and the ordinary drain output passes through untouched."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler-decision-workflow t)
+        (cc-butler--butler-inbox-drained nil)
+        (cc-butler--butler-inbox
+         (list (list :time (current-time) :summary "decide this" :name "w"))))
+    (cl-letf (((symbol-function 'cc-butler--decision-open-backlog-line) (lambda () nil)))
+      (let ((out (cc-butler-tool-pending-decisions)))
+        (should (string-match-p "decide this" out))
+        (should-not (string-match-p "⚖" out))))))
 
 (ert-deftest cc-butler-orchestrator/the-archive-is-bounded ()
   "It is a recovery window, not a log — it must not grow without limit."

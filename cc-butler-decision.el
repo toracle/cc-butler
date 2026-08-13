@@ -654,12 +654,81 @@ Leaving this nil is what protects an answer-in-progress from being interrupted."
             (directory-files (cc-butler--decision-open-dir) nil
                              cc-butler--decision-org-re))))
 
+(defun cc-butler--decision-file-time (filename)
+  "Parse FILENAME's leading id timestamp into a float-time, or nil if it
+doesn't start with one.  Reads the same field `cc-butler--decision-when'
+does (minute precision, no seconds), from the NAME alone -- no file
+content read, so this stays cheap even at hundreds of files.  Filename
+beats file mtime as an age source: `cc-butler--decision-ingest' deletes
+and rewrites a file on `superseded', and an abandoned partial answer
+touches mtime too, neither of which means \"raised again\"; the
+filename is written once, at creation, and never rewritten."
+  (when (string-match "\\`\\([0-9]\\{4\\}\\)\\([0-9][0-9]\\)\\([0-9][0-9]\\)T\\([0-9][0-9]\\)\\([0-9][0-9]\\)"
+                       filename)
+    (float-time (encode-time 0
+                              (string-to-number (match-string 5 filename))
+                              (string-to-number (match-string 4 filename))
+                              (string-to-number (match-string 3 filename))
+                              (string-to-number (match-string 2 filename))
+                              (string-to-number (match-string 1 filename))))))
+
+(defun cc-butler--decision-format-age (seconds)
+  "Render SECONDS as a short age string: \"Nm\", \"Nh\", or \"Nd\"."
+  (cond ((< seconds 3600) (format "%dm" (max 1 (round (/ seconds 60)))))
+        ((< seconds 86400) (format "%dh" (round (/ seconds 3600))))
+        (t (format "%dd" (round (/ seconds 86400))))))
+
+(defun cc-butler--decision-open-files-and-oldest ()
+  "Return (FILES . OLDEST-FLOAT-TIME-OR-NIL) for the open/ dir, one
+`directory-files' call shared by the indicator and the backlog line
+below so neither re-lists the directory the other just listed."
+  (let ((files (ignore-errors (directory-files (cc-butler--decision-open-dir) nil
+                                                cc-butler--decision-org-re))))
+    (cons files
+          (let ((times (delq nil (mapcar #'cc-butler--decision-file-time files))))
+            (and times (apply #'min times))))))
+
 (defun cc-butler--decision-update-indicator ()
-  "Set the mode-line indicator to the open-decision count; return it."
-  (let ((n (cc-butler--decision-open-count)))
-    (setq cc-butler--decision-indicator (if (> n 0) (format " ⚖%d" n) ""))
-    (force-mode-line-update t)
-    n))
+  "Set the mode-line indicator to the open-decision count plus the
+oldest one's age, e.g. \" ⚖476 (oldest 41d)\"; return the count.
+
+The age is not decorative: a bare count cannot distinguish a backlog
+someone is actively working through from one nobody has looked at in
+weeks, which is exactly what let the 2026-07-04 REFINEMENT-3 backlog
+grow to hundreds of files unnoticed -- see governance
+decision-proposal-format.md and this PR's body."
+  (pcase-let ((`(,files . ,oldest) (cc-butler--decision-open-files-and-oldest)))
+    (let ((n (length files)))
+      (setq cc-butler--decision-indicator
+            (if (> n 0)
+                (format " ⚖%d%s" n
+                        (if oldest
+                            (format " (oldest %s)"
+                                    (cc-butler--decision-format-age (- (float-time) oldest)))
+                          ""))
+              ""))
+      (force-mode-line-update t)
+      n)))
+
+(defun cc-butler--decision-open-backlog-line ()
+  "One-line, read-only summary of the open/ decision-doc backlog, or nil
+when empty: count plus the oldest item's age, from filenames alone (no
+file content read).  Exists so `cc-butler-tool-pending-decisions' can
+stop asserting \"No pending decisions\" while decisions actually sit
+in open/ -- see that function's docstring for why the two queues can
+diverge.
+
+This is a queued-duration signal, not a read/answered one: it cannot
+tell a decision nobody has seen from one already answered elsewhere
+and never moved to done/, or from a status report that never needed
+an answer at all -- a manual sample of this backlog on 2026-08-13
+found all three shapes mixed together. Treat it as \"worth a look\",
+not as ground truth about what's actually pending."
+  (pcase-let ((`(,files . ,oldest) (cc-butler--decision-open-files-and-oldest)))
+    (when files
+      (format "⚖ %d decision(s) queued in the open/ workflow (not this drain) — oldest %s ago; see decisions/open/ or the mode-line ⚖ indicator"
+              (length files)
+              (if oldest (cc-butler--decision-format-age (- (float-time) oldest)) "?")))))
 
 (defun cc-butler--decision-display (file)
   "Show decision FILE in a side window without stealing focus."
