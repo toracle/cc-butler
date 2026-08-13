@@ -16,6 +16,13 @@
 (require 'ert)
 (require 'cc-butler-orchestrator)
 (require 'cc-butler-governance)
+;; Needed only so `cc-butler-decision-workflow' is a properly-declared
+;; (defcustom-special) dynamic variable before the backlog-append tests and
+;; the escalate_to_butler kind-routing tests below `let'-bind it -- under
+;; lexical-binding, `let' on an undeclared symbol binds lexically, invisibly
+;; to `cc-butler-tool-pending-decisions'/`cc-butler-tool-escalate-to-butler'
+;; compiled in cc-butler-orchestrator.el's own lexical scope.
+(require 'cc-butler-decision)
 
 ;;;; ---- fleet stale-waiting summary -----------------------------------
 
@@ -749,6 +756,88 @@ only: prefixing at the send primitive would corrupt every one of them."
 ;; tests stub them at the function boundary, so they pass regardless of what
 ;; the drain does with the queue.
 
+;;;; ---- escalate_to_butler: decision vs notification kind ---------------
+;;;; `cc-butler-decision-create' is stubbed here to capture what KIND it
+;;;; was actually called with -- its own real behavior (rendering,
+;;;; delivery) is covered in cc-butler-decision-test.el, consistent with
+;;;; this file's "pure combining logic over stubbed lower-level calls".
+
+(ert-deftest cc-butler-orchestrator/escalate-defaults-to-decision-kind ()
+  "Omitting KIND (the pre-existing calling convention) still routes as a
+decision -- adding the parameter must not change any existing caller's
+behavior."
+  (let ((cc-butler-decision-workflow t)
+        (cc-butler--caller-dir-value "/steward/")
+        (captured nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () cc-butler--caller-dir-value))
+              ((symbol-function 'cc-butler-decision-create)
+               (lambda (&rest args) (setq captured args) "id-1"))
+              ((symbol-function 'cc-butler--append-decision) #'ignore)
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "steward")))
+      (cc-butler-tool-escalate-to-butler "ship it?" "pick one")
+      (should (eq 'decision (nth 4 captured))))))
+
+(ert-deftest cc-butler-orchestrator/escalate-notification-kind-routes-as-note ()
+  "kind=\"notification\" reaches `cc-butler-decision-create' as `note',
+and the tool's own return message says so rather than the decision
+wording -- a caller checking the return value can tell which kind it
+actually got, not just which kind it asked for."
+  (let ((cc-butler-decision-workflow t)
+        (cc-butler--caller-dir-value "/steward/")
+        (captured nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () cc-butler--caller-dir-value))
+              ((symbol-function 'cc-butler-decision-create)
+               (lambda (&rest args) (setq captured args) "id-2"))
+              ((symbol-function 'cc-butler--append-decision) #'ignore)
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "steward")))
+      (let ((result (cc-butler-tool-escalate-to-butler "retracting my hypothesis" nil nil "notification")))
+        (should (eq 'note (nth 4 captured)))
+        (should (string-match-p "notification" result))
+        (should-not (string-match-p "Escalated the decision" result))))))
+
+(ert-deftest cc-butler-orchestrator/escalate-unrecognized-kind-falls-back-to-decision ()
+  "A typo or garbage KIND (anything but exactly \"notification\") must
+fall back to `decision', not silently become a note -- the dangerous
+failure direction is a real decision going unanswered because it
+rendered read-only, not the reverse."
+  (let ((cc-butler-decision-workflow t)
+        (cc-butler--caller-dir-value "/steward/")
+        (captured nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () cc-butler--caller-dir-value))
+              ((symbol-function 'cc-butler-decision-create)
+               (lambda (&rest args) (setq captured args) "id-3"))
+              ((symbol-function 'cc-butler--append-decision) #'ignore)
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "steward")))
+      (dolist (garbage (list "notifcation" "  " "Notify" 'not-a-string))
+        (setq captured nil)
+        (cc-butler-tool-escalate-to-butler "ship it?" "pick one" nil garbage)
+        (should (eq 'decision (nth 4 captured)))))))
+
+(ert-deftest cc-butler-orchestrator/escalate-notification-case-and-whitespace-insensitive ()
+  "\"Notification\", \" notification \", etc. all normalize the same way --
+callers should not need to match the exact casing/spacing to get it
+right."
+  (let ((cc-butler-decision-workflow t)
+        (cc-butler--caller-dir-value "/steward/")
+        (captured nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () cc-butler--caller-dir-value))
+              ((symbol-function 'cc-butler-decision-create)
+               (lambda (&rest args) (setq captured args) "id-4"))
+              ((symbol-function 'cc-butler--append-decision) #'ignore)
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "steward")))
+      (dolist (variant (list "notification" "Notification" " NOTIFICATION " "NoTiFiCaTiOn"))
+        (setq captured nil)
+        (cc-butler-tool-escalate-to-butler "fyi" nil nil variant)
+        (should (eq 'note (nth 4 captured)))))))
+
 (ert-deftest cc-butler-orchestrator/decision-drain-keeps-items-when-rendering-fails ()
   "Rendering happens BEFORE the queue is emptied.  A malformed item used to
 signal from inside the formatter, unwinding past a clear that had already
@@ -800,6 +889,68 @@ escalation had simply not been sent yet."
     (let ((second (cc-butler-tool-pending-decisions)))        ; second sees nothing
       (should (string-match-p "No pending decisions" second))
       (should (string-match-p "delivered" second)))))
+
+;;;; ---- pending_decisions: the decision-workflow open/ backlog line -----
+;;;; escalate_to_butler routes to open/ entirely when `cc-butler-decision-
+;;;; workflow' is on, bypassing `cc-butler--butler-inbox'/maildir -- so this
+;;;; drain used to say "No pending decisions" while hundreds of documents
+;;;; sat unaddressed. `cc-butler--decision-open-backlog-line' is stubbed
+;;;; here (its own real behavior is covered in cc-butler-decision-test.el)
+;;;; so these stay pure combining-logic tests per the file header.
+
+(ert-deftest cc-butler-orchestrator/pending-decisions-appends-backlog-when-workflow-on ()
+  "Given the decision workflow is on and open/ has a backlog, Then the
+backlog line is appended to whatever the ordinary drain returned."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler-decision-workflow t)
+        (cc-butler--butler-inbox-drained nil)
+        (cc-butler--butler-inbox
+         (list (list :time (current-time) :summary "decide this" :name "w"))))
+    (cl-letf (((symbol-function 'cc-butler--decision-open-backlog-line)
+               (lambda () "⚖ 477 decision(s) queued in the open/ workflow (not this drain) — oldest 41d ago; see decisions/open/ or the mode-line ⚖ indicator")))
+      (let ((out (cc-butler-tool-pending-decisions)))
+        (should (string-match-p "decide this" out))
+        (should (string-match-p "477 decision(s) queued" out))))))
+
+(ert-deftest cc-butler-orchestrator/pending-decisions-backlog-alone-when-drain-empty ()
+  "Given nothing in the ordinary drain but a real open/ backlog, Then the
+output is the backlog line alone -- not \"No pending decisions.\" glued
+in front of it, which would read as a contradiction in the same string."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler-decision-workflow t)
+        (cc-butler--butler-inbox-drained nil)
+        (cc-butler--butler-inbox nil))
+    (cl-letf (((symbol-function 'cc-butler--decision-open-backlog-line)
+               (lambda () "⚖ 3 decision(s) queued in the open/ workflow (not this drain) — oldest 2h ago; see decisions/open/ or the mode-line ⚖ indicator")))
+      (let ((out (cc-butler-tool-pending-decisions)))
+        (should (equal "⚖ 3 decision(s) queued in the open/ workflow (not this drain) — oldest 2h ago; see decisions/open/ or the mode-line ⚖ indicator" out))
+        (should-not (string-match-p "No pending decisions" out))))))
+
+(ert-deftest cc-butler-orchestrator/pending-decisions-unchanged-when-workflow-off ()
+  "Given the decision workflow is off, Then behavior is byte-for-byte what
+it was before this change -- this is the KNOWN GAP's dormant case, and it
+must stay dormant rather than start guessing at an open/ directory nobody
+is using."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler-decision-workflow nil)
+        (cc-butler--butler-inbox-drained nil)
+        (cc-butler--butler-inbox nil))
+    (cl-letf (((symbol-function 'cc-butler--decision-open-backlog-line)
+               (lambda () (error "must not be called when the workflow is off"))))
+      (should (equal "No pending decisions." (cc-butler-tool-pending-decisions))))))
+
+(ert-deftest cc-butler-orchestrator/pending-decisions-unchanged-when-backlog-nil ()
+  "Given the workflow is on but open/ is empty, Then the backlog line is
+nil and the ordinary drain output passes through untouched."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler-decision-workflow t)
+        (cc-butler--butler-inbox-drained nil)
+        (cc-butler--butler-inbox
+         (list (list :time (current-time) :summary "decide this" :name "w"))))
+    (cl-letf (((symbol-function 'cc-butler--decision-open-backlog-line) (lambda () nil)))
+      (let ((out (cc-butler-tool-pending-decisions)))
+        (should (string-match-p "decide this" out))
+        (should-not (string-match-p "⚖" out))))))
 
 (ert-deftest cc-butler-orchestrator/the-archive-is-bounded ()
   "It is a recovery window, not a log — it must not grow without limit."

@@ -165,8 +165,12 @@ indicator — driven by arrival, with no agent turn involved."
       (should (equal " ⚖1" cc-butler--decision-indicator)))))
 
 (ert-deftest cc-butler-decision/arrival-note-to-open-unread ()
-  "§③ (read-receipt): a note arrival now renders to open/ as UNREAD (read-only),
-counted by the indicator — it stays visible until `r' closes it."
+  "§③ (read-receipt): a note arrival renders to open/ as UNREAD (read-only),
+same physical location as a decision — it stays visible until `r' closes
+it (moves to done/). It is NOT counted by the ⚖ indicator: a note needs
+no answer, so counting it would reproduce the exact backlog-inflation
+bug the indicator's age display exists to surface — see governance
+escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes."
   (cc-butler-decision-test--with-arrival
     (cc-butler--mail-file-deliver
      "정수님" '(:id "n9" :kind note :from "steward" :summary "CI is green"))
@@ -174,7 +178,138 @@ counted by the indicator — it stays visible until `r' closes it."
       (should (= 1 n))
       (should (= 1 (length (directory-files (cc-butler--decision-open-dir) nil "\\`[^.].*\\.org\\'"))))
       (should (= 0 (length (directory-files (cc-butler--decision-done-dir) nil "\\`[^.].*\\.org\\'"))))
-      (should (equal " ⚖1" cc-butler--decision-indicator)))))
+      (should (equal "" cc-butler--decision-indicator)))))
+
+;;;; ---- note/relay kind is excluded from the answer-required count ----
+;;;; stark PR #71 (escalate_to_butler kind routing) shipped a description
+;;;; claiming a note lands "straight in done/ -- never sitting in the
+;;;; answer-required open/ queue".  Tracing the actual render/ingest path
+;;;; shows every kind lands in open/ identically; only a manual `r' moves
+;;;; it to done/.  These tests pin the MEASURED behavior end to end
+;;;; (actual file location, not a rendered string or a stub), and pin the
+;;;; fix that keeps the ⚖ count/backlog line answer-required-only despite
+;;;; that shared open/ location.
+
+(ert-deftest cc-butler-decision/file-kind-from-filename ()
+  "`cc-butler--decision-file-kind' classifies from the filename suffix
+alone; a plain `ID.org' (every file written before kind existed, and
+every real decision since) is `decision'."
+  (should (eq 'decision (cc-butler--decision-file-kind "20260813T120000-111-0001.org")))
+  (should (eq 'note (cc-butler--decision-file-kind "20260813T120000-111-0001.note.org")))
+  (should (eq 'relay (cc-butler--decision-file-kind "20260813T120000-111-0001.relay.org")))
+  (should (eq 'briefing (cc-butler--decision-file-kind "20260813T120000-111-0001.briefing.org"))))
+
+(ert-deftest cc-butler-decision/render-encodes-kind-in-filename ()
+  "`cc-butler--decision-render' writes a plain `ID.org' for a decision
+(unchanged, so every pre-existing file/caller stays valid) and a
+`ID.KIND.org' for anything else."
+  (cc-butler-decision-test--with-arrival
+    (should (equal "abc123.org"
+                    (file-name-nondirectory
+                     (cc-butler--decision-render '(:id "abc123" :summary "hi")))))
+    (should (equal "abc456.note.org"
+                    (file-name-nondirectory
+                     (cc-butler--decision-render '(:id "abc456" :kind note :summary "hi")))))))
+
+(ert-deftest cc-butler-decision/create-path-note-lands-in-open-not-done ()
+  "KIND `note', all the way from `cc-butler-decision-create' through
+arrival rendering, lands the actual FILE in open/ -- not done/ -- same
+as a decision; only a manual `r' (`cc-butler-decision-mark-read') moves
+it to done/.  This is the measured behavior PR #71's description got
+backwards; unlike `create-path-kind-note-renders-readonly' (which only
+checks a plist/string), this asserts the real directory."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name)
+               (lambda (d) (if (equal d "/worker/") "worker-a" d))))
+      (cc-butler-decision-create "/worker/" "FYI: retracting my earlier hypothesis" nil nil 'note)
+      (should (= 1 (cc-butler--decision-on-arrival)))
+      (should (= 1 (length (directory-files (cc-butler--decision-open-dir) nil
+                                             cc-butler--decision-org-re))))
+      (should (= 0 (length (directory-files (cc-butler--decision-done-dir) nil
+                                             cc-butler--decision-org-re)))))))
+
+(ert-deftest cc-butler-decision/open-files-and-oldest-excludes-non-decision-kinds ()
+  "Given open/ holds one `decision' and one `note' (both physically
+present, per the test above), the answer-required count from
+`cc-butler--decision-open-files-and-oldest' -- what feeds both the ⚖
+indicator and the pending_decisions backlog line -- is 1, not 2."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cc-butler-decision-create "/worker/" "please decide X" nil nil 'decision)
+      (cc-butler-decision-create "/worker/" "FYI: status update" nil nil 'note)
+      (cc-butler--decision-on-arrival)
+      (should (= 2 (length (directory-files (cc-butler--decision-open-dir) nil
+                                             cc-butler--decision-org-re))))
+      (should (= 1 (length (car (cc-butler--decision-open-files-and-oldest))))))))
+
+;;;; ---- open/ backlog staleness (count + oldest age) ------------------
+;;;; The existing arrival tests above use fake ids ("d9"/"n9") that don't
+;;;; match the timestamp format, so they never exercise the age-parsing
+;;;; path at all -- `oldest' stays nil and the indicator degrades to the
+;;;; old bare-count string.  These tests use real `cc-butler--mail-id'-
+;;;; shaped filenames specifically to hit that path.
+
+(ert-deftest cc-butler-decision/file-time-parses-real-id ()
+  "A real id's leading timestamp parses to the matching float-time."
+  (should (equal (cc-butler--decision-file-time "20260704T145334-1585617-0019.org")
+                  (float-time (encode-time 0 53 14 4 7 2026)))))
+
+(ert-deftest cc-butler-decision/file-time-nil-for-non-timestamp-name ()
+  "A filename not starting with the id timestamp shape (e.g. a test's
+hand-picked short id) returns nil, not a wrong guess."
+  (should (null (cc-butler--decision-file-time "d9.org")))
+  (should (null (cc-butler--decision-file-time "not-a-decision-file.org"))))
+
+(ert-deftest cc-butler-decision/format-age-boundaries ()
+  "Minutes under an hour, hours under a day, days at and beyond."
+  (should (equal "1m" (cc-butler--decision-format-age 1)))     ; rounds up, never \"0m\"
+  (should (equal "5m" (cc-butler--decision-format-age 300)))
+  (should (equal "2h" (cc-butler--decision-format-age 7200)))
+  (should (equal "41d" (cc-butler--decision-format-age (* 41 86400)))))
+
+(ert-deftest cc-butler-decision/indicator-shows-oldest-age-for-real-timestamp ()
+  "Given an open/ file with a real id timestamp, Then the mode-line
+indicator appends its age -- the whole point of PR's enrichment, and
+the one path the fake-id arrival tests above cannot reach."
+  (cc-butler-decision-test--with-arrival
+    (let* ((old-time (- (float-time) (* 3 86400)))
+           (id (format-time-string "%Y%m%dT%H%M%S-test-0001" old-time)))
+      (with-temp-file (expand-file-name (format "%s.org" id) (cc-butler--decision-open-dir))
+        (insert "* Decision\nplaceholder\n"))
+      (cc-butler--decision-update-indicator)
+      (should (equal " ⚖1 (oldest 3d)" cc-butler--decision-indicator)))))
+
+(ert-deftest cc-butler-decision/indicator-omits-age-when-no-timestamp-parses ()
+  "Given open/ files whose names don't carry a parseable timestamp
+(mirrors the existing fake-id arrival tests), Then the indicator falls
+back to the bare count -- no crash, no fabricated age."
+  (cc-butler-decision-test--with-arrival
+    (with-temp-file (expand-file-name "d9.org" (cc-butler--decision-open-dir))
+      (insert "* Decision\nplaceholder\n"))
+    (cc-butler--decision-update-indicator)
+    (should (equal " ⚖1" cc-butler--decision-indicator))))
+
+(ert-deftest cc-butler-decision/backlog-line-nil-when-open-dir-empty ()
+  "No open/ files -> no backlog line, not an empty-but-truthy string."
+  (cc-butler-decision-test--with-arrival
+    (should (null (cc-butler--decision-open-backlog-line)))))
+
+(ert-deftest cc-butler-decision/backlog-line-reports-count-and-oldest-age ()
+  "Given two open/ files of different ages, Then the backlog line reports
+the total count and the OLDEST one's age, not the newest or an average."
+  (cc-butler-decision-test--with-arrival
+    (let ((older (- (float-time) (* 10 86400)))
+          (newer (- (float-time) 3600)))
+      (dolist (pair (list (cons older "0001") (cons newer "0002")))
+        (with-temp-file (expand-file-name
+                         (format "%s-test-%s.org"
+                                 (format-time-string "%Y%m%dT%H%M%S" (car pair))
+                                 (cdr pair))
+                         (cc-butler--decision-open-dir))
+          (insert "* Decision\nplaceholder\n"))))
+    (let ((line (cc-butler--decision-open-backlog-line)))
+      (should (string-match-p "\\`⚖ 2 decision(s)" line))
+      (should (string-match-p "oldest 10d ago" line)))))
 
 ;;;; ---- create-path (escalate :options) + full flow -----------------
 
@@ -207,6 +342,31 @@ the escalator) into 정수님's inbox."
             (should (= 2 (length opts)))
             (should (equal "Stripe" (plist-get (car opts) :label)))
             (should (equal "lower fees" (plist-get (car opts) :tradeoff)))))))))
+
+(ert-deftest cc-butler-decision/create-path-kind-defaults-to-decision ()
+  "Omitting KIND entirely still delivers a `decision' -- the pre-existing
+callers of `cc-butler-decision-create' (before this parameter existed)
+must not change behavior."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name)
+               (lambda (d) (if (equal d "/worker/") "worker-a" d))))
+      (cc-butler-decision-create "/worker/" "ship?" nil nil)
+      (should (eq 'decision (plist-get (car (cc-butler--ch-drain cc-butler-human-agent)) :kind))))))
+
+(ert-deftest cc-butler-decision/create-path-kind-note-renders-readonly ()
+  "KIND `note' delivers as a read-only notification through the SAME
+pipeline a decision uses, and it renders with no answer region -- the
+whole point of adding this parameter rather than inventing new
+rendering."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name)
+               (lambda (d) (if (equal d "/worker/") "worker-a" d))))
+      (cc-butler-decision-create "/worker/" "FYI: retracting my earlier hypothesis" nil nil 'note)
+      (let ((m (car (cc-butler--ch-drain cc-butler-human-agent))))
+        (should (eq 'note (plist-get m :kind)))
+        (let ((doc (cc-butler--decision-doc-string m)))
+          (should (string-match-p "Notification (read-only)" doc))
+          (should-not (string-match-p (regexp-quote cc-butler--decision-answer-begin) doc)))))))
 
 (ert-deftest cc-butler-decision/full-flow-create-to-route ()
   "End to end: create → arrival render → answer + submit → routed back to the
@@ -653,9 +813,10 @@ and auto-restores every setting (nothing leaks)."
         (progn
           (cc-butler-decision-demo)
           (should cc-butler--decision-demo-state)
-          ;; §③: the demo delivers a decision AND a note — both land in open/.
+          ;; §③: the demo delivers a decision AND a note — both land in open/,
+          ;; but only the decision is answer-required, so the ⚖ count is 1, not 2.
           (should (= 2 (length (directory-files (cc-butler--decision-open-dir) nil "\\`[^.].*\\.org\\'"))))
-          (should (string-match-p "⚖2" cc-butler--decision-indicator))
+          (should (string-match-p "⚖1" cc-butler--decision-indicator))
           ;; the decision (demo-1) sorts before the note (demo-note); answer it
           (let* ((file (car (directory-files (cc-butler--decision-open-dir) t "\\`[^.].*\\.org\\'")))
                  (doc (with-temp-buffer (insert-file-contents file) (buffer-string)))
