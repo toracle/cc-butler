@@ -277,6 +277,31 @@ the escalator) into 정수님's inbox."
             (should (equal "Stripe" (plist-get (car opts) :label)))
             (should (equal "lower fees" (plist-get (car opts) :tradeoff)))))))))
 
+(ert-deftest cc-butler-decision/create-path-kind-defaults-to-decision ()
+  "Omitting KIND entirely still delivers a `decision' -- the pre-existing
+callers of `cc-butler-decision-create' (before this parameter existed)
+must not change behavior."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name)
+               (lambda (d) (if (equal d "/worker/") "worker-a" d))))
+      (cc-butler-decision-create "/worker/" "ship?" nil nil)
+      (should (eq 'decision (plist-get (car (cc-butler--ch-drain cc-butler-human-agent)) :kind))))))
+
+(ert-deftest cc-butler-decision/create-path-kind-note-renders-readonly ()
+  "KIND `note' delivers as a read-only notification through the SAME
+pipeline a decision uses, and it renders with no answer region -- the
+whole point of adding this parameter rather than inventing new
+rendering."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name)
+               (lambda (d) (if (equal d "/worker/") "worker-a" d))))
+      (cc-butler-decision-create "/worker/" "FYI: retracting my earlier hypothesis" nil nil 'note)
+      (let ((m (car (cc-butler--ch-drain cc-butler-human-agent))))
+        (should (eq 'note (plist-get m :kind)))
+        (let ((doc (cc-butler--decision-doc-string m)))
+          (should (string-match-p "Notification (read-only)" doc))
+          (should-not (string-match-p (regexp-quote cc-butler--decision-answer-begin) doc)))))))
+
 (ert-deftest cc-butler-decision/full-flow-create-to-route ()
   "End to end: create → arrival render → answer + submit → routed back to the
 escalator via correlation."

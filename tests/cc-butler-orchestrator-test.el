@@ -17,9 +17,10 @@
 (require 'cc-butler-orchestrator)
 (require 'cc-butler-governance)
 ;; Needed only so `cc-butler-decision-workflow' is a properly-declared
-;; (defcustom-special) dynamic variable before the backlog-append tests
-;; below `let'-bind it -- under lexical-binding, `let' on an undeclared
-;; symbol binds lexically, invisibly to `cc-butler-tool-pending-decisions'
+;; (defcustom-special) dynamic variable before the backlog-append tests and
+;; the escalate_to_butler kind-routing tests below `let'-bind it -- under
+;; lexical-binding, `let' on an undeclared symbol binds lexically, invisibly
+;; to `cc-butler-tool-pending-decisions'/`cc-butler-tool-escalate-to-butler'
 ;; compiled in cc-butler-orchestrator.el's own lexical scope.
 (require 'cc-butler-decision)
 
@@ -754,6 +755,88 @@ only: prefixing at the send primitive would corrupt every one of them."
 ;; These are the first tests to touch the drains at all — the existing payload
 ;; tests stub them at the function boundary, so they pass regardless of what
 ;; the drain does with the queue.
+
+;;;; ---- escalate_to_butler: decision vs notification kind ---------------
+;;;; `cc-butler-decision-create' is stubbed here to capture what KIND it
+;;;; was actually called with -- its own real behavior (rendering,
+;;;; delivery) is covered in cc-butler-decision-test.el, consistent with
+;;;; this file's "pure combining logic over stubbed lower-level calls".
+
+(ert-deftest cc-butler-orchestrator/escalate-defaults-to-decision-kind ()
+  "Omitting KIND (the pre-existing calling convention) still routes as a
+decision -- adding the parameter must not change any existing caller's
+behavior."
+  (let ((cc-butler-decision-workflow t)
+        (cc-butler--caller-dir-value "/steward/")
+        (captured nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () cc-butler--caller-dir-value))
+              ((symbol-function 'cc-butler-decision-create)
+               (lambda (&rest args) (setq captured args) "id-1"))
+              ((symbol-function 'cc-butler--append-decision) #'ignore)
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "steward")))
+      (cc-butler-tool-escalate-to-butler "ship it?" "pick one")
+      (should (eq 'decision (nth 4 captured))))))
+
+(ert-deftest cc-butler-orchestrator/escalate-notification-kind-routes-as-note ()
+  "kind=\"notification\" reaches `cc-butler-decision-create' as `note',
+and the tool's own return message says so rather than the decision
+wording -- a caller checking the return value can tell which kind it
+actually got, not just which kind it asked for."
+  (let ((cc-butler-decision-workflow t)
+        (cc-butler--caller-dir-value "/steward/")
+        (captured nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () cc-butler--caller-dir-value))
+              ((symbol-function 'cc-butler-decision-create)
+               (lambda (&rest args) (setq captured args) "id-2"))
+              ((symbol-function 'cc-butler--append-decision) #'ignore)
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "steward")))
+      (let ((result (cc-butler-tool-escalate-to-butler "retracting my hypothesis" nil nil "notification")))
+        (should (eq 'note (nth 4 captured)))
+        (should (string-match-p "notification" result))
+        (should-not (string-match-p "Escalated the decision" result))))))
+
+(ert-deftest cc-butler-orchestrator/escalate-unrecognized-kind-falls-back-to-decision ()
+  "A typo or garbage KIND (anything but exactly \"notification\") must
+fall back to `decision', not silently become a note -- the dangerous
+failure direction is a real decision going unanswered because it
+rendered read-only, not the reverse."
+  (let ((cc-butler-decision-workflow t)
+        (cc-butler--caller-dir-value "/steward/")
+        (captured nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () cc-butler--caller-dir-value))
+              ((symbol-function 'cc-butler-decision-create)
+               (lambda (&rest args) (setq captured args) "id-3"))
+              ((symbol-function 'cc-butler--append-decision) #'ignore)
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "steward")))
+      (dolist (garbage (list "notifcation" "  " "Notify" 'not-a-string))
+        (setq captured nil)
+        (cc-butler-tool-escalate-to-butler "ship it?" "pick one" nil garbage)
+        (should (eq 'decision (nth 4 captured)))))))
+
+(ert-deftest cc-butler-orchestrator/escalate-notification-case-and-whitespace-insensitive ()
+  "\"Notification\", \" notification \", etc. all normalize the same way --
+callers should not need to match the exact casing/spacing to get it
+right."
+  (let ((cc-butler-decision-workflow t)
+        (cc-butler--caller-dir-value "/steward/")
+        (captured nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () cc-butler--caller-dir-value))
+              ((symbol-function 'cc-butler-decision-create)
+               (lambda (&rest args) (setq captured args) "id-4"))
+              ((symbol-function 'cc-butler--append-decision) #'ignore)
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "steward")))
+      (dolist (variant (list "notification" "Notification" " NOTIFICATION " "NoTiFiCaTiOn"))
+        (setq captured nil)
+        (cc-butler-tool-escalate-to-butler "fyi" nil nil variant)
+        (should (eq 'note (nth 4 captured)))))))
 
 (ert-deftest cc-butler-orchestrator/decision-drain-keeps-items-when-rendering-fails ()
   "Rendering happens BEFORE the queue is emptied.  A malformed item used to
