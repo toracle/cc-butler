@@ -148,7 +148,11 @@
   (let ((rows (cc-butler-docs--session-rows)))
     (concat
      "#+TITLE: Butler dashboard\n#+STARTUP: overview\n"
-     (format "Last updated: %s\n\n" (format-time-string "[%Y-%m-%d %a %H:%M]"))
+     (format "Last updated: %s\n" (format-time-string "[%Y-%m-%d %a %H:%M]"))
+     (if (fboundp 'cc-butler-runtime-source-oneline)
+         (let ((line (cc-butler-runtime-source-oneline)))
+           (if line (format "Source: %s\n\n" line) "\n"))
+       "\n")
      "* Sessions\n"
      "| Session | State | Branch | PR | Model | Activity |\n"
      "|---------+-------+--------+----+-------+----------|\n"
