@@ -24,6 +24,7 @@
 
 (require 'cc-butler-session)
 (require 'cc-butler-notifications)
+(require 'cc-butler-governance)
 (require 'claude-code-ide)
 (require 'json)
 
@@ -356,15 +357,16 @@ Locations are derived from the butler home (the shared operational home)."
                        " institutionalize-learning,\n  …) — load these to keep"
                        " operating discipline.\n")
                (abbreviate-file-name mem)))
-     (concat "- **operating-principle source of truth:** the cc-butler repo store"
-             " `governance/`\n  (one `.md` per principle, runtime-neutral). `M-x"
-             " cc-butler-governance-regenerate`\n  refreshes each note's cached"
-             " *body* from the store, but it does NOT update\n  `MEMORY.md`'s"
-             " index (tracked: cc-butler#36) — a regenerated note that has no"
-             " line\n  in `MEMORY.md` exists on disk but is never recalled."
-             " Route a new operational\n  learning by editing the store, running"
-             " regenerate, AND adding its index line\n  to `MEMORY.md` by hand —"
-             " all three, until #36 closes.\n")
+     (format (concat "- **operating-principle source of truth:** `%s`\n"
+                     "  (one `.md` per principle, runtime-neutral). `M-x"
+                     " cc-butler-governance-regenerate`\n  refreshes each note's cached"
+                     " *body* from the store, but it does NOT update\n  `MEMORY.md`'s"
+                     " index (tracked: cc-butler#36) — a regenerated note that has no"
+                     " line\n  in `MEMORY.md` exists on disk but is never recalled."
+                     " Route a new operational\n  learning by editing the store, running"
+                     " regenerate, AND adding its index line\n  to `MEMORY.md` by hand —"
+                     " all three, until #36 closes.\n")
+             (abbreviate-file-name (cc-butler-governance-store)))
      "\n")))
 
 (defun cc-butler--roles-metaphor (which)

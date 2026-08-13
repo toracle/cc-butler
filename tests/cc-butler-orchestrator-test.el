@@ -15,6 +15,7 @@
 
 (require 'ert)
 (require 'cc-butler-orchestrator)
+(require 'cc-butler-governance)
 
 ;;;; ---- fleet stale-waiting summary -----------------------------------
 
@@ -980,6 +981,40 @@ unconditional forwarding, ops busy or not, in the legacy format."
     (let ((sent (cc-butler-orchestrator-test--sent-strings)))
       (should (= 2 (length sent)))
       (should (string-match-p "Worker /worker/ needs attention: e1" (car sent))))))
+
+;;;; ---- shared state note: governance source of truth --------------------
+
+;; 2026-08-13: `cc-butler-governance-dir' became a live, meaningfully-set
+;; variable (governance moved out of the cc-butler repo into a shared,
+;; multi-fleet vault). `cc-butler--shared-state-note' never read it — it
+;; injected a literal "the cc-butler repo store `governance/`" string into
+;; every generated CLAUDE.md, so the variable could point anywhere and the
+;; text handed to butler/steward would still describe the old location.
+
+(ert-deftest cc-butler-orchestrator/shared-state-note-describes-the-actual-governance-dir ()
+  "Given `cc-butler-governance-dir' set to a non-default path, Then the
+generated note names THAT path, not a hardcoded description of the
+cc-butler repo's own `governance/' directory."
+  (let* ((cc-butler-home "/home/")
+         (cc-butler--butler nil)
+         (cc-butler-governance-dir "/vault/3-resources/cc-butler-governance/"))
+    (cl-letf (((symbol-function 'cc-butler--claude-memory-dir) (lambda (_) nil)))
+      (let ((note (cc-butler--shared-state-note)))
+        (should (string-match-p (regexp-quote "/vault/3-resources/cc-butler-governance/") note))
+        (should-not (string-match-p "the cc-butler repo store" note))))))
+
+(ert-deftest cc-butler-orchestrator/shared-state-note-falls-back-to-derived-store-when-unset ()
+  "Given `cc-butler-governance-dir' nil (unset), Then the note still names
+SOME concrete path (derived via `cc-butler-governance-store', beside the
+loaded code) rather than the old hardcoded literal — an unset var must not
+silently read as \"no path to report\"."
+  (let* ((cc-butler-home "/home/")
+         (cc-butler--butler nil)
+         (cc-butler-governance-dir nil))
+    (cl-letf (((symbol-function 'cc-butler--claude-memory-dir) (lambda (_) nil)))
+      (let ((note (cc-butler--shared-state-note)))
+        (should (string-match-p (regexp-quote (abbreviate-file-name (cc-butler-governance-store))) note))
+        (should-not (string-match-p "the cc-butler repo store" note))))))
 
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here
