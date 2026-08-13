@@ -1,6 +1,6 @@
 ---
-name: prod-data-access-requires-explicit-approval
-description: "Touching PRODUCTION DATA (prod DB rows, prod credentials from Secrets Manager, SSM tunnels into prod RDS) requires EXPLICIT per-instance human approval — and 'it was read-only / SELECT only / zero mutations' is NOT a justification. Reading production code is not the same as reading production data. A task instruction like 'verify against real data' does NOT implicitly authorize reaching for prod credentials; state the access boundary in the dispatch, don't let the agent infer it."
+name: butler-prod-data-access-requires-explicit-approval
+description: "Touching PRODUCTION DATA (prod DB rows, prod credentials from Secrets Manager, SSM tunnels into prod RDS) requires EXPLICIT per-instance human approval — and 'it was read-only / SELECT only / zero mutations' is NOT a justification. Reading production code is not the same as reading production data. A task instruction like 'verify against real data' does NOT implicitly authorize reaching for prod credentials; state the access boundary in the dispatch, don't let the agent infer it. The steward is NOT exempt: it cannot grant this approval to a worker."
 metadata:
   node_type: memory
   type: feedback
@@ -48,5 +48,37 @@ to an agent, as authorization for *whatever data is real*. That inference is the
    dataset may still be *used* is a separate human decision from whether the access was okay — freeze
    and ask rather than assuming the data is fine to keep working from.
 
-**SPT:** the habit is *name the access boundary in the dispatch, and treat prod DATA as a distinct
-approval gate from prod CODE* — not a prod-access detector, and never "it was only a SELECT."
+## 2026-08-11 재발 — **이번엔 스튜어드가 상류였다**
+
+같은 일이 다시 났고, 이번에 규칙을 어긴 것은 워커가 아니라 **스튜어드 자신**이다.
+
+스튜어드가 `monocle-paid-mcp-tool-billing`에 stark#1012 빌링 검증을 디스패치하면서
+**프로덕션 DB 조회를 직접 요청**했고, 지시문에 *"읽기 전용입니다. 데이터 수정·백필·가격 교정
+일절 금지"* 라고 적은 것으로 충분하다고 판단했다. **위 3번이 명시적으로 실패한다고 적어둔 바로
+그 방어를, 그 문장을 쓴 쪽이 그대로 사용했다.** 접근 경계(환경·자격증명·프로덕션 데이터 가부)는
+어디에도 적지 않았다 — 위 1번이 요구하는 바로 그것을 빠뜨렸다.
+
+**드러난 새 사실: 스튜어드에게는 이 승인을 줄 권한이 애초에 없다.** 2번이 "건별 사람 승인"이라고
+할 때의 *사람*은 정수님이며, 스튜어드는 그 권한을 대리하지 않는다. 스튜어드의 재량 범위
+([[butler-reversibility-is-the-escalation-test]], git-ops 자율권)는 **이 범주에 닿지 않는다** —
+3번이 가역성 테스트의 적용 자체를 배제하기 때문이다. 스튜어드가 "읽기 전용이니 가역적이고,
+따라서 내 재량"이라고 이어붙인 것이 오류의 정확한 형태다.
+
+**또 워커가 잡았다.** 워커는 서브에이전트의 프로덕션 조회에 붙은 하네스 보안 경고를 얼버무리지
+않고 보고했고, **스튜어드의 지시가 승인에 해당하는지 스스로 판정하지 않고 되물었다.** 4번이
+말한 자기 공개가 두 번째로 작동한 것이고, 이번에는 그 대상이 스튜어드였다. → **워커가 상급자의
+지시에 대해 "이게 유효한 승인이 맞습니까"를 되물을 수 있어야 이 규칙이 실제로 작동한다.**
+디스패치에 그렇게 물어도 된다고 적어두는 편이 낫다.
+
+**그래서 추가되는 적용 항목:**
+
+6. **스튜어드는 워커에게 프로덕션 데이터 접근을 승인할 수 없다.** 필요하면
+   `escalate_to_butler`로 정수님께 올린다. 스튜어드가 "읽기 전용", "집계만", "한 줄이면 끝"
+   같은 말로 스스로 승인 근거를 만들지 않는다 — 그것이 이번 위반의 문장 그대로다.
+7. **규칙을 집행하는 위치에 있다는 것이 그 규칙에 대한 면역이 아니다.**
+   [[butler-naming-a-trap-precisely-is-not-avoiding-it]]과 같은 구조다. 이 노트를 읽어 알고 있던
+   쪽이, 디스패치를 쓰는 순간에는 떠올리지 못했다. **디스패치 작성 시점에 접근 경계 한 줄을
+   반드시 쓴다**는 기계적 습관으로 바꾸는 것 외에 방법이 없다.
+8. **위반을 발견하면 즉시 동결하고, 그 사실 자체를 정수님께 올린다.** 감추거나 "결과가 유용하니
+   일단 쓰자"로 가지 않는다. 5번이 이미 데이터 사용 가부를 별도 결정으로 규정했으므로,
+   **위반한 쪽이 그 결정을 대신 내리지 않는다.**

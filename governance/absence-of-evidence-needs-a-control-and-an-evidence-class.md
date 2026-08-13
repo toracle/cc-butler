@@ -20,8 +20,42 @@ A negative result is a claim about your instrument until you prove otherwise. Be
 
 This was the fourth measurement artifact in a single day, after two false watcher fires and a truncated-screen quote — consistent with `fixing-one-instrument-flaw-does-not-validate-the-instrument`.
 
+**A failure's blast radius is the same kind of claim, and needs the same control.**
+On 2026-08-09→10 the steward's `send_to_session` timed out eight times running. It
+diagnosed the scope **three times, wrongly, in sequence**:
+
+1. *"The MCP server is down"* — escalated to 정수님 asking for a restart. Refuted by
+   noticing the butler's own relay had reached the steward fine.
+2. *"My session's MCP client is hung"* — withdrawn on realising that
+   `compact_session`, `escalate_to_butler`, `butler_log`, `read_session_output`,
+   `session_status` and `regenerate_governance` had **all been working from that
+   same session the whole time**.
+3. Only then the true statement: **`send_to_session` alone fails, only from the
+   steward.**
+
+Every refutation came from evidence that was **already in hand and free to check**.
+The control — *call a neighbouring tool and see if it works* — cost one call and was
+available before the first escalation. Instead the most salient symptom was
+generalised straight to "the system is down", and a request went to the human to
+restart a server that was never broken — a restart that would have disturbed every
+running session to fix a fault in one.
+
+So: **"X is broken" is a claim about the boundary of the failure, not just the
+failure.** Before naming a scope, exercise the nearest thing that should still
+work. A failure whose blast radius is asserted rather than bounded will be
+asserted too wide, because the widest reading is the one the first symptom
+suggests.
+
 **How to apply:**
 
+- **Bound a failure before you name it.** One working neighbour separates "the
+  server is down" from "this one call is down", and the two have completely
+  different remedies. Do this before escalating, not after.
+- **Be suspicious when a diagnosis needs revising twice.** Each revision here came
+  from evidence already available — the pattern is not bad luck, it is concluding
+  at the first symptom and re-concluding at the second.
+- **A remedy whose blast radius exceeds the fault's is a tell.** Being about to ask
+  for a restart of everything to fix one call should have prompted the check.
 - Never report a negative without a control that must hit. If the control comes back empty too, the instrument is broken, not the world.
 - Before searching, ask what the store physically records. Transcripts record messages; they do not record keypresses, menu selections, terminal state, or anything the TUI handled locally. Registries record process liveness, not screen contents.
 - Say "structurally inconclusive — this evidence class does not exist here" rather than "not found." They lead to different next actions: one sends you to a different source (billing records, the human's own word), the other closes the question wrongly.

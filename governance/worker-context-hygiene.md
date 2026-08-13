@@ -36,6 +36,47 @@ then. That way the externalized record is always current, a clear is always chea
 and safe because nothing live is lost, and re-hydration is never a scramble.
 Treat making documents as part of the work, not a closing ritual.
 
+**But appending is not maintaining — the doc's *entry point* goes stale on its
+own.** Continuous externalization makes the handoff **grow**, and growth pushes
+today's state to the bottom while the top keeps whatever "read this first" block
+was written weeks ago. A fresh session reads top-down and stops when it finds
+something that looks authoritative. So the doc can be complete, current, and
+verified at every append, and still rehydrate a session into a stale world.
+
+This is worse than an absent entry point, because a heading like *"CURRENT STATE
+— this supersedes anything older that conflicts"* actively **discourages** reading
+further. The reader is doing exactly the right thing and is misled by it. And the
+failure is invisible from the writing side: whoever appends today has the real
+state in context and never re-reads the top.
+
+**Observed twice on 2026-08-08, both times by luck rather than by process.** A
+worker noticed, in the minutes before its own compaction, that its `HANDOFF.md`
+still opened with a two-days-old *"read from here after compaction"* block while
+that day's entire investigation sat at the bottom — the safety net for the
+compaction was the document, and the document pointed at the wrong day. Checking
+the steward's own `steward-handoff.md` on that finding showed the same defect in a
+worse form: four days stale, 422KB, top block self-declared as CURRENT STATE, and
+it is item #1 on the steward's documented startup path. Compaction happened to
+carry the real state forward; a `/clear` would have landed squarely on it.
+
+**So make the entry point part of the cycle, not part of the content:**
+1. **Before** any clear/compact, re-read the doc's *top*, not just append to its
+   bottom. The question is not "is today's work written down" but "where does a
+   session with no memory actually land, and is that where I want it."
+2. Keep **one** block that claims currency, and **date it**. When it stops being
+   current, demote it explicitly — mark it superseded and say so in the heading
+   itself. Prepend the new block; do not rewrite or delete the history, which is
+   both irreversible and where the reasoning lives.
+3. The current block should carry what a cold reader must not get wrong:
+   what is **decided vs. pending**, what is **in flight** (so nothing is
+   re-dispatched), the **standing prohibitions**, and **where the detail lives**.
+   That is a different job from the append log below it.
+4. A doc that another role is told to read on startup is **shared state**. Its
+   staleness is not a private cost — see [[butler-externalizing-is-not-delivering]]
+   for the same lesson at the delivery boundary, and
+   [[butler-a-decision-you-cite-may-have-been-narrowed-later]] for the same
+   shape in the governance store: an accurate quotation of a superseded block.
+
 **When to pick a session (candidate heuristic — start simple):** a long-running
 session whose *current* work is **discontinuous** from its long history is a
 clear candidate — the accumulated history is no longer serving the present task,

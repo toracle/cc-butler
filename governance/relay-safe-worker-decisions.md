@@ -1,6 +1,6 @@
 ---
 name: butler-relay-safe-worker-decisions
-description: "AskUserQuestion assumes a human at the terminal; it does not compose with fleet orchestration, where the steward drives workers via send_to_session (text + one Enter at the end). Workers under fleet orchestration should prefer report_to_steward/escalate_to_butler. Covers the MIXED state (human joins a fleet-driven session) and the PROSE-vs-BARE-DIGIT split: prose is discarded and Enter hits the highlighted default, but a bare digit DOES aim correctly at a menu."
+description: "AskUserQuestion assumes a human at the terminal; it does not compose with fleet orchestration, where the steward drives workers via send_to_session (text + one Enter at the end). Workers under fleet orchestration should prefer report_to_steward/escalate_to_butler. Covers the MIXED state (human joins a fleet-driven session) and the PROSE-vs-BARE-DIGIT split: prose is discarded and Enter hits the highlighted default. A bare digit aims correctly at usage-limit choosers but NOT at AskUserQuestion menus, where it was falsified 2026-08-12 — it silently selected the default instead. There is no relay path for choosing a non-default AskUserQuestion option; the human must use their own keyboard."
 metadata:
   node_type: memory
   type: feedback
@@ -27,8 +27,27 @@ These are two different cases and conflating them costs a real capability:
   discarded and the Enter lands on whatever is highlighted. You are not choosing
   an option, you are pressing Enter and taking whatever the cursor happens to sit
   on. Never do this.
-- **A BARE DIGIT ("2") DOES aim correctly** at these menus. Verified by the
-  butler on the usage-limit choosers and confirmed by reading the screen back.
+- **A BARE DIGIT ("2") aims correctly at SOME menus, and NOT at
+  `AskUserQuestion` menus.** Verified working by the butler on the **usage-limit
+  choosers**, confirmed by reading the screen back — but that verification
+  licenses only its own widget class, and it does not extend.
+
+  **FALSIFIED FOR `AskUserQuestion` ON 2026-08-12.** The steward read
+  `monocle-16-scheduler`'s open `AskUserQuestion` menu, confirmed it was on
+  screen, and sent a bare `3` to pick option 3. The transcript recorded
+  **option 1** — the highlighted default. The digit was typed as text and the
+  Enter took the cursor's option, exactly as PROSE does. Same conditions this
+  note says a digit works under: menu verified open immediately before sending.
+
+  So the operative rule is: **you cannot select a NON-DEFAULT option in an
+  `AskUserQuestion` menu by any means available to you.** Sending the digit does
+  not fail loudly — it silently selects the default, which is a *plausible*
+  answer, so the transcript will show a human-looking choice that nobody made.
+  That is worse than prose, whose damage is at least visible as a swallowed
+  message. If a non-default option must be chosen, the human uses their own
+  keyboard in the Emacs buffer; there is no relay path. Consequence here was
+  small (option 1 added a CDK file edit, overridden a minute later), but the
+  same mistake on a destructive menu would not be.
 
 So a steward/butler CAN faithfully relay a human's own menu answer when the human
 replied in prose to the wrong surface — which happens often, because a human

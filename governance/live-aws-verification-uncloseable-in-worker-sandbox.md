@@ -10,9 +10,9 @@ metadata:
 
 This note previously asserted that worker sandboxes "structurally have NO AWS credentials, so any verification requiring a live AWS call CANNOT be completed inside the worker." **That structural guarantee does not exist.** Verified by the butler directly, reading config only (no secrets read, no auth attempted, no calls made):
 
-- `~/.aws/config` defines **production** profiles alongside staging ones: `monocle-jarvice`, `monocle-stark`, `warmblood-cross-account-admin`, `monocle-entry`, `warmblood`, plus `monocle-jarvice-stg` / `monocle-stark-stg`.
+- `~/.aws/config` defines **production** profiles alongside staging ones: `<AWS_PROFILE_1>`, `<AWS_PROFILE_2>`, `<AWS_PROFILE_3>`, `<AWS_PROFILE_4>`, `<AWS_PROFILE_5>`, plus `<AWS_PROFILE_6>` / `<AWS_PROFILE_7>`.
 - The `aws` CLI is on PATH at `~/.local/bin/aws`.
-- `~/.aws/credentials` holds static keys for only `warmblood`, `warmblood-deploy`, `warmblood-email-template`, `safety-snap-sso`.
+- `~/.aws/credentials` holds static keys for only `<AWS_PROFILE_1>`, `<AWS_PROFILE_2>`, `<AWS_PROFILE_3>`, `<AWS_PROFILE_4>`.
 
 **What is established vs. not:**
 - ESTABLISHED: production profile *definitions* are reachable from the agent environment, and the CLI exists. There is no sandbox boundary making AWS unreachable.
