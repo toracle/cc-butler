@@ -79,6 +79,27 @@ must be a quiet no-op, not an error from a nil dir."
       (should (null (cc-butler--north-star-fire)))
       (should (null (cc-butler-north-star-test--recorded-writes))))))
 
+(ert-deftest cc-butler-north-star/check-command-reports-success ()
+  "The interactive command delegates to `cc-butler--north-star-fire' and
+tells the caller what happened — unlike the timer's silent no-op, a human
+asking explicitly deserves an answer either way."
+  (cc-butler-north-star-test--with-stub-terminal
+    (let (msg)
+      (cl-letf (((symbol-function 'message) (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
+        (cc-butler-north-star-check))
+      (should (string-match-p "sent to the butler" msg)))))
+
+(ert-deftest cc-butler-north-star/check-command-reports-when-skipped ()
+  "A busy butler must still get a message back, not silence — the whole
+point of a manual call is the human wants to know it actually happened."
+  (cc-butler-north-star-test--with-stub-terminal
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (float-time))))
+      (let (msg)
+        (cl-letf (((symbol-function 'message) (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
+          (cc-butler-north-star-check))
+        (should (string-match-p "skipped" msg))))))
+
 (ert-deftest cc-butler-north-star/fire-noop-when-terminal-not-live ()
   "The butler dir is set but its terminal buffer is gone (session ended,
 Emacs just restarted) — must not error, just skip."

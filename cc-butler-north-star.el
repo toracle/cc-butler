@@ -86,6 +86,20 @@ butler is actually doing."
               ((cc-butler--forward-ops-free-p butler)))
     (cc-butler--send-input butler (cc-butler--north-star-prompt) t)))
 
+;;;###autoload
+(defun cc-butler-north-star-check ()
+  "Nudge the butler to self-check active North Stars against their DoD
+right now, instead of waiting for the next scheduled tick.  Still
+respects the same idle gate the timer uses
+\(`cc-butler--forward-ops-free-p'\) — a human asking explicitly still
+should not get to type over the butler mid-turn — but reports why when
+that gate holds it back, since a manual call deserves an answer, not the
+timer's silent no-op."
+  (interactive)
+  (if (cc-butler--north-star-fire)
+      (message "cc-butler: North Star check sent to the butler")
+    (message "cc-butler: North Star check skipped — no butler designated, its terminal isn't live, or it looks busy right now")))
+
 (defun cc-butler--north-star-ensure-timer ()
   "(Re)register the North Star timer; idempotent for hot reloads."
   (when (timerp cc-butler--north-star-timer)
