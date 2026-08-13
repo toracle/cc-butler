@@ -51,6 +51,7 @@
 (require 'cc-butler-provenance)
 (require 'cc-butler-cleanup)
 (require 'cc-butler-compact)
+(require 'cc-butler-north-star)
 
 (require 'hydra)
 
@@ -97,7 +98,8 @@
   '(cc-butler-session cc-butler-notifications cc-butler-workspace
     cc-butler-orchestrator cc-butler-doc-panel cc-butler-docs cc-butler-persist
     cc-butler-mail cc-butler-decision cc-butler-inbox cc-butler-governance
-    cc-butler-provenance cc-butler-cleanup cc-butler-compact)
+    cc-butler-provenance cc-butler-cleanup cc-butler-compact
+    cc-butler-north-star)
   "cc-butler modules, in dependency order.")
 
 (defconst cc-butler--dir
