@@ -360,12 +360,14 @@ Locations are derived from the butler home (the shared operational home)."
      (format (concat "- **operating-principle source of truth:** `%s`\n"
                      "  (one `.md` per principle, runtime-neutral). `M-x"
                      " cc-butler-governance-regenerate`\n  refreshes each note's cached"
-                     " *body* from the store, but it does NOT update\n  `MEMORY.md`'s"
-                     " index (tracked: cc-butler#36) — a regenerated note that has no"
-                     " line\n  in `MEMORY.md` exists on disk but is never recalled."
-                     " Route a new operational\n  learning by editing the store, running"
-                     " regenerate, AND adding its index line\n  to `MEMORY.md` by hand —"
-                     " all three, until #36 closes.\n")
+                     " *body* from the store AND add-only syncs `MEMORY.md`'s\n  index —"
+                     " any note missing an index line gets one appended automatically."
+                     " **Never\n  hand-edit `MEMORY.md`** to add or fix an index line: a"
+                     " hand-written line can drift\n  from the real cached filename"
+                     " (e.g. miss the `butler-` prefix) and sit duplicated\n  next to the"
+                     " correct auto-generated one instead of replacing it. Route a new"
+                     " operational\n  learning by editing the store and running"
+                     " regenerate — that's the whole procedure.\n")
              (abbreviate-file-name (cc-butler-governance-store)))
      "\n")))
 
