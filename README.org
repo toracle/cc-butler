@@ -166,6 +166,39 @@ Or clone both repos and put them on your ~load-path~:
 After any of these, run ~M-x cc-butler-doctor~ to check for fresh-install gaps
 (CLI path, ghostel backend, etc.) — see [[*Requirements][Requirements]] above.
 
+* After a merge: syncing a running installation
+
+~cc-butler~ installs are ~package-vc~-managed — a pinned git checkout, not a
+registry package. *Merging a fix to ~main~ on GitHub does not reach any
+running instance by itself.* Each machine hosting a fleet must explicitly
+upgrade and recompile, and a live Emacs process keeps executing the old code
+until it does. Never treat "merged" as "deployed" — verify by observation.
+
+On each machine:
+
+1. Upgrade the install:
+   #+begin_src emacs-lisp
+   (package-vc-upgrade (car (alist-get 'cc-butler package-alist)))
+   #+end_src
+   (or interactively: ~M-x package-vc-upgrade RET cc-butler RET~)
+
+2. Verify the *files on disk* actually moved — don't infer this from the
+   command not erroring:
+   #+begin_src sh
+   git -C ~/.emacs.d/elpa/cc-butler log -1 --oneline
+   #+end_src
+   Compare that SHA against the expected merge commit / ~origin/main~. Only a
+   match confirms the install itself is current.
+
+3. If a live Emacs session was already running cc-butler before step 1, its
+   already-loaded function definitions stay on the *old* code in memory even
+   after the files on disk are updated. Restart Emacs, or explicitly reload
+   the changed file(s) (~M-x load-file~), so the running process actually
+   executes the new code. Step 2's SHA only tells you the disk is current —
+   it does not tell you the running process picked it up; check that
+   separately (e.g. inspect the live behavior, or ~symbol-file~ / re-eval the
+   function and compare against the source).
+
 * Usage
 
 ~M-x cc-butler~ opens the session manager. In the list buffer, ~?~ opens a
