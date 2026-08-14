@@ -52,6 +52,7 @@
 (require 'cc-butler-cleanup)
 (require 'cc-butler-compact)
 (require 'cc-butler-north-star)
+(require 'cc-butler-self-check)
 
 (require 'hydra)
 
@@ -68,7 +69,7 @@
   "
  _n_ext  _p_rev  _RET_ open  _SPC_ preview  _g_ refresh  _q_ quit
  _c_ new session   _N_ew topic   _K_ close topic   _h_ doctor   _l_og
- _B_utler   _S_teward   _b_ set butler   _i_nbox   _*_ north star check
+ _B_utler   _S_teward   _b_ set butler   _i_nbox   _*_ north star check   _!_ self-check
  doc panel:  _d_ toggle  _o_pen  _v_ reopen  _D_ remove
 "
   ("n" cc-butler-next)
@@ -86,6 +87,7 @@
   ("b" cc-butler-set-butler)
   ("i" cc-butler-inbox)
   ("*" cc-butler-north-star-check)
+  ("!" cc-butler-self-check)
   ("d" cc-butler-doc-toggle)
   ("o" cc-butler-doc-open)
   ("v" cc-butler-doc-reopen)
@@ -100,7 +102,7 @@
     cc-butler-orchestrator cc-butler-doc-panel cc-butler-docs cc-butler-persist
     cc-butler-mail cc-butler-decision cc-butler-inbox cc-butler-governance
     cc-butler-provenance cc-butler-cleanup cc-butler-compact
-    cc-butler-north-star)
+    cc-butler-north-star cc-butler-self-check)
   "cc-butler modules, in dependency order.")
 
 (defconst cc-butler--dir
