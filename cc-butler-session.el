@@ -562,6 +562,7 @@ under the cursor just because some session's wait-state flipped mid-move."
   "C-n"      #'cc-butler-next
   "C-p"      #'cc-butler-prev
   "RET"      #'cc-butler-visit
+  "<mouse-1>" #'cc-butler-mouse-visit
   "SPC"      #'cc-butler-preview
   "g"        #'cc-butler-refresh
   "c"        #'cc-butler-new-session
@@ -1521,6 +1522,16 @@ input-waiting queue."
   (when (window-live-p (cc-butler--main-win))
     (select-window (cc-butler--main-win)))
   (cc-butler--maybe-refresh))
+
+(defun cc-butler-mouse-visit (event)
+  "Like `cc-butler-visit', but for a click at EVENT.
+Bound to <mouse-1> so a tap (e.g. from an SSH/tmux touch client) selects
+the session under it, instead of merely moving point there — which is
+Emacs' default click behavior in this buffer, and was the whole problem."
+  (interactive "e")
+  (when-let ((pos (posn-point (event-end event))))
+    (goto-char pos)
+    (cc-butler-visit)))
 
 (defun cc-butler-refresh ()
   "Refresh the session list and re-fetch forge info."
