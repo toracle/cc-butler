@@ -600,9 +600,19 @@ what a busy steward would otherwise have to remember to go check."
   (let ((now (float-time)) rows)
     (dolist (s (cc-butler--sessions))
       (let* ((dir (plist-get s :dir))
-             (since (cc-butler--waiting-p dir)))
+             (since (cc-butler--waiting-p dir))
+             (reported (gethash dir cc-butler--last-report)))
         (when (and since
                    (>= (- now since) cc-butler-fleet-stale-waiting-seconds)
+                   ;; A report landing at (or just before) the moment this
+                   ;; session went idle means it spoke up right before
+                   ;; parking -- a stuck dialog never gets the chance to call
+                   ;; any tool. 60s of slack covers the gap between the
+                   ;; report call and Claude's own idle notification landing.
+                   ;; Compared against SINCE, not NOW, so a worker parked for
+                   ;; hours stays excluded instead of aging back into the
+                   ;; warning once 60s of wall-clock time passes.
+                   (not (and reported (>= reported (- since 60))))
                    (not (equal dir cc-butler--butler))
                    (not (equal dir cc-butler--steward)))
           (push (format "- %s (waiting %ds)" (cc-butler--display-name dir)
@@ -1602,6 +1612,7 @@ alias for already-connected callers."
   (let ((self (cc-butler--caller-dir)))
     (unless self
       (error "No calling session context for this report"))
+    (cc-butler--mark-reported self)
     (let* ((parts (delq nil
                         (list (and (stringp summary) (not (string-empty-p summary)) summary)
                               (and (stringp status) (not (string-empty-p status))

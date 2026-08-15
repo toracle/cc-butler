@@ -241,6 +241,16 @@ oldest request first (FIFO); absence means the session is not waiting.")
   "Mark session DIR as no longer awaiting input."
   (when dir (remhash dir cc-butler--waiting)))
 
+(defvar cc-butler--last-report (make-hash-table :test 'equal)
+  "Map a session working-dir -> float-time of its last `report_to_steward'.
+A recent entry means the session recently spoke up on its own, which a
+session silently stuck in a dialog (e.g. an unnoticed AskUserQuestion)
+cannot do -- see `cc-butler--fleet-stale-waiting-summary'.")
+
+(defun cc-butler--mark-reported (dir)
+  "Record that session DIR just called `report_to_steward'."
+  (when dir (puthash dir (float-time) cc-butler--last-report)))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Transcript-based liveness (compaction gate)
 ;;;; ------------------------------------------------------------------
