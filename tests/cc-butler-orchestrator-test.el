@@ -92,6 +92,31 @@ this filter does not distinguish anything."
         (should (string-match-p "worker-stuck" summary))
         (should (string-match-p "worker-stale-report" summary))))))
 
+(ert-deftest cc-butler-orchestrator/fleet-stale-waiting-known-gap-report-then-immediate-dialog ()
+  "KNOWN LIMITATION (documented in PR #84's \"what this fix does not
+cover\"): a worker that calls report_to_steward and then immediately opens
+a dialog is wrongly excluded -- the dialog's own idle notification sets
+SINCE only an instant after the report, landing inside the 60s slack meant
+for the report -> notification lag, not for a genuinely stuck session.
+This path is only reachable by violating the standing rule that workers
+must never call AskUserQuestion (report_to_steward / plain text only),
+which is why the trade is accepted rather than closed. This test pins the
+current (accepted) behavior, so a future change to the grace window is a
+deliberate, visible decision rather than a silent regression."
+  (let* ((cc-butler-fleet-stale-waiting-seconds 60)
+         (cc-butler--butler "/butler/") (cc-butler--steward "/steward/")
+         (now (float-time))
+         (cc-butler--waiting (make-hash-table :test 'equal))
+         (cc-butler--last-report (make-hash-table :test 'equal)))
+    ;; Reported at t=-305; a dialog opened 5s later (t=-300) and has sat open
+    ;; ever since -- genuinely stuck, but within the report's 60s grace.
+    (puthash "/worker-reported-then-stuck/" (- now 300) cc-butler--waiting)
+    (puthash "/worker-reported-then-stuck/" (- now 305) cc-butler--last-report)
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () (list (list :dir "/worker-reported-then-stuck/"))))
+              ((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (should (null (cc-butler--fleet-stale-waiting-summary))))))
+
 (ert-deftest cc-butler-orchestrator/report-to-steward-marks-reported ()
   "report_to_steward is the worker's only way to prove it isn't stuck --
 Then calling it must record a fresh `cc-butler--mark-reported' timestamp."
