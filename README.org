@@ -199,6 +199,44 @@ On each machine:
    separately (e.g. inspect the live behavior, or ~symbol-file~ / re-eval the
    function and compare against the source).
 
+* Development
+
+** Running the test suite
+
+#+begin_src sh
+emacs -Q --batch -l tests/run-tests.el
+#+end_src
+
+That script's load-path is deliberately ordered so an elpa-installed copy of
+cc-butler doesn't shadow the working tree under test — see its own header
+comment for why that matters.
+
+** Known issue: broken system ~emacs~ on some machines
+
+On at least one machine running these tests (confirmed 2026-08-15), the
+~emacs~ found on ~PATH~ fails outright:
+
+#+begin_src sh
+$ emacs --batch --eval '(princ emacs-version)'
+exec: /opt/homebrew/Cellar/emacs-plus@30/30.2/Emacs.app/Contents/MacOS/Emacs: No such file or directory
+#+end_src
+
+It is a Homebrew shim exec-ing an app-bundle path that no longer exists on
+that machine. *Run the same command above to check your own machine* — if it
+fails the same way, use the working binary confirmed for this repo's tests
+(Emacs 30.2) directly instead of ~emacs~:
+
+#+begin_src sh
+/Applications/Emacs.app/Contents/MacOS/Emacs -Q --batch -l tests/run-tests.el
+#+end_src
+
+The root cause has not been investigated (a moved or reinstalled app bundle
+is a guess, not a confirmed cause). Scope: this only affects CLI batch runs
+(tests, this troubleshooting section) — a live/GUI Emacs process already
+running cc-butler is unaffected. This is a fact about *that one machine*,
+not about the repo or a universal cc-butler requirement; a machine with a
+working ~emacs~ on ~PATH~ has nothing to do here.
+
 * Usage
 
 ~M-x cc-butler~ opens the session manager. In the list buffer, ~?~ opens a
