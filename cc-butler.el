@@ -173,6 +173,85 @@ Callers must not read it as \"up to date\"."
           (let ((s (string-trim (buffer-string))))
             (unless (string-empty-p s) s)))))))
 
+(defun cc-butler--file-head-line (file &optional max)
+  "First non-blank-trimmed line of FILE (up to MAX bytes, default 512), or nil.
+A plain file read — no subprocess, nothing that can block on a lock."
+  (when (file-readable-p file)
+    (with-temp-buffer
+      (insert-file-contents file nil 0 (or max 512))
+      (goto-char (point-min))
+      (let ((line (string-trim (buffer-substring (point) (line-end-position)))))
+        (unless (string-empty-p line) line)))))
+
+(defun cc-butler--git-dir (dir)
+  "The git directory serving DIR, or nil.
+`.git' is usually a directory, but in a linked worktree or submodule it is a
+FILE containing \"gitdir: PATH\" — follow that one hop."
+  (let ((dotgit (expand-file-name ".git" dir)))
+    (cond
+     ((file-directory-p dotgit) dotgit)
+     ((file-regular-p dotgit)
+      (let ((line (cc-butler--file-head-line dotgit 4096)))
+        (when (and line (string-match "\\`gitdir:[ \t]*\\(.+\\)\\'" line))
+          (let ((target (expand-file-name (match-string 1 line)
+                                          (file-name-as-directory dir))))
+            (and (file-directory-p target) target))))))))
+
+(defun cc-butler--git-ref-hash (gitdir ref)
+  "Hash REF points to, from GITDIR's loose ref file or packed-refs, or nil.
+When GITDIR belongs to a linked worktree, refs live in the COMMON git dir —
+named by GITDIR's `commondir' file — not in GITDIR itself."
+  (let* ((commondir (expand-file-name "commondir" gitdir))
+         (common (or (and (file-regular-p commondir)
+                          (let ((rel (cc-butler--file-head-line commondir 4096)))
+                            (and rel (expand-file-name rel gitdir))))
+                     gitdir))
+         (loose (cc-butler--file-head-line (expand-file-name ref common))))
+    (if (and loose (string-match "\\`[0-9a-f]\\{40,\\}\\'" loose))
+        loose
+      (let ((packed (expand-file-name "packed-refs" common)))
+        (when (file-readable-p packed)
+          (with-temp-buffer
+            (insert-file-contents packed)
+            (goto-char (point-min))
+            (when (re-search-forward
+                   (concat "^\\([0-9a-f]\\{40,\\}\\)[ \t]+" (regexp-quote ref) "$")
+                   nil t)
+              (match-string 1))))))))
+
+(defun cc-butler--git-head (dir)
+  "Short description of DIR's git HEAD — \"abc1234 (main)\" — or nil.
+
+Read straight from the repository files (.git/HEAD, the loose ref,
+packed-refs) with plain file reads: NO subprocess, ever.  This runs inside a
+synchronous MCP tool handler on the daemon's single Lisp thread, where
+`shell-command-to-string' blocks in C with no timeout and `with-timeout'
+cannot interrupt it (timers cannot fire inside a blocked C call) — so a
+wedged .git/index.lock or a stalled filesystem would freeze every fleet
+session's terminal and every other MCP call at once.  Reading refs never
+takes the index lock and cannot wait on one.
+
+Nil means \"cannot determine\" — not a repo, unreadable, an odd state.
+Callers must degrade (drop the line, show nothing), never probe harder."
+  (ignore-errors
+    (let ((gitdir (cc-butler--git-dir dir)))
+      (when gitdir
+        (let ((head (cc-butler--file-head-line (expand-file-name "HEAD" gitdir))))
+          (cond
+           ((null head) nil)
+           ;; On a branch: HEAD is a symbolic ref.
+           ((string-match "\\`ref:[ \t]*\\(refs/[^ \t]+\\)\\'" head)
+            (let* ((ref (match-string 1 head))
+                   (hash (cc-butler--git-ref-hash gitdir ref)))
+              (when hash
+                (format "%s (%s)" (substring hash 0 7)
+                        (if (string-prefix-p "refs/heads/" ref)
+                            (substring ref (length "refs/heads/"))
+                          ref)))))
+           ;; Detached: HEAD is the hash itself (40 hex, or 64 under sha256).
+           ((string-match "\\`[0-9a-f]\\{40,\\}\\'" head)
+            (format "%s (detached)" (substring head 0 7)))))))))
+
 (defun cc-butler--source-revision (dir)
   "One-line description of the commit DIR is on, or nil if not determinable.
 The only trustworthy version signal for a source directory: the `Version:'
@@ -330,14 +409,14 @@ a context, and nothing in this path is a substitute for it."
   (let* ((res (cc-butler-reload))
          (dir (plist-get res :dir))
          (stale (plist-get res :stale))
-         (head (string-trim
-                (or (ignore-errors
-                      (let ((default-directory dir))
-                        (shell-command-to-string "git log --oneline -1 2>/dev/null")))
-                    ""))))
+         ;; File reads only — `shell-command-to-string' here once put the
+         ;; whole daemon one wedged .git/index.lock away from a total freeze
+         ;; (single Lisp thread, no timeout, `with-timeout' can't interrupt
+         ;; a blocked C call).  See `cc-butler--git-head'.
+         (head (ignore-errors (cc-butler--git-head dir))))
     (concat
      (format "Reloaded %d cc-butler modules from %s" (plist-get res :count) dir)
-     (if (string-empty-p head) "" (format "\nSource is at: %s" head))
+     (if head (format "\nSource is at: %s" head) "")
      "\n\nThis loads whatever is ON DISK in that directory — it does not fetch. If you expected newer code, `git pull` there first and call this again. Note that directory is the one this Emacs actually loads from, which is not necessarily the checkout you have been editing."
      (if stale
          (format "\n\n⚠ STALE BYTE-CODE: %s are older than their .el source. Emacs prefers .elc on startup, so these will silently undo this reload the next time Emacs restarts. Delete them (or byte-recompile) in %s."
