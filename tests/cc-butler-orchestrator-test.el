@@ -16,6 +16,7 @@
 (require 'ert)
 (require 'cc-butler-orchestrator)
 (require 'cc-butler-governance)
+(require 'cc-butler-mail)   ; the send path journals; tests sandbox `cc-butler-mail-dir'
 ;; Needed only so `cc-butler-decision-workflow' is a properly-declared
 ;; (defcustom-special) dynamic variable before the backlog-append tests and
 ;; the escalate_to_butler kind-routing tests below `let'-bind it -- under
@@ -668,20 +669,26 @@ do not know what the screen says."
 ;; from me" is relying on it to remember; the code can simply do it.
 
 (defmacro cc-butler-orch-test--sending (self target &rest body)
-  "Run BODY with the send path stubbed; sent text collects in `sent'."
+  "Run BODY with the send path stubbed; sent text collects in `sent'.
+`cc-butler-mail-dir' is bound to a throwaway directory: the send path
+journals every send into <mail-dir>/log/, and a test must never write
+into the REAL ~/.local/state journal."
   (declare (indent 2))
-  `(let ((sent nil))
-     (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () ,self))
-               ((symbol-function 'cc-butler--dir-by-name) (lambda (_n) ,target))
-               ((symbol-function 'cc-butler--send-input)
-                (lambda (_d text &optional _s) (push text sent) t))
-               ((symbol-function 'cc-butler--clear-waiting) #'ignore)
-               ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
-               ((symbol-function 'cc-butler--log) #'ignore)
-               ((symbol-function 'cc-butler--display-name)
-                (lambda (d) (file-name-nondirectory (directory-file-name d))))
-               ((symbol-function 'cc-butler--session-id) (lambda (_d) "sid-1")))
-       ,@body)))
+  `(let ((sent nil)
+         (cc-butler-mail-dir (make-temp-file "cc-butler-orch-test-mail" t)))
+     (unwind-protect
+         (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () ,self))
+                   ((symbol-function 'cc-butler--dir-by-name) (lambda (_n) ,target))
+                   ((symbol-function 'cc-butler--send-input)
+                    (lambda (_d text &optional _s) (push text sent) t))
+                   ((symbol-function 'cc-butler--clear-waiting) #'ignore)
+                   ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+                   ((symbol-function 'cc-butler--log) #'ignore)
+                   ((symbol-function 'cc-butler--display-name)
+                    (lambda (d) (file-name-nondirectory (directory-file-name d))))
+                   ((symbol-function 'cc-butler--session-id) (lambda (_d) "sid-1")))
+           ,@body)
+       (delete-directory cc-butler-mail-dir t))))
 
 (ert-deftest cc-butler-orchestrator/relayed-text-carries-its-sender ()
   "The attribution is prepended by the CODE, on its own line, and names the

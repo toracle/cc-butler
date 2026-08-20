@@ -111,7 +111,69 @@ Bind to a mock channel to contract-test the routing in isolation.")
       (let ((print-length nil) (print-level nil))
         (prin1 msg (current-buffer)) (insert "\n")))
     (rename-file tmp new t)            ; atomic within the filesystem
+    ;; Audit layer: the same id as the inbox file, so the journal line and
+    ;; the delivered message are traceable to each other.  `--mail-journal'
+    ;; is non-fatal by construction — a journal failure never rolls back or
+    ;; breaks the delivery that just happened.
+    (cc-butler--mail-journal (list :channel 'mail
+                                   :kind (plist-get msg :kind)
+                                   :from (plist-get msg :from)
+                                   :to to
+                                   :body (plist-get msg :body)
+                                   :time (plist-get msg :time)
+                                   :id id))
     id))
+
+;;;; ------------------------------------------------------------------
+;;;; Unified channel journal (append-only audit log over BOTH channels)
+;;;; ------------------------------------------------------------------
+;;
+;; Two channels, two consumption patterns: "messenger" (`send_to_session' —
+;; immediate, typed into the terminal, consumed on the spot) and "email"
+;; (maildir — pull-based, held until drained).  The delivery mechanisms stay
+;; separate; this journal is the ONE audit layer over both, so every
+;; inter-session message accumulates in a single chronological record:
+;; <mail-dir>/log/YYYY-MM-DD.eld, one printed plist per line, appended.
+;; Entry shape: (:channel terminal|mail :kind K :from F :to T :body B
+;; :time TIME :id ID).  Logging is strictly subordinate to delivery — the
+;; whole write is wrapped in `ignore-errors' and must never break a send.
+
+(defun cc-butler--mail-log-dir ()
+  "Directory of the channel journal, derived from `cc-butler-mail-dir'."
+  (expand-file-name "log/" (file-name-as-directory
+                            (expand-file-name cc-butler-mail-dir))))
+
+(defun cc-butler--mail-journal (entry)
+  "Append ENTRY (a plist) to today's journal file.  Non-fatal: any failure
+is swallowed (`ignore-errors') — the journal is an audit layer, never a
+precondition.  Fills :time and :id when absent.  Returns the entry, or nil
+if the write failed."
+  (ignore-errors
+    (let* ((entry (plist-put (plist-put entry
+                                        :time (or (plist-get entry :time)
+                                                  (current-time)))
+                             :id (or (plist-get entry :id) (cc-butler--mail-id))))
+           (dir (cc-butler--mail-log-dir))
+           (file (expand-file-name (format-time-string "%Y-%m-%d.eld") dir)))
+      (make-directory dir t)
+      (let ((print-length nil) (print-level nil))
+        (write-region (concat (prin1-to-string entry) "\n") nil file
+                      'append 'silent))
+      entry)))
+
+(defun cc-butler-mail-journal-send (from-dir to-name text)
+  "Journal a terminal (messenger) send: TEXT from session FROM-DIR to TO-NAME.
+An audit record only — the text was already typed into the receiver's
+terminal by `send_to_session', so nothing is delivered to any maildir (a
+`new/' copy would make the next check_inbox deliver it a second time).
+Non-fatal, like every journal write."
+  (ignore-errors
+    (cc-butler--mail-journal
+     (list :channel 'terminal
+           :kind 'send
+           :from (and from-dir (cc-butler--display-name from-dir))
+           :to to-name
+           :body text))))
 
 (defun cc-butler--mail-file-drain (agent)
   "Drain AGENT's new/ (oldest first), archiving each; ignore half-written tmp/."

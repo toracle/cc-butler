@@ -1581,6 +1581,14 @@ The text is prefixed with a line naming the sending session — see
        t)
       (cc-butler--clear-waiting dir)       ; commanding a worker attends to it
       (cc-butler--log "%s → %s │ %s" (cc-butler--who-dir self) (cc-butler--who-dir dir) text)
+      ;; Channel journal: the messenger channel's audit record (mail deliveries
+      ;; journal themselves in `cc-butler--mail-file-deliver').  fboundp-guarded
+      ;; because cc-butler-mail requires THIS module, so requiring it back would
+      ;; be a cycle — same pattern as `cc-butler-docs--auto-log' below.  The
+      ;; journal fn is itself non-fatal (`ignore-errors'): recording never
+      ;; breaks a send that already succeeded.
+      (when (fboundp 'cc-butler-mail-journal-send)
+        (cc-butler-mail-journal-send self name text))
       (cc-butler--maybe-refresh)
       (format "Sent to %s and submitted." name)))))
 
