@@ -59,7 +59,7 @@ the reload, so it has to be surfaced rather than discovered later."
 out in the response rather than left as a silent trap."
   (cl-letf (((symbol-function 'cc-butler-reload)
              (lambda () (list :count 3 :dir "/x/" :stale '("cc-butler-mail.elc"))))
-            ((symbol-function 'shell-command-to-string) (lambda (&rest _) "")))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil)))
     (let ((out (cc-butler-tool-reload-code)))
       (should (string-match-p "STALE" out))
       (should (string-match-p "cc-butler-mail.elc" out)))))
@@ -69,12 +69,101 @@ out in the response rather than left as a silent trap."
 concluding a merge reached the fleet when nothing was pulled."
   (cl-letf (((symbol-function 'cc-butler-reload)
              (lambda () (list :count 3 :dir "/x/" :stale nil)))
-            ((symbol-function 'shell-command-to-string) (lambda (&rest _) "abc123 some commit\n")))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) "abc123f (main)")))
     (let ((out (cc-butler-tool-reload-code)))
       (should (string-match-p "does not fetch" out))
-      (should (string-match-p "abc123" out))
+      (should (string-match-p "abc123f" out))
       ;; and the tool-list caveat, which is the other recurring wrong conclusion
       (should (string-match-p "/mcp" out)))))
+
+;;;; ------------------------------------------------------------------
+;;;; Reading git HEAD without a subprocess — the daemon must never block
+;;;; ------------------------------------------------------------------
+;;
+;; The reload report's HEAD line used to come from `shell-command-to-string',
+;; which blocks in C with no timeout — and `with-timeout' cannot interrupt a
+;; blocked C call, so a wedged .git/index.lock or a stalled filesystem would
+;; freeze the single Lisp thread: every fleet session's terminal, every MCP
+;; call.  The fix reads .git/HEAD (and the ref files) directly; these tests
+;; pin that reader.  `call-process' below is fine — batch tests, not the
+;; daemon.
+
+(defun cc-butler-test--git (dir &rest args)
+  "Run git ARGS in DIR for fixture setup; error if git fails."
+  (let ((default-directory dir))
+    (unless (eq 0 (apply #'call-process "git" nil nil nil args))
+      (error "fixture git %s failed in %s" args dir))))
+
+(defun cc-butler-test--make-git-repo ()
+  "Create a one-commit fixture repo on branch main; return (DIR . FULL-HASH)."
+  (let ((dir (file-name-as-directory (make-temp-file "cc-git-head" t))))
+    (cc-butler-test--git dir "init" "-q")
+    (cc-butler-test--git dir "symbolic-ref" "HEAD" "refs/heads/main")
+    (cc-butler-test--git dir "config" "user.email" "test@test")
+    (cc-butler-test--git dir "config" "user.name" "test")
+    (cc-butler-test--git dir "commit" "-q" "--allow-empty" "-m" "initial")
+    (cons dir
+          (let ((default-directory dir))
+            (with-temp-buffer
+              (call-process "git" nil t nil "rev-parse" "HEAD")
+              (string-trim (buffer-string)))))))
+
+(ert-deftest cc-butler-git-head/reads-branch-head-from-files ()
+  "Normal repo on a branch: short hash and branch name, from file reads alone."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (hash (cdr fix)))
+    (should (equal (cc-butler--git-head dir)
+                   (format "%s (main)" (substring hash 0 7))))))
+
+(ert-deftest cc-butler-git-head/detached-head-still-yields-the-hash ()
+  "Detached HEAD is a hash in .git/HEAD, not a ref — report it, don't error."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (hash (cdr fix)))
+    (cc-butler-test--git dir "checkout" "-q" "--detach")
+    (should (equal (cc-butler--git-head dir)
+                   (format "%s (detached)" (substring hash 0 7))))))
+
+(ert-deftest cc-butler-git-head/resolves-a-packed-ref ()
+  "After `git pack-refs' the loose ref file is gone and the hash lives in
+packed-refs — the state every gc'd repo ends up in."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (hash (cdr fix)))
+    (cc-butler-test--git dir "pack-refs" "--all")
+    (should-not (file-exists-p (expand-file-name ".git/refs/heads/main" dir)))
+    (should (equal (cc-butler--git-head dir)
+                   (format "%s (main)" (substring hash 0 7))))))
+
+(ert-deftest cc-butler-git-head/follows-a-dotgit-file-into-a-worktree ()
+  "In a linked worktree `.git' is a FILE naming the real gitdir, and the refs
+live in the common dir.  cc-butler's own fleet loads from worktrees, so this
+is not an edge case here."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (hash (cdr fix))
+         (wt (expand-file-name "wt" (make-temp-file "cc-git-wt" t))))
+    (cc-butler-test--git dir "worktree" "add" "-q" "-b" "side" wt)
+    (should (equal (cc-butler--git-head wt)
+                   (format "%s (side)" (substring hash 0 7))))))
+
+(ert-deftest cc-butler-git-head/not-a-repo-degrades-to-nil-not-an-error ()
+  "Nil means \"cannot determine\"; the reload report drops the line and goes
+on.  Blocking or erroring while trying harder is the failure this replaced."
+  (let ((dir (file-name-as-directory (make-temp-file "cc-no-repo" t))))
+    (should-not (cc-butler--git-head dir))
+    (should-not (cc-butler--git-head (expand-file-name "absent" dir)))))
+
+(ert-deftest cc-butler-git-head/tool-report-omits-the-line-when-unknown ()
+  "The report must still work with no HEAD available — placeholder behavior,
+never a probe that can hang the daemon."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 3 :dir "/x/" :stale nil)))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil)))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should (string-match-p "Reloaded 3 cc-butler modules" out))
+      (should-not (string-match-p "Source is at:" out)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Which source directory loads — one place decides
@@ -161,7 +250,7 @@ spelled out here.  Which copy just got reloaded, and whether it is behind, is
 the thing that caller is least able to find out for itself."
   (cl-letf (((symbol-function 'cc-butler-reload)
              (lambda () (list :count 3 :dir "/x/" :stale nil)))
-            ((symbol-function 'shell-command-to-string) (lambda (&rest _) ""))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
             ((symbol-function 'cc-butler--source-diagnostics)
              (lambda () '((warn . "SOURCE-STATE-MARKER")))))
     (should (string-match-p "SOURCE-STATE-MARKER" (cc-butler-tool-reload-code)))))
