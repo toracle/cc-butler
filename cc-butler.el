@@ -41,6 +41,7 @@
 (require 'cc-butler-notifications)
 (require 'cc-butler-workspace)
 (require 'cc-butler-orchestrator)
+(require 'cc-butler-mcp-resilience)
 (require 'cc-butler-doc-panel)
 (require 'cc-butler-docs)
 (require 'cc-butler-persist)
@@ -97,7 +98,8 @@
 
 (defconst cc-butler--modules
   '(cc-butler-session cc-butler-notifications cc-butler-workspace
-    cc-butler-orchestrator cc-butler-doc-panel cc-butler-docs cc-butler-persist
+    cc-butler-orchestrator cc-butler-mcp-resilience
+    cc-butler-doc-panel cc-butler-docs cc-butler-persist
     cc-butler-mail cc-butler-decision cc-butler-inbox cc-butler-governance
     cc-butler-provenance cc-butler-cleanup cc-butler-compact
     cc-butler-north-star)
