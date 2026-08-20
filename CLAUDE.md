@@ -33,7 +33,12 @@ Upgrading claude-code-ide is a **standalone migration task**:
 3. re-pin CI to the new SHA —
 
 never a side effect of routine package upgrades. The live daemon's copy is a git
-checkout on branch `main` in `~/.emacs.d/elpa/claude-code-ide`, so
-`package-upgrade-all`, `package-vc-upgrade`, or a casual `git pull` there would
-silently advance it to 0.3.0 and break cc-butler at runtime. Treat those as
-breaking actions on this machine.
+checkout in `~/.emacs.d/elpa/claude-code-ide`, deliberately left in **detached
+HEAD** at `a9485f7` (2026-08-20) as a guard: `git pull` there now fails loudly
+with "You are not currently on a branch". That failure is the guard *working*,
+not breakage — do **not** "fix" it with `git checkout main`; that is exactly the
+trap. The clone's local `origin/main` already points at 0.3.0 (`32a8a90`), so
+staleness no longer protects anything: `package-upgrade-all`,
+`package-vc-upgrade`, a casual `git pull`, **or re-attaching the checkout to a
+branch** would advance it to 0.3.0 and break cc-butler at runtime. Treat all of
+those as breaking actions on this machine.
