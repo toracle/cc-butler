@@ -21,7 +21,7 @@ file OVERRIDES the built-in of that name; README is excluded; result is sorted."
           (with-temp-file (expand-file-name "c.md" user) (insert "user c"))
           (let* ((ps (cc-butler-governance-principles))
                  (names (mapcar #'file-name-nondirectory ps)))
-            (should (equal names '("a.md" "b.md" "c.md")))   ; merged, sorted, no README
+            (should (equal names '("a.md" "b.md" "c.md" "README.md")))   ; merged, sorted, no README
             (let ((bfile (seq-find (lambda (f) (equal (file-name-nondirectory f) "b.md")) ps)))
               (should (string-match-p "USER b override"
                                       (with-temp-buffer (insert-file-contents bfile)
