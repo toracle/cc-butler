@@ -225,8 +225,18 @@ forwarded worker events.  It is pinned to the top of the list.")
 
 (defvar cc-butler--waiting (make-hash-table :test 'equal)
   "Map a session working-dir -> float-time when it began awaiting user input.
-Sessions present here sort to the top of the list as an approval queue,
-oldest request first (FIFO); absence means the session is not waiting.")
+Absence means the session is not considered waiting.  A waiting session is
+marked visually in the list (⏳, `warning' face) but no longer reordered:
+`cc-butler--ordered' keeps workers in a fixed alphabetical order regardless
+of state, so rows do not shift under the cursor when a wait flips mid-move
+\(the old sort-waiting-to-the-top FIFO queue was removed; see the regression
+note in tests/cc-butler-session-test.el).
+
+Note the flag is edge-triggered — set only when a session posts a
+notification (`cc-butler--queue-on-notification') and cleared only by a few
+explicit actions — with no reconciliation against the terminal, so it can
+be stale in either direction.  Judgements that need the session's actual
+current state read it from the screen or the transcript instead.")
 
 (defun cc-butler--waiting-p (dir)
   "Return the wait timestamp for DIR, or nil when it is not waiting."

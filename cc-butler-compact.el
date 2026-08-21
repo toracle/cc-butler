@@ -192,11 +192,13 @@ signal that the prompt-cache confirmation is up and waiting for a choice."
          (cl-some (lambda (l) (string-match-p option l)) lines)
          t)))
 
-(defun cc-butler-compact--input-line (screen)
-  "Return text sitting in SCREEN's input box, or nil when it is empty.
+(defun cc-butler-compact--input-box-row (screen)
+  "Return the raw input-box row drawn on SCREEN, or nil when no box is drawn.
 The box is the non-rule line sandwiched between two rules; the last such
-sandwich wins, since scrollback can hold older boxes.  The `❯' prompt and
-its padding are stripped."
+sandwich wins, since scrollback can hold older boxes.  Presence and content
+are different questions: a screen with no box at all (still starting, just
+cleared, chrome scrolled away) is not the same finding as a box that is
+empty, and the restore gate needs the distinction."
   (let ((lines (split-string (or screen "") "\n"))
         found)
     (cl-loop for (a b c) on lines
@@ -205,9 +207,43 @@ its padding are stripped."
                        (cc-butler-compact--rule-p c)
                        (not (cc-butler-compact--rule-p b)))
              do (setq found b))
-    (when found
-      (let ((s (cc-butler-compact--strip found)))
-        (unless (string-empty-p s) s)))))
+    found))
+
+(defun cc-butler-compact--input-line (screen)
+  "Return text sitting in SCREEN's input box, or nil when it is empty.
+See `cc-butler-compact--input-box-row' for how the box is found.  The `❯'
+prompt and its padding are stripped."
+  (when-let ((found (cc-butler-compact--input-box-row screen)))
+    (let ((s (cc-butler-compact--strip found)))
+      (unless (string-empty-p s) s))))
+
+(defconst cc-butler-compact--busy-hint-regexp "esc to interrupt"
+  "The hint Claude Code paints on its spinner line while a turn is running.
+A running turn — `/compact' very much included — shows a live progress line
+\(\"✶ Compacting… (esc to interrupt)\") above the input box; once the turn
+ends the line is repainted in the past tense with the hint gone (see the
+idle fixture: \"✻ Brewed for 3m 25s\").  This is a WORDING anchor where
+`cc-butler-compact--menu-p' deliberately uses structure, because running and
+idle screens are structurally identical here: both draw the same empty input
+box and statusline, and the hint is the one element the CLI itself adds and
+removes with the turn.  It is CLI chrome (not model-authored text, so no
+locale/re-wording drift) — but chrome can still change across CLI versions,
+and the failure direction of a missed match is typing into a busy session,
+so the restore gate never trusts this alone: it also requires an input box
+and no menu, and the timeout backstop in
+`cc-butler-compact--poll-restore-wait' bounds the opposite miss.")
+
+(defun cc-butler-compact--busy-p (screen)
+  "Non-nil when SCREEN shows a turn in flight (the spinner's interrupt hint).
+Confined to the same live tail as `cc-butler-compact--menu-p', so an old
+hint sitting in scrollback — or prose that merely mentions it — does not
+read as busy forever."
+  (let* ((all (split-string (or screen "") "\n"))
+         (lines (last all (min (length all) cc-butler-compact-menu-lines))))
+    (and (cl-some (lambda (l)
+                    (string-match-p cc-butler-compact--busy-hint-regexp l))
+                  lines)
+         t)))
 
 (defun cc-butler-compact--typed-text (dir)
   "Return the text actually TYPED into DIR's input box, or nil if empty.
@@ -1046,8 +1082,47 @@ for the same reason (cc-butler#18): a throw after the lock is (re)set to
             arg (error-message-string err)))))
     (cc-butler-compact--step dir 'restoring (format "/model %s" arg))))
 
+(defun cc-butler-compact--restore-block-reason (dir st)
+  "Return why the restore must NOT be typed into DIR right now, or nil if idle.
+
+This is the restore gate, and it reads the SCREEN — deliberately not
+`cc-butler--waiting-p'.  That flag is edge-triggered (set only when a
+session posts a notification) with no reconciliation, so it fails this
+caller in BOTH directions: a missed edge leaves it nil forever and the
+restore strands on the timeout (\"compacted but model NOT restored\" —
+observed five-plus times in the ledger, three of six compactions on the
+night of 2026-08-11), while a session parked waiting since before the
+compaction reads t THROUGHOUT the compaction — the driver's own typing
+never clears it — so the gate waves the restore through even while
+`/compact' is still visibly running, which is exactly the 2026-07-23
+freeze this hold exists to prevent.
+
+Idle is judged POSITIVELY from what is painted right now: the screen must
+be readable, show no in-flight turn (`cc-butler-compact--busy-p' — the one
+signal that separates a running `/compact' from an idle prompt, since both
+draw the same empty input box), show no open menu, have an input box drawn
+at all, and hold no unsubmitted text that is not this driver's own restore
+command (our own typed-but-unsubmitted `/model' must pass — resubmitting it
+is precisely how `cc-butler-compact--send-restore' recovers a lost Return).
+An unreadable screen is \"not yet\", never \"go\", for the same reason as
+`cc-butler-compact--menu-block-reason': the cost of holding is another
+poll; the cost of typing into an unseen state is the freeze."
+  (let ((screen (cc-butler--read-output dir 40)))
+    (cond
+     ((null screen)
+      "the screen could not be read — refusing to type into an unseen state")
+     ((cc-butler-compact--busy-p screen)
+      "a turn is still in flight — the interrupt hint is on screen")
+     ((cc-butler-compact--menu-p screen)
+      "an interactive menu/wizard is open")
+     ((not (cc-butler-compact--input-box-row screen))
+      "no input box is drawn on the screen")
+     ((and (cc-butler-compact--pending-input-p dir)
+           (not (cc-butler-compact--own-input dir st)))
+      "operator input is sitting unsubmitted in the box"))))
+
 (defun cc-butler-compact--poll-restore-wait (dir st sent)
-  "Hold the model restore until DIR is idle, then send it.
+  "Hold the model restore until DIR's screen shows it idle, then send it.
 
 `/compact' can still be running when the compact phase stops watching, and
 typing `/model' into a session that is mid-work is what caused the
@@ -1056,21 +1131,32 @@ confirmation modal appeared long after the restore step's own timeout had
 fired and stopped polling.  Nothing was left watching, and the session sat
 on an unanswered dialog for two and a half hours.
 
-Sending only from a waiting point keeps the modal inside the window that is
-actually being watched.  The wait is bounded by `cc-butler-compact-timeout'
-and answers any modal that is already up while it waits."
-  (let ((arg (plist-get st :orig-arg)))
+Sending only from an observed-idle screen keeps the modal inside the window
+that is actually being watched.  Idleness is read directly off the terminal
+by `cc-butler-compact--restore-block-reason' — see there for why the
+`cc-butler--waiting-p' flag this used to consult is wrong in both
+directions.  The wait is bounded by `cc-butler-compact-timeout' and answers
+any modal that is already up while it waits."
+  (let ((arg (plist-get st :orig-arg))
+        (why (cc-butler-compact--restore-block-reason dir st)))
     (cond
      ((cc-butler-compact--answer-modal dir st "pre-restore")
       (cc-butler-compact--schedule-poll dir))
-     ((cc-butler--waiting-p dir)
+     ((not why)
       (cc-butler-compact--send-restore dir st arg))
      ((> (- (float-time) sent) cc-butler-compact-timeout)
       (cc-butler-compact--finish
-       dir "compacted (%s) but model NOT restored — session never reached a waiting point; still on %s, wanted %s"
-       (or (plist-get st :note) "no delta observed")
+       dir "compacted (%s) but model NOT restored — session never reached a waiting point (%s); still on %s, wanted %s"
+       (or (plist-get st :note) "no delta observed") why
        (or (cc-butler-compact--model-now dir) "?") arg))
-     (t (cc-butler-compact--schedule-poll dir)))))
+     (t
+      ;; Log the hold once per distinct reason, not per poll — observable
+      ;; without being noise.
+      (unless (equal why (plist-get st :hold-reason))
+        (cc-butler-compact--set-state dir :hold-reason why)
+        (cc-butler--log "compact: %s │ restore held — %s"
+                        (cc-butler--display-name dir) why))
+      (cc-butler-compact--schedule-poll dir)))))
 
 (defun cc-butler-compact--poll-restore (dir st sent)
   "Wait for the original model to come back, answering the modal."
