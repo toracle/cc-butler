@@ -609,7 +609,7 @@ what a busy steward would otherwise have to remember to go check."
                         (round (- now since)))
                 rows))))
     (when rows
-      (format "🔍 Fleet check: %d worker(s) waiting a while with no report — could be a stuck dialog (e.g. AskUserQuestion) rather than routine idle; read_session_output to check:\n%s"
+      (format "🔍 Fleet check: %d worker(s) waiting a while — could be a stuck dialog (e.g. AskUserQuestion) rather than routine idle; read_session_output to check:\n%s"
               (length rows) (mapconcat #'identity (nreverse rows) "\n")))))
 
 (defun cc-butler--pending-decisions-hook-payload ()
