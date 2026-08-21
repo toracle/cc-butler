@@ -102,7 +102,7 @@ appear in order: inbox, events, fleet check."
       "📥 1 unread inbox message(s) — handle before anything else this turn:\n- from x asks foo"
       "No pending decisions." ; unused by the events payload
       "- [12:00] worker-a: done: PR #42"
-      "🔍 Fleet check: 1 worker(s) waiting a while with no report — could be a stuck dialog (e.g. AskUserQuestion) rather than routine idle; read_session_output to check:\n- worker-b (waiting 300s)"
+      "🔍 Fleet check: 1 worker(s) waiting a while — could be a stuck dialog (e.g. AskUserQuestion) rather than routine idle; read_session_output to check:\n- worker-b (waiting 300s)"
     (let ((payload (cc-butler--pending-events-hook-payload)))
       (should (string-match-p "unread inbox" payload))
       (should (string-match-p "PR #42" payload))
