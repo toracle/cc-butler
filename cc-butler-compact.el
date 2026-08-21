@@ -1078,7 +1078,13 @@ and answers any modal that is already up while it waits."
         (arg (plist-get st :orig-arg)))
     (cond
      ((cc-butler-compact--model-is-p tag arg)
-      (cc-butler-compact--finish dir "compacted (%s); model restored to %s"
+      ;; "driver-sent restore": phase `restoring' is only entered after this
+      ;; driver actually dispatched the /model command (--send-restore), so
+      ;; this outcome line names the path.  A "model restored" with no
+      ;; preceding "restoring (sent ...)" step line and no this suffix was a
+      ;; human hand-restore, not the machine — the ops log mirror makes that
+      ;; distinction provable after the fact.
+      (cc-butler-compact--finish dir "compacted (%s); model restored to %s (driver-sent restore)"
                                  (or (plist-get st :note) "no delta observed") tag))
      ((cc-butler-compact--answer-modal dir st "model restore")
       (cc-butler-compact--schedule-poll dir))

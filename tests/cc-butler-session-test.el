@@ -1251,5 +1251,79 @@ dir — not redraw everything, not guess."
       (cc-butler--on-title-change))
     (should (= 0 (hash-table-count cc-butler--dirty-dirs)))))
 
+;;;; ---- ops log on-disk mirror ---------------------------------------
+
+(defmacro cc-butler-session-test--with-ops-log (&rest body)
+  "Run BODY with the ops-log mirror pointed at a throwaway directory and
+the log buffer at a throwaway name, both cleaned up afterwards."
+  (declare (indent 0))
+  `(let* ((cc-butler-ops-log-dir
+           (expand-file-name "log/" (make-temp-file "cc-butler-ops-test" t)))
+          (cc-butler-log-buffer-name " *cc-butler-ops-test-log*"))
+     (unwind-protect
+         (progn ,@body)
+       (when (get-buffer cc-butler-log-buffer-name)
+         (kill-buffer cc-butler-log-buffer-name))
+       (delete-directory (file-name-directory
+                          (directory-file-name cc-butler-ops-log-dir))
+                         t))))
+
+(defun cc-butler-session-test--ops-file-string ()
+  "Return the contents of today's ops log file, or nil if absent."
+  (let ((file (cc-butler--log-file)))
+    (and (file-exists-p file)
+         (with-temp-buffer
+           (insert-file-contents file)
+           (buffer-string)))))
+
+(ert-deftest cc-butler-session/log-mirrors-line-to-daily-file ()
+  "Given a fresh ops-log dir, When `cc-butler--log' runs, Then the same
+formatted line lands in today's ops-YYYY-MM-DD.log — compact/cleanup
+outcomes no longer live only in a buffer that dies with the process."
+  (cc-butler-session-test--with-ops-log
+    (cc-butler--log "compact: %s │ %s" "worker-a" "done (model restored)")
+    (let ((got (cc-butler-session-test--ops-file-string)))
+      (should got)
+      (should (string-match-p
+               "compact: worker-a │ done (model restored)"
+               (regexp-quote got)))
+      ;; the line carries a timestamp, same format as the buffer
+      (should (string-match-p "\\`\\[[0-9]\\{2\\}:[0-9]\\{2\\}:[0-9]\\{2\\}\\] " got)))))
+
+(ert-deftest cc-butler-session/log-survives-unwritable-mirror-dir ()
+  "Given an ops-log dir that cannot exist (a path under a regular file),
+When `cc-butler--log' runs, Then no error propagates and the buffer sink
+still gets the line — the mirror is an audit layer, never a precondition."
+  (let* ((blocker (make-temp-file "cc-butler-ops-blocker"))  ; a FILE
+         (cc-butler-ops-log-dir (expand-file-name "sub/" blocker))
+         (cc-butler-log-buffer-name " *cc-butler-ops-test-log*"))
+    (unwind-protect
+        (progn
+          (cc-butler--log "cleanup: %s │ %s" "worker-b" "externalized")
+          (with-current-buffer cc-butler-log-buffer-name
+            (should (string-match-p "cleanup: worker-b │ externalized"
+                                    (buffer-string)))))
+      (when (get-buffer cc-butler-log-buffer-name)
+        (kill-buffer cc-butler-log-buffer-name))
+      (delete-file blocker))))
+
+(ert-deftest cc-butler-session/log-accumulates-in-same-daily-file ()
+  "Given several `cc-butler--log' calls on the same day, Then they append
+to the SAME file in order — an append-only record, not one file per event."
+  (cc-butler-session-test--with-ops-log
+    (cc-butler--log "compact: %s │ start" "worker-c")
+    (cc-butler--log "compact: %s │ compacted but model NOT restored" "worker-c")
+    (cc-butler--log "cleanup: %s │ ok" "worker-c")
+    ;; exactly one file in the mirror dir
+    (should (= 1 (length (directory-files cc-butler-ops-log-dir nil "\\`ops-"))))
+    (let ((got (cc-butler-session-test--ops-file-string)))
+      (should (= 3 (with-temp-buffer
+                     (insert got)
+                     (count-lines (point-min) (point-max)))))
+      ;; order preserved: start before outcome before cleanup
+      (should (< (string-match (regexp-quote "start") got)
+                 (string-match (regexp-quote "NOT restored") got)
+                 (string-match (regexp-quote "cleanup") got))))))
+
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here
