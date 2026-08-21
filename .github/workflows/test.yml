@@ -1,0 +1,75 @@
+# Run the full ERT suite on every push and PR.
+#
+# Design notes (load-bearing, please read before "simplifying"):
+#
+# - tests/run-tests.el finds its dependencies by scavenging every directory
+#   under ~/.emacs.d/elpa (dev-machine behavior).  CI reproduces a dev
+#   machine instead of rewriting that bootstrap: install the external
+#   packages into the default ~/.emacs.d/elpa and run-tests.el finds them
+#   unchanged.
+#
+# - transient is FORCE-installed from the archive.  A plain
+#   `package-install 'transient` is a no-op because Emacs 30 ships an older
+#   transient built in, but claude-code-ide needs >= 0.9.0 — and
+#   run-tests.el PREPENDS the elpa dirs precisely so the newer copy shadows
+#   the built-in.  Skipping the force-install re-introduces the stale
+#   built-in silently.
+#
+# - claude-code-ide is a real git checkout, pinned to a9485f7 (v0.2.7, the
+#   version in cc-butler's Package-Requires and the one dev machines run).
+#   Upstream master is 0.3.0 and removed claude-code-ide--processes, which
+#   cc-butler-session.el drives directly — cloning HEAD breaks ~7 tests for
+#   real.  It is deliberately NOT stubbed: tests that read the real package
+#   exercise real control flow, and a stub would make green meaningless.
+#   Even the tests that don't touch it today load modules that hard-require
+#   it, and PR #92's mcp-resilience tests will read it directly the moment
+#   that lands — this clone is what keeps #92 from breaking CI.
+#
+# - Emacs is pinned to 30.1 (the dev-machine version) via
+#   purcell/setup-emacs, which serves exact versions from nix-emacs-ci.
+#
+# Nothing in the suite is excluded or skipped in CI beyond the tests' own
+# skip-unless guards (python3/jq, both present on ubuntu-latest).
+#
+# Possible follow-up (deliberately not in v1): cache ~/.emacs.d/elpa keyed
+# on this file to skip the install steps.
+
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: purcell/setup-emacs@master
+        with:
+          version: '30.1'
+
+      - name: Install external packages into ~/.emacs.d/elpa
+        run: |
+          emacs -Q --batch --eval "(progn
+            (require 'package)
+            (add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t)
+            (package-initialize)
+            (package-refresh-contents)
+            ;; hydra: cc-butler's own dep; websocket + web-server:
+            ;; claude-code-ide's deps (mcp/mcp-server require them at load).
+            (dolist (p '(hydra websocket web-server))
+              (package-install p))
+            ;; transient: force the archive version — see header comment.
+            (package-install (cadr (assq 'transient package-archive-contents))))"
+
+      - name: Install claude-code-ide (real package, pinned to v0.2.7)
+        run: |
+          dir=~/.emacs.d/elpa/claude-code-ide
+          git init -q "$dir"
+          git -C "$dir" fetch -q --depth 1 https://github.com/manzaltu/claude-code-ide.el a9485f766ea69f6cb3a3f08dea20d44fd6596673
+          git -C "$dir" checkout -q FETCH_HEAD
+
+      - name: Run ERT suite
+        run: emacs -Q --batch -l tests/run-tests.el
