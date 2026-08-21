@@ -209,6 +209,99 @@ never read (only complete, renamed messages appear in new/)."
       (should (= 1 (length archived)))
       (should (null remaining)))))
 
+;;;; ---- unified channel journal (audit log over BOTH channels) -------
+;;
+;; Two channels, two consumption patterns: "messenger" (send_to_session —
+;; immediate, typed into the terminal, consumed on the spot) and "email"
+;; (maildir — pull-based, held until drained).  BOTH are audit-logged in ONE
+;; append-only journal under <mail-dir>/log/YYYY-MM-DD.eld, one printed plist
+;; per line.  The journal is an audit layer only: it never touches any
+;; maildir, and a journal failure must never break a delivery or a send.
+
+(defun cc-butler-mail-test--journal-entries ()
+  "Read back every entry in today's journal file (oldest first)."
+  (let ((file (expand-file-name (format-time-string "%Y-%m-%d.eld")
+                                (expand-file-name "log/" cc-butler-mail-dir)))
+        entries)
+    (when (file-exists-p file)
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-min))
+        (while (progn (skip-chars-forward " \t\n") (not (eobp)))
+          (push (read (current-buffer)) entries))))
+    (nreverse entries)))
+
+(ert-deftest cc-butler-mail/journal-terminal-send-without-touching-mail ()
+  "Given a terminal (messenger) send journaled via `cc-butler-mail-journal-send',
+Then today's journal gains one parseable entry (:channel terminal, :kind send,
+from/to/body), and the receiver's maildir stays EMPTY — new/ and archive/
+both — so a drain returns nothing (audit records and real mail never mix)."
+  (cc-butler-mail-test--with-file
+    (cl-letf (((symbol-function 'cc-butler--display-name)
+               (lambda (d) (if (equal d "/steward/") "steward" d))))
+      (cc-butler-mail-journal-send "/steward/" "worker-a" "please rebase")
+      (let ((entry (car (cc-butler-mail-test--journal-entries))))
+        (should entry)
+        (should (eq 'terminal (plist-get entry :channel)))
+        (should (eq 'send (plist-get entry :kind)))
+        (should (equal "steward" (plist-get entry :from)))
+        (should (equal "worker-a" (plist-get entry :to)))
+        (should (equal "please rebase" (plist-get entry :body)))
+        (should (plist-get entry :id))
+        (should (plist-get entry :time)))
+      ;; the journal is not mail: nothing lands in the receiver's maildir
+      (let ((in (cc-butler--mail-inbox "worker-a")))
+        (dolist (sub '("new/" "archive/"))
+          (let ((d (expand-file-name sub in)))
+            (should (null (and (file-directory-p d)
+                               (directory-files d nil "\\.eld\\'")))))))
+      (should (null (cc-butler--ch-drain "worker-a"))))))
+
+(ert-deftest cc-butler-mail/journal-mail-delivery-same-id ()
+  "Given a maildir (email) delivery, Then the inbox file lands in new/ AND the
+journal gains an entry with the SAME id (:channel mail, the message's own kind),
+so every routed delivery is traceable to its inbox file."
+  (cc-butler-mail-test--with-file
+    (let* ((id (cc-butler--ch-deliver "bob" (list :kind 'note :from "alice" :body "hi")))
+           (new (expand-file-name (format "new/%s.eld" id) (cc-butler--mail-inbox "bob")))
+           (entry (car (cc-butler-mail-test--journal-entries))))
+      (should (file-exists-p new))
+      (should entry)
+      (should (eq 'mail (plist-get entry :channel)))
+      (should (eq 'note (plist-get entry :kind)))
+      (should (equal id (plist-get entry :id)))
+      (should (equal "alice" (plist-get entry :from)))
+      (should (equal "bob" (plist-get entry :to)))
+      (should (equal "hi" (plist-get entry :body))))))
+
+(ert-deftest cc-butler-mail/journal-appends-to-same-day-file ()
+  "Given two consecutive journal writes, Then today's file holds BOTH entries
+in order (append semantics — the second never clobbers the first)."
+  (cc-butler-mail-test--with-file
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cc-butler-mail-journal-send "steward" "worker-a" "first")
+      (cc-butler-mail-journal-send "steward" "worker-a" "second")
+      (let ((entries (cc-butler-mail-test--journal-entries)))
+        (should (= 2 (length entries)))
+        (should (equal "first" (plist-get (nth 0 entries) :body)))
+        (should (equal "second" (plist-get (nth 1 entries) :body)))))))
+
+(ert-deftest cc-butler-mail/journal-failure-never-breaks-delivery ()
+  "Given a journal that CANNOT be written (its dir path is blocked by a plain
+file), When a message is delivered, Then delivery still succeeds and returns
+the id — logging is subordinate to delivery."
+  (cc-butler-mail-test--with-file
+    (let ((blocker (expand-file-name "blocker" cc-butler-mail-dir)))
+      (with-temp-file blocker (insert "x"))   ; a FILE where the log dir must go
+      (cl-letf (((symbol-function 'cc-butler--mail-log-dir)
+                 (lambda () (expand-file-name "log/" blocker))))
+        (let ((id (cc-butler--ch-deliver "bob" (list :kind 'note :from "a" :body "hi"))))
+          (should id)
+          (let ((got (cc-butler--ch-drain "bob")))
+            (should (= 1 (length got)))
+            (should (equal "hi" (plist-get (car got) :body)))
+            (should (equal id (plist-get (car got) :id)))))))))
+
 (ert-deftest cc-butler-mail/transport-rollback ()
   "The transport flag switches report_to_steward between the legacy in-memory
 queue and the durable maildir inbox — proving rollback."
