@@ -583,34 +583,106 @@ why (caller-dir resolves to nil from a bare `emacsclient --eval')."
       (format "📥 %d unread inbox message(s) — handle before anything else this turn:\n%s"
               n formatted))))
 
-(defcustom cc-butler-fleet-stale-waiting-seconds 120
-  "Seconds a worker session must sit WAITING-FOR-INPUT before the
-steward's pending_events hook flags it as possibly stuck (e.g. an
-unnoticed AskUserQuestion dialog) rather than routinely idle.
-See `cc-butler--fleet-stale-waiting-summary'."
-  :type 'number
-  :group 'cc-butler)
+;; Screen predicates from cc-butler-compact (which loads after this module,
+;; so calls are fboundp-guarded — same pattern as `cc-butler-mail-journal-send'
+;; in `cc-butler-tool-send-session' and `cc-butler-compact-fleet-summary'
+;; below).
+(declare-function cc-butler-compact--menu-p "cc-butler-compact" (screen))
+(declare-function cc-butler-compact--pending-input-p "cc-butler-compact" (dir))
 
-(defun cc-butler--fleet-stale-waiting-summary ()
-  "Return a string flagging workers WAITING-FOR-INPUT longer than
-`cc-butler-fleet-stale-waiting-seconds', or nil when none. Excludes the
-butler/steward roles themselves — this is about fleet members going
-quiet, not the reader's own state. A structural, every-turn version of
-what a busy steward would otherwise have to remember to go check."
-  (let ((now (float-time)) rows)
-    (dolist (s (cc-butler--sessions))
-      (let* ((dir (plist-get s :dir))
-             (since (cc-butler--waiting-p dir)))
-        (when (and since
-                   (>= (- now since) cc-butler-fleet-stale-waiting-seconds)
-                   (not (equal dir cc-butler--butler))
-                   (not (equal dir cc-butler--steward)))
-          (push (format "- %s (waiting %ds)" (cc-butler--display-name dir)
-                        (round (- now since)))
-                rows))))
-    (when rows
-      (format "🔍 Fleet check: %d worker(s) waiting a while with no report — could be a stuck dialog (e.g. AskUserQuestion) rather than routine idle; read_session_output to check:\n%s"
-              (length rows) (mapconcat #'identity (nreverse rows) "\n")))))
+(defvar cc-butler--fleet-dialog-first-seen (make-hash-table :test 'equal)
+  "Map session working-dir -> float-time its on-screen blocker was first
+detected, for the fleet check's de-duplication.  Same bargain as
+`cc-butler-compact--last-report': a standing situation is restated in an
+abbreviated \"(continuing)\" form rather than re-announced as new every
+turn — and never silently dropped, because a blocker that stops being
+mentioned reads as a blocker that cleared.  An entry survives an
+unreadable scan on purpose (a failed read is not evidence the dialog
+cleared) and is removed only when a successful read shows a clean
+screen, or when the session itself is gone.")
+
+(defun cc-butler--fleet-dialog-state (dir)
+  "Return what session DIR's screen measurably shows, by reading it now.
+`menu' — an open numbered choice menu/dialog is visible on screen
+\(`cc-butler-compact--menu-p').  `input' — typed-but-unsubmitted text is
+sitting in the input box (`cc-butler-compact--pending-input-p').
+`unreadable' — the screen could not be read, so nothing is known either
+way.  nil — the screen was read successfully and shows neither.  These
+are the same measured signals the compaction pre-flight guards act on
+\(`cc-butler-compact--menu-block-reason'), reused here as observation."
+  (condition-case nil
+      (let ((screen (cc-butler--read-output dir 40)))
+        (cond
+         ((null screen) 'unreadable)
+         ((cc-butler-compact--menu-p screen) 'menu)
+         ((cc-butler-compact--pending-input-p dir) 'input)))
+    (error 'unreadable)))
+
+(defun cc-butler--fleet-dialog-summary ()
+  "Return a string listing sessions whose SCREEN actually shows a blocking
+dialog/menu or unsubmitted input, or nil when there is nothing to say.
+Scans every live session (`cc-butler--sessions') regardless of any
+waiting/idle flag — the flags are exactly what can freeze, and a frozen
+session with a dialog up was the real miss.  Excludes the butler/steward
+roles themselves, as before: this is about fleet members, not the
+reader's own state.
+
+Replaces the stale-waiting clock alarm — \"in `cc-butler--waiting' longer
+than `cc-butler-fleet-stale-waiting-seconds'\", a defcustom deleted with
+it 2026-08-21 — whose only predicate was elapsed time: it re-flagged routinely parked workers
+on every steward turn (11 at once, zero actual dialogs among them on the
+day it was measured) while structurally excluding a session whose
+waiting flag was stuck at nil with a dialog genuinely on screen — which
+then sat unanswered for over a day.  Time on a clock implies nothing by
+itself; only the screen says whether something needs answering.
+
+Sessions whose screen cannot be read are listed separately as
+unverified, never silently dropped — a failed read is not evidence of
+absence.  Returns nil without claiming anything when cc-butler-compact's
+screen predicates are not loaded (that module loads after this one)."
+  (when (fboundp 'cc-butler-compact--menu-p)
+    (let ((now (float-time)) live rows unreadable)
+      (dolist (s (cc-butler--sessions))
+        (let ((dir (plist-get s :dir)))
+          (push dir live)
+          (unless (or (equal dir cc-butler--butler)
+                      (equal dir cc-butler--steward))
+            (pcase (cc-butler--fleet-dialog-state dir)
+              ('unreadable
+               (push (format "- %s" (cc-butler--display-name dir)) unreadable))
+              ('nil (remhash dir cc-butler--fleet-dialog-first-seen))
+              (kind
+               (let ((what (if (eq kind 'menu)
+                               "a choice menu/dialog is visible on screen"
+                             "unsubmitted text is sitting in the input box"))
+                     (first (gethash dir cc-butler--fleet-dialog-first-seen)))
+                 (push (if first
+                           (format "- %s — %s (continuing, first detected %dm ago)"
+                                   (cc-butler--display-name dir) what
+                                   (round (/ (- now first) 60)))
+                         (puthash dir now cc-butler--fleet-dialog-first-seen)
+                         (format "- %s — %s" (cc-butler--display-name dir) what))
+                       rows)))))))
+      ;; Entries for sessions that no longer exist are stale state, not
+      ;; standing situations — drop them.
+      (maphash (lambda (dir _)
+                 (unless (member dir live)
+                   (remhash dir cc-butler--fleet-dialog-first-seen)))
+               cc-butler--fleet-dialog-first-seen)
+      (when (or rows unreadable)
+        (mapconcat
+         #'identity
+         (delq nil
+               (list
+                (when rows
+                  (format "🔍 Fleet check: %d session(s) with a dialog/menu or unsubmitted input visible on screen — read_session_output to see it, then answer or clear it:\n%s"
+                          (length rows)
+                          (mapconcat #'identity (nreverse rows) "\n")))
+                (when unreadable
+                  (format "🔍 Fleet check: %d session(s) whose screen could not be read — unverified either way, not evidence of absence; read_session_output to check:\n%s"
+                          (length unreadable)
+                          (mapconcat #'identity (nreverse unreadable) "\n")))))
+         "\n\n")))))
 
 (defun cc-butler--pending-decisions-hook-payload ()
   "Combined payload for the butler's pending_decisions hook: an urgent
@@ -624,24 +696,25 @@ queue. Either half may be absent; returns \"\" when both are empty."
 (defun cc-butler--pending-events-hook-payload ()
   "Combined payload for the steward's pending_events hook: an urgent
 check_inbox block, the drained worker-event queue, and a fleet
-stale-waiting nudge. Any subset may be absent; returns \"\" when all
+dialog check. Any subset may be absent; returns \"\" when all
 three are empty."
   (let* ((inbox (cc-butler--inbox-urgent-block "steward"))
          (events (cc-butler-tool-inbox))
          (has-events (not (equal events "No pending worker events.")))
          ;; Guarded like `ceiling' below, and for a sharper reason: this walks
-         ;; every session, so it is a larger error surface than the drain that
-         ;; precedes it — and it runs AFTER that drain.  An unguarded failure
-         ;; here would take the drained events down with it.  A missing nudge
-         ;; is a small loss; a swallowed worker report is not.
-         (stale (ignore-errors (cc-butler--fleet-stale-waiting-summary)))
+         ;; every session and reads every screen, so it is a larger error
+         ;; surface than the drain that precedes it — and it runs AFTER that
+         ;; drain.  An unguarded failure here would take the drained events
+         ;; down with it.  A missing nudge is a small loss; a swallowed worker
+         ;; report is not.
+         (dialogs (ignore-errors (cc-butler--fleet-dialog-summary)))
          ;; cc-butler-compact loads after this module, so reach it late.
-         ;; Same bargain as the stale-waiting nudge: elisp reports what is
+         ;; Same bargain as the fleet dialog check: elisp reports what is
          ;; over the context ceiling, the steward decides when to act.
          (ceiling (and (fboundp 'cc-butler-compact-fleet-summary)
                        (ignore-errors (cc-butler-compact-fleet-summary)))))
     (mapconcat #'identity
-               (delq nil (list inbox (and has-events events) stale ceiling))
+               (delq nil (list inbox (and has-events events) dialogs ceiling))
                "\n\n")))
 
 (defun cc-butler--pending-decisions-hook-sh ()
@@ -707,13 +780,13 @@ jq -n --arg ctx \"$content\" \\
   "Return the steward's `check-pending-events.sh' UserPromptSubmit hook.
 Mirrors `cc-butler--pending-decisions-hook-sh' (butler): drains
 `cc-butler--pending-events-hook-payload' — check_inbox, the worker-event
-queue (MCP tool `pending_events'), and a fleet stale-waiting nudge — on
+queue (MCP tool `pending_events'), and a fleet dialog check — on
 every turn. Same `cc-butler-message-transport' fragility applies to the
 pending_events half identically; see that function's docstring."
   "#!/usr/bin/env bash
 # UserPromptSubmit hook: mechanically drains cc-butler's pending_events
 # (worker firehose) queue, check_inbox (ask_worker replies), and a fleet
-# stale-waiting scan on every turn and injects them as context, so the
+# dialog check on every turn and injects them as context, so the
 # steward never has to remember to check any of them itself. Mirrors the
 # butler's check-pending-decisions.sh, written 2026-07-06 after a manual
 # pending_decisions check got skipped for an entire long conversation and
