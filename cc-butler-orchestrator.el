@@ -591,12 +591,44 @@ See `cc-butler--fleet-stale-waiting-summary'."
   :type 'number
   :group 'cc-butler)
 
+(defun cc-butler--last-instruction-to (dir)
+  "Return the most recent message logged as sent TO session DIR, or nil.
+Best-effort: `cc-butler--log' tees every `send_to_session' call to
+`cc-butler-log-buffer-name' as \"FROM → TO │ TEXT\", so this is a
+display-name substring search over that in-memory, unindexed transcript
+— not a structured per-session record. It returns nil (not a guess)
+when the buffer does not exist, predates this Emacs's uptime (the log
+is never persisted to disk), or DIR was never addressed via
+`send_to_session' specifically (e.g. dispatched by typing directly into
+its terminal). The match is truncated to its own first line and a
+bounded length, since a dispatch can be long prose."
+  (let* ((name (cc-butler--display-name dir))
+         (buf (get-buffer cc-butler-log-buffer-name))
+         (re (format "→ %s\\(?: ([^)\n]*)\\)? │ \\(.*\\)$" (regexp-quote name))))
+    (when buf
+      (with-current-buffer buf
+        (save-excursion
+          (goto-char (point-max))
+          (when (re-search-backward re nil t)
+            (let ((text (match-string 1)))
+              (if (> (length text) 140) (concat (substring text 0 140) "…") text))))))))
+
 (defun cc-butler--fleet-stale-waiting-summary ()
   "Return a string flagging workers WAITING-FOR-INPUT longer than
 `cc-butler-fleet-stale-waiting-seconds', or nil when none. Excludes the
 butler/steward roles themselves — this is about fleet members going
 quiet, not the reader's own state. A structural, every-turn version of
-what a busy steward would otherwise have to remember to go check."
+what a busy steward would otherwise have to remember to go check.
+
+Each row also carries the worker's last logged instruction
+(`cc-butler--last-instruction-to') — see
+governance/a-park-instruction-needs-a-resume-condition and
+governance/an-approval-names-a-task-it-is-not-a-fence: \"idle 18h\" does
+not distinguish a worker correctly parked with a resume condition from
+one stranded by a stale hold or an over-read approval fence, and a
+stranded worker cannot say so itself. Surfacing what it was actually
+told turns that judgment call over to whoever reads this, instead of
+just restating the duration that already failed to prompt one."
   (let ((now (float-time)) rows)
     (dolist (s (cc-butler--sessions))
       (let* ((dir (plist-get s :dir))
@@ -605,11 +637,15 @@ what a busy steward would otherwise have to remember to go check."
                    (>= (- now since) cc-butler-fleet-stale-waiting-seconds)
                    (not (equal dir cc-butler--butler))
                    (not (equal dir cc-butler--steward)))
-          (push (format "- %s (waiting %ds)" (cc-butler--display-name dir)
-                        (round (- now since)))
-                rows))))
+          (let ((last (cc-butler--last-instruction-to dir)))
+            (push (format "- %s (waiting %ds) — last told: %s"
+                          (cc-butler--display-name dir)
+                          (round (- now since))
+                          (if last (format "%S" last)
+                            "(none logged — check directly)"))
+                  rows)))))
     (when rows
-      (format "🔍 Fleet check: %d worker(s) waiting a while with no report — could be a stuck dialog (e.g. AskUserQuestion) rather than routine idle; read_session_output to check:\n%s"
+      (format "🔍 Fleet check: %d worker(s) waiting a while with no report. Idle is not stuck — read what each was last told: a park needing a resume nudge, or a narrow approval it's over-reading as a fence, look different from a live dialog once you see the text. \"last told\" is a best-effort in-memory log lookup, not authoritative; read_session_output to check the ones that stay ambiguous:\n%s"
               (length rows) (mapconcat #'identity (nreverse rows) "\n")))))
 
 (defun cc-butler--pending-decisions-hook-payload ()

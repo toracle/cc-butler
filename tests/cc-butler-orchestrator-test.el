@@ -46,7 +46,14 @@ themselves are never flagged even if waiting a long time."
               ((symbol-function 'cc-butler--display-name)
                (lambda (d) (pcase d ("/worker-stale/" "worker-stale")
                              ("/worker-fresh/" "worker-fresh")
-                             ("/butler/" "butler") ("/steward/" "steward") (_ d)))))
+                             ("/butler/" "butler") ("/steward/" "steward") (_ d))))
+              ;; Stubbed rather than left to hit the real `cc-butler-log-buffer-name'
+              ;; buffer: this suite is "pure combining logic over stubbed lower-level
+              ;; calls" per the file header, and the real buffer holds this actual
+              ;; fleet's live traffic — asserting against it would make this test's
+              ;; pass/fail depend on today's chat content. `last-instruction-to''s own
+              ;; behavior is covered separately below.
+              ((symbol-function 'cc-butler--last-instruction-to) (lambda (_dir) nil)))
       (let ((summary (cc-butler--fleet-stale-waiting-summary)))
         (should (string-match-p "worker-stale" summary))
         (should-not (string-match-p "worker-fresh" summary))
@@ -60,6 +67,102 @@ themselves are never flagged even if waiting a long time."
          (cc-butler--waiting (make-hash-table :test 'equal)))
     (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () (list (list :dir "/worker/")))))
       (should (null (cc-butler--fleet-stale-waiting-summary))))))
+
+(ert-deftest cc-butler-orchestrator/fleet-stale-waiting-surfaces-last-instruction ()
+  "Given a stale worker whose last logged instruction is known, Then its
+text appears in the row — this is the whole point: idle-because-told-to
+must be distinguishable from idle-because-nothing-was-ever-said without
+opening the worker's terminal."
+  (let* ((cc-butler-fleet-stale-waiting-seconds 60)
+         (cc-butler--butler "/butler/") (cc-butler--steward "/steward/")
+         (now (float-time))
+         (cc-butler--waiting (make-hash-table :test 'equal)))
+    (puthash "/worker-parked/" (- now 300) cc-butler--waiting)
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () (list (list :dir "/worker-parked/"))))
+              ((symbol-function 'cc-butler--display-name)
+               (lambda (d) (pcase d ("/worker-parked/" "worker-parked") (_ d))))
+              ((symbol-function 'cc-butler--last-instruction-to)
+               (lambda (_dir) "do nothing now, I'll tell you when to resume")))
+      (let ((summary (cc-butler--fleet-stale-waiting-summary)))
+        (should (string-match-p "do nothing now, I'll tell you when to resume" summary))))))
+
+(ert-deftest cc-butler-orchestrator/fleet-stale-waiting-falls-back-when-no-log ()
+  "Given no logged instruction for a stale worker, Then the row says so
+honestly instead of omitting one or fabricating a plausible-looking one."
+  (let* ((cc-butler-fleet-stale-waiting-seconds 60)
+         (cc-butler--butler "/butler/") (cc-butler--steward "/steward/")
+         (now (float-time))
+         (cc-butler--waiting (make-hash-table :test 'equal)))
+    (puthash "/worker-x/" (- now 300) cc-butler--waiting)
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () (list (list :dir "/worker-x/"))))
+              ((symbol-function 'cc-butler--display-name)
+               (lambda (d) (pcase d ("/worker-x/" "worker-x") (_ d))))
+              ((symbol-function 'cc-butler--last-instruction-to) (lambda (_dir) nil)))
+      (let ((summary (cc-butler--fleet-stale-waiting-summary)))
+        (should (string-match-p "none logged" summary))))))
+
+;;;; ---- last-instruction-to (best-effort dispatch lookup) ---------------
+
+(ert-deftest cc-butler-orchestrator/last-instruction-to-finds-most-recent-line ()
+  "Given multiple logged sends to the same session, Then the most recent
+one wins, and other sessions' lines are not confused with it."
+  (let ((cc-butler-log-buffer-name "*cc-butler-log-test*"))
+    (unwind-protect
+        (progn
+          (with-current-buffer (get-buffer-create cc-butler-log-buffer-name)
+            (erase-buffer)
+            (insert "[10:00:00] steward → worker-a (sess-1) │ start on the billing task\n")
+            (insert "[10:05:00] worker-a (sess-1) → steward │ done, PR up\n")
+            (insert "[11:00:00] steward → worker-a (sess-1) │ hold for now, I'll tell you when to resume\n")
+            (insert "[11:01:00] steward → worker-b (sess-2) │ unrelated dispatch\n"))
+          (cl-letf (((symbol-function 'cc-butler--display-name)
+                     (lambda (d) (pcase d ("/worker-a/" "worker-a") (_ d)))))
+            (should (equal "hold for now, I'll tell you when to resume"
+                            (cc-butler--last-instruction-to "/worker-a/")))))
+      (when (get-buffer cc-butler-log-buffer-name) (kill-buffer cc-butler-log-buffer-name)))))
+
+(ert-deftest cc-butler-orchestrator/last-instruction-to-nil-when-unmatched ()
+  "Given a session with nothing addressed to it in the log, Then nil —
+never a guess pulled from an unrelated line."
+  (let ((cc-butler-log-buffer-name "*cc-butler-log-test*"))
+    (unwind-protect
+        (progn
+          (with-current-buffer (get-buffer-create cc-butler-log-buffer-name)
+            (erase-buffer)
+            (insert "[10:00:00] steward → worker-a (sess-1) │ start on the billing task\n"))
+          (cl-letf (((symbol-function 'cc-butler--display-name)
+                     (lambda (d) (pcase d ("/worker-c/" "worker-c") (_ d)))))
+            (should (null (cc-butler--last-instruction-to "/worker-c/")))))
+      (when (get-buffer cc-butler-log-buffer-name) (kill-buffer cc-butler-log-buffer-name)))))
+
+(ert-deftest cc-butler-orchestrator/last-instruction-to-nil-when-buffer-absent ()
+  "Given the log buffer does not exist at all (fresh Emacs, nothing
+dispatched yet this uptime), Then nil, not an error."
+  (let ((cc-butler-log-buffer-name "*cc-butler-log-test-absent*"))
+    (when (get-buffer cc-butler-log-buffer-name) (kill-buffer cc-butler-log-buffer-name))
+    (cl-letf (((symbol-function 'cc-butler--display-name)
+               (lambda (d) (pcase d ("/worker-a/" "worker-a") (_ d)))))
+      (should (null (cc-butler--last-instruction-to "/worker-a/"))))))
+
+(ert-deftest cc-butler-orchestrator/last-instruction-to-truncates-long-text ()
+  "Given a dispatch longer than the bound, Then it is truncated with an
+ellipsis rather than dumped whole into the nudge — this text is read
+alongside up to N other rows, not on its own."
+  (let ((cc-butler-log-buffer-name "*cc-butler-log-test*"))
+    (unwind-protect
+        (progn
+          (with-current-buffer (get-buffer-create cc-butler-log-buffer-name)
+            (erase-buffer)
+            (insert (format "[10:00:00] steward → worker-a (sess-1) │ %s\n"
+                             (make-string 200 ?x))))
+          (cl-letf (((symbol-function 'cc-butler--display-name)
+                     (lambda (d) (pcase d ("/worker-a/" "worker-a") (_ d)))))
+            (let ((result (cc-butler--last-instruction-to "/worker-a/")))
+              (should (= 141 (length result)))
+              (should (string-suffix-p "…" result)))))
+      (when (get-buffer cc-butler-log-buffer-name) (kill-buffer cc-butler-log-buffer-name)))))
 
 ;;;; ---- hook payload combinators ---------------------------------------
 
