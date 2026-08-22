@@ -2,7 +2,7 @@
 
 ;;; Commentary:
 
-;; `governance/dod-vs-ultimate-goal.md' already states the discipline: when a
+;; `dod-vs-ultimate-goal' in the governance store already states the discipline: when a
 ;; session reports "done" or stalls out, judge it against its ULTIMATE goal,
 ;; not against how much effort went in — difficulty is not evidence of
 ;; completion.  Until now nothing made the butler actually apply that
@@ -79,7 +79,7 @@ is exactly the kind of thing nobody notices until the file is unusable."
 %s
 
 각 활성 목표에 대해:
-1. 그 목표의 DoD가 실제로 충족되었는가? (\"어려움이 있었다\"는 완료의 증거가 아니다 — governance/dod-vs-ultimate-goal.md 기준 적용.)
+1. 그 목표의 DoD가 실제로 충족되었는가? (\"어려움이 있었다\"는 완료의 증거가 아니다 — governance store의 dod-vs-ultimate-goal 기준 적용.)
 2. 아직이라면 막힌 지점이 있는가? manager/enabler로서 시도할 수 있는 안전한 조치를 먼저 강구할 것.
 3. 판단이 불명확하면 escalate_to_butler로 정수님께 질문할 것 — 짐작으로 채우지 말 것.
 원래 목표와 무관한 부수 작업(yak-shaving)에 머물러 있지는 않은지도 함께 점검할 것."
