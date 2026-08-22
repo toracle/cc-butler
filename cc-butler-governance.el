@@ -152,9 +152,12 @@ actually appended."
 ;;;###autoload
 (defun cc-butler-governance-regenerate ()
   "Regenerate the Claude Code memory cache from the neutral store — the store is
-the source of truth; the memory is derived.  Also merges any note missing from
-`MEMORY.md's index into it (add-only — see `cc-butler-governance--sync-index').
-Returns the count of principles written."
+the source of truth; the memory is derived.  Also syncs `MEMORY.md's index
+against it in both directions: merges in any note missing from the index
+(add-only — see `cc-butler-governance--sync-index'), and prunes any index
+line whose principle no longer exists in the store (see
+`cc-butler-governance--prune-dead-entries').  Returns the count of
+principles written."
   (interactive)
   (make-directory cc-butler-governance-memory-dir t)
   (let ((n 0) (slugs nil))
@@ -165,9 +168,90 @@ Returns the count of principles written."
       (push (file-name-sans-extension (file-name-nondirectory f)) slugs)
       (setq n (1+ n)))
     (cc-butler-governance--sync-index (nreverse slugs))
+    (cc-butler-governance--prune-dead-entries)
     (when (called-interactively-p 'interactive)
       (message "cc-butler: regenerated %d principle(s) from the store" n))
     n))
+
+(defun cc-butler-governance--index-butler-slugs (text)
+  "Slugs of every line in TEXT shaped like this store's own generated entry:
+`- [S](butler-S.md) — ...'.  Anything hand-authored in a different shape
+(a different link target, or a slug that doesn't match on both sides) is
+never returned — this is deliberately narrow, so pruning below can never
+touch a line this store did not itself write."
+  (let (slugs (start 0))
+    (while (string-match "^- \\[\\([a-z0-9][a-z0-9-]*\\)\\](butler-\\1\\.md) — "
+                         text start)
+      (push (match-string 1 text) slugs)
+      (setq start (match-end 0)))
+    (nreverse slugs)))
+
+(defun cc-butler-governance--dead-index-slugs ()
+  "Index slugs (this store's own generated lines only) whose store principle
+no longer exists.  This is the index -> store direction: a note that was
+deleted or renamed out of the store leaves its `MEMORY.md' line dangling,
+and the add-only `--sync-index' merge has no reason to ever look at it
+again since it already has a line.  Read-only — see
+`cc-butler-governance--prune-dead-entries' for the mutating half."
+  (let ((index (cc-butler-governance--memory-index-file)))
+    (when (file-readable-p index)
+      (let* ((text (with-temp-buffer (insert-file-contents index) (buffer-string)))
+             (indexed (cc-butler-governance--index-butler-slugs text))
+             (live (cc-butler-governance-names)))
+        (seq-remove (lambda (s) (member s live)) indexed)))))
+
+(defun cc-butler-governance--prune-dead-entries ()
+  "Remove every `MEMORY.md' line `cc-butler-governance--dead-index-slugs'
+currently reports dead.  Only ever removes lines matching this store's own
+generated shape (see `cc-butler-governance--index-butler-slugs') — a
+hand-authored entry in any other shape is never touched, dead-looking link
+or not.  Deletion, not merely reporting, is deliberate here: unlike a
+description (which might be hand-curated on purpose, see
+`cc-butler-governance--stale-index-entries'), a link to a principle that no
+longer exists in the store has no legitimate reading — the store is the
+source of truth, so nothing is lost by removing a pointer to nothing.
+Returns the removed slugs."
+  (let ((dead (cc-butler-governance--dead-index-slugs))
+        (index (cc-butler-governance--memory-index-file)))
+    (when (and dead (file-readable-p index))
+      (with-temp-buffer
+        (insert-file-contents index)
+        (goto-char (point-min))
+        (while (re-search-forward
+                "^- \\[\\([a-z0-9][a-z0-9-]*\\)\\](butler-\\1\\.md) — .*\n?" nil t)
+          (when (member (match-string 1) dead)
+            (delete-region (match-beginning 0) (match-end 0))))
+        (write-region (point-min) (point-max) index nil 'quiet)))
+    dead))
+
+(defun cc-butler-governance--stale-index-entries ()
+  "Slugs (this store's own generated lines only) whose `MEMORY.md'
+description no longer matches the store note's CURRENT frontmatter
+description.  Read-only and deliberately never auto-corrected: on disk, a
+line that drifted because a principle was revised in place (record_principle
+updates the store + memory note but `--sync-index' never touches an
+existing line, by design) is indistinguishable from a line a human
+hand-curated with different wording on purpose — see
+`cc-butler-governance/regenerate-does-not-duplicate-an-already-curated-entry'.
+So this only surfaces the mismatch for a human or agent to judge; the fix,
+if wanted, is to call `record_principle' again or hand-edit the line."
+  (let ((index (cc-butler-governance--memory-index-file))
+        stale)
+    (when (file-readable-p index)
+      (with-temp-buffer
+        (insert-file-contents index)
+        (goto-char (point-min))
+        (while (re-search-forward
+                "^- \\[\\([a-z0-9][a-z0-9-]*\\)\\](butler-\\1\\.md) — \\(.*\\)$" nil t)
+          (let* ((slug (match-string 1))
+                 (indexed-desc (match-string 2))
+                 (store-file (expand-file-name (concat slug ".md")
+                                               (cc-butler-governance-store))))
+            (when (file-exists-p store-file)
+              (let ((current (cc-butler-governance--frontmatter-description store-file)))
+                (when (and current (not (equal current indexed-desc)))
+                  (push slug stale))))))))
+    (nreverse stale)))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Recording a principle
@@ -317,12 +401,25 @@ until something calls this. Call it once after any such direct write.
 Also useful with nothing new to sync: it reports how many store notes are
 CURRENTLY un-indexed, so running it any time surfaces a forgotten sync
 instead of staying silent — the same silent-gap failure mode this file
-exists to close (cc-butler#36)."
+exists to close (cc-butler#36).
+
+REGRESSION (2026-08-05): this used to check store -> index only (missing
+entries) and reported \"0 un-indexed\" as if the index were fully verified,
+when a dangling link (index -> store: the principle was deleted) and a
+stale description (content drift after an in-place update) both went
+completely unchecked.  A check that reports itself as more thorough than
+it is is worse than no check — it ends the search.  The report below now
+states plainly what was actually verified, in three directions: store ->
+index, index -> store, and description drift."
   (let* ((before (cc-butler-governance--unindexed-names))
+         (dead-before (cc-butler-governance--dead-index-slugs))
          (n (cc-butler-governance-regenerate))
-         (after (cc-butler-governance--unindexed-names)))
+         (after (cc-butler-governance--unindexed-names))
+         (dead-after (cc-butler-governance--dead-index-slugs))
+         (stale (cc-butler-governance--stale-index-entries)))
     (concat
      (format "Regenerated %d principle(s) from the store.\n" n)
+     "Checked: store->index (notes missing an index line), index->store (index lines whose principle no longer exists), and description drift (index text vs each note's current frontmatter).\n"
      (if before
          (format "Merged %d previously un-indexed note(s) into MEMORY.md: %s\n"
                  (length before) (string-join before ", "))
@@ -330,7 +427,19 @@ exists to close (cc-butler#36)."
      (if after
          (format "STILL %d un-indexed after regenerating: %s — these notes are cached but will not be recalled by any session; investigate cc-butler-governance--sync-index.\n"
                  (length after) (string-join after ", "))
-       "Index check: 0 un-indexed notes remain.\n"))))
+       "Store->index: 0 un-indexed notes remain.\n")
+     (if dead-before
+         (format "Removed %d dangling index link(s) whose principle no longer exists in the store: %s\n"
+                 (length dead-before) (string-join dead-before ", "))
+       "Index->store: 0 dangling links found.\n")
+     (if dead-after
+         (format "STILL %d dangling link(s) after pruning: %s — investigate cc-butler-governance--prune-dead-entries.\n"
+                 (length dead-after) (string-join dead-after ", "))
+       "")
+     (if stale
+         (format "%d indexed description(s) no longer match the store's current wording (left as-is — this may be deliberate curation rather than staleness, so it is reported, not auto-edited; review and re-run record_principle or hand-edit MEMORY.md if it should change): %s\n"
+                 (length stale) (string-join stale ", "))
+       "Description drift: all indexed descriptions match the store's current wording.\n"))))
 
 ;; Idempotent registration.
 (when (fboundp 'claude-code-ide-make-tool)
