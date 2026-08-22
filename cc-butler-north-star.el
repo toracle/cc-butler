@@ -66,16 +66,30 @@ even on the very first run, before it has ever opened it.")
 
 (defun cc-butler--north-star-prompt ()
   "Build the nudge text sent to the butler's terminal.
-The template is always inlined, whether or not the file exists yet: on a
-missing file it is what the butler creates the first entry from (after
-asking 정수님 what the actual goal is — never guessing); on an existing
-file it is a standing reminder of the expected shape, since drift there
-is exactly the kind of thing nobody notices until the file is unusable."
+The template is always inlined, whether or not the file exists yet, but its
+role differs by case: on an existing file it is a standing reminder of the
+expected shape, since drift there is exactly the kind of thing nobody
+notices until the file is unusable. On a missing file the prompt does NOT
+tell the butler to create it — `cc-butler-governance-dir' is a directory
+shared across multiple fleets (e.g. `north-star-x600.org' and
+`north-star-macbook-m1-max.org' side by side), so a missing file almost
+always means `cc-butler-north-star-file' resolved to the wrong path, not
+that goals were never started; creating a new file there risks silently
+discarding another fleet's real goal history, or colliding with it
+outright. Instead the prompt tells the butler to stop and escalate to
+정수님 — never guessing, never fabricating a fresh file."
   (format "[North Star Check]
-%s 파일을 읽고 각 활성 목표를 점검할 것. 파일이 아직 없다면 아래 템플릿 형식으로
-새로 만들되, 실제 목표가 무엇인지 먼저 정수님께 물어볼 것 — 짐작으로 채우지 말 것.
+%s 파일을 읽고 각 활성 목표를 점검할 것. 파일이 없다면 새로 만들지 말고 즉시 멈출 것 —
+cc-butler-governance-dir는 여러 fleet이 함께 쓰는 저장소로, north-star-x600.org와
+north-star-macbook-m1-max.org처럼 서로 다른 fleet의 목표 파일이 나란히 존재한다.
+이런 상황에서 파일이 \"없다\"는 것은 대개 목표가 아직 없다는 뜻이 아니라 경로가
+잘못 설정되었다는 뜻이다. 여기서 새로 만들면 다른 fleet의 실제 목표/판단 이력을
+빈 파일로 조용히 덮어써 유실시키거나, 잘못된 경로가 다른 fleet의 디렉터리와 겹쳐
+그 fleet의 파일을 침범할 수 있다. escalate_to_butler로 정수님/steward에게 경로가
+잘못된 것 같다고 보고할 것 — 짐작으로 채우거나 새로 만들지 말 것.
 
-템플릿:
+아래 템플릿은 경로가 올바른 실제 파일이라면 각 항목이 어떤 모양이어야 하는지
+보여주는 참고 기준이지, 지금 새 파일을 만들라는 뜻이 아니다:
 %s
 
 각 활성 목표에 대해:
