@@ -61,6 +61,74 @@ themselves are never flagged even if waiting a long time."
     (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () (list (list :dir "/worker/")))))
       (should (null (cc-butler--fleet-stale-waiting-summary))))))
 
+(ert-deftest cc-butler-orchestrator/fleet-stale-waiting-excludes-recent-reporter ()
+  "Given three workers all waiting long past the threshold (300s, so a
+window merely a little longer than the threshold cannot pass by accident):
+one whose report landed right as it went idle (a normal report-then-park,
+still excluded even though it has now sat quiet for hours -- the filter
+must not expire), one with no report at all (a silently stuck dialog can
+never call any tool), and one whose only report is old and unrelated to
+this waiting episode (stale amnesty must not apply) -- Then only the
+first is excluded. The three states must produce different output, or
+this filter does not distinguish anything."
+  (let* ((cc-butler-fleet-stale-waiting-seconds 60)
+         (cc-butler--butler "/butler/") (cc-butler--steward "/steward/")
+         (now (float-time))
+         (cc-butler--waiting (make-hash-table :test 'equal))
+         (cc-butler--last-report (make-hash-table :test 'equal)))
+    (puthash "/worker-parked/" (- now 300) cc-butler--waiting)
+    (puthash "/worker-parked/" (- now 298) cc-butler--last-report)   ; reported right as it went idle
+    (puthash "/worker-stuck/" (- now 300) cc-butler--waiting)        ; never reported
+    (puthash "/worker-stale-report/" (- now 300) cc-butler--waiting)
+    (puthash "/worker-stale-report/" (- now 1000) cc-butler--last-report) ; old, unrelated report
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () (list (list :dir "/worker-parked/") (list :dir "/worker-stuck/")
+                                 (list :dir "/worker-stale-report/"))))
+              ((symbol-function 'cc-butler--display-name)
+               (lambda (d) (pcase d ("/worker-parked/" "worker-parked")
+                             ("/worker-stuck/" "worker-stuck")
+                             ("/worker-stale-report/" "worker-stale-report") (_ d)))))
+      (let ((summary (cc-butler--fleet-stale-waiting-summary)))
+        (should-not (string-match-p "worker-parked" summary))
+        (should (string-match-p "worker-stuck" summary))
+        (should (string-match-p "worker-stale-report" summary))))))
+
+(ert-deftest cc-butler-orchestrator/fleet-stale-waiting-known-gap-report-then-immediate-dialog ()
+  "KNOWN LIMITATION (documented in PR #84's \"what this fix does not
+cover\"): a worker that calls report_to_steward and then immediately opens
+a dialog is wrongly excluded -- the dialog's own idle notification sets
+SINCE only an instant after the report, landing inside the 60s slack meant
+for the report -> notification lag, not for a genuinely stuck session.
+This path is only reachable by violating the standing rule that workers
+must never call AskUserQuestion (report_to_steward / plain text only),
+which is why the trade is accepted rather than closed. This test pins the
+current (accepted) behavior, so a future change to the grace window is a
+deliberate, visible decision rather than a silent regression."
+  (let* ((cc-butler-fleet-stale-waiting-seconds 60)
+         (cc-butler--butler "/butler/") (cc-butler--steward "/steward/")
+         (now (float-time))
+         (cc-butler--waiting (make-hash-table :test 'equal))
+         (cc-butler--last-report (make-hash-table :test 'equal)))
+    ;; Reported at t=-305; a dialog opened 5s later (t=-300) and has sat open
+    ;; ever since -- genuinely stuck, but within the report's 60s grace.
+    (puthash "/worker-reported-then-stuck/" (- now 300) cc-butler--waiting)
+    (puthash "/worker-reported-then-stuck/" (- now 305) cc-butler--last-report)
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () (list (list :dir "/worker-reported-then-stuck/"))))
+              ((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (should (null (cc-butler--fleet-stale-waiting-summary))))))
+
+(ert-deftest cc-butler-orchestrator/report-to-steward-marks-reported ()
+  "report_to_steward is the worker's only way to prove it isn't stuck --
+Then calling it must record a fresh `cc-butler--mark-reported' timestamp."
+  (require 'cc-butler-orchestrator)
+  (let (marked)
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () "/worker/"))
+              ((symbol-function 'cc-butler--maybe-refresh) (lambda () nil))
+              ((symbol-function 'cc-butler--mark-reported) (lambda (d) (setq marked d))))
+      (cc-butler-tool-report-to-steward "hello"))
+    (should (equal marked "/worker/"))))
+
 ;;;; ---- hook payload combinators ---------------------------------------
 
 (defmacro cc-butler-orchestrator-test--with-payload-stubs (inbox-block decisions events stale &rest body)
