@@ -1040,6 +1040,53 @@ even with the waiting flag set idle."
 ;;;; Self-compaction: the butler must be able to target ITSELF
 ;;;; ------------------------------------------------------------------
 
+(ert-deftest cc-butler-compact/a-throwing-poll-releases-the-in-flight-lock ()
+  "REGRESSION (2026-08-24, warmble-jumble's stuck in-flight flag): the poll
+runs as a ONE-SHOT timer callback, and its phase handlers reach the
+terminal through paths that can signal (`cc-butler--read-output''s
+io-timeout bound, a refused window borrow).  An error escaping the
+callback meant no re-arm, no finish, and a state entry left holding its
+fired timer — the session read as \"compaction already in flight\"
+forever.  Any throw must conclude through `--finish': lock released,
+failure logged."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")             ; phase `switching'
+    (should (cc-butler-compact--active-p "w"))
+    (cl-letf (((symbol-function 'cc-butler-compact--model-now)
+               (lambda (d)
+                 (error "Timed out reading session %s's output after 8s" d))))
+      ;; Must not signal out of the tick, and must not strand the lock.
+      (cc-butler-compact--poll "w"))
+    (should-not (cc-butler-compact--active-p "w"))))
+
+(ert-deftest cc-butler-compact/orphan-reaping-heals-a-fired-timer-corpse ()
+  "A one-shot poll timer that fired without re-arming stays in `:timer' as
+a dead OBJECT — truthy, so the old `(not :timer)' test read the corpse as
+a live watcher and refused to reap exactly the entries that most needed
+it (the machine is provably not coming back for them).  A dead timer must
+count as \"no timer\" for `cc-butler-compact--orphaned-p'."
+  (cc-butler-compact-test--with-session "w"
+    (let ((dead (run-with-timer 9999 nil #'ignore)))
+      (cancel-timer dead)                       ; no longer pending — same as fired
+      (cc-butler-compact--set-state
+       "w" :phase 'switching
+       :sent-time (- (float-time) (1+ cc-butler-compact-state-max-age))
+       :timer dead))
+    ;; Terminal corroborates abandonment (idle screen, no menu, nothing
+    ;; pending — the harness default), so merely asking must heal it.
+    (should-not (cc-butler-compact--active-p "w"))))
+
+(ert-deftest cc-butler-compact/test-placeholder-timer-still-counts-as-watched ()
+  "The inverse guard: under `cc-butler-compact--inhibit-timers' the
+schedule stores `t' instead of a timer, and hand-driven entries must NOT
+be reaped as orphans no matter how old — a test driving the machine
+slowly is not an abandoned compaction."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-state-max-age)))
+    (should (cc-butler-compact--active-p "w"))))
+
 (ert-deftest cc-butler-compact/busy-session-is-queued-not-refused ()
   "A session can only call a tool from inside its own turn, and a session
 inside its own turn is busy — so refusing busy made self-compaction
