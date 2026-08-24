@@ -870,23 +870,28 @@ seconds from now; `cc-butler-compact-cancel' calls it off."
     (if (and (cc-butler--waiting-p dir)
              (not (cc-butler-compact--blocked-reason dir)))
         (progn (cc-butler-compact-session dir) 'started)
-      (cc-butler-compact--queue-idle-poll dir deadline)
+      (cc-butler-compact--queue-idle-poll dir deadline (float-time))
       (cc-butler--log "compact: %s │ queued — waiting for a safe idle point" name)
       'queued)))
 
-(defun cc-butler-compact--queue-idle-poll (dir deadline)
+(defun cc-butler-compact--queue-idle-poll (dir deadline &optional queued-at)
   "Arrange the next idle check for DIR, giving up at DEADLINE.
-The queue entry is recorded whether or not a real timer is scheduled, so
-that `cc-butler-compact-waiting-p' and `cc-butler-compact-cancel' describe
+QUEUED-AT is when the compaction was first queued, carried along so the
+give-up report can say how long was actually waited.  The queue entry is
+recorded whether or not a real timer is scheduled, so that
+`cc-butler-compact-waiting-p' and `cc-butler-compact-cancel' describe
 the same state under test as in production."
   (puthash dir (or (unless cc-butler-compact--inhibit-timers
                      (run-with-timer cc-butler-compact-poll-interval nil
-                                     #'cc-butler-compact--idle-poll dir deadline))
+                                     #'cc-butler-compact--idle-poll dir deadline
+                                     queued-at))
                    t)                   ; queued, but driven by hand (tests)
            cc-butler-compact--pending))
 
-(defun cc-butler-compact--idle-poll (dir deadline)
-  "One idle-wait tick: start the compaction once DIR is safely idle."
+(defun cc-butler-compact--idle-poll (dir deadline &optional queued-at)
+  "One idle-wait tick: start the compaction once DIR is safely idle.
+QUEUED-AT is when the compaction was first queued (see
+`cc-butler-compact--queue-idle-poll')."
   (remhash dir cc-butler-compact--pending)
   (let ((name (cc-butler--display-name dir)))
     (cond
@@ -894,7 +899,14 @@ the same state under test as in production."
       (cc-butler--log "compact: %s │ session vanished while queued" name))
      ((> (float-time) deadline)
       (cc-butler--log "compact: %s │ gave up waiting for idle (nothing typed)" name)
-      (message "cc-butler compact: %s — gave up waiting for a safe idle point" name))
+      (message "cc-butler compact: %s — gave up waiting for a safe idle point" name)
+      ;; The log line above is evidence; it is not DELIVERY.  A queued
+      ;; compaction is a promise to whoever requested it, and a promise
+      ;; that evaporates with only a log line is a silent failure — on
+      ;; 2026-08-24 two queued compactions (285k and 291k) gave up and
+      ;; nobody learned of it until a human read the ops file.  Tell the
+      ;; ops session through the same channel the fleet monitor uses.
+      (cc-butler-compact--report-give-up dir name queued-at))
      (t
       ;; The queue entry was already dropped above, so anything that throws
       ;; between there and the re-queue below loses the compaction outright —
@@ -910,7 +922,7 @@ the same state under test as in production."
                     "could not determine whether it is safe"))))
         (if why
             ;; Still busy, or something new is in the way; keep waiting.
-            (cc-butler-compact--queue-idle-poll dir deadline)
+            (cc-butler-compact--queue-idle-poll dir deadline queued-at)
           (condition-case err
               (cc-butler-compact-session dir)
             (error (cc-butler--log "compact: %s │ queued start failed: %s" name
@@ -1419,6 +1431,33 @@ target is safely idle.  Returns non-nil if it was actually typed."
                       (if ops (cc-butler--display-name ops) "nobody")
                       (cond (typed "notified") (ops "queued only") (t "no ops session")))
       typed)))
+
+(defun cc-butler-compact--report-give-up (dir name queued-at)
+  "Tell the ops session that DIR's queued compaction gave up un-run.
+NAME is DIR's display name; QUEUED-AT is when the compaction was queued,
+or nil when unknown (an entry queued before this report existed).
+
+Reuses `cc-butler-compact--report-to-ops' — the same queue-plus-type
+channel the fleet monitor speaks through — because the failure mode this
+answers is precisely a message that exists only in the log: the requester
+asked for a compaction, the wait timed out, and the only trace was an
+ops-file line nobody was reading.  The report carries what the requester
+needs in order to act: which session, how large it still is, how long was
+waited, and that nothing was typed (so the session was left untouched,
+not half-compacted)."
+  (let* ((ctx (cc-butler-cleanup-context-for dir))
+         (waited (and (numberp queued-at)
+                      (max 0 (round (- (float-time) queued-at))))))
+    (cc-butler-compact--report-to-ops
+     (format (concat "⚠️ Compaction GAVE UP: %s was queued but never reached a"
+                     " safe idle point%s. Nothing was typed into it and it was"
+                     " NOT compacted — it is still at %s. If it still needs"
+                     " shrinking, call compact_session %s again; use force=true"
+                     " if it never goes idle.")
+             name
+             (if waited (format " within %d min" (max 1 (round waited 60))) "")
+             (if (integerp ctx) (format "%.0fk" (/ ctx 1000.0)) "an unknown size")
+             name))))
 
 ;;;###autoload
 (define-minor-mode cc-butler-compact-monitor-mode
