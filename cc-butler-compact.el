@@ -1406,6 +1406,18 @@ standing situation is restated occasionally rather than constantly.  A
 CHANGED set always reports immediately regardless."
   :type 'number :group 'cc-butler)
 
+(defcustom cc-butler-compact-monitor-watchdog-factor 3
+  "How many missed intervals before the watchdog treats the monitor as dead.
+The monitor's timer has died silently before (a reload racing a load-time
+error, or something else that leaves `cc-butler-compact-monitor-mode' at t
+while its `run-with-timer' has quietly stopped firing) with nothing
+surfacing it for days.  When the last tick is older than
+`cc-butler-compact-monitor-interval' times this factor, the watchdog
+re-arms the mode — see `cc-butler-compact--monitor-watchdog-maybe-rearm'.
+Kept well above 1 so an ordinary slow scan or a busy daemon does not
+trip it."
+  :type 'number :group 'cc-butler)
+
 (defcustom cc-butler-compact-monitor-notify 'submit
   "How the monitor delivers its report to the steward.
 
@@ -1452,6 +1464,19 @@ session versus retire a finished one — is exactly what gets forgotten."
 (defvar cc-butler-compact--monitor-timer nil
   "Timer running the fleet compaction scan, or nil.")
 
+(defvar cc-butler-compact--monitor-last-tick nil
+  "`float-time' of the monitor's last completed scan, or nil if it has
+never ticked.  Set unconditionally at the top of
+`cc-butler-compact--monitor-scan', including a tick that finds zero
+candidates and reports nothing — a quiet fleet is not the same evidence
+as a dead timer, and only this variable tells them apart.")
+
+(defvar cc-butler-compact--monitor-armed-at nil
+  "`float-time' when `cc-butler-compact-monitor-mode' was last turned on,
+or nil if it never has been.  Baseline for staleness before the first
+tick lands, so a freshly (re)armed monitor is not flagged stale during
+its own first `cc-butler-compact-monitor-interval'.")
+
 (defun cc-butler-compact-fleet-summary ()
   "Return a report of sessions that want compacting, or nil when none.
 
@@ -1484,7 +1509,12 @@ way, so the steward can tell \"do it\" from \"wait\" without going to look."
 (defun cc-butler-compact--monitor-scan ()
   "One monitor tick: report new or long-standing candidates to the steward.
 No-op when there is no session to report to — a scan with nobody listening
-is just a way to be wrong later."
+is just a way to be wrong later.
+
+Records `cc-butler-compact--monitor-last-tick' first, unconditionally —
+before the no-ops-session no-op below — so a tick that finds nothing to
+report still counts as evidence the monitor is alive."
+  (setq cc-butler-compact--monitor-last-tick (float-time))
   (when (cc-butler--ops-dir)
     (let* ((dirs (cc-butler-compact-candidates))
            (names (sort (mapcar #'cc-butler--display-name dirs) #'string<))
@@ -1579,7 +1609,9 @@ the ceiling with nobody reading."
   (setq cc-butler-compact--monitor-timer nil
         cc-butler-compact--last-report nil)
   (when cc-butler-compact-monitor-mode
-    (setq cc-butler-compact--monitor-timer
+    (setq cc-butler-compact--monitor-armed-at (float-time)
+          cc-butler-compact--monitor-last-tick nil
+          cc-butler-compact--monitor-timer
           (run-with-timer cc-butler-compact-monitor-interval
                           cc-butler-compact-monitor-interval
                           #'cc-butler-compact--monitor-scan))
@@ -1592,6 +1624,94 @@ the ceiling with nobody reading."
 ;; and the mode body cancels the previous timer before arming a new one, so
 ;; reloading cannot leave two scans running.
 (cc-butler-compact-monitor-mode 1)
+
+;;;; ------------------------------------------------------------------
+;;;; Monitor watchdog: the monitor's own timer has died silently before —
+;;;; `cc-butler-compact-monitor-mode' stayed t while its `run-with-timer'
+;;;; quietly stopped firing, for days, with nothing surfacing it.  These
+;;;; two pieces make that visible and self-correcting:
+;;;;
+;;;;  - a diagnostic (tick age), surfaced in `session_status' so it is not
+;;;;    something you have to know to go looking for;
+;;;;  - a watchdog that piggybacks on a channel independently proven to
+;;;;    survive whatever killed the timer: butler/steward's own per-turn
+;;;;    hooks (`cc-butler--pending-events-hook-payload' /
+;;;;    `cc-butler--pending-decisions-hook-payload').  A second
+;;;;    `run-with-timer' would be no safer than the first if the same
+;;;;    thing that silenced one silences the other.
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-compact--monitor-tick-age ()
+  "Seconds since the monitor last ticked, or nil if it never has (including
+never having been armed at all — `cc-butler-compact--monitor-armed-at' also
+nil).  Prefers the last actual tick over the arm time, so a freshly
+(re)armed monitor is not treated as already-stale before its first
+interval elapses."
+  (let ((baseline (or cc-butler-compact--monitor-last-tick
+                      cc-butler-compact--monitor-armed-at)))
+    (and baseline (- (float-time) baseline))))
+
+(defun cc-butler-compact--monitor-stale-p ()
+  "Non-nil when the monitor is supposed to be running but has not ticked
+in over `cc-butler-compact-monitor-watchdog-factor' intervals — the signal
+that its timer has died while `cc-butler-compact-monitor-mode' still
+reads t.  Nil (never stale) when the mode is deliberately off: a human
+turning it off is not a fault to correct."
+  (and cc-butler-compact-monitor-mode
+       (let ((age (cc-butler-compact--monitor-tick-age)))
+         (and age (> age (* cc-butler-compact-monitor-interval
+                            cc-butler-compact-monitor-watchdog-factor))))))
+
+(defun cc-butler-compact--format-age (seconds)
+  "Render SECONDS as a short age string: \"Nm\", \"Nh\", or \"Nd\"."
+  (cond ((< seconds 60) "under 1m")
+        ((< seconds 3600) (format "%dm" (round (/ seconds 60))))
+        ((< seconds 86400) (format "%dh" (round (/ seconds 3600))))
+        (t (format "%dd" (round (/ seconds 86400))))))
+
+(defun cc-butler-compact--monitor-status-line ()
+  "One line describing the fleet monitor's own health, for `session_status'.
+The monitor reporting nothing is ambiguous by itself — a healthy fleet
+and a dead timer both produce silence — so this names the one fact that
+tells them apart: when it last actually ticked."
+  (let ((age (cc-butler-compact--monitor-tick-age)))
+    (cond
+     ((not cc-butler-compact-monitor-mode) "compact monitor: OFF")
+     ((null age)
+      "compact monitor: on, has not ticked yet")
+     ((cc-butler-compact--monitor-stale-p)
+      (format "compact monitor: STALE — last tick %s ago (expected every %s); watchdog will re-arm it on the next steward/butler turn"
+              (cc-butler-compact--format-age age)
+              (cc-butler-compact--format-age cc-butler-compact-monitor-interval)))
+     (t (format "compact monitor: alive, last tick %s ago (every %s)"
+                (cc-butler-compact--format-age age)
+                (cc-butler-compact--format-age cc-butler-compact-monitor-interval))))))
+
+(defun cc-butler-compact--monitor-watchdog-maybe-rearm ()
+  "Re-arm the fleet monitor if its timer has gone silently dead, and say so.
+
+Returns a short string when it actually fired (for a per-turn hook payload
+to surface), or nil the overwhelming majority of the time when the
+monitor is fine — same quiet-unless-it-matters convention as
+`cc-butler-compact-fleet-summary'.
+
+`(cc-butler-compact-monitor-mode 1)' is safe to call unconditionally per
+its own docstring: the mode body always cancels any existing timer before
+arming a new one, so this cannot leave two scans running.  Deliberately
+NOT another `run-with-timer' on the side — if whatever silenced the
+original timer can silence a structurally identical one the same way,
+that adds nothing.  This instead rides a channel independently confirmed
+to have kept firing throughout the last known outage: the per-turn hook
+that calls it."
+  (when (cc-butler-compact--monitor-stale-p)
+    (let ((age (cc-butler-compact--monitor-tick-age)))
+      (cc-butler-compact-monitor-mode 1)
+      (cc-butler--log "compact monitor │ WATCHDOG: last tick %s ago (expected every %ds, threshold %dx) — re-armed a fresh timer"
+                      (cc-butler-compact--format-age age)
+                      cc-butler-compact-monitor-interval
+                      cc-butler-compact-monitor-watchdog-factor)
+      (format "🐕 Compact monitor watchdog: its timer had gone silent for %s and was just re-armed. This should not recur — if it does, `cc-butler-compact-monitor-mode' is dying repeatedly and wants investigating, not just re-arming."
+              (cc-butler-compact--format-age age)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; MCP tools — the whole point: the LLM calls one function
@@ -1619,13 +1739,15 @@ the ceiling with nobody reading."
 (defun cc-butler-tool-session-status ()
   "MCP tool: per-session context size, used%, model, and compaction readiness."
   (let ((rows (mapcar (lambda (s) (cc-butler-compact--status-line (plist-get s :dir)))
-                      (cc-butler--sessions))))
+                      (cc-butler--sessions)))
+        (monitor (cc-butler-compact--monitor-status-line)))
     (if (null rows)
-        "No live sessions."
+        (concat "No live sessions.\n\n" monitor)
       (concat (format "%-36s %9s %6s  %-10s  %-13s  %s\n" "SESSION" "CONTEXT" "PCT" "MODEL" "STATE" "COMPACTION")
               (string-join rows "\n")
-              (format "\n\nThreshold: %d%% of the model's context window (`cc-butler-compact-threshold-fraction'), not a flat token count — it scales with each model's window size, so a large-window session can be well past any fixed figure while nowhere near this gate. PCT is that same live signal: the session's own reported usage when its statusline carries one, else its context tokens against the assumed window. A context/PCT figure is what the session's statusline last reported, not a live measurement; \"?\" means it is not known there — never a computed-looking guess."
-                      (cc-butler-compact--threshold-pct))))))
+              (format "\n\nThreshold: %d%% of the model's context window (`cc-butler-compact-threshold-fraction'), not a flat token count — it scales with each model's window size, so a large-window session can be well past any fixed figure while nowhere near this gate. PCT is that same live signal: the session's own reported usage when its statusline carries one, else its context tokens against the assumed window. A context/PCT figure is what the session's statusline last reported, not a live measurement; \"?\" means it is not known there — never a computed-looking guess.\n%s"
+                      (cc-butler-compact--threshold-pct)
+                      monitor)))))
 
 (defun cc-butler-tool-compact-session (name &optional force)
   "MCP tool: compact the session called NAME.

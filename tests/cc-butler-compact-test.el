@@ -1825,6 +1825,144 @@ still gets through, so a blocked steward is not left uninformed."
         (should-not sent)))))            ; but nothing typed
 
 ;;;; ------------------------------------------------------------------
+;;;; Monitor watchdog: the timer has died silently before (`t' mode
+;;;; variable, dead `run-with-timer', nothing surfacing it for days) —
+;;;; these prove the diagnostic and the self-heal, isolated from the real
+;;;; global timer so tests cannot leak one.
+;;;; ------------------------------------------------------------------
+
+(defmacro cc-butler-compact-test--with-monitor-state (&rest body)
+  "Run BODY with the monitor's tick-tracking state reset and isolated,
+never touching the real global timer."
+  (declare (indent 0))
+  `(let ((cc-butler-compact-monitor-mode t)
+         (cc-butler-compact-monitor-interval 900)
+         (cc-butler-compact-monitor-watchdog-factor 3)
+         (cc-butler-compact--monitor-last-tick nil)
+         (cc-butler-compact--monitor-armed-at nil))
+     ,@body))
+
+(ert-deftest cc-butler-compact/monitor-tick-age-nil-when-never-armed ()
+  "Before the mode has ever been turned on, there is no baseline to age —
+absence of evidence, not evidence of a dead timer."
+  (cc-butler-compact-test--with-monitor-state
+    (should-not (cc-butler-compact--monitor-tick-age))))
+
+(ert-deftest cc-butler-compact/monitor-tick-age-uses-armed-at-before-first-tick ()
+  "A freshly (re)armed monitor is not stale before its own first interval —
+age is measured from when it was armed, not treated as infinite."
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-armed-at (- (float-time) 10))
+    (let ((age (cc-butler-compact--monitor-tick-age)))
+      (should age)
+      (should (< (abs (- age 10)) 2)))))
+
+(ert-deftest cc-butler-compact/monitor-scan-records-a-tick-even-with-nothing-to-report ()
+  "A zero-candidate tick is still evidence the monitor is alive — this is
+the whole point: silence from a healthy fleet and silence from a dead
+timer must not look the same on disk."
+  (cc-butler-compact-test--with-monitor-state
+    (cc-butler-compact-test--with-fleet '(("/w/" . 10000))
+      (should-not cc-butler-compact--monitor-last-tick)
+      (cc-butler-compact--monitor-scan)
+      (should cc-butler-compact--monitor-last-tick)
+      (should (< (cc-butler-compact--monitor-tick-age) 2)))))
+
+(ert-deftest cc-butler-compact/monitor-not-stale-just-after-a-tick ()
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick (float-time))
+    (should-not (cc-butler-compact--monitor-stale-p))))
+
+(ert-deftest cc-butler-compact/monitor-stale-past-the-watchdog-factor ()
+  "Past interval * factor with no tick, the monitor is presumed dead."
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick
+          (- (float-time) (* 3.5 cc-butler-compact-monitor-interval)))
+    (should (cc-butler-compact--monitor-stale-p))))
+
+(ert-deftest cc-butler-compact/monitor-not-stale-below-the-watchdog-factor ()
+  "Two missed intervals is a slow tick, not a dead timer — the factor
+exists precisely so an ordinary delay does not trip the watchdog."
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick
+          (- (float-time) (* 2 cc-butler-compact-monitor-interval)))
+    (should-not (cc-butler-compact--monitor-stale-p))))
+
+(ert-deftest cc-butler-compact/monitor-never-stale-when-deliberately-off ()
+  "A human turning the monitor off is not a fault for the watchdog to
+correct — the mode variable being nil must short-circuit staleness."
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact-monitor-mode nil
+          cc-butler-compact--monitor-last-tick
+          (- (float-time) (* 100 cc-butler-compact-monitor-interval)))
+    (should-not (cc-butler-compact--monitor-stale-p))))
+
+(ert-deftest cc-butler-compact/monitor-status-line-reports-off ()
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact-monitor-mode nil)
+    (should (string-match-p "OFF" (cc-butler-compact--monitor-status-line)))))
+
+(ert-deftest cc-butler-compact/monitor-status-line-reports-not-yet-ticked ()
+  (cc-butler-compact-test--with-monitor-state
+    (should (string-match-p "has not ticked" (cc-butler-compact--monitor-status-line)))))
+
+(ert-deftest cc-butler-compact/monitor-status-line-reports-alive ()
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick (float-time))
+    (let ((line (cc-butler-compact--monitor-status-line)))
+      (should (string-match-p "alive" line))
+      (should-not (string-match-p "STALE" line)))))
+
+(ert-deftest cc-butler-compact/monitor-status-line-reports-stale ()
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick
+          (- (float-time) (* 10 cc-butler-compact-monitor-interval)))
+    (should (string-match-p "STALE" (cc-butler-compact--monitor-status-line)))))
+
+(ert-deftest cc-butler-compact/session-status-surfaces-monitor-line ()
+  "The diagnostic must be reachable without deep code-reading — session_status
+is the tool an operator (or the steward) actually calls."
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick
+          (- (float-time) (* 10 cc-butler-compact-monitor-interval)))
+    (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () nil)))
+      (should (string-match-p "STALE" (cc-butler-tool-session-status))))))
+
+(ert-deftest cc-butler-compact/watchdog-does-nothing-when-not-stale ()
+  "The overwhelming majority case: a healthy monitor, no action, no noise."
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick (float-time))
+    (let (rearmed)
+      (cl-letf (((symbol-function 'cc-butler-compact-monitor-mode)
+                 (lambda (&rest _) (push t rearmed))))
+        (should-not (cc-butler-compact--monitor-watchdog-maybe-rearm))
+        (should-not rearmed)))))
+
+(ert-deftest cc-butler-compact/watchdog-rearms-and-reports-when-stale ()
+  "The self-heal: past the staleness threshold, the watchdog calls the
+mode function to re-arm — never a second `run-with-timer' of its own —
+logs loudly, and returns a string a human reading the turn would notice."
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick
+          (- (float-time) (* 10 cc-butler-compact-monitor-interval)))
+    (let (rearmed logged)
+      (cl-letf (((symbol-function 'cc-butler-compact-monitor-mode)
+                 (lambda (&rest args) (push args rearmed)))
+                ((symbol-function 'cc-butler--log)
+                 (lambda (fmt &rest args) (push (apply #'format fmt args) logged))))
+        (let ((out (cc-butler-compact--monitor-watchdog-maybe-rearm)))
+          (should out)
+          (should (string-match-p "re-armed" out))
+          (should (equal rearmed '((1))))
+          (should logged)
+          (should (string-match-p "WATCHDOG" (car logged))))))))
+
+;; Wiring into the per-turn hook payloads (`cc-butler--pending-events-hook-payload'
+;; / `cc-butler--pending-decisions-hook-payload' / `cc-butler--compact-monitor-watchdog-check')
+;; is tested in tests/cc-butler-orchestrator-test.el, next to those functions'
+;; other tests — this file covers the pure monitor-state logic above.
+
+;;;; ------------------------------------------------------------------
 ;;;; Restoring a model without a closed list of families
 ;;;; ------------------------------------------------------------------
 

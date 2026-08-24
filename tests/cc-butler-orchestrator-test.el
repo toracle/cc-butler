@@ -218,12 +218,17 @@ ORIGINAL detection, not as new."
 INBOX-BLOCK/DIALOGS are the pre-formatted string-or-nil `cc-butler--inbox-urgent-block'
 /`cc-butler--fleet-dialog-summary' would return; DECISIONS/EVENTS
 are the raw strings `cc-butler-tool-pending-decisions'/`cc-butler-tool-inbox'
-would return (including their own \"No pending ...\" empty sentinels)."
+would return (including their own \"No pending ...\" empty sentinels).
+
+Also stubs the compact-monitor watchdog check to nil (quiet) so these
+tests do not depend on the real global monitor's timing — see the
+dedicated watchdog-surfacing tests below for that behavior."
   (declare (indent 4))
   `(cl-letf (((symbol-function 'cc-butler--inbox-urgent-block) (lambda (_agent) ,inbox-block))
              ((symbol-function 'cc-butler-tool-pending-decisions) (lambda () ,decisions))
              ((symbol-function 'cc-butler-tool-inbox) (lambda () ,events))
-             ((symbol-function 'cc-butler--fleet-dialog-summary) (lambda () ,dialogs)))
+             ((symbol-function 'cc-butler--fleet-dialog-summary) (lambda () ,dialogs))
+             ((symbol-function 'cc-butler--compact-monitor-watchdog-check) (lambda () nil)))
      ,@body))
 
 (ert-deftest cc-butler-orchestrator/pending-decisions-payload-empty-is-empty-string ()
@@ -266,6 +271,52 @@ exactly the events text, with no stray separators."
   (cc-butler-orchestrator-test--with-payload-stubs nil "No pending decisions."
       "- [12:00] worker-a: done: PR #42" nil
     (should (equal "- [12:00] worker-a: done: PR #42" (cc-butler--pending-events-hook-payload)))))
+
+;;;; ---- compact-monitor watchdog check -----------------------------------
+;;;; The fleet monitor's own `run-with-timer' has died silently before —
+;;;; `cc-butler-compact-monitor-mode' stayed t while the timer quietly
+;;;; stopped firing, for days, with nothing surfacing it.  A second
+;;;; `run-with-timer' would be exactly as vulnerable, so the watchdog
+;;;; instead piggybacks on this per-turn hook path — confirmed to have
+;;;; kept firing throughout the outage that motivated it.  These tests
+;;;; prove the wiring: a firing watchdog reaches BOTH the steward's
+;;;; pending_events payload and the butler's pending_decisions payload
+;;;; (single-mode fleets have no separate steward, so the butler's hook
+;;;; is their only per-turn channel), and a quiet one adds nothing.
+
+(ert-deftest cc-butler-orchestrator/watchdog-check-degrades-to-nil-on-error ()
+  "The watchdog check must never take the rest of a payload down with it —
+same bargain as the `ceiling' check it sits beside."
+  (cl-letf (((symbol-function 'cc-butler-compact--monitor-watchdog-maybe-rearm)
+             (lambda () (error "boom"))))
+    (should-not (cc-butler--compact-monitor-watchdog-check))))
+
+(ert-deftest cc-butler-orchestrator/pending-events-payload-surfaces-a-firing-watchdog ()
+  "The steward must actually see it when the watchdog fires — a re-arm
+nobody reads is not meaningfully different from one that never happened."
+  (cc-butler-orchestrator-test--with-payload-stubs nil "No pending decisions."
+      "No pending worker events." nil
+    (cl-letf (((symbol-function 'cc-butler--compact-monitor-watchdog-check)
+               (lambda () "🐕 watchdog fired")))
+      (should (string-match-p "watchdog fired" (cc-butler--pending-events-hook-payload))))))
+
+(ert-deftest cc-butler-orchestrator/pending-decisions-payload-surfaces-a-firing-watchdog ()
+  "Single-mode fleets have no separate steward, so the butler's own
+pending_decisions hook is the only per-turn channel — the watchdog must
+reach it too, not just the steward's."
+  (cc-butler-orchestrator-test--with-payload-stubs nil "No pending decisions."
+      "No pending worker events." nil
+    (cl-letf (((symbol-function 'cc-butler--compact-monitor-watchdog-check)
+               (lambda () "🐕 watchdog fired")))
+      (should (string-match-p "watchdog fired" (cc-butler--pending-decisions-hook-payload))))))
+
+(ert-deftest cc-butler-orchestrator/pending-events-payload-quiet-when-watchdog-is-quiet ()
+  "No news from the watchdog must not become news in the payload — proven
+by the shared stub macro's default (nil) already producing an empty
+payload above; this test pins that default explicitly against regression."
+  (cc-butler-orchestrator-test--with-payload-stubs nil "No pending decisions."
+      "No pending worker events." nil
+    (should (equal "" (cc-butler--pending-events-hook-payload)))))
 
 ;;;; ---- session I/O timeout guard ---------------------------------------
 ;;;; 2026-07-15: a stuck ghostel redraw or wedged terminal write used to hang
