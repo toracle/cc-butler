@@ -1713,5 +1713,72 @@ the behaviour we want to keep for a genuinely unknown model."
       (clrhash cc-butler-cleanup--model-cache)
       (should (null (cc-butler-compact--model-for-restore "/e/"))))))
 
+;;;; ---- outcomes on disk (ops log mirror) ----------------------------
+
+(defmacro cc-butler-compact-test--with-ops-log-on-disk (&rest body)
+  "Run BODY inside `--with-session' \"w\" but with the REAL `cc-butler--log'
+(the session macro stubs it to `ignore') pointed at a throwaway ops-log dir
+and a throwaway log buffer, both cleaned up afterwards."
+  (declare (indent 0))
+  `(let* ((tmp (make-temp-file "cc-butler-compact-ops" t))
+          (cc-butler-ops-log-dir (expand-file-name "log/" tmp))
+          (cc-butler-log-buffer-name " *cc-butler-compact-ops-test-log*")
+          (real-log (symbol-function 'cc-butler--log)))
+     (unwind-protect
+         (cc-butler-compact-test--with-session "w"
+           (cl-letf (((symbol-function 'cc-butler--log) real-log))
+             ,@body))
+       (when (get-buffer cc-butler-log-buffer-name)
+         (kill-buffer cc-butler-log-buffer-name))
+       (delete-directory tmp t))))
+
+(defun cc-butler-compact-test--ops-log-string ()
+  "Contents of today's ops log file, or nil if it was never written."
+  (let ((file (cc-butler--log-file)))
+    (and (file-exists-p file)
+         (with-temp-buffer (insert-file-contents file) (buffer-string)))))
+
+(ert-deftest cc-butler-compact/driver-restore-leaves-disk-evidence ()
+  "A machine-performed restore is provable from disk alone: the ops file
+holds the driver's own \"restoring (sent /model ...)\" step line AND the
+outcome line names the path (\"driver-sent restore\").  A hand-typed /model
+leaves neither — so their absence reads as \"not the machine\", which is the
+distinction the stranding audit needed and could previously only get from a
+volatile buffer."
+  (cc-butler-compact-test--with-ops-log-on-disk
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")            ; -> /compact
+    (setq cc-butler-compact-test--ctx 90000)
+    (cc-butler-compact--poll "w")            ; -> /model claude-opus-4-8
+    (setq cc-butler-compact-test--model "Opus-4.8")
+    (cc-butler-compact--poll "w")            ; -> restored, finish
+    (should-not (cc-butler-compact--active-p "w"))
+    (let ((got (cc-butler-compact-test--ops-log-string)))
+      (should got)
+      (should (string-match-p (regexp-quote "restoring (sent /model claude-opus-4-8)") got))
+      (should (string-match-p (regexp-quote "model restored to Opus-4.8 (driver-sent restore)") got)))))
+
+(ert-deftest cc-butler-compact/failure-outcome-lands-on-disk ()
+  "A restore failure is written to the daily ops file as surely as a
+success — a log where only successes survive the process makes the failure
+rate look like zero (the 1066 stranding evidence lived in a volatile
+buffer for exactly this reason)."
+  (cc-butler-compact-test--with-ops-log-on-disk
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")
+    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+      (cc-butler-compact--set-state
+       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+      (cc-butler-compact--poll "w")          ; -> held in restore-wait
+      (cc-butler-compact--set-state
+       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+      (cc-butler-compact--poll "w"))         ; -> gives up: NOT restored
+    (should-not (cc-butler-compact--active-p "w"))
+    (let ((got (cc-butler-compact-test--ops-log-string)))
+      (should got)
+      (should (string-match-p "NOT restored" got)))))
+
 (provide 'cc-butler-compact-test)
 ;;; cc-butler-compact-test.el ends here

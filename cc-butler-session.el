@@ -468,18 +468,58 @@ envelope and a relayed terminal message render a path the same way.")
 (define-derived-mode cc-butler-log-mode special-mode "cc-butler-Log"
   "Major mode for the cc-butler butler<->worker message log.")
 
+(defcustom cc-butler-ops-log-dir
+  (expand-file-name
+   "cc-butler/log/"
+   (let ((xdg (getenv "XDG_STATE_HOME")))
+     (if (and xdg (not (string-empty-p xdg))) xdg
+       (expand-file-name ".local/state" "~"))))
+  "Directory of the on-disk mirror of the cc-butler operations log.
+Every `cc-butler--log' line (compact/cleanup outcomes, message routing,
+session events) is appended to a daily plain-text file here,
+ops-YYYY-MM-DD.log, so operational evidence survives the Emacs process
+instead of living only in the `cc-butler-log-buffer-name' buffer.
+
+Defaults under `$XDG_STATE_HOME' (falling back to ~/.local/state) — the
+same derivation as `cc-butler-mail-dir', duplicated rather than reused
+because cc-butler-mail requires this module, so the log layer cannot
+require mail back."
+  :type 'directory
+  :group 'cc-butler)
+
+(defun cc-butler--log-file ()
+  "Return today's on-disk ops log file under `cc-butler-ops-log-dir'."
+  (expand-file-name (format-time-string "ops-%Y-%m-%d.log")
+                    cc-butler-ops-log-dir))
+
+(defun cc-butler--log-mirror (line)
+  "Append LINE to today's ops log file.  Non-fatal: any failure is
+swallowed (`ignore-errors') — the mirror is an audit layer, never a
+precondition, so a full disk or an unwritable directory must not break
+the operation being logged.  Returns LINE, or nil if the write failed."
+  (ignore-errors
+    (make-directory cc-butler-ops-log-dir t)
+    (write-region (concat line "\n") nil (cc-butler--log-file)
+                  'append 'silent)
+    line))
+
 (defun cc-butler--log (fmt &rest args)
-  "Append a timestamped FMT/ARGS line to `cc-butler-log-buffer-name'."
-  (let ((buf (get-buffer-create cc-butler-log-buffer-name)))
-    (with-current-buffer buf
-      (unless (derived-mode-p 'cc-butler-log-mode) (cc-butler-log-mode))
-      (let ((inhibit-read-only t))
-        (save-excursion
-          (goto-char (point-max))
-          (insert (format-time-string "[%H:%M:%S] ")
-                  (apply #'format fmt args) "\n")))
-      (dolist (w (get-buffer-window-list buf nil t))
-        (set-window-point w (point-max))))))
+  "Append a timestamped FMT/ARGS line to `cc-butler-log-buffer-name',
+mirrored on disk via `cc-butler--log-mirror' (one line, two sinks —
+the buffer for live watching, the daily file for evidence that
+outlives the process)."
+  (let ((line (concat (format-time-string "[%H:%M:%S] ")
+                      (apply #'format fmt args))))
+    (cc-butler--log-mirror line)
+    (let ((buf (get-buffer-create cc-butler-log-buffer-name)))
+      (with-current-buffer buf
+        (unless (derived-mode-p 'cc-butler-log-mode) (cc-butler-log-mode))
+        (let ((inhibit-read-only t))
+          (save-excursion
+            (goto-char (point-max))
+            (insert line "\n")))
+        (dolist (w (get-buffer-window-list buf nil t))
+          (set-window-point w (point-max)))))))
 
 (defun cc-butler-show-log ()
   "Pop to the cc-butler message-log buffer."
