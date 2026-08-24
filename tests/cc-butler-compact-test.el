@@ -1434,6 +1434,61 @@ blindly."
             ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil)))
     (should (string-match-p "?" (cc-butler-tool-session-status)))))
 
+;;;; ------------------------------------------------------------------
+;;;; cc-butler#99: the footer must state the real fraction gate, never
+;;;; the stale flat `cc-butler-compact-threshold' it replaced
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/status-tool-footer-states-the-real-fraction-gate-not-the-stale-flat-constant ()
+  "Reproduces cc-butler#99: a session sitting at 37%% of a ~1M window
+\(369538 tokens\) is well under the real 60%% gate -- `--over-threshold-p'
+already gets this right and does not flag it -- but the footer used to
+print the stale flat `cc-butler-compact-threshold' (300k) regardless, a
+number this session's absolute token count sails past while nowhere near
+the real gate.  That is exactly the misreading that got a session
+compacted on 2026-08-25 under the false premise of \"over 300k\", when the
+real 60%%-of-window gate was not remotely close.  The footer must describe
+the real gate and must never print the flat constant as if it still
+means something."
+  (let ((cc-butler-compact-threshold 300000)
+        (cc-butler-compact-threshold-fraction 0.60))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () '((:dir "/d/"))))
+              ((symbol-function 'cc-butler--display-name) (lambda (_d) "big-window-worker"))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 369538))
+              ((symbol-function 'cc-butler-cleanup-model-for) (lambda (_d) "Opus-4.8"))
+              ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx 369538 :pct 37 :model "Opus-4.8"))))
+      (let ((out (cc-butler-tool-session-status)))
+        ;; The real gate is correctly not tripped.
+        (should-not (string-match-p "OVER THRESHOLD" out))
+        ;; The footer must describe the real 60% gate...
+        (should (string-match-p "60%" out))
+        ;; ...and must never print the stale flat constant as a threshold.
+        (should-not (string-match-p "300k" out))))))
+
+(ert-deftest cc-butler-compact/status-tool-pct-column-is-unknown-not-fabricated ()
+  "When neither the statusline percentage nor a usable window is known, the
+displayed percentage must say so honestly rather than print a computed-
+looking number -- the same honest-refusal `cc-butler-compact--over-
+threshold-p' already applies to gating must apply to what is shown, per
+the standing rule that an unknown size is not a candidate for a guess.
+Checked on the per-row line itself (not the whole tool output, whose
+footer legitimately names the gate percentage)."
+  (let ((cc-butler-cleanup-context-window 0))  ; window itself unusable
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 150000))
+              ((symbol-function 'cc-butler-cleanup-model-for) (lambda (_d) "Opus-4.8"))
+              ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--statusline-fields-now) (lambda (_d) nil)))
+      (let ((row (cc-butler-compact--status-line "/w/")))
+        (should (string-match-p "150k" row))       ; ctx IS known
+        ;; but no numeric percentage may appear -- it is not computable.
+        (should-not (string-match-p "[0-9]+%" row))))))
+
 (ert-deftest cc-butler-compact/compact-tool-resolves-a-session-by-name ()
   "compact_session takes the name the LLM already has, not a directory."
   (let (target)
@@ -1488,6 +1543,20 @@ never a silent no-op that reads as success."
             ((symbol-function 'cc-butler--display-name) (lambda (_d) "butler")))
     (should (string-match-p "butler" (cc-butler-tool-compact-large-sessions)))))
 
+(ert-deftest cc-butler-compact/sweep-tool-nothing-started-states-the-real-gate ()
+  "cc-butler#99: the \"nothing started\" explanation must describe the real
+percentage gate, not the stale flat 300k constant that no longer gates
+anything -- reading the flat number here is what lets someone conclude a
+session must be under 300k when the real reason may be unrelated (busy,
+menu open) or the real gate is a different absolute figure entirely on a
+large-window model."
+  (let ((cc-butler-compact-threshold 300000)
+        (cc-butler-compact-threshold-fraction 0.60))
+    (cl-letf (((symbol-function 'cc-butler-compact-large-sessions) (lambda () nil)))
+      (let ((out (cc-butler-tool-compact-large-sessions)))
+        (should (string-match-p "60%" out))
+        (should-not (string-match-p "300k" out))))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Fleet monitor: elisp reports, the steward decides
 ;;;; ------------------------------------------------------------------
@@ -1537,6 +1606,19 @@ something that will never clear itself."
     (cl-letf (((symbol-function 'cc-butler-compact--blocked-reason)
                (lambda (_d &optional _i) "an interactive menu/wizard is open")))
       (should (string-match-p "menu" (cc-butler-compact-fleet-summary))))))
+
+(ert-deftest cc-butler-compact/fleet-summary-states-the-real-gate-not-the-flat-constant ()
+  "cc-butler#99: the steward-facing ceiling report must describe the real
+60%% gate, not the stale flat 300k constant.  Set up the exact incident
+shape -- a large (~1M) window where the real gate (60% of window) sits far
+above the flat 300k figure -- so a report that still says \"over 300k\"
+would be actively misleading about why this session was flagged."
+  (cc-butler-compact-test--with-fleet '(("/b/" . 620000))
+    (let ((cc-butler-cleanup-context-window 1000000)  ; 60% of this is 600000
+          (cc-butler-compact-threshold-fraction 0.60))
+      (let ((out (cc-butler-compact-fleet-summary)))
+        (should (string-match-p "60%" out))
+        (should-not (string-match-p "300k" out))))))
 
 (ert-deftest cc-butler-compact/monitor-notifies-and-queues ()
   "By default the steward is TOLD, not left to ask: the report is typed in

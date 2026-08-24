@@ -53,11 +53,19 @@
 ;;;; ------------------------------------------------------------------
 
 (defcustom cc-butler-compact-threshold 300000
-  "Input-token count above which a session is a compaction candidate.
-Read from the statusline `CTX:' marker via `cc-butler-cleanup-context-for'.
-Higher than `cc-butler-cleanup-context-threshold' on purpose: that one
-surfaces a worker for cleanup (externalize and tear down), this one is the
-cheaper in-place remedy that also applies to the butler itself."
+  "UNUSED — does NOT gate compaction and is not rendered in any tool output,
+log line, or report.  Superseded by `cc-butler-compact-threshold-fraction',
+which is the sole gate and the only threshold this file displays anywhere.
+Kept only so a pre-existing customization of this variable does not raise
+a void-variable error; changing its value has zero effect on behavior or
+on anything shown to a caller.
+
+This is the constant whose display survived its own retirement and got a
+session compacted on 2026-08-25 under the false premise \"over 300k\" when
+the real 60%%-of-window gate was nowhere close — see cc-butler#99.  A
+number this authoritative-looking is exactly what caused that misreading;
+do not wire it back into any display without first making it the real
+gate again, which it is not."
   :type 'integer :group 'cc-butler)
 
 (defcustom cc-butler-compact-threshold-fraction 0.60
@@ -478,6 +486,29 @@ known — an unknown size is not a candidate (honest, never a guess)."
         (and (integerp ctx)
              (> cc-butler-cleanup-context-window 0)
              (> ctx (* cc-butler-cleanup-context-window frac)))))))
+
+(defun cc-butler-compact--threshold-pct ()
+  "The compaction gate as a whole percentage, for display only.
+Never used for gating -- `cc-butler-compact--over-threshold-p' reads
+`cc-butler-compact-threshold-fraction' directly; this just formats the
+same number for text a caller reads."
+  (round (* 100 cc-butler-compact-threshold-fraction)))
+
+(defun cc-butler-compact--display-pct (dir)
+  "DIR's best-known percentage of its context window used, or nil.
+Mirrors the exact hybrid signal `cc-butler-compact--over-threshold-p'
+gates on -- the statusline's own reported percentage first, falling back
+to CTX against `cc-butler-cleanup-context-window' -- so a number shown
+here is never out of step with what actually decided candidacy.  Nil,
+never a guess, when neither is known: an unknown size is not a number to
+display any more than it is a candidate to act on."
+  (let ((pct (plist-get (cc-butler-compact--statusline-fields-now dir) :pct)))
+    (if (integerp pct)
+        pct
+      (let ((ctx (cc-butler-cleanup-context-for dir)))
+        (and (integerp ctx)
+             (> cc-butler-cleanup-context-window 0)
+             (round (* 100 (/ (float ctx) cc-butler-cleanup-context-window))))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Pre-flight guards
@@ -1243,7 +1274,8 @@ important work first.  Includes the butler and the steward by design."
 
 ;;;###autoload
 (defun cc-butler-compact-large-sessions ()
-  "Compact every session whose context exceeds `cc-butler-compact-threshold'.
+  "Compact every session at/above `cc-butler-compact-threshold-fraction' of
+its context window (see `cc-butler-compact--over-threshold-p').
 
 The butler and the steward are included — they are the long-lived sessions
 that grow without bound, and excluding them would leave the biggest context
@@ -1356,10 +1388,12 @@ way, so the steward can tell \"do it\" from \"wait\" without going to look."
   (let (rows)
     (dolist (dir (cc-butler-compact-candidates))
       (let* ((ctx (cc-butler-cleanup-context-for dir))
+             (pct (cc-butler-compact--display-pct dir))
              (why (cc-butler-compact--blocked-reason dir)))
-        (push (format "- %s (%.0fk) — %s"
+        (push (format "- %s (%.0fk, %s) — %s"
                       (cc-butler--display-name dir)
                       (/ (or ctx 0) 1000.0)
+                      (if (integerp pct) (format "%d%%" pct) "?")
                       (cond ((cc-butler-compact-waiting-p dir)
                              "compaction already queued, waiting for it to go idle")
                             ((null why) "ready: compact_session now")
@@ -1368,8 +1402,8 @@ way, so the steward can tell \"do it\" from \"wait\" without going to look."
                             (t why)))
               rows)))
     (when rows
-      (format "🧠 Context ceiling: %d session(s) over %.0fk and wanting attention:\n%s\n\nWhat you can do — yours to time, since each one interrupts whatever that session does next:\n%s"
-              (length rows) (/ cc-butler-compact-threshold 1000.0)
+      (format "🧠 Context ceiling: %d session(s) at/above %d%% of their context window and wanting attention:\n%s\n\nWhat you can do — yours to time, since each one interrupts whatever that session does next:\n%s"
+              (length rows) (cc-butler-compact--threshold-pct)
               (mapconcat #'identity (nreverse rows) "\n")
               cc-butler-compact-remedies))))
 
@@ -1448,9 +1482,9 @@ the ceiling with nobody reading."
           (run-with-timer cc-butler-compact-monitor-interval
                           cc-butler-compact-monitor-interval
                           #'cc-butler-compact--monitor-scan))
-    (cc-butler--log "compact monitor │ on (every %ds, threshold %.0fk, notify %s)"
+    (cc-butler--log "compact monitor │ on (every %ds, threshold %d%% of window, notify %s)"
                     cc-butler-compact-monitor-interval
-                    (/ cc-butler-compact-threshold 1000.0)
+                    (cc-butler-compact--threshold-pct)
                     (or cc-butler-compact-monitor-notify "queue-only"))))
 
 ;; Start with cc-butler itself.  Idempotent: `cc-butler-reload' re-runs this
@@ -1463,14 +1497,16 @@ the ceiling with nobody reading."
 ;;;; ------------------------------------------------------------------
 
 (defun cc-butler-compact--status-line (dir)
-  "One status row for DIR: name, context size, model, and readiness."
+  "One status row for DIR: name, context size, used%, model, and readiness."
   (let* ((name (cc-butler--display-name dir))
          (ctx (cc-butler-cleanup-context-for dir))
+         (pct (cc-butler-compact--display-pct dir))
          (model (cc-butler-cleanup-model-for dir))
          (why (cc-butler-compact--blocked-reason dir)))
-    (format "%-36s %9s  %-10s  %-13s  %s"
+    (format "%-36s %9s %6s  %-10s  %-13s  %s"
             name
             (if (integerp ctx) (format "%.0fk" (/ ctx 1000.0)) "?")
+            (if (integerp pct) (format "%d%%" pct) "?")
             (or model "?")
             (if (cc-butler--waiting-p dir) "WAITING" "running")
             (let ((over (cc-butler-compact--over-threshold-p dir)))
@@ -1480,15 +1516,15 @@ the ceiling with nobody reading."
                     (t "ok"))))))
 
 (defun cc-butler-tool-session-status ()
-  "MCP tool: per-session context size, model, and compaction readiness."
+  "MCP tool: per-session context size, used%, model, and compaction readiness."
   (let ((rows (mapcar (lambda (s) (cc-butler-compact--status-line (plist-get s :dir)))
                       (cc-butler--sessions))))
     (if (null rows)
         "No live sessions."
-      (concat (format "%-36s %9s  %-10s  %-13s  %s\n" "SESSION" "CONTEXT" "MODEL" "STATE" "COMPACTION")
+      (concat (format "%-36s %9s %6s  %-10s  %-13s  %s\n" "SESSION" "CONTEXT" "PCT" "MODEL" "STATE" "COMPACTION")
               (string-join rows "\n")
-              (format "\n\nThreshold: %.0fk. A context figure is what the session's statusline last reported, not a live measurement; \"?\" means the statusline is not installed there."
-                      (/ cc-butler-compact-threshold 1000.0))))))
+              (format "\n\nThreshold: %d%% of the model's context window (`cc-butler-compact-threshold-fraction'), not a flat token count — it scales with each model's window size, so a large-window session can be well past any fixed figure while nowhere near this gate. PCT is that same live signal: the session's own reported usage when its statusline carries one, else its context tokens against the assumed window. A context/PCT figure is what the session's statusline last reported, not a live measurement; \"?\" means it is not known there — never a computed-looking guess."
+                      (cc-butler-compact--threshold-pct))))))
 
 (defun cc-butler-tool-compact-session (name &optional force)
   "MCP tool: compact the session called NAME.
@@ -1518,8 +1554,8 @@ waiting is the wrong answer when nothing is ever going to make it idle
   "MCP tool: compact every session over the threshold, butler/steward included."
   (let ((started (cc-butler-compact-large-sessions)))
     (if (null started)
-        (format "Nothing started. Either no session is over %.0fk, or the ones that are are busy or have something open — session_status shows the per-session reason."
-                (/ cc-butler-compact-threshold 1000.0))
+        (format "Nothing started. Either no session is at/above %d%% of its context window (the compaction gate — see PCT in session_status), or the ones that are are busy or have something open — session_status shows the per-session reason."
+                (cc-butler-compact--threshold-pct))
       (format "Compaction started for %d session(s): %s. Each runs asynchronously; poll session_status."
               (length started)
               (string-join (mapcar #'cc-butler--display-name started) ", ")))))
