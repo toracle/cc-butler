@@ -4,11 +4,13 @@
 ;; SPDX-License-Identifier: MIT
 
 ;; Acceptance oracle for the structural nudges added 2026-07-09: the fleet
-;; stale-waiting scan, and the payload combinators the butler/steward
-;; UserPromptSubmit hooks inject as context (check_inbox + decisions/events +
-;; fleet check). These are pure combining logic over stubbed lower-level
-;; calls — the lower-level calls themselves (drain mechanics, session
-;; listing) are covered in cc-butler-mail-test.el / cc-butler-session-test.el.
+;; dialog check (a screen-measuring scan since 2026-08-21; it was a
+;; stale-waiting clock alarm before that), and the payload combinators the
+;; butler/steward UserPromptSubmit hooks inject as context (check_inbox +
+;; decisions/events + fleet check). These are pure combining logic over
+;; stubbed lower-level calls — the lower-level calls themselves (drain
+;; mechanics, session listing) are covered in cc-butler-mail-test.el /
+;; cc-butler-session-test.el.
 ;;
 ;;   emacs -Q --batch -L . -l ert -l cc-butler-orchestrator-test.el \
 ;;     -f ert-run-tests-batch-and-exit
@@ -16,6 +18,11 @@
 (require 'ert)
 (require 'cc-butler-orchestrator)
 (require 'cc-butler-governance)
+;; The fleet dialog check reuses cc-butler-compact's screen predicates
+;; (`cc-butler-compact--menu-p'); required here so the fboundp guard in
+;; `cc-butler--fleet-dialog-summary' sees them and the tests exercise the
+;; REAL menu detector against realistic screens, not a stub of it.
+(require 'cc-butler-compact)
 (require 'cc-butler-mail)   ; the send path journals; tests sandbox `cc-butler-mail-dir'
 ;; Needed only so `cc-butler-decision-workflow' is a properly-declared
 ;; (defcustom-special) dynamic variable before the backlog-append tests and
@@ -25,55 +32,191 @@
 ;; compiled in cc-butler-orchestrator.el's own lexical scope.
 (require 'cc-butler-decision)
 
-;;;; ---- fleet stale-waiting summary -----------------------------------
+;;;; ---- fleet dialog check (screen-measured, 2026-08-21) ----------------
+;;;; The predecessor was a clock alarm — "in `cc-butler--waiting' over
+;;;; 120s" — which re-flagged routinely parked workers every steward turn
+;;;; (11 at once with zero actual dialogs on the day it was measured) and
+;;;; structurally excluded a session whose waiting flag froze at nil with
+;;;; a dialog genuinely on screen.  The check now reads the screens.
 
-(ert-deftest cc-butler-orchestrator/fleet-stale-waiting-flags-old-waiters ()
-  "Given a worker waiting well past the threshold, Then it is flagged;
-given one waiting only briefly, Then it is not; and the butler/steward
-themselves are never flagged even if waiting a long time."
-  (let* ((cc-butler-fleet-stale-waiting-seconds 60)
-         (cc-butler--butler "/butler/")
-         (cc-butler--steward "/steward/")
-         (now (float-time))
-         (cc-butler--waiting (make-hash-table :test 'equal)))
-    (puthash "/worker-stale/" (- now 300) cc-butler--waiting)   ; long stale
-    (puthash "/worker-fresh/" (- now 5) cc-butler--waiting)     ; just started
-    (puthash "/butler/" (- now 300) cc-butler--waiting)         ; excluded role
-    (puthash "/steward/" (- now 300) cc-butler--waiting)        ; excluded role
-    (cl-letf (((symbol-function 'cc-butler--sessions)
-               (lambda () (list (list :dir "/worker-stale/") (list :dir "/worker-fresh/")
-                                 (list :dir "/butler/") (list :dir "/steward/"))))
-              ((symbol-function 'cc-butler--display-name)
-               (lambda (d) (pcase d ("/worker-stale/" "worker-stale")
-                             ("/worker-fresh/" "worker-fresh")
-                             ("/butler/" "butler") ("/steward/" "steward") (_ d)))))
-      (let ((summary (cc-butler--fleet-stale-waiting-summary)))
-        (should (string-match-p "worker-stale" summary))
-        (should-not (string-match-p "worker-fresh" summary))
-        (should-not (string-match-p "butler" summary))
-        (should-not (string-match-p "steward" summary))))))
+(defconst cc-butler-orchestrator-test--dialog-screen
+  (string-join
+   '("Do you want to make this edit to config.el?"
+     "❯ 1. Yes"
+     "  2. No, and tell Claude what to do differently"
+     "")
+   "\n")
+  "A live numbered choice dialog, as Claude Code renders one — the marker
+`❯' on a numbered option plus a sibling option row, which is exactly the
+structural signature `cc-butler-compact--menu-p' keys on.")
 
-(ert-deftest cc-butler-orchestrator/fleet-stale-waiting-nil-when-none-stale ()
-  "Given no session waiting past the threshold, Then the summary is nil."
-  (let* ((cc-butler-fleet-stale-waiting-seconds 60)
-         (cc-butler--butler "/butler/") (cc-butler--steward "/steward/")
-         (cc-butler--waiting (make-hash-table :test 'equal)))
-    (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () (list (list :dir "/worker/")))))
-      (should (null (cc-butler--fleet-stale-waiting-summary))))))
+(defconst cc-butler-orchestrator-test--idle-screen
+  (string-join
+   '("✻ Done."
+     "──────────────────────────────────────────────"
+     "❯ "
+     "──────────────────────────────────────────────")
+   "\n")
+  "An idle session at an empty input box: nothing on screen to answer.")
+
+(defmacro cc-butler-orchestrator-test--with-fleet (dirs &rest body)
+  "Run BODY with `cc-butler--sessions' listing DIRS and screens stubbed.
+Butler is \"/the-butler/\", steward \"/the-steward/\".  BODY can see and
+mutate two hashes: `screens' (dir -> screen text; a missing/nil entry is
+an UNREADABLE screen, matching `cc-butler--read-output' returning nil on
+a failed refresh) and `typed' (dir -> non-nil when unsubmitted input sits
+in that session's box).  Menu detection is NOT stubbed — the real
+`cc-butler-compact--menu-p' runs over the screen text.  The de-dup state
+`cc-butler--fleet-dialog-first-seen' is rebound fresh."
+  (declare (indent 1))
+  `(let ((cc-butler--butler "/the-butler/")
+         (cc-butler--steward "/the-steward/")
+         (cc-butler--fleet-dialog-first-seen (make-hash-table :test 'equal))
+         (screens (make-hash-table :test 'equal))
+         (typed (make-hash-table :test 'equal)))
+     (ignore screens typed)
+     (cl-letf (((symbol-function 'cc-butler--sessions)
+                (lambda () (mapcar (lambda (d) (list :dir d)) ,dirs)))
+               ((symbol-function 'cc-butler--display-name)
+                (lambda (d) (string-trim d "/" "/")))
+               ((symbol-function 'cc-butler--read-output)
+                (lambda (d &optional _lines) (gethash d screens)))
+               ((symbol-function 'cc-butler-compact--pending-input-p)
+                (lambda (d) (gethash d typed))))
+       ,@body)))
+
+(ert-deftest cc-butler-orchestrator/fleet-check-flags-only-screens-that-show-a-dialog ()
+  "Only the session with a dialog ACTUALLY on its screen is flagged.  A
+session parked waiting for ages with a clean screen — the shape of the 11
+false positives the clock alarm produced in one day — is not flagged: how
+long it has been waiting appears nowhere in the predicate.  The
+butler/steward exclusion holds even when their own screens show dialogs."
+  (let ((cc-butler--waiting (make-hash-table :test 'equal)))
+    ;; parked for a week — under the old clock alarm this alone flagged it
+    (puthash "/worker-parked/" (- (float-time) 604800) cc-butler--waiting)
+    (cc-butler-orchestrator-test--with-fleet
+        '("/worker-dialog/" "/worker-parked/" "/the-butler/" "/the-steward/")
+      (puthash "/worker-dialog/" cc-butler-orchestrator-test--dialog-screen screens)
+      (puthash "/worker-parked/" cc-butler-orchestrator-test--idle-screen screens)
+      (puthash "/the-butler/" cc-butler-orchestrator-test--dialog-screen screens)
+      (puthash "/the-steward/" cc-butler-orchestrator-test--dialog-screen screens)
+      (let ((summary (cc-butler--fleet-dialog-summary)))
+        (should (string-match-p "worker-dialog" summary))
+        (should (string-match-p "visible on screen" summary))
+        (should-not (string-match-p "worker-parked" summary))
+        (should-not (string-match-p "the-butler" summary))
+        (should-not (string-match-p "the-steward" summary))
+        ;; measured facts only: no unmeasured "no report" claim
+        (should-not (string-match-p "no report" summary))))))
+
+(ert-deftest cc-butler-orchestrator/fleet-check-catches-a-dialog-on-a-session-with-no-waiting-flag ()
+  "THE false negative the clock alarm could never see: a session whose
+waiting flag is frozen at nil (it is in no waiting hash at all) but whose
+screen shows a live dialog.  The scan reads every session's screen,
+flag-independent, so it is flagged."
+  (let ((cc-butler--waiting (make-hash-table :test 'equal)))   ; empty: no flag
+    (cc-butler-orchestrator-test--with-fleet '("/worker-frozen/")
+      (puthash "/worker-frozen/" cc-butler-orchestrator-test--dialog-screen screens)
+      (let ((summary (cc-butler--fleet-dialog-summary)))
+        (should summary)
+        (should (string-match-p "worker-frozen" summary))
+        (should (string-match-p "menu/dialog\\|visible on screen" summary))))))
+
+(ert-deftest cc-butler-orchestrator/fleet-check-flags-unsubmitted-input ()
+  "Typed-but-unsubmitted text in the input box is the other measured
+blocker: the session will sit forever unless someone submits or clears
+it, so it is reported — in its own words, not as a dialog."
+  (cc-butler-orchestrator-test--with-fleet '("/worker-typed/")
+    (puthash "/worker-typed/" cc-butler-orchestrator-test--idle-screen screens)
+    (puthash "/worker-typed/" t typed)
+    (let ((summary (cc-butler--fleet-dialog-summary)))
+      (should (string-match-p "worker-typed" summary))
+      (should (string-match-p "unsubmitted text" summary)))))
+
+(ert-deftest cc-butler-orchestrator/fleet-check-nil-when-every-screen-is-clean ()
+  "All screens read successfully and show nothing — the summary is nil.
+The old alarm could not produce this outcome for a parked fleet; this one
+does, every turn, which is the false-positive fix."
+  (cc-butler-orchestrator-test--with-fleet '("/worker-a/" "/worker-b/")
+    (puthash "/worker-a/" cc-butler-orchestrator-test--idle-screen screens)
+    (puthash "/worker-b/" cc-butler-orchestrator-test--idle-screen screens)
+    (should (null (cc-butler--fleet-dialog-summary)))))
+
+(ert-deftest cc-butler-orchestrator/fleet-check-reports-unreadable-screens-as-unverified ()
+  "A screen that cannot be read is reported as UNVERIFIED, separately and
+in words that claim no dialog — never silently dropped.  Absence of a
+reading is not evidence of absence.  Both failure shapes count: a nil
+return (failed refresh) and a signal (I/O timeout)."
+  (cc-butler-orchestrator-test--with-fleet '("/worker-dark/" "/worker-hung/" "/worker-ok/")
+    ;; /worker-dark/ has no screens entry -> read returns nil
+    (puthash "/worker-ok/" cc-butler-orchestrator-test--idle-screen screens)
+    (let ((plain (symbol-function 'cc-butler--read-output)))
+      (cl-letf (((symbol-function 'cc-butler--read-output)
+                 (lambda (d &optional lines)
+                   (if (equal d "/worker-hung/")
+                       (error "terminal did not redraw within io-timeout")
+                     (funcall plain d lines)))))
+        (let ((summary (cc-butler--fleet-dialog-summary)))
+          (should summary)
+          (should (string-match-p "could not be read" summary))
+          (should (string-match-p "not evidence of absence" summary))
+          (should (string-match-p "worker-dark" summary))
+          (should (string-match-p "worker-hung" summary))
+          (should-not (string-match-p "worker-ok" summary))
+          ;; unverified is not a detection: no "visible on screen" claim
+          (should-not (string-match-p "visible on screen" summary)))))))
+
+(ert-deftest cc-butler-orchestrator/fleet-check-repeat-detection-abbreviates-never-silences ()
+  "A blocker still on screen at the next scan is restated as
+\"(continuing, first detected Nm ago)\" — abbreviated, not re-announced
+as new, and NEVER dropped.  When a later scan reads a clean screen the
+state clears, and a fresh dialog after that rings as new again."
+  (cc-butler-orchestrator-test--with-fleet '("/worker-x/")
+    (puthash "/worker-x/" cc-butler-orchestrator-test--dialog-screen screens)
+    ;; first detection: rings plainly, no (continuing)
+    (let ((first (cc-butler--fleet-dialog-summary)))
+      (should (string-match-p "worker-x" first))
+      (should-not (string-match-p "continuing" first)))
+    ;; backdate the detection so the repeat shows elapsed minutes
+    (puthash "/worker-x/" (- (float-time) 300) cc-butler--fleet-dialog-first-seen)
+    (let ((again (cc-butler--fleet-dialog-summary)))
+      (should (string-match-p "worker-x" again))         ; still audible
+      (should (string-match-p "continuing, first detected 5m ago" again)))
+    ;; the dialog is answered: a clean read clears the state...
+    (puthash "/worker-x/" cc-butler-orchestrator-test--idle-screen screens)
+    (should (null (cc-butler--fleet-dialog-summary)))
+    (should (null (gethash "/worker-x/" cc-butler--fleet-dialog-first-seen)))
+    ;; ...so a NEW dialog later is a new event, not a continuation
+    (puthash "/worker-x/" cc-butler-orchestrator-test--dialog-screen screens)
+    (should-not (string-match-p "continuing" (cc-butler--fleet-dialog-summary)))))
+
+(ert-deftest cc-butler-orchestrator/fleet-check-unreadable-scan-keeps-the-continuing-state ()
+  "An unreadable scan between two detections does not reset first-seen:
+a failed read is not evidence the dialog cleared, so when the screen
+comes back with the dialog still up, it reports as continuing from the
+ORIGINAL detection, not as new."
+  (cc-butler-orchestrator-test--with-fleet '("/worker-x/")
+    (puthash "/worker-x/" cc-butler-orchestrator-test--dialog-screen screens)
+    (cc-butler--fleet-dialog-summary)                     ; detected
+    (remhash "/worker-x/" screens)                        ; goes unreadable
+    (cc-butler--fleet-dialog-summary)
+    (should (gethash "/worker-x/" cc-butler--fleet-dialog-first-seen))
+    (puthash "/worker-x/" cc-butler-orchestrator-test--dialog-screen screens)
+    (should (string-match-p "continuing" (cc-butler--fleet-dialog-summary)))))
 
 ;;;; ---- hook payload combinators ---------------------------------------
 
-(defmacro cc-butler-orchestrator-test--with-payload-stubs (inbox-block decisions events stale &rest body)
+(defmacro cc-butler-orchestrator-test--with-payload-stubs (inbox-block decisions events dialogs &rest body)
   "Stub the four payload ingredients and run BODY.
-INBOX-BLOCK/STALE are the pre-formatted string-or-nil `cc-butler--inbox-urgent-block'
-/`cc-butler--fleet-stale-waiting-summary' would return; DECISIONS/EVENTS
+INBOX-BLOCK/DIALOGS are the pre-formatted string-or-nil `cc-butler--inbox-urgent-block'
+/`cc-butler--fleet-dialog-summary' would return; DECISIONS/EVENTS
 are the raw strings `cc-butler-tool-pending-decisions'/`cc-butler-tool-inbox'
 would return (including their own \"No pending ...\" empty sentinels)."
   (declare (indent 4))
   `(cl-letf (((symbol-function 'cc-butler--inbox-urgent-block) (lambda (_agent) ,inbox-block))
              ((symbol-function 'cc-butler-tool-pending-decisions) (lambda () ,decisions))
              ((symbol-function 'cc-butler-tool-inbox) (lambda () ,events))
-             ((symbol-function 'cc-butler--fleet-stale-waiting-summary) (lambda () ,stale)))
+             ((symbol-function 'cc-butler--fleet-dialog-summary) (lambda () ,dialogs)))
      ,@body))
 
 (ert-deftest cc-butler-orchestrator/pending-decisions-payload-empty-is-empty-string ()
@@ -96,13 +239,13 @@ inbox first."
       (should (< (string-match "unread inbox" payload) (string-match "Stripe or Paddle" payload))))))
 
 (ert-deftest cc-butler-orchestrator/pending-events-payload-combines-all-three ()
-  "Given an inbox block, events, and a fleet-stale nudge, Then all three
+  "Given an inbox block, events, and a fleet dialog check, Then all three
 appear in order: inbox, events, fleet check."
   (cc-butler-orchestrator-test--with-payload-stubs
       "📥 1 unread inbox message(s) — handle before anything else this turn:\n- from x asks foo"
       "No pending decisions." ; unused by the events payload
       "- [12:00] worker-a: done: PR #42"
-      "🔍 Fleet check: 1 worker(s) waiting a while with no report — could be a stuck dialog (e.g. AskUserQuestion) rather than routine idle; read_session_output to check:\n- worker-b (waiting 300s)"
+      "🔍 Fleet check: 1 session(s) with a dialog/menu or unsubmitted input visible on screen — read_session_output to see it, then answer or clear it:\n- worker-b — a choice menu/dialog is visible on screen"
     (let ((payload (cc-butler--pending-events-hook-payload)))
       (should (string-match-p "unread inbox" payload))
       (should (string-match-p "PR #42" payload))
@@ -979,7 +1122,7 @@ take the events with it."
         (cc-butler--inbox
          (list (list :time (current-time) :name "w" :body "done: PR #42"))))
     (cl-letf (((symbol-function 'cc-butler--inbox-urgent-block) (lambda (_a) nil))
-              ((symbol-function 'cc-butler--fleet-stale-waiting-summary)
+              ((symbol-function 'cc-butler--fleet-dialog-summary)
                (lambda () (error "fleet scan blew up"))))
       ;; whatever the payload does, the drained events must remain recoverable
       (ignore-errors (cc-butler--pending-events-hook-payload))
