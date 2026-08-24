@@ -50,6 +50,19 @@
    "\n")
   "The prompt-cache confirmation raised by /model.")
 
+(defconst cc-butler-compact-test--busy-screen
+  (string-join
+   '("✶ Compacting conversation… (esc to interrupt)"
+     ""
+     "──────────────────────────────────────────────"
+     "❯ "
+     "──────────────────────────────────────────────"
+     "  CTX:203356 20% >200k MODEL:Sonnet-5")
+   "\n")
+  "A session mid-turn: the spinner's interrupt hint above an empty input box.
+Structurally identical to the idle screen apart from that hint line — which
+is exactly why the restore gate must key on it.")
+
 ;;;; ------------------------------------------------------------------
 ;;;; Screen reading
 ;;;; ------------------------------------------------------------------
@@ -66,6 +79,35 @@ not mistaken for one."
            "무엇을 할까요?\n❯ 1. 예, 전환합니다\n  2. 아니오"))
   ;; Prose containing digits is not a menu.
   (should-not (cc-butler-compact--menu-p "step 1. do it\nthen finish")))
+
+(ert-deftest cc-butler-compact/busy-detected-by-the-interrupt-hint ()
+  "A running turn is recognized by the spinner's interrupt hint; the idle
+screen (past-tense spinner line, hint gone) and the modal are not busy.
+Running and idle screens draw the same empty input box, so the hint is the
+one signal that separates a still-running /compact from an idle prompt."
+  (should (cc-butler-compact--busy-p cc-butler-compact-test--busy-screen))
+  (should-not (cc-butler-compact--busy-p cc-butler-compact-test--idle-screen))
+  (should-not (cc-butler-compact--busy-p cc-butler-compact-test--typed-screen))
+  (should-not (cc-butler-compact--busy-p cc-butler-compact-test--modal-screen))
+  (should-not (cc-butler-compact--busy-p nil)))
+
+(ert-deftest cc-butler-compact/busy-hint-in-deep-scrollback-is-ignored ()
+  "The hint is only live inside the screen tail; an old one that scrolled far
+up (or prose quoting it) must not read as busy forever."
+  (let ((screen (string-join
+                 (append '("✶ Reticulating… (esc to interrupt)")
+                         (make-list (* 2 cc-butler-compact-menu-lines) "output")
+                         '("─────" "❯ " "─────"))
+                 "\n")))
+    (should-not (cc-butler-compact--busy-p screen))))
+
+(ert-deftest cc-butler-compact/input-box-presence-is-not-content ()
+  "Box drawn vs box empty are different findings: an empty box on the idle
+screen is still PRESENT, and a screen with no box at all is absent."
+  (should (cc-butler-compact--input-box-row cc-butler-compact-test--idle-screen))
+  (should (cc-butler-compact--input-box-row cc-butler-compact-test--typed-screen))
+  (should-not (cc-butler-compact--input-box-row "no box here at all"))
+  (should-not (cc-butler-compact--input-box-row nil)))
 
 (ert-deftest cc-butler-compact/input-line-distinguishes-empty-from-typed ()
   "The text between the input-box rules is extracted with the prompt stripped;
@@ -679,44 +721,114 @@ so a stale frame cannot draw a stray answer onto the screen behind it."
 was STILL RUNNING and typed /model opus into a busy session.  The modal
 appeared long after the restore step's own 90s clock had expired, so nothing
 was polling by the time it came up.  The restore must not be typed at all
-until the session is at a waiting point."
+while the SCREEN shows the turn still running."
   (cc-butler-compact-test--with-session "w"
     (cc-butler-compact-session "w")
     (setq cc-butler-compact-test--model "Sonnet-5")
     (cc-butler-compact--poll "w")            ; -> /compact
-    ;; /compact overruns its timeout and the session is still working.
-    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
-      (cc-butler-compact--set-state
-       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
-      (cc-butler-compact--poll "w")
-      ;; Nothing typed: the restore is held, not fired into a busy session.
-      (should (equal (cc-butler-compact-test--sent-in-order)
-                     '("/model sonnet" "/compact")))
-      (should (cc-butler-compact--active-p "w"))
-      (cc-butler-compact--poll "w")
-      (should (equal (length cc-butler-compact-test--sent) 2)))
+    ;; /compact overruns its timeout and the screen shows it still working.
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--busy-screen)
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (cc-butler-compact--poll "w")
+    ;; Nothing typed: the restore is held, not fired into a busy session.
+    (should (equal (cc-butler-compact-test--sent-in-order)
+                   '("/model sonnet" "/compact")))
+    (should (cc-butler-compact--active-p "w"))
+    (cc-butler-compact--poll "w")
+    (should (equal (length cc-butler-compact-test--sent) 2))
     ;; The turn ends; now the restore goes out, inside a watched window.
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--idle-screen)
     (cc-butler-compact--poll "w")
     (should (equal (cc-butler-compact-test--sent-in-order)
                    '("/model sonnet" "/compact" "/model claude-opus-4-8")))))
 
+(ert-deftest cc-butler-compact/restore-held-even-when-the-waiting-flag-says-t ()
+  "The empty half of the 2026-07-23 protection: a session parked waiting since
+BEFORE the compaction has `cc-butler--waiting-p' t throughout — the driver's
+own typing never clears the flag — so the old flag gate waved the restore
+into a still-running /compact.  The screen says busy; busy wins over the
+flag."
+  (cc-butler-compact-test--with-session "w"
+    ;; The harness's `cc-butler--waiting-p' stub already returns non-nil —
+    ;; that IS the parked-session case; make it explicit and loud anyway.
+    (cl-letf (((symbol-function 'cc-butler--waiting-p)
+               (lambda (_d) (float-time))))
+      (cc-butler-compact-session "w")
+      (setq cc-butler-compact-test--model "Sonnet-5")
+      (cc-butler-compact--poll "w")          ; -> /compact
+      ;; Context has dropped, so the machine moves to restore — but the
+      ;; screen still shows /compact running.
+      (setq cc-butler-compact-test--ctx 90000
+            cc-butler-compact-test--screen cc-butler-compact-test--busy-screen)
+      (cc-butler-compact--poll "w")
+      (should (equal (cc-butler-compact-test--sent-in-order)
+                     '("/model sonnet" "/compact")))
+      (should (cc-butler-compact--active-p "w"))
+      (cc-butler-compact--poll "w")          ; still busy, still held
+      (should (equal (length cc-butler-compact-test--sent) 2))
+      ;; The screen goes idle; only now is the restore typed.
+      (setq cc-butler-compact-test--screen cc-butler-compact-test--idle-screen)
+      (cc-butler-compact--poll "w")
+      (should (equal (cc-butler-compact-test--sent-in-order)
+                     '("/model sonnet" "/compact" "/model claude-opus-4-8"))))))
+
+(ert-deftest cc-butler-compact/restore-fires-on-an-idle-screen-without-the-flag ()
+  "The stranding half: `cc-butler--waiting' is edge-triggered with no
+reconciliation, so a missed notification edge leaves it nil forever and the
+old flag gate held an IDLE session until the timeout — \"compacted but model
+NOT restored\", three of six compactions on the night of 2026-08-11.  An
+idle screen must let the restore through even when the flag was never set."
+  (cc-butler-compact-test--with-session "w"
+    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+      (cc-butler-compact-session "w")
+      (setq cc-butler-compact-test--model "Sonnet-5")
+      (cc-butler-compact--poll "w")          ; -> /compact
+      (setq cc-butler-compact-test--ctx 90000)
+      (cc-butler-compact--poll "w")          ; idle screen -> restore goes out
+      (should (equal (cc-butler-compact-test--sent-in-order)
+                     '("/model sonnet" "/compact" "/model claude-opus-4-8"))))))
+
+(ert-deftest cc-butler-compact/unreadable-screen-holds-the-restore ()
+  "A screen that cannot be read is \"not yet\", never \"go\" — same
+conservative direction as `cc-butler-compact--menu-block-reason'.  The
+timeout backstop still ends it explicitly rather than hanging forever."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")            ; -> /compact
+    (setq cc-butler-compact-test--ctx 90000
+          cc-butler-compact-test--screen nil)
+    (cc-butler-compact--poll "w")            ; held: nothing seen, nothing typed
+    (should (equal (cc-butler-compact-test--sent-in-order)
+                   '("/model sonnet" "/compact")))
+    (should (cc-butler-compact--active-p "w"))
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (let ((msg (cc-butler-compact--poll "w")))
+      (should (string-match-p "NOT restored" msg))
+      (should (string-match-p "could not be read" msg)))
+    (should-not (cc-butler-compact--active-p "w"))))
+
 (ert-deftest cc-butler-compact/held-restore-still-gives-up-eventually ()
-  "Holding for idle must not become its own way to hang: a session that never
-reaches a waiting point ends the compaction with an explicit failure."
+  "Holding for idle must not become its own way to hang: a session whose
+screen never goes idle ends the compaction with an explicit failure naming
+the last blocker."
   (cc-butler-compact-test--with-session "w"
     (cc-butler-compact-session "w")
     (setq cc-butler-compact-test--model "Sonnet-5")
     (cc-butler-compact--poll "w")
-    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
-      (cc-butler-compact--set-state
-       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
-      (cc-butler-compact--poll "w")          ; -> held in restore-wait
-      (cc-butler-compact--set-state
-       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
-      (let ((msg (cc-butler-compact--poll "w")))
-        (should (string-match-p "NOT restored" msg))
-        (should (string-match-p "waiting point" msg)))
-      (should-not (cc-butler-compact--active-p "w")))))
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--busy-screen)
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (cc-butler-compact--poll "w")            ; -> held in restore-wait
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (let ((msg (cc-butler-compact--poll "w")))
+      (should (string-match-p "NOT restored" msg))
+      (should (string-match-p "waiting point" msg))
+      (should (string-match-p "in flight" msg)))
+    (should-not (cc-butler-compact--active-p "w"))))
 
 (ert-deftest cc-butler-compact/never-walks-away-from-a-standing-modal ()
   "REGRESSION (2026-07-23): giving up is recoverable; abandoning a session
