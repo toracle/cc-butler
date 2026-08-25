@@ -1325,5 +1325,183 @@ to the SAME file in order — an append-only record, not one file per event."
                  (string-match (regexp-quote "NOT restored") got)
                  (string-match (regexp-quote "cleanup") got))))))
 
+;;;; ------------------------------------------------------------------
+;;;; ghostel event-pipe deadlock workaround (cc-butler#104)
+;;;; ------------------------------------------------------------------
+;;
+;; Full-blown integration testing of an actual OS-level pipe resize is not
+;; practical under `emacs -Q --batch' (there is no live ghostel session, no
+;; native pty, and no guarantee the sandbox even permits `F_SETPIPE_SZ').
+;; These tests instead pin the CONTRACT that matters for condition 3 of
+;; cc-butler#104: whatever goes wrong, session launch is never blocked and
+;; never sees a signal escape this function — only mock/stub the resize
+;; machinery, never a real subprocess.
+
+(ert-deftest cc-butler-session/pipe-mitigation-noop-on-non-ghostel-backend ()
+  "Given a non-ghostel terminal backend (vterm/eat — no native event pipe
+exists to resize), When the mitigation runs, Then it does not even look for
+`python3' or spawn a process — there is nothing to mitigate."
+  (let ((claude-code-ide-terminal-backend 'vterm)
+        (looked-for-python nil))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (p) (setq looked-for-python (equal p "python3")) nil))
+              ((symbol-function 'make-process)
+               (lambda (&rest _) (error "should not spawn a process for a non-ghostel backend"))))
+      (should (null (cc-butler--mitigate-ghostel-event-pipe-deadlock)))
+      (should (null looked-for-python)))))
+
+(ert-deftest cc-butler-session/pipe-mitigation-degrades-when-python3-missing ()
+  "Given the ghostel backend but no `python3' on PATH, When the mitigation
+runs, Then it logs exactly one warning and returns without signaling or
+spawning a process — degrade to the default pipe, never block launch."
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (log-calls 0))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) nil))
+              ((symbol-function 'cc-butler--log)
+               (lambda (&rest _) (cl-incf log-calls) nil))
+              ((symbol-function 'make-process)
+               (lambda (&rest _) (error "should not spawn without python3"))))
+      (should (null (cc-butler--mitigate-ghostel-event-pipe-deadlock)))
+      (should (= 1 log-calls)))))
+
+(ert-deftest cc-butler-session/pipe-mitigation-survives-make-process-erroring ()
+  "Given `make-process' itself signals (the underlying resize plumbing is
+broken in some unforeseen way), When the mitigation runs, Then the error is
+caught here — it never escapes to the launch caller — and exactly one
+warning is logged. This is condition 3 of cc-butler#104: the cure must
+never be worse than the disease."
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (log-calls 0))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/python3"))
+              ((symbol-function 'cc-butler--log)
+               (lambda (&rest _) (cl-incf log-calls) nil))
+              ((symbol-function 'make-process)
+               (lambda (&rest _) (error "simulated: resize plumbing broken"))))
+      (should (null (cc-butler--mitigate-ghostel-event-pipe-deadlock)))
+      (should (= 1 log-calls)))))
+
+(ert-deftest cc-butler-session/pipe-mitigation-spawns-async-not-sync ()
+  "Given the ghostel backend and `python3' available, When the mitigation
+runs, Then it shells out via `make-process' (async) — never `call-process'
+\(sync, which could itself hang the command loop, exactly the failure this
+workaround exists to avoid) — passing this Emacs process's own pid and the
+configured target size as argv."
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (cc-butler-ghostel-event-pipe-size 1048576)
+        (spawn-command nil))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/python3"))
+              ((symbol-function 'call-process)
+               (lambda (&rest _) (error "must not use a synchronous call-process")))
+              ((symbol-function 'make-process)
+               (lambda (&rest args) (setq spawn-command (plist-get args :command)) 'fake-proc)))
+      (cc-butler--mitigate-ghostel-event-pipe-deadlock)
+      (should spawn-command)
+      (should (equal (list (car spawn-command) (cadr spawn-command))
+                     '("python3" "-c")))
+      (should (equal (nth 2 spawn-command) cc-butler--ghostel-pipe-resize-script))
+      (should (equal (nth 3 spawn-command) (number-to-string (emacs-pid))))
+      (should (equal (nth 4 spawn-command) "1048576")))))
+
+;; The two sentinel tests below deliberately drive a REAL child process
+;; (a trivial `sh -c exit N') through the REAL Emacs process machinery
+;; rather than stubbing `process-status'/`process-exit-status'/
+;; `process-buffer' — those are primitives, and faking them with `cl-letf'
+;; tripped native-comp's subr-trampoline machinery in batch mode (an
+;; environment quirk, not something worth working around by faking less
+;; safely). Swapping only the :command — the resize payload — for a
+;; trivial shell command keeps the test fast, dependency-free, and still
+;; exercises the actual sentinel this code registers.
+
+(defmacro cc-butler-test--with-real-sentinel (shell-command &rest body)
+  "Run BODY after the REAL sentinel
+`cc-butler--mitigate-ghostel-event-pipe-deadlock' registers via
+`make-process' has fired for real, following a real child process running
+SHELL-COMMAND to exit.  `log-calls' counts `cc-butler--log' invocations
+made while running BODY and while waiting for the process to exit."
+  (declare (indent 1))
+  `(let ((claude-code-ide-terminal-backend 'ghostel)
+         (log-calls 0)
+         (orig-make-process (symbol-function 'make-process))
+         proc)
+     (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/python3"))
+               ((symbol-function 'cc-butler--log)
+                (lambda (&rest _) (cl-incf log-calls) nil))
+               ((symbol-function 'make-process)
+                (lambda (&rest args)
+                  (setq proc
+                        (apply orig-make-process
+                               (plist-put (copy-sequence args) :command ,shell-command))))))
+       (cc-butler--mitigate-ghostel-event-pipe-deadlock)
+       (should (process-live-p proc))
+       (let ((deadline (+ (float-time) 5)))
+         (while (and (process-live-p proc) (< (float-time) deadline))
+           (accept-process-output proc 0.05))))
+     ,@body))
+
+(ert-deftest cc-butler-session/pipe-mitigation-sentinel-logs-on-nonzero-exit ()
+  "Given the spawned resize helper exits non-zero (a real resize it
+attempted actually failed), When its sentinel fires, Then a warning is
+logged — a recurrence of cc-butler#104's conditions stays observable
+instead of silent, per condition 3's \"ideally with a single logged
+warning\"."
+  (cc-butler-test--with-real-sentinel '("sh" "-c" "echo boom 1>&2; exit 1")
+    (should (= 1 log-calls))))
+
+(ert-deftest cc-butler-session/pipe-mitigation-sentinel-quiet-on-clean-exit ()
+  "Given the spawned resize helper exits 0 (nothing to resize, or resized
+cleanly), When its sentinel fires, Then nothing is logged — finding
+nothing to do, or succeeding, is not a failure worth surfacing."
+  (cc-butler-test--with-real-sentinel '("sh" "-c" "exit 0")
+    (should (= 0 log-calls))))
+
+(ert-deftest cc-butler-session/pipe-mitigation-sentinel-survives-second-call-on-dead-buffer ()
+  "Given the sentinel fires twice for the same process (real subprocess
+sentinels can be invoked more than once, e.g. `signal' then `exit') and the
+first call already killed the process buffer, When the second call runs,
+Then it must not signal trying to read the now-dead buffer — the workaround
+exists to keep a real failure observable, so a sentinel that itself errors
+on a repeat call defeats its own purpose.  (Deliberately does not reuse
+`cc-butler-test--with-real-sentinel': that macro's BODY runs after its
+`cl-letf' closes, so a second, manual sentinel call made from BODY would hit
+the real, unmocked `cc-butler--log' and this test could not tell a silent
+signal apart from a real second log line.)"
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (log-calls 0)
+        (orig-make-process (symbol-function 'make-process))
+        proc)
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/python3"))
+              ((symbol-function 'cc-butler--log)
+               (lambda (&rest _) (cl-incf log-calls) nil))
+              ((symbol-function 'make-process)
+               (lambda (&rest args)
+                 (setq proc
+                       (apply orig-make-process
+                              (plist-put (copy-sequence args) :command
+                                         '("sh" "-c" "echo boom 1>&2; exit 1")))))))
+      (cc-butler--mitigate-ghostel-event-pipe-deadlock)
+      (should (process-live-p proc))
+      (let ((deadline (+ (float-time) 5)))
+        (while (and (process-live-p proc) (< (float-time) deadline))
+          (accept-process-output proc 0.05)))
+      (should (= 1 log-calls))
+      (should-not (buffer-live-p (process-buffer proc)))
+      (funcall (process-sentinel proc) proc "exit abnormally\n")
+      (should (= 2 log-calls)))))
+
+(ert-deftest cc-butler-session/configure-session-fires-the-pipe-mitigation ()
+  "Given a session launch, When the deferred buffer-config timer fires
+\(`cc-butler--configure-session'), Then it also fires the cc-butler#104
+pipe-resize mitigation on the same delay — the workaround is wired into the
+one shared launch path, not an opt-in a caller could forget."
+  (let ((mitigated nil))
+    (cl-letf (((symbol-function 'run-at-time)
+               (lambda (_secs _repeat fn) (funcall fn)))
+              ((symbol-function 'cc-butler--configure-session-buffer) #'ignore)
+              ((symbol-function 'claude-code-ide--get-buffer-name) (lambda (_d) "x"))
+              ((symbol-function 'cc-butler--mitigate-ghostel-event-pipe-deadlock)
+               (lambda () (setq mitigated t))))
+      (cc-butler--configure-session "/tmp/some-worker/"))
+    (should mitigated)))
+
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here

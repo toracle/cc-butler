@@ -1018,14 +1018,177 @@ previews.  Return BUF."
                 #'cc-butler--session-refit-on-change nil t)))
   buf)
 
+;;;; ------------------------------------------------------------------
+;;;; WORKAROUND: ghostel event-pipe deadlock (cc-butler#104) — remove
+;;;; this whole section (and its one call site below) once fixed upstream
+;;;; ------------------------------------------------------------------
+;;
+;; 2026-08-24 incident: the Emacs daemon froze fleet-wide for 101 minutes.
+;; Confirmed root cause (see cc-butler#104 for the full writeup): ghostel's
+;; native pty reader thread (NativeProcess.zig:loopOnce) holds `term_mutex'
+;; across a *blocking* write into its event pipe to Emacs (64KB default, no
+;; O_NONBLOCK).  A busy session can fill that pipe faster than Emacs drains
+;; it; once full, the reader thread blocks in `write' while still holding
+;; the mutex, and the next Lisp-side screen read that needs the same mutex
+;; (`ghostel--redraw', which cc-butler's own polling triggers every ~3s
+;; while watching a compaction) parks the entire Emacs command loop — every
+;; timer, filter, and session, not just the busy one.  It only recovered
+;; because a human ran an external script to enlarge the live pipe by hand
+;; (`F_SETPIPE_SZ' to 1MB).  The real fix — not holding the mutex across a
+;; blocking write — belongs upstream in ghostel; as of this writing there is
+;; no known upstream issue for it (checked the `dakra/ghostel' tracker) —
+;; filing one is separate follow-up, not part of this workaround.
+;;
+;; This only buys headroom (a fuller pipe takes longer to hit, not never),
+;; it does not remove the deadlock.  Delete it once ghostel stops holding
+;; the mutex across the write, or grows its own pipe.
+
+(defcustom cc-butler-ghostel-event-pipe-size (* 1024 1024)
+  "Target size in bytes for a ghostel native event pipe, via `F_SETPIPE_SZ'.
+1MB — matches the manual recovery size used during the 2026-08-24 incident
+(cc-butler#104).  See `cc-butler--mitigate-ghostel-event-pipe-deadlock'."
+  :type 'integer
+  :group 'cc-butler)
+
+(defconst cc-butler--ghostel-pipe-resize-script
+  "import os, sys, fcntl
+F_SETPIPE_SZ, F_GETPIPE_SZ = 1031, 1032
+try:
+    pid, size = int(sys.argv[1]), int(sys.argv[2])
+except (IndexError, ValueError):
+    sys.exit(2)
+fdroot = '/proc/%d/fd' % pid
+try:
+    names = os.listdir(fdroot)
+except OSError as e:
+    print('cannot list %s: %s' % (fdroot, e), file=sys.stderr)
+    sys.exit(1)
+pipes = {}
+for n in names:
+    try:
+        target = os.readlink('%s/%s' % (fdroot, n))
+    except OSError:
+        continue
+    if not target.startswith('pipe:['):
+        continue
+    try:
+        info = open('/proc/%d/fdinfo/%s' % (pid, n)).read()
+    except OSError:
+        continue
+    flag_lines = [l for l in info.splitlines() if l.startswith('flags')]
+    if not flag_lines:
+        continue
+    fl = int(flag_lines[0].split()[1], 8) & 3
+    pipes.setdefault(target, []).append((int(n), fl))
+resized, failed = 0, 0
+for target, ends in pipes.items():
+    accesses = {a for _, a in ends}
+    # ghostel's native module dups BOTH a read end and a write end of its
+    # event pipe into Emacs's own fd table; a plain subprocess pipe only
+    # ever has one end here.  That two-sided signature is how this finds
+    # 'our' pipes without ever knowing their fd numbers ahead of time.
+    if not (os.O_RDONLY in accesses and os.O_WRONLY in accesses):
+        continue
+    read_fd = next(f for f, a in ends if a == os.O_RDONLY)
+    try:
+        fd = os.open('%s/%d' % (fdroot, read_fd), os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        continue
+    cur = None
+    try:
+        cur = fcntl.fcntl(fd, F_GETPIPE_SZ)
+        if cur < size:
+            fcntl.fcntl(fd, F_SETPIPE_SZ, size)
+            resized += 1
+            # per-pipe success line: which fd, and what it grew from/to —
+            # so a partial run (budget exhausted partway through) still
+            # says exactly which pipes are and are not fixed, not just a count.
+            print('fd %d: resized %d -> %d' % (read_fd, cur, size))
+    except OSError as e:
+        failed += 1
+        print('fd %d: failed at size %s: %s' % (read_fd, cur if cur is not None else '?', e),
+              file=sys.stderr)
+    finally:
+        os.close(fd)
+print('resized=%d failed=%d candidates=%d' % (resized, failed, len(pipes)))
+sys.exit(1 if failed else 0)
+"
+  "Body of the Python helper `cc-butler--mitigate-ghostel-event-pipe-deadlock'
+shells out to.  Emacs Lisp has neither a way to read the raw fd number
+behind a process object (no `process-fd' primitive — confirmed absent on
+Emacs 30) nor an `fcntl' primitive to call `F_SETPIPE_SZ' itself, so the
+actual syscall has to happen in a child process.  Takes PID and SIZE as
+argv, resizes every ghostel event pipe it finds on PID's own fd table that
+is still smaller than SIZE, and exits non-zero only if a resize it
+attempted actually failed (finding none to resize is not a failure).")
+
+(defun cc-butler--mitigate-ghostel-event-pipe-deadlock ()
+  "WORKAROUND for cc-butler#104 (ghostel event-pipe deadlock) — see the
+section comment above for the full mechanism.  Best-effort and
+asynchronous; MUST NEVER prevent a session from starting.  Every failure
+mode below — no `python3' on PATH, a non-ghostel backend, the resize call
+itself erroring, an unexpected Lisp error while shelling out — is caught
+here and degrades to \"the session runs with the default, deadlock-prone
+64KB pipe\", never a thrown signal that could unwind session launch.  A
+genuine failure gets exactly one `cc-butler--log' line so a recurrence is
+observable instead of silent; finding nothing to do is not logged.
+
+Cannot target only the newly-launched session's own pipe (elisp cannot
+read the fd number behind its process object — see
+`cc-butler--ghostel-pipe-resize-script'), so the helper script scans and
+enlarges every ghostel event pipe it finds on this Emacs process
+\(`(emacs-pid)') below `cc-butler-ghostel-event-pipe-size'.  That is a
+superset of \"just this session,\" but harmless: `F_GETPIPE_SZ' is checked
+before any resize, so an already-large pipe is a no-op, and catching any
+other session still on the small default closes the same gap for it too.
+
+Shells out via `make-process' (async) rather than `call-process' (sync) so
+a hung or slow resize cannot itself block the command loop — the exact
+failure this workaround exists to avoid.  Resizing this process's OWN fds
+via `F_SETPIPE_SZ' needs no privilege escalation, unlike the incident's
+manual recovery (which resized a DIFFERENT process's fds from outside it,
+and needed sudo once past the pipe-user-pages soft limit); if it fails
+here anyway — e.g. this uid is already over that limit — the failure is
+caught and logged, never escalated to sudo."
+  (condition-case err
+      (if (not (eq (bound-and-true-p claude-code-ide-terminal-backend) 'ghostel))
+          nil ;; nothing to mitigate under vterm/eat — no event pipe exists
+        (if (not (executable-find "python3"))
+            (cc-butler--log "ghostel pipe-resize workaround (cc-butler#104): no `python3' on PATH — skipping; sessions keep the default 64KB event pipe and stay deadlock-prone under load")
+          (let ((buf (generate-new-buffer " *cc-butler-ghostel-pipe-resize*")))
+            (make-process
+             :name "cc-butler-ghostel-pipe-resize"
+             :buffer buf
+             :command (list "python3" "-c" cc-butler--ghostel-pipe-resize-script
+                             (number-to-string (emacs-pid))
+                             (number-to-string cc-butler-ghostel-event-pipe-size))
+             :noquery t
+             :sentinel
+             (lambda (proc _event)
+               (when (memq (process-status proc) '(exit signal))
+                 (unless (eq 0 (process-exit-status proc))
+                   (cc-butler--log "ghostel pipe-resize workaround (cc-butler#104) reported a problem (exit %s): %s — some sessions may still be on the default 64KB event pipe"
+                                    (process-exit-status proc)
+                                    (if (buffer-live-p (process-buffer proc))
+                                        (string-trim (with-current-buffer (process-buffer proc) (buffer-string)))
+                                      "(output buffer already gone — sentinel ran more than once)")))
+                 (when (buffer-live-p (process-buffer proc))
+                   (kill-buffer (process-buffer proc)))))))))
+    (error
+     (cc-butler--log "ghostel pipe-resize workaround (cc-butler#104) failed to start: %s — session proceeds with the default 64KB event pipe"
+                      (error-message-string err)))))
+
 (defun cc-butler--configure-session (dir)
   "Apply the uniform config to session DIR's buffer once it exists (deferred,
-since the launch is async)."
+since the launch is async).  Also fires the cc-butler#104 ghostel pipe-resize
+workaround (`cc-butler--mitigate-ghostel-event-pipe-deadlock') on the same
+delay, since it needs the native pty/event-pipe to actually exist too."
   (run-at-time
    0.5 nil
    (lambda ()
      (cc-butler--configure-session-buffer
-      (get-buffer (claude-code-ide--get-buffer-name dir))))))
+      (get-buffer (claude-code-ide--get-buffer-name dir)))
+     (cc-butler--mitigate-ghostel-event-pipe-deadlock))))
 
 (defun cc-butler--launch-preflight-diagnostics ()
   "Return a list of (SEVERITY . MESSAGE) launch-environment problems.
