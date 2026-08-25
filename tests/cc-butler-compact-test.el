@@ -1131,6 +1131,72 @@ and must still have had nothing typed into it."
       (should-not cc-butler-compact-test--sent)
       (should-not (cc-butler-compact-waiting-p "w")))))
 
+(ert-deftest cc-butler-compact/give-up-reaches-the-requester-not-just-the-log ()
+  "REGRESSION (2026-08-24): dealmatch (285k) and monocle-skills (291k) were
+queued for compaction, timed out, and logged `gave up waiting for idle' —
+and NOBODY was told.  The steward discovered both only by reading the ops
+file by hand.  A requested action must not evaporate silently: the give-up
+must land in the ops inbox (the `pending_events' drain) carrying what the
+requester needs to act — which session, its size, how long was waited, and
+that nothing was typed."
+  (cc-butler-compact-test--with-session "w"
+    (let ((cc-butler--inbox nil))
+      (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+                ((symbol-function 'cc-butler--ops-dir) (lambda () nil))
+                ((symbol-function 'cc-butler--sessions) (lambda () nil)))
+        (cc-butler-compact-session-when-idle "w")
+        (cc-butler-compact--idle-poll "w" (- (float-time) 1)
+                                      (- (float-time) 300))
+        (should (= (length cc-butler--inbox) 1))
+        (let ((body (plist-get (car cc-butler--inbox) :body)))
+          (should (string-match-p "\\bw\\b" body))            ; which session
+          (should (string-match-p "400k" body))               ; how large it still is
+          (should (string-match-p "5 min" body))              ; how long it waited
+          (should (string-match-p "[Nn]othing was typed" body))
+          (should (string-match-p "NOT compacted" body)))))))
+
+(ert-deftest cc-butler-compact/give-up-with-unknown-queue-time-still-reports ()
+  "An idle-wait entry queued before this report existed (or re-queued by a
+path that lost the timestamp) carries no queued-at — the report must still
+be delivered, just without claiming a duration it does not know."
+  (cc-butler-compact-test--with-session "w"
+    (let ((cc-butler--inbox nil))
+      (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+                ((symbol-function 'cc-butler--ops-dir) (lambda () nil))
+                ((symbol-function 'cc-butler--sessions) (lambda () nil)))
+        (cc-butler-compact-session-when-idle "w")
+        ;; Old-shape call: no queued-at.
+        (cc-butler-compact--idle-poll "w" (- (float-time) 1))
+        (should (= (length cc-butler--inbox) 1))
+        (let ((body (plist-get (car cc-butler--inbox) :body)))
+          (should (string-match-p "NOT compacted" body))
+          (should-not (string-match-p "[0-9]+ min" body)))))))
+
+(ert-deftest cc-butler-compact/give-up-report-is-typed-at-an-idle-ops-session ()
+  "The give-up report goes through the same channel as the fleet monitor:
+queued for the next `pending_events' drain ALWAYS, and additionally typed
+into the ops session when it is safely idle — a report that waits to be
+asked for is a report nobody reads."
+  (cc-butler-compact-test--with-session "w"
+    (let ((cc-butler--inbox nil)
+          typed)
+      (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+                ((symbol-function 'cc-butler--ops-dir) (lambda () "ops"))
+                ((symbol-function 'cc-butler--sessions) (lambda () nil))
+                ((symbol-function 'cc-butler-compact--blocked-reason)
+                 (lambda (_d &optional _i) nil))
+                ((symbol-function 'cc-butler--send-input)
+                 (lambda (dir text &optional submit)
+                   (push (list dir text submit) typed) t)))
+        (cc-butler-compact-session-when-idle "w")
+        (cc-butler-compact--idle-poll "w" (- (float-time) 1)
+                                      (- (float-time) 300))
+        (should cc-butler--inbox)
+        (should (= (length typed) 1))
+        (should (equal (nth 0 (car typed)) "ops"))
+        (should (nth 2 (car typed)))                          ; submitted
+        (should (string-match-p "GAVE UP" (nth 1 (car typed))))))))
+
 (ert-deftest cc-butler-compact/a-throwing-idle-poll-keeps-the-compaction-queued ()
   "REGRESSION (2026-07-31): the poll drops the queue entry FIRST and only then
 asks whether it is safe to start.  When that question signalled — as it did on
