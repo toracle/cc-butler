@@ -458,6 +458,31 @@ a session on the wrong one."
         (cc-butler--transcript-model dir)
         remembered)))
 
+(defun cc-butler-compact--model-for-status-line (dir)
+  "Return the model name to show in `session_status' for DIR, or nil if
+unknowable.
+
+Uses the same TTL-cached reader the sessions-list tag uses
+\(`cc-butler-cleanup-model-for'\), but gives it the transcript as a
+fallback source the way `cc-butler-compact--model-for-restore' does for
+the compaction driver.  This is what fixes a coordinator's OWN MODEL
+column going stale mid-turn: its own statusline is covered by the turn's
+progress indicator and structurally cannot be screen-scraped while it is
+running, so without a fallback the TTL cache would keep serving whatever
+was scraped before the turn started, indefinitely.
+
+When the returned name is merely the sticky last-known value — not a live
+scrape, not transcript-confirmed — it is visibly marked with a trailing
+`~' so a caller can tell a genuinely fresh answer apart from a guess, per
+the steward's explicit requirement.  This only happens at the same cadence
+the scrape itself runs at (once per TTL-refresh cycle), never once per
+call regardless of TTL."
+  (let ((name (cc-butler-cleanup-model-for dir #'cc-butler--transcript-model)))
+    (when (stringp name)
+      (if (cc-butler-cleanup-model-fresh-p dir)
+          name
+        (concat name "~")))))
+
 (defun cc-butler-compact--context-now (dir)
   "Read DIR's current context size, bypassing the TTL cache.  See above."
   (when (boundp 'cc-butler-cleanup--context-cache)
@@ -1577,7 +1602,7 @@ the ceiling with nobody reading."
   (let* ((name (cc-butler--display-name dir))
          (ctx (cc-butler-cleanup-context-for dir))
          (pct (cc-butler-compact--display-pct dir))
-         (model (cc-butler-cleanup-model-for dir))
+         (model (cc-butler-compact--model-for-status-line dir))
          (why (cc-butler-compact--blocked-reason dir)))
     (format "%-36s %9s %6s  %-10s  %-13s  %s"
             name
