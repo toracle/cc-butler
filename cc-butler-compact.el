@@ -568,21 +568,38 @@ stops a second compaction racing the same session.")
 (defvar cc-butler-compact--inhibit-timers nil
   "When non-nil, schedule no real timers (tests drive polls by hand).")
 
+(defun cc-butler-compact--timer-live-p (timer)
+  "Non-nil when TIMER still counts as \"a poll is scheduled to revisit this\".
+`t' is the placeholder `cc-butler-compact--schedule-poll' stores under
+`cc-butler-compact--inhibit-timers' (tests drive polls by hand), and must
+keep counting as live.  A real timer object must additionally still be
+PENDING (`timer-list'): a one-shot poll timer that has already fired stays
+recorded in the state plist as an object, and a fired timer whose callback
+died before re-arming is precisely the abandonment
+`cc-butler-compact--orphaned-p' exists to notice — treating the corpse as
+a live watcher made the reaper refuse exactly the entries that most
+needed reaping."
+  (or (eq timer t)
+      (and (timerp timer) (memq timer timer-list))))
+
 (defun cc-butler-compact--orphaned-p (dir st)
   "Non-nil when ST (DIR's in-flight compaction state) looks abandoned.
 Age alone is refused as a signal on purpose — it would happily reap a
 compaction that is genuinely still running (a very large context, a slow
-`/compact').  Requires ALL of: no `:timer' recorded (a poll is scheduled —
-real or, under `cc-butler-compact--inhibit-timers', its test placeholder —
-means the machine is still watching this entry and will conclude it on its
-own), old enough that a live compaction would long since have timed out,
+`/compact').  Requires ALL of: no LIVE `:timer' recorded (a still-pending
+timer — or, under `cc-butler-compact--inhibit-timers', its test
+placeholder — means the machine is still watching this entry and will
+conclude it on its own; a timer object that already fired without
+re-arming is a corpse, not a watcher — see
+`cc-butler-compact--timer-live-p'), old enough that a live compaction
+would long since have timed out,
 AND the terminal itself corroborates abandonment rather than being
 mid-dance — sitting at an ordinary idle waiting point with no menu open and
 nothing pending, which an actual in-flight switch/compact/restore would not
 be showing."
   (let ((sent (plist-get st :sent-time)))
     (and (numberp sent)
-         (not (plist-get st :timer))
+         (not (cc-butler-compact--timer-live-p (plist-get st :timer)))
          (> (- (float-time) sent) cc-butler-compact-state-max-age)
          (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
            (or (not (buffer-live-p buf))
@@ -1013,19 +1030,39 @@ because those do not resolve on their own the way busy does."
       (message "cc-butler compact: %s — started (ctx %s)" name (or ctx "?")))))
 
 (defun cc-butler-compact--poll (dir)
-  "One poll tick: answer a modal, advance a phase, or time out."
+  "One poll tick: answer a modal, advance a phase, or time out.
+
+The dispatch is guarded as a whole: this runs as a ONE-SHOT timer
+callback, and the phase handlers read the terminal through paths that can
+signal (`cc-butler--read-output''s `cc-butler-session-io-timeout' bound,
+a window borrow refused, a vanished buffer racing the check above).  An
+error escaping a timer callback is merely logged by Emacs and the timer
+is already spent — nothing ever re-arms, so before this guard the state
+entry survived with its fired timer still recorded in `:timer', which
+also defeated `cc-butler-compact--orphaned-p''s lazy reaping (a dead
+timer object is truthy).  The session then read as \"compaction already
+in flight\" forever — until an operator found `cc-butler-compact-reset'
+or restarted Emacs.  Same shape as cc-butler#18, one layer up: there the
+SEND could throw and strand the lock; here the READS can.  Conclude
+through `cc-butler-compact--finish' like every other give-up path, so
+the lock always releases and the failure reaches the log."
   (when-let ((st (gethash dir cc-butler-compact--state)))
     (let ((phase (plist-get st :phase))
           (sent (plist-get st :sent-time)))
-      (cond
-       ((not (get-buffer (claude-code-ide--get-buffer-name dir)))
-        (cc-butler-compact--finish dir "session vanished mid-compaction — aborted"))
-       ((eq phase 'switching)   (cc-butler-compact--poll-switch dir st sent))
-       ((eq phase 'compacting)  (cc-butler-compact--poll-compact dir st sent))
-       ((eq phase 'restore-wait)
-        (cc-butler-compact--poll-restore-wait dir st sent))
-       ((eq phase 'restoring)   (cc-butler-compact--poll-restore dir st sent))
-       (t (cc-butler-compact--finish dir "unknown phase %S — stopped" phase))))))
+      (condition-case err
+          (cond
+           ((not (get-buffer (claude-code-ide--get-buffer-name dir)))
+            (cc-butler-compact--finish dir "session vanished mid-compaction — aborted"))
+           ((eq phase 'switching)   (cc-butler-compact--poll-switch dir st sent))
+           ((eq phase 'compacting)  (cc-butler-compact--poll-compact dir st sent))
+           ((eq phase 'restore-wait)
+            (cc-butler-compact--poll-restore-wait dir st sent))
+           ((eq phase 'restoring)   (cc-butler-compact--poll-restore dir st sent))
+           (t (cc-butler-compact--finish dir "unknown phase %S — stopped" phase)))
+        (error
+         (cc-butler-compact--finish
+          dir "poll failed while %S (%s) — stopped, lock released"
+          phase (error-message-string err)))))))
 
 (defun cc-butler-compact--poll-switch (dir st sent)
   "Wait for the switch to `cc-butler-compact-model', answering the modal."
