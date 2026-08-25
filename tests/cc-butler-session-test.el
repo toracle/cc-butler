@@ -1454,6 +1454,40 @@ nothing to do, or succeeding, is not a failure worth surfacing."
   (cc-butler-test--with-real-sentinel '("sh" "-c" "exit 0")
     (should (= 0 log-calls))))
 
+(ert-deftest cc-butler-session/pipe-mitigation-sentinel-survives-second-call-on-dead-buffer ()
+  "Given the sentinel fires twice for the same process (real subprocess
+sentinels can be invoked more than once, e.g. `signal' then `exit') and the
+first call already killed the process buffer, When the second call runs,
+Then it must not signal trying to read the now-dead buffer — the workaround
+exists to keep a real failure observable, so a sentinel that itself errors
+on a repeat call defeats its own purpose.  (Deliberately does not reuse
+`cc-butler-test--with-real-sentinel': that macro's BODY runs after its
+`cl-letf' closes, so a second, manual sentinel call made from BODY would hit
+the real, unmocked `cc-butler--log' and this test could not tell a silent
+signal apart from a real second log line.)"
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (log-calls 0)
+        (orig-make-process (symbol-function 'make-process))
+        proc)
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/python3"))
+              ((symbol-function 'cc-butler--log)
+               (lambda (&rest _) (cl-incf log-calls) nil))
+              ((symbol-function 'make-process)
+               (lambda (&rest args)
+                 (setq proc
+                       (apply orig-make-process
+                              (plist-put (copy-sequence args) :command
+                                         '("sh" "-c" "echo boom 1>&2; exit 1")))))))
+      (cc-butler--mitigate-ghostel-event-pipe-deadlock)
+      (should (process-live-p proc))
+      (let ((deadline (+ (float-time) 5)))
+        (while (and (process-live-p proc) (< (float-time) deadline))
+          (accept-process-output proc 0.05)))
+      (should (= 1 log-calls))
+      (should-not (buffer-live-p (process-buffer proc)))
+      (funcall (process-sentinel proc) proc "exit abnormally\n")
+      (should (= 2 log-calls)))))
+
 (ert-deftest cc-butler-session/configure-session-fires-the-pipe-mitigation ()
   "Given a session launch, When the deferred buffer-config timer fires
 \(`cc-butler--configure-session'), Then it also fires the cc-butler#104

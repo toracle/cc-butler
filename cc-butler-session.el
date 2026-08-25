@@ -1094,14 +1094,20 @@ for target, ends in pipes.items():
         fd = os.open('%s/%d' % (fdroot, read_fd), os.O_RDONLY | os.O_NONBLOCK)
     except OSError:
         continue
+    cur = None
     try:
         cur = fcntl.fcntl(fd, F_GETPIPE_SZ)
         if cur < size:
             fcntl.fcntl(fd, F_SETPIPE_SZ, size)
             resized += 1
+            # per-pipe success line: which fd, and what it grew from/to —
+            # so a partial run (budget exhausted partway through) still
+            # says exactly which pipes are and are not fixed, not just a count.
+            print('fd %d: resized %d -> %d' % (read_fd, cur, size))
     except OSError as e:
         failed += 1
-        print('fd %d: %s' % (read_fd, e), file=sys.stderr)
+        print('fd %d: failed at size %s: %s' % (read_fd, cur if cur is not None else '?', e),
+              file=sys.stderr)
     finally:
         os.close(fd)
 print('resized=%d failed=%d candidates=%d' % (resized, failed, len(pipes)))
@@ -1163,7 +1169,9 @@ caught and logged, never escalated to sudo."
                  (unless (eq 0 (process-exit-status proc))
                    (cc-butler--log "ghostel pipe-resize workaround (cc-butler#104) reported a problem (exit %s): %s — some sessions may still be on the default 64KB event pipe"
                                     (process-exit-status proc)
-                                    (string-trim (with-current-buffer (process-buffer proc) (buffer-string)))))
+                                    (if (buffer-live-p (process-buffer proc))
+                                        (string-trim (with-current-buffer (process-buffer proc) (buffer-string)))
+                                      "(output buffer already gone — sentinel ran more than once)")))
                  (when (buffer-live-p (process-buffer proc))
                    (kill-buffer (process-buffer proc)))))))))
     (error
