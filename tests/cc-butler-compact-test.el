@@ -2070,18 +2070,25 @@ volatile buffer."
   "A restore failure is written to the daily ops file as surely as a
 success — a log where only successes survive the process makes the failure
 rate look like zero (the 1066 stranding evidence lived in a volatile
-buffer for exactly this reason)."
+buffer for exactly this reason).
+
+The restore-wait gate reads the SCREEN, not `cc-butler--waiting-p' (see
+`cc-butler-compact--restore-block-reason' — that flag was retired from this
+path for the reasons documented there), so what must hold the restore open
+here is a screen that never goes idle, not a stubbed flag.  Same setup as
+`cc-butler-compact/held-restore-still-gives-up-eventually', just proved
+through the on-disk ops log instead of the in-memory return value."
   (cc-butler-compact-test--with-ops-log-on-disk
     (cc-butler-compact-session "w")
     (setq cc-butler-compact-test--model "Sonnet-5")
     (cc-butler-compact--poll "w")
-    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
-      (cc-butler-compact--set-state
-       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
-      (cc-butler-compact--poll "w")          ; -> held in restore-wait
-      (cc-butler-compact--set-state
-       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
-      (cc-butler-compact--poll "w"))         ; -> gives up: NOT restored
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--busy-screen)
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (cc-butler-compact--poll "w")          ; -> held in restore-wait
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (cc-butler-compact--poll "w")          ; -> gives up: NOT restored
     (should-not (cc-butler-compact--active-p "w"))
     (let ((got (cc-butler-compact-test--ops-log-string)))
       (should got)
