@@ -503,23 +503,61 @@ misattributed as ours.  Returns nil when this session shows no own statusline."
 cheap, and a nil read does not erase a previously-known name (same
 no-flicker reasoning as `cc-butler-cleanup-context-for').")
 
-(defun cc-butler-cleanup-model-for (dir)
+(defvar cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal)
+  "Map a session dir -> FRESH-P, kept in lockstep with
+`cc-butler-cleanup--model-cache' but as a SEPARATE table rather than
+widening that cache's tuple shape.  Non-nil means the name currently cached
+for DIR in `cc-butler-cleanup--model-cache' came from a live scrape or a
+`fallback-fn' this cycle; nil means it was merely carried forward unchanged
+after both came back empty.  Kept separate deliberately: a bug here can only
+corrupt the display marker `cc-butler-cleanup-model-fresh-p' feeds, never
+`cc-butler-compact--model-for-restore''s remembered-value fallback, which
+still reads the untouched `(TIMESTAMP . NAME)' cons directly.")
+
+(defun cc-butler-cleanup-model-for (dir &optional fallback-fn)
   "Return DIR's current model name, cached for a short TTL.
 The TTL is `cc-butler-cleanup-model-ttl'; the value comes from
 `cc-butler-cleanup-model-function'.  A nil read keeps the last-known name
-instead of clearing it — see `cc-butler-cleanup-context-for' for why."
+instead of clearing it — see `cc-butler-cleanup-context-for' for why.
+
+When the TTL has expired and the fresh scrape comes back nil, and
+FALLBACK-FN is given, it is called with DIR before falling back to the
+last-known cached name; a string it returns is used and cached as fresh.
+Callers that omit FALLBACK-FN see no change in behavior.
+
+Use `cc-butler-cleanup-model-fresh-p' after calling this to tell a
+genuinely fresh (or fallback-confirmed) answer apart from a merely
+remembered one."
   (let ((cached (gethash dir cc-butler-cleanup--model-cache))
         (now (float-time)))
     (if (and cached (< (- now (car cached)) cc-butler-cleanup-model-ttl))
         (cdr cached)
       (let ((name (ignore-errors
                     (funcall cc-butler-cleanup-model-function (list :dir dir)))))
-        (if (stringp name)
-            (progn (puthash dir (cons now name) cc-butler-cleanup--model-cache)
-                   name)
-          (let ((last (and cached (cdr cached))))
-            (puthash dir (cons now last) cc-butler-cleanup--model-cache)
-            last))))))
+        (cond
+         ((stringp name)
+          (puthash dir (cons now name) cc-butler-cleanup--model-cache)
+          (puthash dir t cc-butler-cleanup--model-fresh-cache)
+          name)
+         (t
+          (let ((fallback (and fallback-fn (ignore-errors (funcall fallback-fn dir)))))
+            (if (stringp fallback)
+                (progn
+                  (puthash dir (cons now fallback) cc-butler-cleanup--model-cache)
+                  (puthash dir t cc-butler-cleanup--model-fresh-cache)
+                  fallback)
+              (let ((last (and cached (cdr cached))))
+                (puthash dir (cons now last) cc-butler-cleanup--model-cache)
+                (puthash dir nil cc-butler-cleanup--model-fresh-cache)
+                last)))))))))
+
+(defun cc-butler-cleanup-model-fresh-p (dir)
+  "Non-nil when DIR's currently-cached model name (per
+`cc-butler-cleanup--model-cache') came from a live scrape or a `fallback-fn'
+this cycle, rather than being carried forward unchanged from a prior cycle.
+Call `cc-butler-cleanup-model-for' first so the entry reflects the current
+cycle; this only reads `cc-butler-cleanup--model-fresh-cache'."
+  (gethash dir cc-butler-cleanup--model-fresh-cache))
 
 (defun cc-butler-cleanup-model-tag (dir)
   "Return a compact model tag for DIR (its \"claude-\" prefix stripped, e.g.

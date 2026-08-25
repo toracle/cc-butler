@@ -1512,7 +1512,7 @@ row must therefore carry a size, a model, and why it can or cannot compact."
                (lambda (d) (if (equal d "/butler/") "butler" "worker")))
               ((symbol-function 'cc-butler-cleanup-context-for)
                (lambda (d) (if (equal d "/butler/") 480466 152222)))
-              ((symbol-function 'cc-butler-cleanup-model-for) (lambda (_d) "Opus-4.8"))
+              ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
               ((symbol-function 'cc-butler--waiting-p) (lambda (_d) (float-time)))
               ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil)))
       (let ((out (cc-butler-tool-session-status)))
@@ -1529,7 +1529,7 @@ blindly."
   (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () '((:dir "/w/"))))
             ((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
             ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 400000))
-            ((symbol-function 'cc-butler-cleanup-model-for) (lambda (_d) "Opus-4.8"))
+            ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
             ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
             ((symbol-function 'cc-butler-compact--blocked-reason)
              (lambda (_d) "session is busy")))
@@ -1542,7 +1542,7 @@ blindly."
   (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () '((:dir "/w/"))))
             ((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
             ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) nil))
-            ((symbol-function 'cc-butler-cleanup-model-for) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) nil))
             ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
             ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil)))
     (should (string-match-p "?" (cc-butler-tool-session-status)))))
@@ -1569,7 +1569,7 @@ means something."
                (lambda () '((:dir "/d/"))))
               ((symbol-function 'cc-butler--display-name) (lambda (_d) "big-window-worker"))
               ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 369538))
-              ((symbol-function 'cc-butler-cleanup-model-for) (lambda (_d) "Opus-4.8"))
+              ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
               ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
               ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil))
               ((symbol-function 'cc-butler-compact--statusline-fields-now)
@@ -1593,7 +1593,7 @@ footer legitimately names the gate percentage)."
   (let ((cc-butler-cleanup-context-window 0))  ; window itself unusable
     (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
               ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 150000))
-              ((symbol-function 'cc-butler-cleanup-model-for) (lambda (_d) "Opus-4.8"))
+              ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
               ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
               ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil))
               ((symbol-function 'cc-butler-compact--statusline-fields-now) (lambda (_d) nil)))
@@ -1979,6 +1979,20 @@ the pre-flight read had to become a separate caller instead."
       (should (equal "Opus-5" (cc-butler-compact--model-now "/d/")))
       (should (= 1 calls)))))
 
+(ert-deftest cc-butler-compact/model-now-still-nil-on-failed-scrape-no-fallback-consulted ()
+  "GUARD for the new `fallback-fn' parameter on `cc-butler-cleanup-model-for':
+`--model-now' must call it with no fallback, so a failed scrape with nothing
+cached still returns bare nil and never touches a transcript or any other
+fallback source.  FRESHNESS OVER AVAILABILITY -- this is the test that would
+catch an accidental regression of that contract."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-function (lambda (_s) nil))
+        (transcript-calls 0))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model)
+               (lambda (_d) (setq transcript-calls (1+ transcript-calls)) "claude-opus-5")))
+      (should (null (cc-butler-compact--model-now "/d/")))
+      (should (= 0 transcript-calls)))))
+
 (ert-deftest cc-butler-compact/restore-model-falls-back-to-transcript ()
   "Cases 1-4: the screen cannot say (mid-turn, just restarted, or a window too
 narrow to render MODEL:).  The pre-flight read wants AVAILABILITY, so it falls
@@ -2019,6 +2033,87 @@ the behaviour we want to keep for a genuinely unknown model."
       ;; nothing ever known -> nil -> the driver refuses
       (clrhash cc-butler-cleanup--model-cache)
       (should (null (cc-butler-compact--model-for-restore "/e/"))))))
+
+(ert-deftest cc-butler-compact/restore-model-remembered-fallback-still-a-plain-string ()
+  "GUARD for the new `fallback-fn' parameter and the separate freshness
+cache: `--model-for-restore''s remembered-value read pulls straight from
+`cc-butler-cleanup--model-cache', whose `(TIMESTAMP . NAME)' shape was
+deliberately left untouched.  This pins that it still hands back a plain
+string, not some other shape, so a session is never asked to `/model' to
+something that is not a name."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-function (lambda (_s) nil)))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model) (lambda (_d) nil)))
+      (puthash "/d/" (cons (float-time) "Opus-4.8") cc-butler-cleanup--model-cache)
+      (let ((result (cc-butler-compact--model-for-restore "/d/")))
+        (should (stringp result))
+        (should (equal "Opus-4.8" result))))))
+
+;;;; ---- session_status's own-turn model fix ---------------------------
+;;;; cc-butler-compact--model-for-status-line gives the display path the
+;;;; driver's 3-source order (screen -> transcript -> remembered), and
+;;;; marks the remembered/sticky case visibly so it is never mistaken for
+;;;; a fresh or transcript-confirmed answer.
+
+(ert-deftest cc-butler-compact/status-line-model-fresh-screen-no-marker ()
+  "A legible screen scrape is used as-is, no marker appended."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 60)
+        (cc-butler-cleanup-model-function (lambda (_s) "claude-sonnet-5")))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model)
+               (lambda (_d) (error "transcript must not be consulted when the screen answers"))))
+      (should (equal "claude-sonnet-5" (cc-butler-compact--model-for-status-line "/d/"))))))
+
+(ert-deftest cc-butler-compact/status-line-model-screen-fails-transcript-confirms-no-marker ()
+  "Screen illegible (e.g. own status mid-turn), transcript answers: the
+transcript is authoritative, not a guess, so still no marker -- but the
+name reflects the transcript, not the screen."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 60)
+        (cc-butler-cleanup-model-function (lambda (_s) nil)))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model)
+               (lambda (_d) "claude-opus-5")))
+      (should (equal "claude-opus-5" (cc-butler-compact--model-for-status-line "/d/"))))))
+
+(ert-deftest cc-butler-compact/status-line-model-both-fail-last-known-gets-marker ()
+  "Screen illegible AND no transcript signal, but a last-known value is
+cached: it is still shown (availability over refusing), but visibly marked
+with a trailing `~' so it is never mistaken for a fresh or transcript-
+confirmed answer."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 0)
+        (cc-butler-cleanup-model-function (lambda (_s) "claude-sonnet-5")))
+    ;; seed a last-known value via a real fresh scrape first
+    (should (equal "claude-sonnet-5" (cc-butler-compact--model-for-status-line "/d/")))
+    ;; now the screen and the transcript both go quiet
+    (setq cc-butler-cleanup-model-function (lambda (_s) nil))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model) (lambda (_d) nil)))
+      (should (equal "claude-sonnet-5~" (cc-butler-compact--model-for-status-line "/d/"))))))
+
+(ert-deftest cc-butler-compact/status-line-model-nothing-ever-known-is-nil ()
+  "Screen, transcript, and cache all empty: nil, which `--status-line' then
+renders as the existing \"?\" unknown marker -- never a fabricated name."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 0)
+        (cc-butler-cleanup-model-function (lambda (_s) nil)))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model) (lambda (_d) nil)))
+      (should (null (cc-butler-compact--model-for-status-line "/d/"))))))
+
+(ert-deftest cc-butler-compact/status-line-renders-unknown-model-as-question-mark ()
+  "End-to-end through `--status-line': an unknown model renders as \"?\",
+matching how an unknown context/pct already render, per the existing
+`(or model \"?\")' handling."
+  (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
+            ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) nil))
+            ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil)))
+    (let ((row (cc-butler-compact--status-line "/w/")))
+      (should (string-match-p "\\?" row)))))
 
 ;;;; ---- outcomes on disk (ops log mirror) ----------------------------
 

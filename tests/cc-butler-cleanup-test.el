@@ -395,6 +395,54 @@ model name, mirroring the context tag's no-flicker behavior."
       (setq reading "claude-opus-4-8")
       (should (equal "opus-4-8" (cc-butler-cleanup-model-tag "/w/"))))))
 
+;;;; ---- fallback-fn and freshness marking ----------------------------
+
+(ert-deftest cc-butler-cleanup/model-for-uses-fallback-fn-when-scrape-fails ()
+  "When the fresh scrape comes back nil and a `fallback-fn' is given, its
+answer is used and cached as fresh -- this is what lets the display path
+recover a coordinator's own model mid-turn, when its own statusline is
+covered and cannot be scraped."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 0)
+        (cc-butler-cleanup-model-function (lambda (_s) nil)))
+    (should (equal "claude-opus-5"
+                   (cc-butler-cleanup-model-for
+                    "/w/" (lambda (_d) "claude-opus-5"))))
+    (should (cc-butler-cleanup-model-fresh-p "/w/"))))
+
+(ert-deftest cc-butler-cleanup/model-for-falls-back-to-last-known-when-fallback-fn-also-nil ()
+  "When BOTH the scrape and the `fallback-fn' come back nil, the old
+last-known name is still returned -- but now marked NOT fresh, so a caller
+can tell a sticky guess apart from a confirmed answer."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 0)
+        (reading "claude-sonnet-5"))
+    (let ((cc-butler-cleanup-model-function (lambda (_s) reading)))
+      ;; seed a last-known value with a real scrape first
+      (should (equal "claude-sonnet-5" (cc-butler-cleanup-model-for "/w/")))
+      (should (cc-butler-cleanup-model-fresh-p "/w/"))
+      ;; now both the scrape and the fallback come back empty
+      (setq reading nil)
+      (should (equal "claude-sonnet-5"
+                     (cc-butler-cleanup-model-for "/w/" (lambda (_d) nil))))
+      (should-not (cc-butler-cleanup-model-fresh-p "/w/")))))
+
+(ert-deftest cc-butler-cleanup/model-for-no-fallback-fn-behaves-exactly-as-before ()
+  "Existing callers that omit `fallback-fn' (e.g. the sessions-list tag, and
+`cc-butler-compact--model-now') see no behavior change: a failed scrape
+still just falls back to the last-known name, nothing more."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 0)
+        (reading "claude-sonnet-5"))
+    (let ((cc-butler-cleanup-model-function (lambda (_s) reading)))
+      (should (equal "claude-sonnet-5" (cc-butler-cleanup-model-for "/w/")))
+      (setq reading nil)
+      (should (equal "claude-sonnet-5" (cc-butler-cleanup-model-for "/w/")))
+      (should-not (cc-butler-cleanup-model-fresh-p "/w/")))))
+
 ;;;; ---- trigger gating ----------------------------------------------
 
 (ert-deftest cc-butler-cleanup/trigger-fires-over-200k ()
