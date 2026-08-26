@@ -1223,6 +1223,81 @@ whose state is unknown must not be typed into."
     (cc-butler--forward-to-ops (cc-butler-orchestrator-test--event "worker died"))
     (should (null (cc-butler-orchestrator-test--recorded-writes)))))
 
+;;;; `cc-butler--forward-ops-free-p' must also refuse to type over a human
+;;;; draft sitting in ops's OWN input box (cc-butler infra fix, 2026-08-27).
+;;;; Before this fix the gate only ever consulted transcript freshness, so
+;;;; a human composing a reply -- which looks exactly like an idle terminal
+;;;; to the transcript clock -- got a batched summary appended mid-sentence
+;;;; and silently submitted. Reuses `cc-butler-compact--pending-input-p'
+;;;; (the terminal-cursor real/ghost/unknown judgement in
+;;;; `cc-butler--input-state', already exercised by
+;;;; cc-butler-compact-test.el) rather than a new probe.
+
+(ert-deftest cc-butler-orchestrator/forward-ops-free-blocks-on-real-typed-draft ()
+  "A human draft in ops's own input box blocks the gate even though the
+transcript alone looks idle enough. The spy proves the real gate
+function ran, not just that the final boolean happened to match."
+  (cc-butler-orchestrator-test--with-forward-fixture
+    (puthash "/ops/" (- (float-time) 120) activity) ; transcript alone says free
+    (let (calls)
+      (cl-letf (((symbol-function 'cc-butler-compact--pending-input-p)
+                 (lambda (d) (push d calls) t))) ; a real draft is sitting there
+        (should-not (cc-butler--forward-ops-free-p "/ops/"))
+        (should (member "/ops/" calls))))))
+
+(ert-deftest cc-butler-orchestrator/forward-ops-free-allows-on-ghost-only ()
+  "A dimmed suggestion painted into an empty box must NOT block the gate --
+over-blocking here silences every fleet notification, which is the
+failure this three-way judgement exists to prevent in the other
+direction (a boolean color check cannot make this distinction; see
+`cc-butler--input-state')."
+  (cc-butler-orchestrator-test--with-forward-fixture
+    (puthash "/ops/" (- (float-time) 120) activity)
+    (let (calls)
+      (cl-letf (((symbol-function 'cc-butler-compact--pending-input-p)
+                 (lambda (d) (push d calls) nil))) ; ghost only, no real draft
+        (should (cc-butler--forward-ops-free-p "/ops/"))
+        (should (member "/ops/" calls))))))
+
+(ert-deftest cc-butler-orchestrator/forward-ops-free-blocks-on-unknown-input-state ()
+  "When the input box's ghost-vs-real state cannot be read at all, the gate
+fails closed -- same asymmetry as the compaction guard
+(`cc-butler-compact--typed-text'): the event is already durable in the
+inbox regardless, so declining to push costs only latency, while typing
+over an unreadable box risks destroying a real, unread human sentence.
+Runs the REAL `cc-butler-compact--pending-input-p' (nothing mocked at
+that layer) with the exact fixture
+`cc-butler-compact/unknown-cursor-is-treated-as-real-input' uses, so the
+unknown case is proven end-to-end, not merely asserted at this level."
+  (cc-butler-orchestrator-test--with-forward-fixture
+    (puthash "/ops/" (- (float-time) 120) activity)
+    (let ((screen (string-join '("─────" "❯ half-typed sentence" "─────") "\n")))
+      (cl-letf (((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_b) t))
+                ((symbol-function 'cc-butler--read-output) (lambda (&rest _) screen))
+                ((symbol-function 'claude-code-ide--get-buffer-name)
+                 (lambda (_d) (buffer-name (current-buffer))))
+                ((symbol-function 'ghostel-cursor-point) (lambda () nil)))
+        (with-temp-buffer
+          (insert screen)
+          (should-not (cc-butler--forward-ops-free-p "/ops/")))))))
+
+(ert-deftest cc-butler-orchestrator/forward-ops-free-p-guard-not-bypassable-by-transcript-alone ()
+  "Dedicated invocation check, kept separate from the direction tests above
+on purpose (2026-08-27 steward instruction): the failure mode that
+actually cost a day's worth of debugging today was not a wrong
+direction, it was a guard patched out of the call path entirely while
+the suite stayed green. A very idle transcript alone must not be
+sufficient -- if a future edit stops consulting
+`cc-butler-compact--pending-input-p', THIS test catches it by asserting
+the mock actually ran, before any test asks what it returned."
+  (cc-butler-orchestrator-test--with-forward-fixture
+    (puthash "/ops/" (- (float-time) 3600) activity) ; transcript very idle
+    (let (invoked)
+      (cl-letf (((symbol-function 'cc-butler-compact--pending-input-p)
+                 (lambda (_d) (setq invoked t) nil)))
+        (cc-butler--forward-ops-free-p "/ops/")
+        (should invoked)))))
+
 (ert-deftest cc-butler-orchestrator/forward-deferred-self-resolves-on-progress ()
   "An idle notification whose session then progresses (its sub-agent
 completed, a turn ran) resolves silently — no push, entry dropped."

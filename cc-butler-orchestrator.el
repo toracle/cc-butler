@@ -1162,12 +1162,34 @@ screen, which may itself be degraded (cc-butler#39)."
 
 (defun cc-butler--forward-ops-free-p (ops)
   "Non-nil when OPS looks free enough to type into right now.
-nil when its newest transcript write is fresher than
-`cc-butler-forward-idle-threshold' — or when no transcript can be found
-at all, since a session whose state cannot be confirmed must not be
-typed into (same fail-safe direction as the compaction gate)."
+
+Two independent checks, both must pass:
+
+- TRANSCRIPT: nil when OPS's newest transcript write is fresher than
+  `cc-butler-forward-idle-threshold', or when no transcript can be found
+  at all — a session whose state cannot be confirmed must not be typed
+  into. On this axis, same fail-safe direction as the compaction gate.
+
+- INPUT BOX: nil when OPS's own input box holds text a human actually
+  typed, via `cc-butler-compact--pending-input-p' — reusing the
+  cursor-based real/ghost/unknown judgement in `cc-butler--input-state'
+  rather than a new probe (a painted ghost suggestion is not real input
+  and does not block; see that function's docstring for why no color
+  check can tell the two apart). On THIS axis, an earlier version of this
+  docstring claimed blanket parity with the compaction gate while this
+  check did not exist yet — true only on the transcript/unknown axis
+  above, false here, since a reader who stopped at \"same as compaction\"
+  had no reason to suspect a typed human draft could still be typed over.
+  It cannot anymore: `cc-butler-compact--pending-input-p' returns non-nil
+  (blocking) on a real draft, and, like the compaction gate, also on an
+  UNKNOWN box read. The push is only ever an accelerant — the event is
+  already durable in the inbox regardless — so declining to push costs
+  latency, while typing over an unread human sentence destroys it
+  outright; that asymmetry is why unknown blocks here too, same as it
+  does for compaction, rather than defaulting to allow."
   (let ((last (cc-butler--session-last-activity ops)))
-    (and last (>= (- (float-time) last) cc-butler-forward-idle-threshold))))
+    (and last (>= (- (float-time) last) cc-butler-forward-idle-threshold)
+         (not (cc-butler-compact--pending-input-p ops)))))
 
 (defun cc-butler--forward-pending-count ()
   "How many worker events are sitting undrained for the ops session.
