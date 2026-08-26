@@ -31,6 +31,13 @@
 ;; to `cc-butler-tool-pending-decisions'/`cc-butler-tool-escalate-to-butler'
 ;; compiled in cc-butler-orchestrator.el's own lexical scope.
 (require 'cc-butler-decision)
+;; cc-butler-session-test.el loads alphabetically AFTER this file under
+;; run-tests.el's sorted `require' loop, so its ops/message-log test
+;; helpers (`cc-butler-session-test--ops-grep-count' /
+;; `--msg-file-string') would otherwise be void here -- pull it in
+;; explicitly, same cross-test `require' pattern as
+;; cc-butler-decision-test.el/cc-butler-inbox-test.el.
+(require 'cc-butler-session-test)
 
 ;;;; ---- fleet dialog check (screen-measured, 2026-08-21) ----------------
 ;;;; The predecessor was a clock alarm — "in `cc-butler--waiting' over
@@ -892,6 +899,38 @@ only: prefixing at the send primitive would corrupt every one of them."
                 ((symbol-function 'buffer-live-p) (lambda (_b) t)))
         (cc-butler--send-input "/w/" "/model sonnet" t)
         (should (equal '("/model sonnet") sent))))))
+
+(ert-deftest cc-butler-orchestrator/send-session-relay-body-goes-to-message-log-not-ops ()
+  "REGRESSION, the literal call site from the 2026-08-26 incident narrative
+(\"the suspicious line was quoted into a RELAY message\") --
+`cc-butler-tool-send-session' at cc-butler-orchestrator.el:1689. The
+relayed TEXT must not land raw in the ops log (a log-line-shaped quote
+inside it must not re-count as a real event there); the full text must
+still be recoverable, from the message log."
+  (let* ((cc-butler-ops-log-dir (expand-file-name "log/" (make-temp-file "cc-butler-orch-ops-test" t)))
+         (cc-butler-log-buffer-name " *cc-butler-orch-ops-test-log*")
+         (cc-butler-mail-dir (make-temp-file "cc-butler-orch-test-mail" t))
+         (quoted-line "[12:34:56] compact: worker-x │ start (ctx 100)")
+         (relay-text (concat "investigating an anomaly, quoting: " quoted-line)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () "/steward/"))
+                  ((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/worker/"))
+                  ((symbol-function 'cc-butler--send-input) (lambda (&rest _) t))
+                  ((symbol-function 'cc-butler--clear-waiting) #'ignore)
+                  ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+                  ((symbol-function 'cc-butler--display-name)
+                   (lambda (d) (file-name-nondirectory (directory-file-name d))))
+                  ((symbol-function 'cc-butler--session-id) (lambda (_d) "sid-1")))
+          ;; one real prior compact event, exactly like the other call site's test
+          (cc-butler--log "compact: worker-x │ start (ctx 100)")
+          (cc-butler-tool-send-session "worker" relay-text)
+          (should (= 1 (cc-butler-session-test--ops-grep-count "compact:")))
+          (let ((msg (cc-butler-session-test--msg-file-string)))
+            (should msg)
+            (should (string-match-p (regexp-quote relay-text) msg))))
+      (when (get-buffer cc-butler-log-buffer-name) (kill-buffer cc-butler-log-buffer-name))
+      (delete-directory (file-name-directory (directory-file-name cc-butler-ops-log-dir)) t)
+      (delete-directory cc-butler-mail-dir t))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Draining must not destroy what it has not yet delivered

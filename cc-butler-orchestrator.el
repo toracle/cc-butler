@@ -1359,13 +1359,26 @@ butler only ever sees decisions, drained via `pending_decisions'.")
                       (file-name-as-directory (expand-file-name cc-butler--butler)))))
 
 (defun cc-butler--append-decision (from summary needs)
-  "Append a decision (SUMMARY/NEEDS from session FROM) to the shared doc."
+  "Append a decision (SUMMARY/NEEDS from session FROM) to the shared doc.
+SUMMARY may be multi-line; continuation lines are indented two spaces under
+the heading (same convention as the daily log's
+`cc-butler-docs--render-log-entry') so an embedded newline cannot land as a
+bare, unindented line -- which, at column 0 starting with `* ', could even
+be misread as a new heading by anything scanning this file structurally.
+NEEDS is not split the same way: in practice it stays a short one-line ask,
+and this file's own `from:'/`needs:' sub-lines already assume single-line
+values -- flagged here, not fixed, since nothing observed exercises it."
   (when-let ((file (cc-butler--decisions-file)))
     (make-directory (file-name-directory file) t)
-    (let ((new (not (file-exists-p file))))
+    (let* ((new (not (file-exists-p file)))
+           (summary-lines (split-string (string-trim (or summary "")) "\n"))
+           (summary-head (or (car summary-lines) ""))
+           (summary-rest (cdr summary-lines)))
       (write-region
        (concat (when new "#+TITLE: Open decisions\n#+STARTUP: showeverything\n\n")
-               (format "* %s %s\n" (format-time-string "[%Y-%m-%d %a %H:%M]") summary)
+               (format "* %s %s\n" (format-time-string "[%Y-%m-%d %a %H:%M]") summary-head)
+               (when summary-rest
+                 (concat (mapconcat (lambda (l) (concat "  " l)) summary-rest "\n") "\n"))
                (when from (format "  from: %s\n" (cc-butler--who-dir from)))
                (when (and needs (stringp needs) (not (string-empty-p (string-trim needs))))
                  (format "  needs: %s\n" (string-trim needs))))
@@ -1434,8 +1447,15 @@ the workflow is on. Either way it is appended to the shared
                     :summary s :needs n)
               cc-butler--butler-inbox)))
     (cc-butler--append-decision self s needs)   ; decisions.org audit doc, all paths
-    (cc-butler--log "%s -> butler [%s] | %s"
-                    (if self (cc-butler--who-dir self) "steward") k s)
+    ;; Ops log gets a short gist, never the raw summary S (arbitrary,
+    ;; possibly multi-line -- see `cc-butler--log-message'); the full text
+    ;; already lives in decisions.org above, and also goes to the message
+    ;; log so a reader has one consistent place to find any event's full
+    ;; body, matching report/relay below instead of one exception among them.
+    (cc-butler--log "%s -> butler [%s] │ escalated (%d chars, see msg log)"
+                    (if self (cc-butler--who-dir self) "steward") k (length s))
+    (cc-butler--log-message "escalate" (if self (cc-butler--who-dir self) "steward")
+                            "butler" s)
     (cc-butler--maybe-refresh)
     (if (eq k 'note)
         "Sent as a notification (read-only; no answer expected)."
@@ -1686,7 +1706,14 @@ The text is prefixed with a line naming the sending session — see
              (concat (cc-butler--relay-attribution self dir) "\n" text))
        t)
       (cc-butler--clear-waiting dir)       ; commanding a worker attends to it
-      (cc-butler--log "%s → %s │ %s" (cc-butler--who-dir self) (cc-butler--who-dir dir) text)
+      ;; Ops log gets a short gist, never the raw TEXT (which is arbitrary and
+      ;; can be multi-line -- see `cc-butler--log-message'); the full body
+      ;; goes to the message log instead, unconditionally (unlike the
+      ;; fboundp-guarded mail journal below, this does not depend on
+      ;; cc-butler-mail being loaded).
+      (cc-butler--log "%s → %s │ sent (%d chars, see msg log)"
+                      (cc-butler--who-dir self) (cc-butler--who-dir dir) (length text))
+      (cc-butler--log-message "relay" (cc-butler--who-dir self) (cc-butler--who-dir dir) text)
       ;; Channel journal: the messenger channel's audit record (mail deliveries
       ;; journal themselves in `cc-butler--mail-file-deliver').  fboundp-guarded
       ;; because cc-butler-mail requires THIS module, so requiring it back would
