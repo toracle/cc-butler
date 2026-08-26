@@ -1325,6 +1325,108 @@ to the SAME file in order — an append-only record, not one file per event."
                  (string-match (regexp-quote "NOT restored") got)
                  (string-match (regexp-quote "cleanup") got))))))
 
+;;;; ---- ops log vs message log: a quoted event must not re-count -----
+;;;;
+;;;; REGRESSION for the live 2026-08-26 incident: investigating a compact
+;;;; anomaly, a suspicious ops-log LINE got quoted verbatim into a relay
+;;;; message body -- and because `cc-butler--log' used to write that whole
+;;;; multi-line body straight into the ops log, the quoted line became a
+;;;; second, indistinguishable occurrence of the very event being
+;;;; investigated. Butler and steward independently hit this (count 23 vs
+;;;; actual 22) -- observing the log inflated the thing being observed.
+
+(defun cc-butler-session-test--msg-file-string ()
+  "Return the contents of today's message log file, or nil if absent."
+  (let ((file (cc-butler--msg-log-file)))
+    (and (file-exists-p file)
+         (with-temp-buffer
+           (insert-file-contents file)
+           (buffer-string)))))
+
+(defun cc-butler-session-test--ops-grep-count (needle)
+  "Count lines in today's ops log containing NEEDLE, or 0 if the file is absent."
+  (let ((got (cc-butler-session-test--ops-file-string)))
+    (if (not got) 0
+      (with-temp-buffer
+        (insert got)
+        (goto-char (point-min))
+        (let ((n 0))
+          (while (search-forward needle nil t) (setq n (1+ n)))
+          n)))))
+
+(ert-deftest cc-butler-session/quoted-log-line-in-a-report-body-does-not-recount ()
+  "A worker report whose BODY happens to contain something that looks
+exactly like a real ops-log line for a DIFFERENT event kind must not make
+that event kind's count go up in the ops log -- reproduces the 2026-08-26
+incident directly: `cc-butler--inbox-push' (report_to_steward's legacy-
+transport path) is the exact call site that carried it live."
+  (cc-butler-session-test--with-ops-log
+    (cc-butler--log "compact: worker-x │ start (ctx 100)")   ; one real event
+    (should (= 1 (cc-butler-session-test--ops-grep-count "compact:")))
+    (let ((cc-butler--inbox nil))
+      (cc-butler--inbox-push
+       "/worker-y/"
+       "investigating a compact anomaly, quoting the suspicious line: [12:34:56] compact: worker-x │ start (ctx 100)"))
+    ;; The quote sat inside a report body -- it must not be read back as a
+    ;; second real compact event.
+    (should (= 1 (cc-butler-session-test--ops-grep-count "compact:")))))
+
+(ert-deftest cc-butler-session/a-real-second-compact-event-still-counts ()
+  "Positive control for the test above: this is not a filter that happens
+to swallow every occurrence of `compact:' -- a GENUINE second compact
+event, logged the normal way (not embedded in a report body), still counts.
+Without this, a broken implementation that discarded all `compact:' lines
+unconditionally would pass the negative test above for the wrong reason."
+  (cc-butler-session-test--with-ops-log
+    (cc-butler--log "compact: worker-x │ start (ctx 100)")
+    (cc-butler--log "compact: worker-x │ compacted (ctx 12000 -> 400)")
+    (should (= 2 (cc-butler-session-test--ops-grep-count "compact:")))))
+
+(ert-deftest cc-butler-session/report-body-lands-whole-in-the-message-log ()
+  "The report body is not discarded -- it is still evidence -- it just
+does not live in the ops event stream any more. The full multi-line body
+must be recoverable from the message log."
+  (cc-butler-session-test--with-ops-log
+    (let ((cc-butler--inbox nil)
+          (body "line one of the report\nline two, with a compact: lookalike\nline three"))
+      (cc-butler--inbox-push "/worker-z/" body)
+      (let ((got (cc-butler-session-test--msg-file-string)))
+        (should got)
+        ;; exactly one JSON object, i.e. one physical line in the file
+        (should (= 1 (with-temp-buffer (insert got) (count-lines (point-min) (point-max)))))
+        (let ((record (json-parse-string got :object-type 'alist)))
+          (should (equal (alist-get 'kind record) "report"))
+          (should (equal (alist-get 'body record) body)))))))
+
+(ert-deftest cc-butler-session/multiline-body-does-not-break-ops-log-line-structure ()
+  "A multi-line report body must not fragment the ops log into extra,
+unprefixed lines -- the ops log gets exactly one short gist line per event,
+regardless of how many lines the body itself contains."
+  (cc-butler-session-test--with-ops-log
+    (let ((cc-butler--inbox nil))
+      (cc-butler--inbox-push "/worker-w/" "five\nseparate\nlines\nof\nreport"))
+    (let ((got (cc-butler-session-test--ops-file-string)))
+      (should (= 1 (with-temp-buffer (insert got) (count-lines (point-min) (point-max)))))
+      ;; the gist, not the raw body, is what landed
+      (should (string-match-p "report ([0-9]+ chars, see msg log)" got))
+      (should-not (string-match-p "separate" got)))))
+
+(ert-deftest cc-butler-session/inbox-push-guard-actually-calls-the-message-log ()
+  "Dedicated invocation check, kept separate from the outcome tests above
+on purpose (same reasoning as the forward-ops-free-p tests from the
+previous fix): confirm `cc-butler--log-message' is actually invoked by
+`cc-butler--inbox-push', not merely that file contents happen to look
+right -- a future edit that quietly dropped the call could still leave
+the ops-log tests above passing by accident if nothing then LOOKS for the
+body anywhere."
+  (cc-butler-session-test--with-ops-log
+    (let ((cc-butler--inbox nil) (calls nil))
+      (cl-letf (((symbol-function 'cc-butler--log-message)
+                 (lambda (kind from to body) (push (list kind from to body) calls))))
+        (cc-butler--inbox-push "/worker-v/" "some body"))
+      (should (= 1 (length calls)))
+      (should (equal (nth 0 (car calls)) "report")))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; ghostel event-pipe deadlock workaround (cc-butler#104)
 ;;;; ------------------------------------------------------------------

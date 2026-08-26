@@ -22,6 +22,7 @@
 (require 'claude-code-ide-mcp-server)
 (require 'subr-x)
 (require 'seq)
+(require 'json)
 
 ;;;; ------------------------------------------------------------------
 ;;;; Channel launch flag (shared by the topic/session launchers)
@@ -513,6 +514,46 @@ the operation being logged.  Returns LINE, or nil if the write failed."
                   'append 'silent)
     line))
 
+(defun cc-butler--msg-log-file ()
+  "Return today's on-disk message-body log file under `cc-butler-ops-log-dir'."
+  (expand-file-name (format-time-string "msg-%Y-%m-%d.log")
+                    cc-butler-ops-log-dir))
+
+(defun cc-butler--log-message (kind from to body)
+  "Append a full-body message record to today's message log, one JSON
+object per physical line, always.  KIND identifies the caller (e.g.
+\"report\", \"relay\", \"escalate\"), FROM/TO are display-name strings (TO
+may be nil), and BODY is the arbitrary, possibly multi-line text this
+record exists to preserve without discarding it (see `cc-butler--log',
+whose own ops-log line stays a short single-line gist -- this is where the
+full body actually lives).
+
+Why JSON rather than this codebase's existing `prin1'/`.eld' journal
+convention (`cc-butler--mail-journal'): verified empirically that Emacs's
+default string printer does NOT escape embedded newlines --
+`(prin1-to-string \"a\\nb\")' prints the literal newline character, not a
+`\\n' escape sequence -- so a line-based read of an .eld journal (a human
+skimming it, or any tool that is not doing a proper `read') hits exactly
+the multi-line ambiguity this fix exists to close. `json-encode' does
+escape control characters inside strings, so a record here is safe under
+naive line-based scanning by construction, not by a convention the reader
+has to already know. (This means `cc-butler--mail-journal' carries the
+same latent gap for a multi-line message body -- out of scope for this
+fix; flagged, not silently left for the next person to rediscover.)
+
+Non-fatal like `cc-butler--log-mirror': an audit layer, never a
+precondition for the operation being logged."
+  (ignore-errors
+    (make-directory cc-butler-ops-log-dir t)
+    (write-region
+     (concat (json-encode (list (cons 'time (format-time-string "%FT%T"))
+                                 (cons 'kind kind)
+                                 (cons 'from (or from ""))
+                                 (cons 'to (or to ""))
+                                 (cons 'body (or body ""))))
+             "\n")
+     nil (cc-butler--msg-log-file) 'append 'silent)))
+
 (defun cc-butler--log (fmt &rest args)
   "Append a timestamped FMT/ARGS line to `cc-butler-log-buffer-name',
 mirrored on disk via `cc-butler--log-mirror' (one line, two sinks —
@@ -539,14 +580,21 @@ outlives the process)."
 (defun cc-butler--inbox-push (dir body)
   "Record a worker event from session DIR with BODY into the butler inbox.
 The worker's name and session id are attached, and the event is teed to
-the cc-butler log."
+the cc-butler log -- a short gist to the ops log (events only, kept
+grep-safe and single-line), the full BODY to the message log
+(`cc-butler--log-message'), never both -- an arbitrary, possibly
+multi-line worker report body must not land verbatim in the ops event
+stream (2026-08-27: a log line quoted back into a relay message got
+re-logged as if the event it described had happened a second time)."
   (push (list :time (current-time)
               :dir dir
               :name (cc-butler--display-name dir)
               :id (cc-butler--session-id dir)
               :body (or body ""))
         cc-butler--inbox)
-  (cc-butler--log "%s → butler │ %s" (cc-butler--who-dir dir) (or body "")))
+  (cc-butler--log "%s → butler │ report (%d chars, see msg log)"
+                  (cc-butler--who-dir dir) (length (or body "")))
+  (cc-butler--log-message "report" (cc-butler--who-dir dir) "butler" body))
 
 ;; The steward is designated in `cc-butler-orchestrator' (loaded after this
 ;; file); forward-declare it so the list UI can pin/label it.
