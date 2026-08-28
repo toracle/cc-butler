@@ -1607,7 +1607,21 @@ only says how many and how stale the oldest is."
         (rows '()))
     (dolist (s (cc-butler--sessions))
       (let ((dir (plist-get s :dir)))
-        (push (format "- %s%s | %s | branch:%s%s | %s%s"
+        ;; :osc and :status are DIFFERENT facts about a session (see
+        ;; `cc-butler--sessions'): :osc is the live activity title the
+        ;; harness pushes via OSC escape (what it's doing right now); :status
+        ;; is a human-readable note a session deliberately left via
+        ;; `set_session_info' (e.g. "parked -- PR #112 open, waiting on
+        ;; merge"). `list_claude_sessions' used to render only :osc, so a
+        ;; session that had explicitly left a status note looked identical
+        ;; to one idling with nothing to say -- the steward could not tell
+        ;; "parked with a reason" from "just sitting there". Both are now
+        ;; surfaced, each under its own label so they stay distinguishable
+        ;; instead of being concatenated into one ambiguous string. Each
+        ;; optional field is self-contained (carries its own leading " | "
+        ;; only when non-empty) so an absent field never leaves a stray
+        ;; separator or empty segment in the row.
+        (push (format "- %s%s | %s | branch:%s%s%s%s%s"
                       (cc-butler--display-name dir)
                       (cond ((equal dir self) " (you)")
                             ((equal dir cc-butler--butler) " (butler)")
@@ -1615,7 +1629,8 @@ only says how many and how stale the oldest is."
                       (if (cc-butler--waiting-p dir) "WAITING-FOR-INPUT" "running")
                       (let ((b (plist-get s :branch))) (if (string-empty-p b) "-" b))
                       (let ((f (plist-get s :forge))) (if (string-empty-p f) "" (concat " " f)))
-                      (let ((o (plist-get s :osc))) (if (string-empty-p o) "" o))
+                      (let ((o (plist-get s :osc))) (if (string-empty-p o) "" (concat " | activity:" o)))
+                      (let ((st (plist-get s :status))) (if (string-empty-p st) "" (concat " | status:" st)))
                       (let ((m (and (fboundp 'cc-butler-cleanup-model-tag)
                                     (cc-butler-cleanup-model-tag dir))))
                         (if m (concat " | " m) "")))
@@ -1850,7 +1865,7 @@ without anything being typed into its input box."
 (claude-code-ide-make-tool
  :function #'cc-butler-tool-list-sessions
  :name "list_claude_sessions"
- :description "List the other live Claude Code sessions running in this Emacs (the workers you orchestrate): their stable name, whether each is WAITING-FOR-INPUT, its git branch, its current activity title, and (when known) the model it's running. Call this first to learn the names used by read_session_output and send_to_session."
+ :description "List the other live Claude Code sessions running in this Emacs (the workers you orchestrate): their stable name, whether each is WAITING-FOR-INPUT, its git branch, its live activity title (what it's doing right now), any status note it deliberately left via set_session_info (e.g. parked with a reason), and (when known) the model it's running. Call this first to learn the names used by read_session_output and send_to_session."
  :args nil)
 
 (claude-code-ide-make-tool

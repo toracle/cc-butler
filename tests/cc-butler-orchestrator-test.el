@@ -1431,5 +1431,72 @@ silently read as \"no path to report\"."
         (should (string-match-p (regexp-quote (abbreviate-file-name (cc-butler-governance-store))) note))
         (should-not (string-match-p "the cc-butler repo store" note))))))
 
+;;;; ---- list_claude_sessions surfaces the :status note (2026-08-27) -------
+
+;; `set_session_info' writes a deliberately-left human-readable note into a
+;; session's :status metadata (`cc-butler-tool-set-session-info',
+;; cc-butler-session.el). `cc-butler--sessions' already builds that field
+;; alongside :osc (live harness-pushed activity title) -- see its docstring
+;; -- but `cc-butler-tool-list-sessions' rendered only :osc, so a session
+;; that had explicitly parked with a reason looked identical in the list to
+;; one idling with nothing to say. Fixed by surfacing both under their own
+;; labels (cc-butler-orchestrator.el).
+
+(defmacro cc-butler-orchestrator-test--with-list-sessions (sessions &rest body)
+  "Run BODY with `cc-butler--sessions' returning SESSIONS (full plists) and
+the ancillary lookups `cc-butler-tool-list-sessions' consults stubbed to
+deterministic values: no caller/butler match, nothing waiting, no forge
+model tag."
+  (declare (indent 1))
+  `(let ((cc-butler--butler nil)
+         (cc-butler--waiting (make-hash-table :test 'equal)))
+     (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () ,sessions))
+               ((symbol-function 'cc-butler--display-name)
+                (lambda (d) (string-trim d "/" "/")))
+               ((symbol-function 'cc-butler--caller-dir) (lambda () "/caller/"))
+               ((symbol-function 'cc-butler-cleanup-model-tag) (lambda (_dir) nil)))
+       ,@body)))
+
+(ert-deftest cc-butler-orchestrator/list-sessions-shows-a-left-status-note ()
+  "Given a session with a non-empty :status left via set_session_info, Then
+list_claude_sessions's output includes that status text -- the bug this
+guards against is the note being silently absent from the fleet view."
+  (cc-butler-orchestrator-test--with-list-sessions
+      (list (list :dir "/worker-a/" :branch "" :forge "" :osc ""
+                   :status "parked -- PR #112 open, waiting on merge"))
+    (let ((out (cc-butler-tool-list-sessions)))
+      (should (string-match-p "parked -- PR #112 open, waiting on merge" out)))))
+
+(ert-deftest cc-butler-orchestrator/list-sessions-empty-status-leaves-no-stray-artifact ()
+  "Given a session with an EMPTY :status (the common case: no note left),
+Then its rendered line carries no stray blank field, doubled separator, or
+empty-parens artifact -- checked against the exact rendered string, not
+merely \"it doesn't error\"."
+  (cc-butler-orchestrator-test--with-list-sessions
+      (list (list :dir "/worker-b/" :branch "main" :forge "" :osc "" :status ""))
+    (let* ((out (cc-butler-tool-list-sessions))
+           (line (car (split-string out "\n"))))
+      (should (equal line "- worker-b | running | branch:main"))
+      (should-not (string-match-p "||" line))
+      (should-not (string-match-p "| \\'" line))
+      (should-not (string-match-p "status:" line))
+      (should-not (string-match-p "activity:" line)))))
+
+(ert-deftest cc-butler-orchestrator/list-sessions-shows-status-and-osc-distinguishably ()
+  "Given a session with BOTH a non-empty :osc (live activity) and a
+non-empty :status (a deliberately-left note), Then both appear in the
+output as separately labeled fields, not merged into one ambiguous string
+-- losing either one, or conflating them, would be worse than the original
+bug (per the reporting session's framing)."
+  (cc-butler-orchestrator-test--with-list-sessions
+      (list (list :dir "/worker-c/" :branch "" :forge "" :osc "Running tests"
+                   :status "blocked: waiting on API key"))
+    (let* ((out (cc-butler-tool-list-sessions))
+           (line (car (split-string out "\n"))))
+      (should (string-match-p "activity:Running tests" line))
+      (should (string-match-p "status:blocked: waiting on API key" line))
+      ;; distinguishable, not concatenated into one unlabeled run
+      (should-not (string-match-p "Running testsblocked" line)))))
+
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here
