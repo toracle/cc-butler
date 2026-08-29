@@ -1773,7 +1773,19 @@ error mid-task. New callers should use `report_to_steward'.")
   "MCP tool: return and clear the steward's pending worker events.
 This is the pull side of the bus: worker notifications (needs input /
 done) are queued in Emacs and drained here, so the steward gets them
-without anything being typed into its input box."
+without anything being typed into its input box.
+
+Excludes the ops session's OWN idle notification from what is returned.
+`cc-butler--queue-on-notification' (cc-butler-notifications.el) pushes
+every session's idle event into this same inbox with no self-filter,
+unlike `cc-butler--forward-to-ops', which already excludes `dir' == ops
+at ITS delivery point -- so without this, the steward's own \"waiting for
+your input\" wakes its UserPromptSubmit hook and this drain hands it right
+back, a full turn burned on nothing. Filtered HERE, at the drain, rather
+than at `cc-butler--inbox-push' (record time), so
+`cc-butler-docs--auto-log' -- advised on that push -- keeps mirroring
+every event, including the steward's own liveness pings, into the daily
+durable log; only delivery to the steward is suppressed."
   (if (eq cc-butler-message-transport 'maildir)
       (let ((msgs (cc-butler-mail-up-drain (cc-butler--caller-dir))))
         (if (null msgs) "No pending worker events."
@@ -1785,15 +1797,25 @@ without anything being typed into its input box."
         (cc-butler--nothing-pending "No pending worker events."
                                     cc-butler--inbox-drained)
       (let* ((events (reverse cc-butler--inbox))
+             (ops (cc-butler--ops-dir))
+             ;; `ops' is nil before a butler is designated; guard so a
+             ;; missing self never matches a missing `dir' and wrongly
+             ;; excludes everything.
+             (deliverable (if ops
+                               (seq-remove (lambda (e) (equal (plist-get e :dir) ops))
+                                           events)
+                             events))
              ;; Render BEFORE clearing — same reason as the decision queue,
              ;; and this payload goes on to compute a fleet scan afterwards,
              ;; which is a larger error surface than the drain itself.
-             (text (mapconcat (lambda (e)
-                                (format "- [%s] %s: %s"
-                                        (format-time-string "%H:%M" (plist-get e :time))
-                                        (cc-butler--who (plist-get e :name) (plist-get e :id))
-                                        (plist-get e :body)))
-                              events "\n")))
+             (text (if deliverable
+                       (mapconcat (lambda (e)
+                                    (format "- [%s] %s: %s"
+                                            (format-time-string "%H:%M" (plist-get e :time))
+                                            (cc-butler--who (plist-get e :name) (plist-get e :id))
+                                            (plist-get e :body)))
+                                  deliverable "\n")
+                     "No pending worker events.")))
         (setq cc-butler--inbox-drained
               (cc-butler--archive-drained cc-butler--inbox-drained events))
         (setq cc-butler--inbox nil)

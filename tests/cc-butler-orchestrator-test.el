@@ -1048,6 +1048,35 @@ run — no string was ever returned and the decisions were gone."
     (should-error (cc-butler-tool-inbox))
     (should cc-butler--inbox)))
 
+(ert-deftest cc-butler-orchestrator/tool-inbox-excludes-ops-own-notification ()
+  "`cc-butler--queue-on-notification' pushes EVERY session's idle
+notification into this inbox with no self-filter -- including the ops
+(steward) session's own -- unlike `cc-butler--forward-to-ops', which
+already excludes `dir' == ops at its delivery point. Left unfiltered,
+the steward's own \"waiting for your input\" comes right back out of its
+own pending_events drain, waking its hook on nothing (the bug this
+guards). A genuine WORKER event (a different `dir') must still come
+through undisturbed -- a fix that swallowed everything would be a worse
+regression than the bug it fixes."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--butler "/ops/")
+        (cc-butler--steward nil)
+        (cc-butler--inbox-drained nil)
+        (cc-butler--inbox
+         (list (list :time (current-time) :dir "/ops/" :name "ops"
+                     :body "Claude is waiting for your input")
+               (list :time (current-time) :dir "/worker/" :name "worker"
+                     :body "needs input on auth"))))
+    (let ((text (cc-butler-tool-inbox)))
+      ;; the worker event must survive the drain ...
+      (should (string-match-p "needs input on auth" text))
+      ;; ... but the steward's own idle ping must not come back to it
+      (should-not (string-match-p "waiting for your input" text)))
+    ;; both entries are still drained/archived — self-filtering suppresses
+    ;; delivery, not the record (see `cc-butler-docs--auto-log').
+    (should (null cc-butler--inbox))
+    (should (= 2 (length cc-butler--inbox-drained)))))
+
 (ert-deftest cc-butler-orchestrator/a-drain-archives-rather-than-discards ()
   "Emptying the queue must not mean losing its contents.  Delivery can still
 fail after the drain — the hook can be killed at its timeout, `jq' can be
