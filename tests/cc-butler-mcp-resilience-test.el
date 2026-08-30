@@ -246,5 +246,40 @@ exactly once, and a heal still fixes the counter up once, not twice."
                           logged))))))
     (cc-butler-mcp-resilience-install)))
 
+;;;; ------------------------------------------------------------------
+;;;; json-rpc-error catchability
+;;;; ------------------------------------------------------------------
+;;
+;; Regression for the 300s `send_to_session' hang: claude-code-ide signals
+;; `json-rpc-error' on a bad MCP request (missing arg, unknown tool, unknown
+;; method) but never registers it via `define-error', so no `condition-case'
+;; anywhere — including claude-code-ide's own `--handle-post' handler meant
+;; to catch exactly this and send a JSON-RPC error response — ever catches
+;; it, and the HTTP response is simply never sent.
+
+(ert-deftest cc-butler-mcp-resilience/json-rpc-error-is-defined ()
+  "`json-rpc-error' must actually be a registered error symbol (not just a
+bare symbol `signal' happens to be called with) — a `condition-case'
+handler matches on the `error-conditions' property, which only exists
+once `define-error' has been called."
+  (should (get 'json-rpc-error 'error-conditions))
+  (should (memq 'error (get 'json-rpc-error 'error-conditions))))
+
+(ert-deftest cc-butler-mcp-resilience/json-rpc-error-is-catchable-as-error ()
+  "The actual behavior this exists to fix: signaling `json-rpc-error' — the
+same way claude-code-ide-mcp-http-server.el does at all three of its call
+sites — must be caught by a plain `(error ...)' `condition-case' clause,
+not escape uncaught. Without the `define-error' in cc-butler-mcp-resilience,
+this test fails with an uncaught \"peculiar error\", exactly reproducing the
+300s hang (the HTTP response never gets sent because the handler meant to
+send it is never reached)."
+  (let ((caught
+         (condition-case err
+             (progn (signal 'json-rpc-error (list -32602 "Missing required argument: text"))
+                    'not-caught)
+           (error (error-message-string err)))))
+    (should (stringp caught))
+    (should (string-match-p "Missing required argument: text" caught))))
+
 (provide 'cc-butler-mcp-resilience-test)
 ;;; cc-butler-mcp-resilience-test.el ends here

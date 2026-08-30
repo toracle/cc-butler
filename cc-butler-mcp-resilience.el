@@ -65,6 +65,41 @@
 (require 'claude-code-ide)
 
 ;;;; ------------------------------------------------------------------
+;;;; Layer 0 — make claude-code-ide's own error signal catchable
+;;;; ------------------------------------------------------------------
+;;
+;; `claude-code-ide-mcp-http-server.el' signals `json-rpc-error' at three
+;; sites (a missing required MCP tool argument, an unknown tool name, an
+;; unknown JSON-RPC method) but never registers it via `define-error'.
+;; `condition-case' matches a handler by the signaled symbol's
+;; `error-conditions' property, not by call-stack position — an
+;; unregistered symbol has no such property, so NO `condition-case'
+;; anywhere, including that file's own `(error ...)' handler in
+;; `--handle-post' (meant to catch exactly this and send a JSON-RPC error
+;; response), ever catches it. The signal propagates out of the Emacs
+;; process filter uncaught, silently logged to `*Messages*' as
+;; "error in process filter: ... peculiar error: ...", and the HTTP
+;; response is simply never sent — the connection sits open and the MCP
+;; caller (e.g. a fleet session driving `send_to_session') hangs until
+;; ITS OWN client-side timeout (observed: 300s), with nothing on the
+;; server side indicating anything went wrong.
+;;
+;; `define-error' only mutates the symbol's plist (`error-conditions',
+;; `error-message') — it is not tied to the file that calls it, and the
+;; property is looked up dynamically at `signal' time, not at load time,
+;; so declaring it HERE (a file that already loads before any MCP request
+;; can possibly arrive) is sufficient to make `claude-code-ide's own
+;; `condition-case' start catching it, without touching the third-party
+;; file at all. Registering it twice is harmless — a later call just
+;; overwrites the message, verified directly — so this remains safe if
+;; upstream ever adds its own `define-error' for the same symbol.
+;;
+;; This only fixes the symptom for an Emacs process that loads cc-butler;
+;; it does not fix `claude-code-ide' for anyone using it standalone — an
+;; upstream fix is still the real fix, tracked separately.
+(define-error 'json-rpc-error "JSON-RPC Error" 'error)
+
+;;;; ------------------------------------------------------------------
 ;;;; Layer 1 — don't wipe the registry while sessions are alive
 ;;;; ------------------------------------------------------------------
 
