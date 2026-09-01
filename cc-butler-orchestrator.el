@@ -1391,7 +1391,7 @@ Anything other than exactly \"notification\" (trimmed, case-insensitive)
 is the safe direction: a real decision silently downgraded to a
 read-only notification could go unanswered without anyone noticing,
 while a notification that stays answerable is only today's status quo,
-not a new failure. See governance
+not a new failure. See the governance note titled
 escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes."
   (if (and kind (stringp kind)
            (string-equal (downcase (string-trim kind)) "notification"))
@@ -1408,7 +1408,7 @@ per line) for a pick-one answer, and KIND \"decision\" (default) or
 
 KIND governs whether this needs an answer at all. Ask before calling:
 would anything the human could say change what happens next? If not,
-this is a notification, not a decision — see governance
+this is a notification, not a decision — see the governance note titled
 escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes
 for why getting this wrong silently manufactures a backlog that looks
 like neglect but is really miscategorization. A notification renders

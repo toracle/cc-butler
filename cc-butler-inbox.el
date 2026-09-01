@@ -4,7 +4,7 @@
 ;; SPDX-License-Identifier: MIT
 
 ;; The inbox is the *pending queue* half of the documents↔inbox coexistence
-;; model (Option C, docs/cc-butler-inbox-vs-documents-ux.md): a browsable index
+;; model (Option C): a browsable index
 ;; of the push/transient items 정수님 must attend to — the open decision and note
 ;; documents — that FEEDS the one reading surface (the doc-view panel).  Handled
 ;; items move to done/ and stay re-referenceable; reference documents are opened
@@ -33,23 +33,32 @@
   "Return the inbox items in FOLDER, oldest first (filename = timestamp order).
 FOLDER is `unread' (the open/ pending queue, default) or `archive' (done/, the
 handled items, re-referenceable — email-folder style).  Each item is a plist:
-  (:file FILE :title TITLE :kind decision|note :answerable BOOL)
-`answerable' is non-nil for decisions; reference documents are NOT queued here."
+  (:file FILE :title TITLE :kind decision|note|relay|briefing :answerable BOOL)
+KIND is read from the filename alone (`cc-butler--decision-file-kind'), the
+same classification `cc-butler--decision-open-files-and-oldest' uses for the
+⚖ mode-line count.  `answerable' is non-nil only for `decision'; the other
+kinds render read-only and reference documents are NOT queued here."
   (mapcar
    (lambda (f)
      (let* ((title (cc-butler--inbox-title f))
-            (decisionp (string-prefix-p "Decision" title)))
+            (kind (cc-butler--decision-file-kind f)))
        (list :file f :title title
-             :kind (if decisionp 'decision 'note)
-             :answerable decisionp)))
+             :kind kind
+             :answerable (eq kind 'decision))))
    (sort (ignore-errors
            (directory-files (cc-butler--inbox-dir (or folder 'unread))
                             t cc-butler--decision-org-re))
          #'string<)))
 
 (defun cc-butler-inbox-count ()
-  "Number of UNREAD inbox items (the badge count — open/ only)."
-  (length (cc-butler-inbox-items 'unread)))
+  "Number of UNREAD, answer-required inbox items (the ⚖ badge count —
+open/ only, `decision'-kind only).  A `note'/`relay'/`briefing' item
+renders in this same open/ queue (see `cc-butler--decision-file-kind')
+but needs no answer, so it must not inflate this count — the same fix
+`cc-butler--decision-open-files-and-oldest' already applies to the
+mode-line indicator and `pending_decisions'."
+  (length (seq-filter (lambda (it) (plist-get it :answerable))
+                       (cc-butler-inbox-items 'unread))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; The inbox list surface (browse the pending queue)

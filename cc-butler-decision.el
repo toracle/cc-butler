@@ -10,7 +10,7 @@
 ;; free-form "Other" — and, on an explicit `C-c C-c', routes 정수님's answer back
 ;; to whoever asked via the same maildir correlation (return-path) as B.
 ;;
-;; Design (see docs/cc-butler-decision-workflow-sdd.md):
+;; Design:
 ;;   - one file per decision, timestamp-named, in open/ → done/ (audit trail);
 ;;   - render by :kind — `decision' is answerable, `note'/`relay' are read-only
 ;;     notifications (so the answer queue is exactly the open decisions);
@@ -523,8 +523,14 @@ org-edit-special pattern): edit freely — no command-key collisions — then
     (cc-butler-decision-mode 1)))
 
 (defun cc-butler--decision-open-files ()
-  (sort (ignore-errors (directory-files (cc-butler--decision-open-dir) t cc-butler--decision-org-re))
-        #'string<))
+  "Full paths of `decision'-kind documents in open/, sorted by filename
+\(= arrival order\).  Excludes `note'/`relay'/`briefing' documents -- see
+`cc-butler--decision-file-kind' -- so `n'/`p' navigation and
+`cc-butler-decision-answer-next' never land on a document that has no
+answer region to actually respond to."
+  (seq-filter (lambda (f) (eq (cc-butler--decision-file-kind f) 'decision))
+              (sort (ignore-errors (directory-files (cc-butler--decision-open-dir) t cc-butler--decision-org-re))
+                    #'string<)))
 
 (defun cc-butler--decision-move (step)
   (let* ((files (cc-butler--decision-open-files))
@@ -666,7 +672,7 @@ Reads the `.KIND.org' suffix `cc-butler--decision-render' writes for any
 non-`decision' kind -- from the name alone, no file content read.  A
 plain `ID.org', including every file written before this encoding
 existed, is `decision' -- correct, since all of those really were
-decisions (see governance
+decisions (see the governance note titled
 escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes)."
   (if (string-match "\\.\\(note\\|relay\\|briefing\\)\\.org\\'" filename)
       (intern (match-string 1 filename))
@@ -705,8 +711,8 @@ re-lists the directory the other just listed.
 A `note'/`relay'/`briefing' document renders read-only in this same
 open/ directory (see `cc-butler--decision-render') but needs no answer,
 so counting it here would reproduce, under a new label, the exact
-backlog-inflation this counting feature exists to fix -- see governance
-escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes.
+backlog-inflation this counting feature exists to fix -- see the governance
+note titled escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes.
 Classification reads the FILENAME only (`cc-butler--decision-file-kind'),
 never file content, so this stays cheap even at hundreds of files and on
 every arrival, where `cc-butler--decision-update-indicator' calls it."
@@ -881,11 +887,13 @@ nothing into any input box."
 ;;;###autoload
 (defun cc-butler-decision-answer-next ()
   "Open the oldest open decision for answering, in `cc-butler-decision-mode'.
-Renders any freshly-arrived decisions from the human inbox first."
+Renders any freshly-arrived decisions from the human inbox first.  Only
+considers `decision'-kind documents (`cc-butler--decision-open-files') --
+a `note'/`relay'/`briefing' has no answer region, so \"go to the next
+thing that needs an answer\" must never land on one."
   (interactive)
   (cc-butler-decision-refresh)
-  (let* ((open (cc-butler--decision-open-dir))
-         (files (sort (directory-files open t cc-butler--decision-org-re) #'string<)))
+  (let ((files (cc-butler--decision-open-files)))
     (if (null files)
         (message "cc-butler: no open decisions.")
       (let ((create-lockfiles nil)) (find-file (car files)))
