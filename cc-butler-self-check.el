@@ -208,6 +208,14 @@ basename still looks fine."
 ;;;; Check 4: module load path -- DELIBERATE PARTIAL IMPLEMENTATION
 ;;;; ------------------------------------------------------------------
 
+;; PR #74's runtime-source vars, in cc-butler.el -- which REQUIRES this file
+;; (cc-butler-self-check), so this file cannot require it back. Bare defvars,
+;; same forward-reference workaround as the `fboundp' guard on
+;; `cc-butler--commit-merged-p' below: both are only ever read once cc-butler.el
+;; has finished loading and actually set them.
+(defvar cc-butler--runtime-source-dir)
+(defvar cc-butler--runtime-commit-sha)
+
 (defun cc-butler-self-check--module-load-path ()
   "Check 4 (partial by design -- see the design doc, verdict 3): the full
 \"running code == stable install location\" comparison needs the
@@ -222,7 +230,8 @@ detail string that says explicitly WHY it was not checked -- a bare
 \"not checked\" would be indistinguishable from a real pass, repeating
 tonight's exact mistake one level up."
   (if (fboundp 'cc-butler--commit-merged-p)
-      (let ((verdict (cc-butler--commit-merged-p (cc-butler-source-dir))))
+      (let ((verdict (cc-butler--commit-merged-p cc-butler--runtime-source-dir
+                                                  cc-butler--runtime-commit-sha)))
         (if (eq verdict 'unmerged)
             (list :ok nil
                   :detail (format "module load path: running code is UNMERGED — not reachable from origin/main (cc-butler--commit-merged-p -> %s); this is a hot-load of unreleased code"
