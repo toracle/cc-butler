@@ -70,6 +70,68 @@ back, so pin the property itself rather than trusting the declaration."
       (should (equal (cc-butler-governance-store) "/checkout-b/governance/")))))
 
 ;;;; ------------------------------------------------------------------
+;;;; Where the memory cache is  (the 2026-09-01 sibling of the above —
+;;;; `cc-butler-governance-memory-dir' had the identical defcustom-default
+;;;; shape and was never converted when `cc-butler-governance-dir' was.
+;;;; Confirmed live: `cc-butler-orchestrator.el' requires this file before
+;;;; it defines `cc-butler-home', so on every normal boot the frozen
+;;;; default landed on the hardcoded ~/.ccsm fallback and stayed there —
+;;;; every record_principle/regenerate_governance call kept writing to a
+;;;; directory no session's startup memory-load ever reads.
+;;;;
+;;;; NOTE on what these tests actually prove, vs what they don't: what
+;;;; follows exercises `cc-butler-governance-memory-store' the same way
+;;;; `store-is-derived-not-frozen-at-definition' above exercises its
+;;;; sibling — two `let'-bindings of an input in the SAME Emacs process,
+;;;; asserting the accessor's output tracks each. That proves "the
+;;;; accessor recomputes from its input on every call," not "this variable
+;;;; is immune to the original freeze-on-first-load defect" — a real
+;;;; cross-process reload can't be simulated inside one `ert-deftest'. THAT
+;;;; guarantee is structural, not tested: it comes from `cc-butler-home'
+;;;; and `cc-butler--claude-memory-dir' being ordinary `defun'/`defcustom'
+;;;; values read fresh inside a function body (never captured into another
+;;;; defcustom's default form), the same reasoning
+;;;; `cc-butler-governance--load-dir's docstring gives for why a `defconst'
+;;;; re-evaluates on reload. Keep both kinds of guarantee — and the
+;;;; distinction between them — visible; conflating "tested" with
+;;;; "structurally guaranteed" is exactly how the original defect went
+;;;; unnoticed this long.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/memory-store-follows-cc-butler-home ()
+  "With no explicit `cc-butler-governance-memory-dir' override, the memory
+path must derive from `cc-butler-home' via `cc-butler--claude-memory-dir' —
+never from a value captured once and reused."
+  (let ((cc-butler-governance-memory-dir nil)
+        (cc-butler-home "/some/butler/home"))
+    (should (equal (cc-butler-governance-memory-store)
+                   (file-name-as-directory
+                    (cc-butler--claude-memory-dir "/some/butler/home"))))))
+
+(ert-deftest cc-butler-governance/memory-store-is-derived-not-frozen-at-definition ()
+  "Two different `cc-butler-home' values, read within the SAME process, must
+produce two different effective memory paths. See the section comment above
+for exactly what this test does and does not prove."
+  (let ((cc-butler-governance-memory-dir nil))
+    (let ((cc-butler-home "/home-a"))
+      (should (equal (cc-butler-governance-memory-store)
+                     (file-name-as-directory (cc-butler--claude-memory-dir "/home-a")))))
+    (let ((cc-butler-home "/home-b"))
+      (should (equal (cc-butler-governance-memory-store)
+                     (file-name-as-directory (cc-butler--claude-memory-dir "/home-b")))))
+    ;; And the two must actually differ, or the assertions above would both
+    ;; pass vacuously against a value that never moved.
+    (should-not (equal (let ((cc-butler-home "/home-a")) (cc-butler-governance-memory-store))
+                        (let ((cc-butler-home "/home-b")) (cc-butler-governance-memory-store))))))
+
+(ert-deftest cc-butler-governance/memory-store-explicit-setting-wins ()
+  "Deriving is the default, not a policy: an explicit override still wins
+over whatever `cc-butler-home' says, same as `cc-butler-governance-dir'."
+  (let ((cc-butler-governance-memory-dir "/explicit/memory/dir")
+        (cc-butler-home "/some/butler/home"))
+    (should (equal (cc-butler-governance-memory-store) "/explicit/memory/dir/"))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Recording a principle
 ;;;; ------------------------------------------------------------------
 

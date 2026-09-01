@@ -59,18 +59,50 @@ private, user-custom layer here — the two-tier design 정수님 asked for."
   :type '(choice (const :tag "None" nil) directory)
   :group 'cc-butler)
 
-(defcustom cc-butler-governance-memory-dir
-  (or (and (fboundp 'cc-butler--claude-memory-dir) (boundp 'cc-butler-home)
-           (cc-butler--claude-memory-dir cc-butler-home))
-      (expand-file-name "~/.claude/projects/-home-toracle--ccsm/memory/"))
+(defcustom cc-butler-governance-memory-dir nil
   "The Claude Code memory dir — a GENERATED cache of the store (never
-hand-edited). Derived from the butler home the same way
-`cc-butler--shared-state-note' computes it, so it tracks
-`cc-butler-home' instead of drifting to a stale hardcoded path if the
-home ever moves; falls back to the historical ~/.ccsm path only if
-`cc-butler--claude-memory-dir'/`cc-butler-home' aren't loaded yet."
-  :type 'directory
+hand-edited).
+
+Nil — the default — means DERIVE it fresh from `cc-butler-home' on every
+call, via `cc-butler-governance-memory-store' — the same pattern
+`cc-butler-governance-dir'/`cc-butler-governance-store' above already use
+for the store path. Set it only to point the memory dir somewhere
+genuinely different from `cc-butler-home's derived location; an explicit
+value is always honoured.
+
+Do not restore a computed default here. A default that captures
+`cc-butler-home's value at DEFINITION time is exactly the bug this
+replaced: as a `defcustom', that computation ran ONCE, the first time this
+file was loaded in a given Emacs image, and `cc-butler-home' is not
+guaranteed to be bound yet at that moment —
+`cc-butler-orchestrator.el' requires this file (to reach
+`cc-butler-governance-store' from its own code) before it defines
+`cc-butler-home', so on every normal boot the very first evaluation landed
+on the hardcoded fallback and froze there for the rest of the process's
+life. Confirmed live, 2026-09-01: days after `cc-butler-home' correctly
+pointed at the butler's own workspace, every `record_principle'/
+`regenerate_governance' call was still silently writing to
+`~/.claude/projects/-home-toracle--ccsm/memory/' — a directory no running
+session's startup memory-load ever reads — while reporting success. Ask
+for the effective path with `cc-butler-governance-memory-store', never by
+reading this variable directly."
+  :type '(choice (const :tag "Derived from cc-butler-home" nil) directory)
   :group 'cc-butler)
+
+(defun cc-butler-governance-memory-store ()
+  "Absolute path of the Claude Code memory dir actually in effect.
+The single place this path is decided, so a writer and a reader cannot
+disagree about where it is — mirrors `cc-butler-governance-store' above.
+Recomputed on every call, so it cannot freeze the way the old
+`cc-butler-governance-memory-dir' defcustom default did. Falls back to the
+historical ~/.ccsm path only if `cc-butler--claude-memory-dir'/
+`cc-butler-home' truly aren't loaded yet (e.g. this file evaluated in
+isolation, outside the normal `cc-butler.el' load)."
+  (file-name-as-directory
+   (or cc-butler-governance-memory-dir
+       (and (fboundp 'cc-butler--claude-memory-dir) (boundp 'cc-butler-home)
+            (cc-butler--claude-memory-dir cc-butler-home))
+       (expand-file-name "~/.claude/projects/-home-toracle--ccsm/memory/"))))
 
 (defun cc-butler--governance-dir-principles (dir)
   "Principle .md files in DIR (absolute paths), excluding README; nil if no DIR."
@@ -95,7 +127,7 @@ overrides the built-in of that name, so you can specialize a built-in privately.
   "Absolute path of `MEMORY.md' — the hand-maintained index every session
 actually loads.  A note's body can be regenerated perfectly and still never be
 recalled if this file has no line pointing at it (cc-butler#36)."
-  (expand-file-name "MEMORY.md" cc-butler-governance-memory-dir))
+  (expand-file-name "MEMORY.md" (cc-butler-governance-memory-store)))
 
 (defun cc-butler-governance--frontmatter-description (path)
   "PATH's frontmatter `description:' value, or nil if unreadable/absent."
@@ -113,7 +145,7 @@ recalled if this file has no line pointing at it (cc-butler#36)."
 (defun cc-butler-governance--index-line (slug)
   "Render the `MEMORY.md' line for SLUG, using the note's own description."
   (let* ((note (expand-file-name (concat "butler-" slug ".md")
-                                 cc-butler-governance-memory-dir))
+                                 (cc-butler-governance-memory-store)))
          (desc (or (cc-butler-governance--frontmatter-description note)
                    "(no description in store)")))
     (format "- [%s](butler-%s.md) — %s\n" slug slug desc)))
@@ -159,11 +191,11 @@ line whose principle no longer exists in the store (see
 `cc-butler-governance--prune-dead-entries').  Returns the count of
 principles written."
   (interactive)
-  (make-directory cc-butler-governance-memory-dir t)
-  (let ((n 0) (slugs nil))
+  (let ((mem (cc-butler-governance-memory-store))
+        (n 0) (slugs nil))
+    (make-directory mem t)
     (dolist (f (cc-butler-governance-principles))
-      (copy-file f (expand-file-name (concat "butler-" (file-name-nondirectory f))
-                                     cc-butler-governance-memory-dir)
+      (copy-file f (expand-file-name (concat "butler-" (file-name-nondirectory f)) mem)
                  t)
       (push (file-name-sans-extension (file-name-nondirectory f)) slugs)
       (setq n (1+ n)))
@@ -301,14 +333,14 @@ not only right after a regenerate, so a forgotten sync still shows up."
 (defun cc-butler-governance--memory-note (slug)
   "Absolute path of the generated memory note for SLUG."
   (expand-file-name (concat cc-butler-governance--name-prefix slug ".md")
-                    cc-butler-governance-memory-dir))
+                    (cc-butler-governance-memory-store)))
 
 (defun cc-butler-governance--note-count ()
   "How many generated notes (butler-*.md) are in the memory dir right now.
 Matches only the `butler-' prefix regenerate writes, not every `.md' file in
 the dir — `MEMORY.md' lives there too (cc-butler#36) and is not a note."
   (length (ignore-errors
-            (directory-files cc-butler-governance-memory-dir nil "\\`butler-.*\\.md\\'"))))
+            (directory-files (cc-butler-governance-memory-store) nil "\\`butler-.*\\.md\\'"))))
 
 (defun cc-butler-governance--render (slug description body type)
   "The full file text for a principle, frontmatter included.
@@ -383,7 +415,7 @@ source of truth."
      (if verified
          ""
        (format "\nDo not treat this as recorded. The store being written (%s) and the memory being generated (%s) are the two paths to compare — a write landing in a store nobody regenerates from is what this check exists to catch.\n"
-               (plist-get res :store) cc-butler-governance-memory-dir))
+               (plist-get res :store) (cc-butler-governance-memory-store)))
      (format "\nPrinciples now in the store (%d): %s\n"
              (length (plist-get res :names))
              (string-join (plist-get res :names) ", "))
