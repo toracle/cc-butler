@@ -116,20 +116,43 @@ basename (or PR #73's check simply unavailable), must pass."
       (should (plist-get r :ok))
       (should (string-match-p "reachable from origin/main" (plist-get r :detail))))))
 
+(ert-deftest cc-butler-self-check/module-load-path-calls-commit-merged-p-with-dir-and-sha ()
+  "THE BUG: this call site used to pass only `cc-butler-source-dir', one
+argument, while `cc-butler--commit-merged-p' requires DIR and SHA -- a
+`wrong-number-of-arguments' error every time the periodic self-check
+timer fired. This is the guard-invocation check: the real runtime-source
+vars PR #74 populates, not just \"does it eventually return a verdict\"."
+  (let ((cc-butler--runtime-source-dir "/some/checkout/")
+        (cc-butler--runtime-commit-sha "deadbeef")
+        captured)
+    (cl-letf (((symbol-function 'cc-butler--commit-merged-p)
+               (lambda (dir sha) (setq captured (list dir sha)) 'merged)))
+      (cc-butler-self-check--module-load-path))
+    (should (equal captured '("/some/checkout/" "deadbeef")))))
+
 (ert-deftest cc-butler-self-check/module-load-path-not-checked-when-dependency-missing ()
-  "When PR #74's `cc-butler--commit-merged-p' is not loaded (the actual
-state of this fleet right now), the check must still report :ok t, but
-its :detail must say explicitly that it was NOT checked and why -- never
-a bare pass that reads identically to a real one."
-  (should-not (fboundp 'cc-butler--commit-merged-p))
-  (let ((r (cc-butler-self-check--module-load-path)))
-    (should (plist-get r :ok))
-    (should (string-match-p "not verified" (plist-get r :detail)))
-    (should (string-match-p "PR #74\\|cc-butler--commit-merged-p" (plist-get r :detail)))
-    ;; The two "pass" detail strings (real pass vs. not-checked) must not
-    ;; read identically -- distinguish "reachable from origin/main" (real
-    ;; pass) from "not verified" (not checked at all).
-    (should-not (string-match-p "reachable from origin/main" (plist-get r :detail)))))
+  "When PR #74's `cc-butler--commit-merged-p' is not loaded (some fleets
+run without it), the check must still report :ok t, but its :detail must
+say explicitly that it was NOT checked and why -- never a bare pass that
+reads identically to a real one. Forces the unbound state directly
+(`fmakunbound', restored after) rather than assuming ambient fleet state
+-- PR #74 and this module are both merged together on THIS fleet's main,
+so `fboundp' is normally true here."
+  (let ((was-bound (fboundp 'cc-butler--commit-merged-p))
+        (orig (and (fboundp 'cc-butler--commit-merged-p)
+                   (symbol-function 'cc-butler--commit-merged-p))))
+    (unwind-protect
+        (progn
+          (fmakunbound 'cc-butler--commit-merged-p)
+          (let ((r (cc-butler-self-check--module-load-path)))
+            (should (plist-get r :ok))
+            (should (string-match-p "not verified" (plist-get r :detail)))
+            (should (string-match-p "PR #74\\|cc-butler--commit-merged-p" (plist-get r :detail)))
+            ;; The two "pass" detail strings (real pass vs. not-checked) must not
+            ;; read identically -- distinguish "reachable from origin/main" (real
+            ;; pass) from "not verified" (not checked at all).
+            (should-not (string-match-p "reachable from origin/main" (plist-get r :detail)))))
+      (when was-bound (fset 'cc-butler--commit-merged-p orig)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Check 5: persisted vs. live
