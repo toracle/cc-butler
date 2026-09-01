@@ -16,6 +16,7 @@ this file does not depend on load order against another test file."
   (declare (indent 0))
   `(let* ((cc-butler-north-star-test--writes nil)
           (cc-butler--butler "/butler/")
+          (cc-butler-north-star-file "/tmp/north-star-test-fleet.org")
           (cc-butler-forward-idle-threshold 60)
           (cc-butler-submit-delay 0.01)
           (cc-butler-session-io-timeout 5)
@@ -247,6 +248,55 @@ a busy (idle-gate) skip reads differently from a structurally-unavailable
       (should busy-msg)
       (should no-terminal-msg)
       (should-not (equal busy-msg no-terminal-msg)))))
+
+(ert-deftest cc-butler-north-star/namespaced-p-rejects-generic-basename ()
+  "The generic, un-overridden basename \"north-star.org\" must read as
+not-namespaced regardless of directory — that basename colliding across
+fleets sharing the governance directory is exactly the bug this guards
+against."
+  (should (null (let ((cc-butler-north-star-file "/tmp/wherever/north-star.org"))
+                  (cc-butler--north-star-file-namespaced-p))))
+  (should (null (let ((cc-butler-north-star-file "~/projects/cc-butler-governance/north-star.org"))
+                  (cc-butler--north-star-file-namespaced-p)))))
+
+(ert-deftest cc-butler-north-star/namespaced-p-accepts-fleet-specific-basename ()
+  "A fleet-specific basename like the two already in production
+(north-star-macbook-m1-max.org, north-star-x600.org) must read as
+namespaced."
+  (should (let ((cc-butler-north-star-file "/tmp/north-star-macbook-m1-max.org"))
+            (cc-butler--north-star-file-namespaced-p))))
+
+(ert-deftest cc-butler-north-star/fire-refuses-generic-basename-before-idle-check ()
+  "Even when the butler is idle and every other fixture condition is
+fine, an unnamespaced `cc-butler-north-star-file' must block the send —
+this proves the new guard is checked FIRST, ahead of the existing
+idle/liveness `when-let*' chain, not layered on after it."
+  (cc-butler-north-star-test--with-stub-terminal
+    (let ((cc-butler-north-star-file "/tmp/wherever/north-star.org"))
+      (should (eq 'skipped-unnamespaced (cc-butler--north-star-fire)))
+      (should (null (cc-butler-north-star-test--recorded-writes))))))
+
+(ert-deftest cc-butler-north-star/ensure-timer-refuses-to-arm-generic-basename ()
+  "A misconfigured fleet must not even get a permanently-no-op timer
+sitting in `timer-list' — better to have no timer at all than one that
+looks armed but can never fire anything useful."
+  (let ((cc-butler-north-star-file "/tmp/wherever/north-star.org")
+        (cc-butler--north-star-timer nil))
+    (cc-butler--north-star-ensure-timer)
+    (should (null cc-butler--north-star-timer))))
+
+(ert-deftest cc-butler-north-star/check-command-reports-when-blocked-by-generic-basename ()
+  "`cc-butler-north-star-check' must not error and must still report via
+`message' when blocked by the new guard, same as any other reason the
+manual command can't send — the human asking explicitly still deserves
+an answer."
+  (cc-butler-north-star-test--with-stub-terminal
+    (let ((cc-butler-north-star-file "/tmp/wherever/north-star.org")
+          msg)
+      (cl-letf (((symbol-function 'message) (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
+        (cc-butler-north-star-check))
+      (should (string-match-p "skipped" msg))
+      (should (null (cc-butler-north-star-test--recorded-writes))))))
 
 (provide 'cc-butler-north-star-test)
 ;;; cc-butler-north-star-test.el ends here

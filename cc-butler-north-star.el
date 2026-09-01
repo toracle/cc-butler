@@ -66,6 +66,40 @@ actually uses; do not infer the running value from this default."
 (defvar cc-butler--north-star-timer nil
   "Repeating timer driving `cc-butler--north-star-fire', or nil before first use.")
 
+(defun cc-butler--north-star-file-namespaced-p (&optional file)
+  "Non-nil unless FILE (default `cc-butler-north-star-file') is still the
+generic, un-overridden basename \"north-star.org\" — the collision risk
+once `cc-butler-governance-dir' is a directory shared by more than one
+fleet. FILE lets `cc-butler-self-check--north-star-file' check an
+arbitrary path instead of only the currently configured one."
+  (not (equal (file-name-nondirectory (or file cc-butler-north-star-file))
+              "north-star.org")))
+
+(defun cc-butler--north-star-warn-not-namespaced ()
+  "Loudly warn that `cc-butler-north-star-file' needs a fleet-specific
+override, with the exact fix inline — a message that scrolls past in
+*Messages* is not enough for a misconfiguration this easy to miss, and
+the next person to hit this should not have to go spelunking for the fix."
+  (display-warning
+   'cc-butler-north-star
+   "cc-butler-north-star-file is still the generic \"north-star.org\" — refusing to run the North Star check.
+
+Set a fleet-specific override in THIS MACHINE's local custom.el (never
+committed anywhere — this is per-machine, not shared with other fleets):
+
+  (with-eval-after-load 'cc-butler-north-star
+    (setq cc-butler-north-star-file
+          (expand-file-name \"north-star-<your-fleet-id>.org\" cc-butler-governance-dir)))
+
+Convention: one file per machine/fleet, named after the machine — the two
+that already exist are north-star-macbook-m1-max.org and
+north-star-x600.org. Pick a similarly descriptive <your-fleet-id> for
+this machine.
+
+Then apply it live: `(load custom-file)', and re-arm with
+`(cc-butler--north-star-ensure-timer)' or just `M-x cc-butler-north-star-check'."
+   :warning))
+
 (defvar cc-butler--north-star-last-sent-hash nil
   "MD5 hash of `cc-butler-north-star-file' content as of the last
 successfully SENT nudge, or nil.
@@ -166,9 +200,13 @@ and reusing the result — see `cc-butler--north-star-fire'."
 (defun cc-butler--north-star-fire (&optional force)
   "Nudge the butler to self-check active North Stars against their DoD.
 Mirrors `cc-butler--forward-backstop': only types into the butler's
-terminal when it looks idle (`cc-butler--forward-ops-free-p'), so a
+terminal when it looks idle (`cc-butler--forward-ops-free-p'), so an
 hourly housekeeping ping cannot land mid-turn and scramble whatever the
-butler is actually doing.
+butler is actually doing.  Also refuses outright if `cc-butler-north-star-file'
+is still unnamespaced (see `cc-butler--north-star-file-namespaced-p') —
+this is the one gate that protects the manual `cc-butler-north-star-check'
+path too, since that command calls straight into this function rather
+than through `cc-butler--north-star-ensure-timer'.
 
 Also gated on content: skipped when `cc-butler-north-star-file's content
 is unchanged since the last successfully SENT nudge (see
@@ -184,20 +222,23 @@ A tick skipped by the idle gate does NOT update the recorded hash: the
 same pending content is retried on the next tick.
 
 Returns `sent' on an actual send, `skipped-idle' or `skipped-delta' when
-gated, or nil when there is no live butler terminal at all (no butler
-designated, or its terminal buffer is gone)."
-  (when-let* ((butler cc-butler--butler)
-              (buf (get-buffer (claude-code-ide--get-buffer-name butler)))
-              ((buffer-live-p buf)))
-    (if (not (cc-butler--forward-ops-free-p butler))
-        'skipped-idle
-      (let ((hash (cc-butler--north-star-file-hash)))
-        (if (and (not force) hash (equal hash cc-butler--north-star-last-sent-hash))
-            'skipped-delta
-          (cc-butler--send-input butler (cc-butler--north-star-prompt) t)
-          (when hash
-            (setq cc-butler--north-star-last-sent-hash hash))
-          'sent)))))
+gated, `skipped-unnamespaced' when the file path guard refuses, or nil
+when there is no live butler terminal at all (no butler designated, or
+its terminal buffer is gone)."
+  (if (not (cc-butler--north-star-file-namespaced-p))
+      (progn (cc-butler--north-star-warn-not-namespaced) 'skipped-unnamespaced)
+    (when-let* ((butler cc-butler--butler)
+                (buf (get-buffer (claude-code-ide--get-buffer-name butler)))
+                ((buffer-live-p buf)))
+      (if (not (cc-butler--forward-ops-free-p butler))
+          'skipped-idle
+        (let ((hash (cc-butler--north-star-file-hash)))
+          (if (and (not force) hash (equal hash cc-butler--north-star-last-sent-hash))
+              'skipped-delta
+            (cc-butler--send-input butler (cc-butler--north-star-prompt) t)
+            (when hash
+              (setq cc-butler--north-star-last-sent-hash hash))
+            'sent))))))
 
 ;;;###autoload
 (defun cc-butler-north-star-check ()
@@ -213,16 +254,24 @@ timer's silent no-op."
   (pcase (cc-butler--north-star-fire t)
     ('sent (message "cc-butler: North Star check sent to the butler"))
     ('skipped-idle (message "cc-butler: North Star check skipped — the butler looks busy right now"))
+    ('skipped-unnamespaced (message "cc-butler: North Star check skipped — cc-butler-north-star-file is unnamespaced, see *Warnings*"))
     (_ (message "cc-butler: North Star check skipped — no butler designated, or its terminal isn't live"))))
 
 (defun cc-butler--north-star-ensure-timer ()
-  "(Re)register the North Star timer; idempotent for hot reloads."
-  (when (timerp cc-butler--north-star-timer)
-    (cancel-timer cc-butler--north-star-timer))
-  (setq cc-butler--north-star-timer
-        (run-with-timer cc-butler-north-star-interval
-                         cc-butler-north-star-interval
-                         #'cc-butler--north-star-fire)))
+  "(Re)register the North Star timer; idempotent for hot reloads.
+Refuses to arm at all when `cc-butler-north-star-file' is still the
+generic \"north-star.org\" basename — see `cc-butler--north-star-warn-not-namespaced'
+for the fix.  A timer that would just fire into a permanent no-op is
+worse than no timer: it looks armed in `timer-list' while doing nothing,
+which is its own kind of silent failure."
+  (if (not (cc-butler--north-star-file-namespaced-p))
+      (cc-butler--north-star-warn-not-namespaced)
+    (when (timerp cc-butler--north-star-timer)
+      (cancel-timer cc-butler--north-star-timer))
+    (setq cc-butler--north-star-timer
+          (run-with-timer cc-butler-north-star-interval
+                           cc-butler-north-star-interval
+                           #'cc-butler--north-star-fire))))
 
 (cc-butler--north-star-ensure-timer)
 
