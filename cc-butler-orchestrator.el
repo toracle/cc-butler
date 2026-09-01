@@ -1097,6 +1097,36 @@ The steward when one is designated, else the butler (single mode)."
   "Return non-nil when a distinct steward session is designated (split mode)."
   (and cc-butler--steward (not (equal cc-butler--steward cc-butler--butler))))
 
+(defun cc-butler--inbox-deliverable-events ()
+  "Pending worker events actually worth telling ops about — `cc-butler--inbox',
+newest last, minus the ops session's OWN idle notifications.
+
+`cc-butler--queue-on-notification' (cc-butler-notifications.el) pushes
+EVERY session's idle event into `cc-butler--inbox' unfiltered, including
+the ops session's own \"waiting for your input\" — see that function's
+docstring for why filtering happens here, at read time, rather than
+there. `cc-butler-tool-inbox' (the pull-side drain `pending_events'
+calls) and `cc-butler--forward-pending-count' (what decides whether the
+push-side backstop has anything worth waking ops for) BOTH need exactly
+this same answer to \"how many events are actually pending\" — they used
+to compute it separately, and diverged: the drain excluded self-events,
+the backstop's count did not. Every time ops went idle it queued its own
+notification, the backstop counted it as 1 pending, ops got woken with a
+false \"N worker events pending\", and `pending_events' then correctly
+found nothing deliverable — a self-sustaining false-alarm loop, roughly
+once per `cc-butler-forward-backstop-interval', that would recur forever
+because nothing ever consumed the count the backstop was reading (see
+`cc-butler--forward-backstop-interval's docstring: default 3600s, which
+matches the ~1-1.5h gaps actually observed). One function, shared by
+both, so they cannot disagree again."
+  (let ((events (reverse cc-butler--inbox))
+        (ops (cc-butler--ops-dir)))
+    ;; `ops' is nil before a butler is designated; guard so a missing self
+    ;; never matches a missing `dir' and wrongly excludes everything.
+    (if ops
+        (seq-remove (lambda (e) (equal (plist-get e :dir) ops)) events)
+      events)))
+
 (defcustom cc-butler-forward-gate t
   "When non-nil, worker notifications go through the batched, gated
 forwarder (classification + idle gate + backstop) instead of being typed
@@ -1213,7 +1243,15 @@ Two independent checks, both must pass:
 (defun cc-butler--forward-pending-count ()
   "How many worker events are sitting undrained for the ops session.
 Under the maildir transport the in-memory `cc-butler--inbox' is not the
-authority, so count the ops box's new/ files instead."
+authority, so count the ops box's new/ files instead.
+
+REGRESSION (found 2026-09-02): this used to be `(length cc-butler--inbox)'
+— the RAW inbox length, including the ops session's own idle
+notifications, which `cc-butler-tool-inbox' (the drain) already excluded.
+Now shares `cc-butler--inbox-deliverable-events' with that drain, so the
+backstop and `pending_events' can no longer disagree about what counts as
+pending — see that function's docstring for the false-alarm loop this
+caused."
   (if (and (boundp 'cc-butler-message-transport)
            (eq cc-butler-message-transport 'maildir)
            (fboundp 'cc-butler--mail-box))
@@ -1223,7 +1261,7 @@ authority, so count the ops box's new/ files instead."
         (if (file-directory-p new)
             (length (directory-files new nil "^[^.]"))
           0))
-    (length cc-butler--inbox)))
+    (length (cc-butler--inbox-deliverable-events))))
 
 (defun cc-butler--forward-push-batched (ops trigger)
   "Type ONE batched summary into OPS: TRIGGER plus the pending backlog size.
@@ -1854,14 +1892,10 @@ durable log; only delivery to the steward is suppressed."
         (cc-butler--nothing-pending "No pending worker events."
                                     cc-butler--inbox-drained)
       (let* ((events (reverse cc-butler--inbox))
-             (ops (cc-butler--ops-dir))
-             ;; `ops' is nil before a butler is designated; guard so a
-             ;; missing self never matches a missing `dir' and wrongly
-             ;; excludes everything.
-             (deliverable (if ops
-                               (seq-remove (lambda (e) (equal (plist-get e :dir) ops))
-                                           events)
-                             events))
+             ;; Shared with `cc-butler--forward-pending-count' — see
+             ;; `cc-butler--inbox-deliverable-events' for why they must not
+             ;; compute this separately.
+             (deliverable (cc-butler--inbox-deliverable-events))
              ;; Render BEFORE clearing — same reason as the decision queue,
              ;; and this payload goes on to compute a fleet scan afterwards,
              ;; which is a larger error surface than the drain itself.
