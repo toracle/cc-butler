@@ -1445,7 +1445,16 @@ in 정수님's inbox; otherwise (workflow off) this always queues for
 `pending_decisions' as a plain entry regardless of KIND — that legacy
 path has no notion of a read-only item, so KIND only has teeth once
 the workflow is on. Either way it is appended to the shared
-`decisions.org'."
+`decisions.org'.
+
+A real DECISION (never a note) also fires `cc-butler-notify-decision' — an
+OS notification plus messenger command straight to 정수님, still typing
+NOTHING into any terminal — unless the decision workflow is on, where
+`cc-butler--decision-on-arrival' already does this same push once the
+human-inbox channel drains. This exists because the butler's own
+UserPromptSubmit hook only auto-drains `pending_decisions' on a prompt
+turn; an escalation arriving between prompts would otherwise sit until
+the next one."
   (unless (and summary (stringp summary) (not (string-empty-p (string-trim summary))))
     (error "A decision summary is required"))
   (let* ((self (cc-butler--caller-dir))
@@ -1466,6 +1475,20 @@ the workflow is on. Either way it is appended to the shared
                     :summary s :needs n)
               cc-butler--butler-inbox)))
     (cc-butler--append-decision self s needs)   ; decisions.org audit doc, all paths
+    ;; Active PUSH straight to 정수님's real attention (OS notification +
+    ;; messenger command), independent of any agent turn — closes a real
+    ;; gap: the butler's own UserPromptSubmit hook only auto-drains
+    ;; `pending_decisions' on a PROMPT turn, so an escalation arriving
+    ;; between prompts otherwise waits for the next one.  Skipped when the
+    ;; decision workflow is on: that path already gets this exact push,
+    ;; asynchronously, from `cc-butler--decision-on-arrival' once the
+    ;; human-inbox channel drains it — adding it here too would double-fire.
+    (when (and (eq k 'decision)
+               (not (bound-and-true-p cc-butler-decision-workflow))
+               (fboundp 'cc-butler-notify-decision))
+      (ignore-errors
+        (cc-butler-notify-decision "cc-butler — a decision needs you"
+                                   (car (split-string s "\n")))))
     ;; Ops log gets a short gist, never the raw summary S (arbitrary,
     ;; possibly multi-line -- see `cc-butler--log-message'); the full text
     ;; already lives in decisions.org above, and also goes to the message

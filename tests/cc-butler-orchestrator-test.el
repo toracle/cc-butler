@@ -1078,6 +1078,74 @@ right."
         (cc-butler-tool-escalate-to-butler "fyi" nil nil variant)
         (should (eq 'note (nth 4 captured)))))))
 
+;;;; ---- escalate_to_butler: active push to 정수님 (legacy transport) -----
+;;;; This fleet actually runs with `cc-butler-decision-workflow' nil (the
+;;;; default) -- the escalations above all `let'-bind it to t to exercise
+;;;; the decision-workflow branch. These exercise the OTHER, live branch:
+;;;; the push must reach `cc-butler-notify-decision' directly, since no
+;;;; arrival watcher exists on that path to do it later.
+
+(ert-deftest cc-butler-orchestrator/escalate-decision-pushes-notify-decision-on-legacy-transport ()
+  "A real decision, on the default (decision-workflow off) transport, must
+call `cc-butler-notify-decision' -- this is the guard-invocation check:
+without it, `cc-butler-tool-escalate-to-butler' silently enqueues into
+`cc-butler--butler-inbox' with nothing pushing it to 정수님's actual
+attention between UserPromptSubmit turns."
+  (let ((cc-butler-decision-workflow nil)
+        (cc-butler--caller-dir-value "/steward/")
+        (cc-butler--butler-inbox nil)
+        (captured nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () cc-butler--caller-dir-value))
+              ((symbol-function 'cc-butler--append-decision) #'ignore)
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler--log-message) #'ignore)
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "steward"))
+              ((symbol-function 'cc-butler-notify-decision)
+               (lambda (title body) (setq captured (list title body)))))
+      (cc-butler-tool-escalate-to-butler "ship it?\nmore detail on another line" "pick one")
+      (should captured)
+      (should (string-match-p "decision needs you" (nth 0 captured)))
+      (should (equal "ship it?" (nth 1 captured))))))
+
+(ert-deftest cc-butler-orchestrator/escalate-notification-kind-does-not-push ()
+  "kind=\"notification\" must NOT push -- nothing the human could say would
+change anything, so paging them defeats the point of a read-only note."
+  (let ((cc-butler-decision-workflow nil)
+        (cc-butler--caller-dir-value "/steward/")
+        (cc-butler--butler-inbox nil)
+        (called nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () cc-butler--caller-dir-value))
+              ((symbol-function 'cc-butler--append-decision) #'ignore)
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler--log-message) #'ignore)
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "steward"))
+              ((symbol-function 'cc-butler-notify-decision)
+               (lambda (&rest _) (setq called t))))
+      (cc-butler-tool-escalate-to-butler "fyi only" nil nil "notification")
+      (should-not called))))
+
+(ert-deftest cc-butler-orchestrator/escalate-decision-workflow-on-does-not-double-push ()
+  "When the decision workflow IS on, `cc-butler-tool-escalate-to-butler'
+must NOT call `cc-butler-notify-decision' itself -- `cc-butler--decision-
+on-arrival' already does, once the human-inbox channel drains the
+message, and firing here too would page 정수님 twice for one escalation."
+  (let ((cc-butler-decision-workflow t)
+        (cc-butler--caller-dir-value "/steward/")
+        (called nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () cc-butler--caller-dir-value))
+              ((symbol-function 'cc-butler-decision-create) (lambda (&rest _) "id-push"))
+              ((symbol-function 'cc-butler--append-decision) #'ignore)
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler--log-message) #'ignore)
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "steward"))
+              ((symbol-function 'cc-butler-notify-decision)
+               (lambda (&rest _) (setq called t))))
+      (cc-butler-tool-escalate-to-butler "ship it?" "pick one")
+      (should-not called))))
+
 (ert-deftest cc-butler-orchestrator/decision-drain-keeps-items-when-rendering-fails ()
   "Rendering happens BEFORE the queue is emptied.  A malformed item used to
 signal from inside the formatter, unwinding past a clear that had already
