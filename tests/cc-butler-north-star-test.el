@@ -43,6 +43,26 @@ path — the file's location is user-configurable via defcustom."
     (should (string-match-p (regexp-quote cc-butler-north-star-file)
                             (cc-butler--north-star-prompt)))))
 
+(ert-deftest cc-butler-north-star/prompt-does-not-instruct-creating-missing-file ()
+  "The old wording told the butler to fabricate the file from the template
+on a missing path. `cc-butler-governance-dir' is now a store shared across
+multiple fleets (e.g. north-star-x600.org and north-star-macbook-m1-max.org
+side by side), so a missing file almost always means the path is wrong, not
+that goals were never started — creating one there risks discarding or
+colliding with another fleet's real goals. That create instruction must be
+gone from the prompt."
+  (should-not (string-match-p (regexp-quote "새로 만들되")
+                              (cc-butler--north-star-prompt))))
+
+(ert-deftest cc-butler-north-star/prompt-instructs-stop-and-escalate-on-missing-file ()
+  "In place of creating the file, the prompt must tell the butler to stop
+and escalate to 정수님 via `escalate_to_butler' when the file cannot be
+found, since a missing file most likely means a misresolved path rather
+than an empty goal list."
+  (let ((prompt (cc-butler--north-star-prompt)))
+    (should (string-match-p (regexp-quote "새로 만들지 말고 즉시 멈출 것") prompt))
+    (should (string-match-p (regexp-quote "escalate_to_butler로 정수님/steward에게 경로가") prompt))))
+
 (ert-deftest cc-butler-north-star/prompt-always-inlines-the-template ()
   "The entry-shape template must ride along in the nudge itself — the
 butler needs it to create the file correctly on the very first run,
