@@ -66,11 +66,14 @@ actually uses; do not infer the running value from this default."
 (defvar cc-butler--north-star-timer nil
   "Repeating timer driving `cc-butler--north-star-fire', or nil before first use.")
 
-(defun cc-butler--north-star-file-namespaced-p ()
-  "Non-nil unless `cc-butler-north-star-file' is still the generic,
-un-overridden basename \"north-star.org\" — the collision risk once
-`cc-butler-governance-dir' is a directory shared by more than one fleet."
-  (not (equal (file-name-nondirectory cc-butler-north-star-file) "north-star.org")))
+(defun cc-butler--north-star-file-namespaced-p (&optional file)
+  "Non-nil unless FILE (default `cc-butler-north-star-file') is still the
+generic, un-overridden basename \"north-star.org\" — the collision risk
+once `cc-butler-governance-dir' is a directory shared by more than one
+fleet. FILE lets `cc-butler-self-check--north-star-file' check an
+arbitrary path instead of only the currently configured one."
+  (not (equal (file-name-nondirectory (or file cc-butler-north-star-file))
+              "north-star.org")))
 
 (defun cc-butler--north-star-warn-not-namespaced ()
   "Loudly warn that `cc-butler-north-star-file' needs a fleet-specific
