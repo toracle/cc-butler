@@ -64,7 +64,7 @@ your init:
 ;; org-specific here) while giving a fresh install a real, immediately-usable
 ;; template instead of only the `arbitrary' escape hatch.
 (cc-butler-define-project-template default
-  :base-dir "~/.emacs.d/cc-butler/topics"
+  :base-dir "~/projects/cc-butler-topics"
   :dir-format "%s"
   :repos nil
   :claude-import nil)
