@@ -157,6 +157,12 @@ resumed-fleet incident went through, so it needs the same guard against
 handing back a false-ready session (cc-butler#8)."
   (let (waited-for)
     (cl-letf (((symbol-function 'claude-code-ide) (lambda (&rest _) nil))
+              ;; Stubbed so the real, 0.5s-deferred `cc-butler--configure-
+              ;; session' does not spawn the actual cc-butler#104
+              ;; pipe-resize subprocess -- a leaked real timer/process from
+              ;; here can fire mid-`accept-process-output' in an unrelated
+              ;; LATER test and inflate ITS `cc-butler--log' mock's count.
+              ((symbol-function 'cc-butler--configure-session) #'ignore)
               ((symbol-function 'cc-butler--wait-for-session-ready)
                (lambda (dir) (setq waited-for dir))))
       (cc-butler--resume-in "/tmp/some-resumed-worker/"))

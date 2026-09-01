@@ -391,12 +391,32 @@ which is the likeliest time to hit this at all."
   (require 'cc-butler-persist)
   (let ((order nil))
     (cl-letf (((symbol-function 'claude-code-ide) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler--configure-session) (lambda (_d) nil))
               ((symbol-function 'cc-butler--ensure-pty-size)
                (lambda (_d) (push 'sized order)))
               ((symbol-function 'cc-butler--wait-for-session-ready)
                (lambda (_d) (push 'waited order))))
       (cc-butler--resume-in "/tmp/some-worker/"))
     (should (equal (nreverse order) '(sized waited)))))
+
+(ert-deftest cc-butler-session/resume-also-installs-the-refit-hook ()
+  "THE BUG: `cc-butler--resume-in' used to skip `cc-butler--configure-session'
+entirely, so a resumed session never got the persistent
+`window-configuration-change-hook' that keeps refitting its PTY to the
+largest window on later layout changes -- only the one-shot launch-time
+floor. It looked fine right after a restore, then quietly shrank on the
+next window split/switch with nothing to catch it. This is the
+guard-invocation check: called with the right DIR, not just \"does the
+session eventually work\"."
+  (require 'cc-butler-persist)
+  (let ((called nil))
+    (cl-letf (((symbol-function 'claude-code-ide) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler--configure-session)
+               (lambda (d) (push d called)))
+              ((symbol-function 'cc-butler--ensure-pty-size) #'ignore)
+              ((symbol-function 'cc-butler--wait-for-session-ready) #'ignore))
+      (cc-butler--resume-in "/tmp/some-worker/"))
+    (should (equal called '("/tmp/some-worker/")))))
 
 (ert-deftest cc-butler-session/refit-reapplies-the-floor ()
   "A refit is sized from a window, so it can drop back under the floor the
