@@ -8,8 +8,8 @@
 ;; Compaction is a four-step terminal dance that no single prompt can perform:
 ;; switch the session to a cheap model, answer the "switch model?" confirmation
 ;; that Claude Code raises because switching discards the prompt cache, run
-;; `/compact', and put the original model back.  `governance/context-ceiling-
-;; and-compaction.md' is the standing rule; this file is its mechanism.
+;; `/compact', and put the original model back.  `context-ceiling-and-compaction'
+;; in the governance store is the standing rule; this file is its mechanism.
 ;;
 ;; It exists because an LLM cannot reliably drive it.  Each step needs a
 ;; *separate* submission (a multi-line body is pasted and submitted once, so
