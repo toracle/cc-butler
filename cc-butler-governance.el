@@ -59,18 +59,46 @@ private, user-custom layer here — the two-tier design 정수님 asked for."
   :type '(choice (const :tag "None" nil) directory)
   :group 'cc-butler)
 
-(defcustom cc-butler-governance-memory-dir
-  (or (and (fboundp 'cc-butler--claude-memory-dir) (boundp 'cc-butler-home)
-           (cc-butler--claude-memory-dir cc-butler-home))
-      (expand-file-name "~/.claude/projects/-home-toracle--ccsm/memory/"))
+(defcustom cc-butler-governance-memory-dir nil
   "The Claude Code memory dir — a GENERATED cache of the store (never
-hand-edited). Derived from the butler home the same way
-`cc-butler--shared-state-note' computes it, so it tracks
-`cc-butler-home' instead of drifting to a stale hardcoded path if the
-home ever moves; falls back to the historical ~/.ccsm path only if
-`cc-butler--claude-memory-dir'/`cc-butler-home' aren't loaded yet."
-  :type 'directory
+hand-edited).
+
+Nil — the default — means DERIVE it from `cc-butler-home' the same way
+`cc-butler--shared-state-note' computes it, evaluated lazily on every
+call (see `cc-butler-governance-memory-store') rather than once at
+definition time.  Set it only to point somewhere genuinely different;
+an explicit value is always honoured.
+
+REGRESSION (2026-08-31, live 8 days on this fleet): this used to be a
+computed `defcustom' default, exactly the bug `cc-butler-governance-dir'
+above already replaced once. A `defcustom' default binds once, at the
+first definition — if `cc-butler--claude-memory-dir'/`cc-butler-home'
+were not yet loaded at that moment (a load-order race, not a
+configuration error), it silently froze onto the hardcoded fallback
+path below, a stale path from a DIFFERENT fleet machine, and never
+self-corrected even after those symbols became available later in the
+same session. `regenerate_governance' kept reporting \"0 un-indexed\"
+throughout, because it only ever checked its own write against its own
+index — see `cc-butler-tool-regenerate-governance''s report, which now
+also cross-checks against an independently-derived read path.
+
+Do not restore a computed default here. Ask for the effective path
+with `cc-butler-governance-memory-store', never by reading this
+variable directly."
+  :type '(choice (const :tag "Derive from cc-butler-home" nil) directory)
   :group 'cc-butler)
+
+(defun cc-butler-governance-memory-store ()
+  "Absolute path of the Claude Code memory dir actually in effect.
+Mirrors `cc-butler-governance-store': the single place this is decided,
+re-derived on every call so a reload or a `cc-butler-home' change is
+picked up immediately instead of freezing at whatever was true when
+this file first loaded."
+  (file-name-as-directory
+   (or cc-butler-governance-memory-dir
+       (and (fboundp 'cc-butler--claude-memory-dir) (boundp 'cc-butler-home)
+            (cc-butler--claude-memory-dir cc-butler-home))
+       (expand-file-name "~/.claude/projects/-home-toracle--ccsm/memory/"))))
 
 (defun cc-butler--governance-dir-principles (dir)
   "Principle .md files in DIR (absolute paths), excluding README; nil if no DIR."
@@ -95,25 +123,35 @@ overrides the built-in of that name, so you can specialize a built-in privately.
   "Absolute path of `MEMORY.md' — the hand-maintained index every session
 actually loads.  A note's body can be regenerated perfectly and still never be
 recalled if this file has no line pointing at it (cc-butler#36)."
-  (expand-file-name "MEMORY.md" cc-butler-governance-memory-dir))
+  (expand-file-name "MEMORY.md" (cc-butler-governance-memory-store)))
 
 (defun cc-butler-governance--frontmatter-description (path)
-  "PATH's frontmatter `description:' value, or nil if unreadable/absent."
+  "PATH's frontmatter `description:' value, or nil if unreadable/absent.
+
+REGRESSION (2026-09-01): this used to assume line 1 is the opening `---',
+skipping it unconditionally with `forward-line 1' and searching for the
+NEXT `^---$' as the close. A note with a leading blank line (line 1
+blank, `---' on line 2) made that skip land ON the opening delimiter
+itself, which the search then matched as its own close — collapsing the
+frontmatter range to nothing and silently losing the description. Now
+finds the opening `---' explicitly and searches for the close only
+after it, so a leading blank line no longer matters."
   (when (file-readable-p path)
     (with-temp-buffer
       (insert-file-contents path)
       (goto-char (point-min))
-      (let ((frontmatter-end (save-excursion
-                               (forward-line 1)
-                               (and (re-search-forward "^---$" nil t) (point)))))
-        (when (and frontmatter-end
-                   (re-search-forward "^description: \"\\(.*\\)\"$" frontmatter-end t))
-          (match-string 1))))))
+      (let* ((frontmatter-start (and (re-search-forward "^---$" nil t) (point)))
+             (frontmatter-end (and frontmatter-start
+                                    (re-search-forward "^---$" nil t) (point))))
+        (when frontmatter-end
+          (goto-char frontmatter-start)
+          (when (re-search-forward "^description: \"\\(.*\\)\"$" frontmatter-end t)
+            (match-string 1)))))))
 
 (defun cc-butler-governance--index-line (slug)
   "Render the `MEMORY.md' line for SLUG, using the note's own description."
   (let* ((note (expand-file-name (concat "butler-" slug ".md")
-                                 cc-butler-governance-memory-dir))
+                                 (cc-butler-governance-memory-store)))
          (desc (or (cc-butler-governance--frontmatter-description note)
                    "(no description in store)")))
     (format "- [%s](butler-%s.md) — %s\n" slug slug desc)))
@@ -159,19 +197,20 @@ line whose principle no longer exists in the store (see
 `cc-butler-governance--prune-dead-entries').  Returns the count of
 principles written."
   (interactive)
-  (make-directory cc-butler-governance-memory-dir t)
-  (let ((n 0) (slugs nil))
-    (dolist (f (cc-butler-governance-principles))
-      (copy-file f (expand-file-name (concat "butler-" (file-name-nondirectory f))
-                                     cc-butler-governance-memory-dir)
-                 t)
-      (push (file-name-sans-extension (file-name-nondirectory f)) slugs)
-      (setq n (1+ n)))
-    (cc-butler-governance--sync-index (nreverse slugs))
-    (cc-butler-governance--prune-dead-entries)
-    (when (called-interactively-p 'interactive)
-      (message "cc-butler: regenerated %d principle(s) from the store" n))
-    n))
+  (let ((memory-dir (cc-butler-governance-memory-store)))
+    (make-directory memory-dir t)
+    (let ((n 0) (slugs nil))
+      (dolist (f (cc-butler-governance-principles))
+        (copy-file f (expand-file-name (concat "butler-" (file-name-nondirectory f))
+                                       memory-dir)
+                   t)
+        (push (file-name-sans-extension (file-name-nondirectory f)) slugs)
+        (setq n (1+ n)))
+      (cc-butler-governance--sync-index (nreverse slugs))
+      (cc-butler-governance--prune-dead-entries)
+      (when (called-interactively-p 'interactive)
+        (message "cc-butler: regenerated %d principle(s) from the store" n))
+      n)))
 
 (defun cc-butler-governance--index-butler-slugs (text)
   "Slugs of every line in TEXT shaped like this store's own generated entry:
@@ -301,14 +340,14 @@ not only right after a regenerate, so a forgotten sync still shows up."
 (defun cc-butler-governance--memory-note (slug)
   "Absolute path of the generated memory note for SLUG."
   (expand-file-name (concat cc-butler-governance--name-prefix slug ".md")
-                    cc-butler-governance-memory-dir))
+                    (cc-butler-governance-memory-store)))
 
 (defun cc-butler-governance--note-count ()
   "How many generated notes (butler-*.md) are in the memory dir right now.
 Matches only the `butler-' prefix regenerate writes, not every `.md' file in
 the dir — `MEMORY.md' lives there too (cc-butler#36) and is not a note."
   (length (ignore-errors
-            (directory-files cc-butler-governance-memory-dir nil "\\`butler-.*\\.md\\'"))))
+            (directory-files (cc-butler-governance-memory-store) nil "\\`butler-.*\\.md\\'"))))
 
 (defun cc-butler-governance--render (slug description body type)
   "The full file text for a principle, frontmatter included.
@@ -383,11 +422,34 @@ source of truth."
      (if verified
          ""
        (format "\nDo not treat this as recorded. The store being written (%s) and the memory being generated (%s) are the two paths to compare — a write landing in a store nobody regenerates from is what this check exists to catch.\n"
-               (plist-get res :store) cc-butler-governance-memory-dir))
+               (plist-get res :store) (cc-butler-governance-memory-store)))
      (format "\nPrinciples now in the store (%d): %s\n"
              (length (plist-get res :names))
              (string-join (plist-get res :names) ", "))
      "\nTo revise one of these, call this again with that same name — it is overwritten in place.")))
+
+(defun cc-butler-governance--memory-dir-drift-detail ()
+  "Nil if the write path (`cc-butler-governance-memory-store') agrees with
+an independently-derived path (`cc-butler--claude-memory-dir' via
+`cc-butler-home', computed fresh here rather than read back off the same
+accessor); a detail string describing the mismatch otherwise.
+
+REGRESSION (2026-08-31): `cc-butler-tool-regenerate-governance' checked
+its own write against its own index and always reported \"0 un-indexed\",
+even the entire 8 days `cc-butler-governance-memory-dir' was frozen onto
+a stale path from a different fleet machine — because every check in
+that report resolves through the SAME variable that was wrong. This
+check is deliberately the odd one out: it recomputes the expected path
+from scratch instead of trusting the accessor, so a future variant of
+the same bug (the accessor itself derives wrong) cannot hide from it the
+way it hid from every store->index/index->store check that shares its
+one source of truth."
+  (when (and (fboundp 'cc-butler--claude-memory-dir) (boundp 'cc-butler-home))
+    (let* ((write (file-name-as-directory (expand-file-name (cc-butler-governance-memory-store))))
+           (read (file-name-as-directory
+                  (expand-file-name (cc-butler--claude-memory-dir cc-butler-home)))))
+      (unless (equal write read)
+        (format "write path (%s) != independently-derived read path (%s)" write read)))))
 
 (defun cc-butler-tool-regenerate-governance ()
   "MCP tool: bare-trigger governance regeneration, no arguments.
@@ -439,7 +501,11 @@ index, index -> store, and description drift."
      (if stale
          (format "%d indexed description(s) no longer match the store's current wording (left as-is — this may be deliberate curation rather than staleness, so it is reported, not auto-edited; review and re-run record_principle or hand-edit MEMORY.md if it should change): %s\n"
                  (length stale) (string-join stale ", "))
-       "Description drift: all indexed descriptions match the store's current wording.\n"))))
+       "Description drift: all indexed descriptions match the store's current wording.\n")
+     (let ((drift (cc-butler-governance--memory-dir-drift-detail)))
+       (if drift
+           (format "MEMORY-DIR MISMATCH: %s — this regenerate wrote somewhere a session may not actually read from; see the governance principle one-path-for-write-and-read.\n" drift)
+         "Memory dir: write path matches the independently-derived read path.\n")))))
 
 ;; Idempotent registration.
 (when (fboundp 'claude-code-ide-make-tool)

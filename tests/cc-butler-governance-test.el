@@ -69,6 +69,43 @@ back, so pin the property itself rather than trusting the declaration."
     (let ((cc-butler-governance--load-dir "/checkout-b/"))
       (should (equal (cc-butler-governance-store) "/checkout-b/governance/")))))
 
+(ert-deftest cc-butler-governance/memory-dir-is-derived-not-frozen-at-load-order ()
+  "REGRESSION (2026-08-31, live 8 days on this fleet): `cc-butler-governance-memory-dir'
+used to be a `defcustom' default computed once, at definition time, from
+`cc-butler--claude-memory-dir'/`cc-butler-home'.  If either was not yet
+loaded at that moment (a load-order race, not misconfiguration) it
+silently froze onto a hardcoded fallback path from a DIFFERENT fleet
+machine and never self-corrected, even after both symbols became
+available later in the same session.  The accessor must re-derive on
+every call instead of trusting a value captured once."
+  (let ((cc-butler-governance-memory-dir nil))
+    (let* ((cc-butler-home "/home-a/butler")
+           (a (cc-butler-governance-memory-store)))
+      (let* ((cc-butler-home "/home-b/butler")
+             (b (cc-butler-governance-memory-store)))
+        (should-not (equal a b))))))
+
+;;;; ------------------------------------------------------------------
+;;;; Frontmatter description parsing
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/frontmatter-description-survives-a-leading-blank-line ()
+  "REGRESSION (2026-09-01): the parser assumed line 1 is the opening `---'
+and skipped it unconditionally with `forward-line 1', then searched for
+the NEXT `^---$' as the close. A file with a leading blank line (blank
+line 1, `---' on line 2) made that skip land ON the opening delimiter
+itself, which the search then matched as its own close, collapsing the
+frontmatter range to nothing and silently losing the description. A
+real store note (`a-guard-that-cannot-fail-is-theatre') hit exactly
+this shape and dropped out of the recallable index."
+  (let ((f (make-temp-file "gov-blank-line")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert "\n---\nname: butler-x\ndescription: \"Hello\"\n---\nbody\n"))
+          (should (equal (cc-butler-governance--frontmatter-description f) "Hello")))
+      (delete-file f))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Recording a principle
 ;;;; ------------------------------------------------------------------

@@ -131,8 +131,14 @@ rebind, now silently pointed at a dead port."
 ;;;; ------------------------------------------------------------------
 
 (defun cc-butler-self-check--governance-write-dir ()
-  "Reality A (write path): where `regenerate_governance' actually writes."
-  cc-butler-governance-memory-dir)
+  "Reality A (write path): where `regenerate_governance' actually writes.
+
+Goes through `cc-butler-governance-memory-store', not the raw
+`cc-butler-governance-memory-dir' variable — that variable now defaults
+to nil (2026-09-01 fix for the load-order race this check exists to
+catch), so reading it directly would report every default-configured
+fleet as a permanent mismatch against Reality B below."
+  (cc-butler-governance-memory-store))
 
 (defun cc-butler-self-check--governance-read-dir ()
   "Reality B (read path): where the running butler's own CLAUDE.md actually
