@@ -418,6 +418,39 @@ session eventually work\"."
       (cc-butler--resume-in "/tmp/some-worker/"))
     (should (equal called '("/tmp/some-worker/")))))
 
+;;;; ---- border-line-p: a titled border's trailing run ----------------
+
+(ert-deftest cc-butler-session/border-line-p-accepts-one-trailing-rule-char ()
+  "THE BUG (2026-09-01): a top border with a topic title embedded can leave
+as little as ONE trailing ─ before the terminal edge -- how much survives
+is whatever the terminal WIDTH leaves over after subtracting the title,
+which has no reason to land on 2+. Requiring two silently broke
+`cc-butler--find-input-line' (and everything built on it -- context,
+model, the whole statusline read) for any session whose title happened
+to render that way, for as long as that title stayed set."
+  (with-temp-buffer
+    (insert "───────────────────────── some longer topic title here ─")
+    (goto-char (point-min))
+    (should (cc-butler--border-line-p))))
+
+(ert-deftest cc-butler-session/border-line-p-still-accepts-a-plain-rule ()
+  "The ordinary case (no title, both ends pure rule) must keep working --
+this is not a case relaxing the check should ever touch."
+  (with-temp-buffer
+    (insert "──────────────────────────────────────────────")
+    (goto-char (point-min))
+    (should (cc-butler--border-line-p))))
+
+(ert-deftest cc-butler-session/border-line-p-rejects-ordinary-text ()
+  "Relaxing the trailing-run length must not make ordinary prose read as a
+border -- `cc-butler--border-rule-char' (U+2500) essentially never
+appears in real text, so even a lone trailing char stays a safe signal,
+but this pins that a normal line still does not match."
+  (with-temp-buffer
+    (insert "이것은 그냥 평범한 대화 텍스트입니다.")
+    (goto-char (point-min))
+    (should-not (cc-butler--border-line-p))))
+
 (ert-deftest cc-butler-session/refit-reapplies-the-floor ()
   "A refit is sized from a window, so it can drop back under the floor the
 moment the frame is split narrow.  Without re-applying it there, the

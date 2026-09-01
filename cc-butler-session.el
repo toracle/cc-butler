@@ -1466,14 +1466,25 @@ sampled.")
 of color. Not required to be PURELY the rule character — Claude Code
 sometimes draws a short title (a branch/topic name) embedded in the
 middle of the top border (confirmed 2026-07-21, e.g. \"───── some-topic
-──\"), so this checks framing, not purity."
+──\"), so this checks framing, not purity.
+
+The trailing run can be as short as ONE rule char, not two: how much
+border survives after the title is whatever the terminal WIDTH leaves
+over once the title text is subtracted, and that arithmetic has no
+reason to land on 2+ (confirmed 2026-09-01: a session with a longer topic
+title — \"침몰한 함대 복원 및 업무 재개\" — rendered with exactly one
+trailing ─, which a 2-char suffix requirement rejected outright, so
+`cc-butler--find-input-line' never found the sandwich below it and every
+downstream read — context, model, the whole statusline — silently read
+as unknown for that session specifically, indefinitely, since a session
+with a fixed title renders the same short suffix every time)."
   (let ((text (string-trim (buffer-substring-no-properties
                              (line-beginning-position) (line-end-position))))
         (rule3 (make-string 3 cc-butler--border-rule-char))
-        (rule2 (make-string 2 cc-butler--border-rule-char)))
+        (rule1 (char-to-string cc-butler--border-rule-char)))
     (and (> (length text) 3)
          (string-prefix-p rule3 text)
-         (string-suffix-p rule2 text))))
+         (string-suffix-p rule1 text))))
 
 (defun cc-butler--find-input-line (start end)
   "Search START..END for the input row: the single line sandwiched

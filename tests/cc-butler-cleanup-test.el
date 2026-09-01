@@ -311,6 +311,38 @@ lines must not make the scan stop EARLIER and discard the model."
     (should (= 222 (plist-get fields :ctx)))
     (should (equal "Sonnet-5" (plist-get fields :model)))))
 
+;;;; ---- titled top border: a short trailing run --------------------
+
+;; PROVENANCE: this top-border line is the VERBATIM text captured read-only
+;; from a live session (the butler session, captured 2026-09-01 via
+;; `read_session_output' / `cc-butler--read-output') whose topic title left
+;; exactly ONE trailing ─ before the terminal's right edge.  `cc-butler--
+;; border-line-p' required a 2-char trailing run, so this line was never
+;; recognized as a border at all -- `cc-butler--find-input-line' then found
+;; no sandwich below it, and the whole statusline read (:ctx/:pct/:model)
+;; came back nil indefinitely, for as long as that same title stayed set.
+(defconst cc-butler-cleanup-test--titled-border-one-trailing-char
+  "───────────────────────────────────────────────────────────────────────────────────────────────────────── 침몰한 함대 복원 및 업무 재개 ─"
+  "A real top-border line whose title leaves only one trailing ─.")
+
+(ert-deftest cc-butler-cleanup/statusline-fields-reads-below-a-titled-border-with-one-trailing-char ()
+  "THE BUG (2026-09-01): a topic title long enough to leave only ONE
+trailing border char on the top border must still anchor the input box --
+requiring two silently broke context/model reading for any session whose
+title happened to render that way, with nothing on the surface pointing
+at the border check specifically."
+  (let ((fields (cc-butler-cleanup--statusline-fields
+                 (string-join
+                  (list cc-butler-cleanup-test--titled-border-one-trailing-char
+                        "❯ "
+                        "──────────────────────────────────────────────"
+                        "  CTX:116481 12% MODEL:Opus-5"
+                        "  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent")
+                  "\n"))))
+    (should (= 116481 (plist-get fields :ctx)))
+    (should (= 12 (plist-get fields :pct)))
+    (should (equal "Opus-5" (plist-get fields :model)))))
+
 ;;;; ---- last-known-value persistence (no flicker) -------------------
 
 (ert-deftest cc-butler-cleanup/context-keeps-last-known-on-nil-read ()
