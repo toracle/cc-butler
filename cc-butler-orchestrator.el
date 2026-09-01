@@ -695,20 +695,38 @@ screen predicates are not loaded (that module loads after this one)."
                           (mapconcat #'identity (nreverse unreadable) "\n")))))
          "\n\n")))))
 
+(defun cc-butler--compact-monitor-watchdog-check ()
+  "Re-arm the fleet compact monitor if its timer has died, and report if so.
+Nil the overwhelming majority of the time.  Piggybacks on whichever
+per-turn hook payload calls this — `cc-butler--pending-decisions-hook-payload'
+(butler, covering single mode where there is no separate steward) and
+`cc-butler--pending-events-hook-payload' (steward) both do — because that
+channel is independently confirmed to have kept firing through the last
+known outage where the monitor's own `run-with-timer' quietly went dead
+for days.  cc-butler-compact loads after this module, so reach it late,
+guarded exactly like the `ceiling' checks below: a missing watchdog check
+is a small loss, not something worth risking the rest of the payload for."
+  (and (fboundp 'cc-butler-compact--monitor-watchdog-maybe-rearm)
+       (ignore-errors (cc-butler-compact--monitor-watchdog-maybe-rearm))))
+
 (defun cc-butler--pending-decisions-hook-payload ()
   "Combined payload for the butler's pending_decisions hook: an urgent
-check_inbox block (ask_worker replies) followed by the drained decision
-queue. Either half may be absent; returns \"\" when both are empty."
+check_inbox block (ask_worker replies), the drained decision queue, and a
+compact-monitor watchdog check. Any subset may be absent; returns \"\"
+when all three are empty."
   (let* ((inbox (cc-butler--inbox-urgent-block "butler"))
          (decisions (cc-butler-tool-pending-decisions))
-         (has-decisions (not (equal decisions "No pending decisions."))))
-    (mapconcat #'identity (delq nil (list inbox (and has-decisions decisions))) "\n\n")))
+         (has-decisions (not (equal decisions "No pending decisions.")))
+         (watchdog (cc-butler--compact-monitor-watchdog-check)))
+    (mapconcat #'identity
+               (delq nil (list inbox (and has-decisions decisions) watchdog))
+               "\n\n")))
 
 (defun cc-butler--pending-events-hook-payload ()
   "Combined payload for the steward's pending_events hook: an urgent
-check_inbox block, the drained worker-event queue, and a fleet
-dialog check. Any subset may be absent; returns \"\" when all
-three are empty."
+check_inbox block, the drained worker-event queue, a fleet dialog check,
+and a compact-monitor watchdog check. Any subset may be absent; returns
+\"\" when all four are empty."
   (let* ((inbox (cc-butler--inbox-urgent-block "steward"))
          (events (cc-butler-tool-inbox))
          (has-events (not (equal events "No pending worker events.")))
@@ -723,9 +741,10 @@ three are empty."
          ;; Same bargain as the fleet dialog check: elisp reports what is
          ;; over the context ceiling, the steward decides when to act.
          (ceiling (and (fboundp 'cc-butler-compact-fleet-summary)
-                       (ignore-errors (cc-butler-compact-fleet-summary)))))
+                       (ignore-errors (cc-butler-compact-fleet-summary))))
+         (watchdog (cc-butler--compact-monitor-watchdog-check)))
     (mapconcat #'identity
-               (delq nil (list inbox (and has-events events) dialogs ceiling))
+               (delq nil (list inbox (and has-events events) dialogs ceiling watchdog))
                "\n\n")))
 
 (defun cc-butler--pending-decisions-hook-sh ()
