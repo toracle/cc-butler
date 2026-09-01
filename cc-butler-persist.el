@@ -153,11 +153,22 @@ gets spawned, and the startup race that can drop a caller's first
          (string-trim (concat (or claude-code-ide-cli-extra-flags "")
                               " " (mapconcat #'identity cc-butler-resume-args " "))))
         (default-directory (file-name-as-directory (expand-file-name dir))))
-    (cc-butler--with-channel (claude-code-ide)))
-  ;; The second spawn site, and it needs the same floor for the same reason
-  ;; — see `cc-butler--ensure-pty-size'.  A restore after a restart is in
-  ;; fact the likeliest time to hit it, since every session comes back at
-  ;; once into whatever layout the frame happens to be in.
+    (cc-butler--with-channel (claude-code-ide))
+    ;; The second spawn site, so it needs the SAME uniform config as
+    ;; `cc-butler--launch-session' — most of all the buffer-local
+    ;; `window-configuration-change-hook' `cc-butler--configure-session-buffer'
+    ;; installs, which keeps refitting the PTY to the largest window on every
+    ;; later layout change. Without this call a resumed session only ever got
+    ;; the one-shot `cc-butler--ensure-pty-size' floor below, so it looked
+    ;; fine right after a restore and then quietly shrank on the next window
+    ;; split/switch, with nothing to catch it — this was the actual root
+    ;; cause of that recurring "terminal collapses" symptom, not a redraw bug.
+    (cc-butler--configure-session dir))
+  ;; The one-shot floor, for the same reason as `cc-butler--ensure-pty-size'
+  ;; documents at its own call site in `cc-butler--launch-session': a restore
+  ;; after a restart brings every session back at once into whatever layout
+  ;; the frame happens to be in, before `cc-butler--configure-session's
+  ;; 0.5s-deferred hook install has even run.
   (cc-butler--ensure-pty-size dir)
   (cc-butler--wait-for-session-ready dir))
 
