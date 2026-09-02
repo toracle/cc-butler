@@ -1196,6 +1196,64 @@ regression than the bug it fixes."
     (should (null cc-butler--inbox))
     (should (= 2 (length cc-butler--inbox-drained)))))
 
+(ert-deftest cc-butler-orchestrator/forward-pending-count-ignores-ops-own-notification ()
+  "REGRESSION (found 2026-09-02, steward-reported false alarms at ~02:2x/
+03:42/05:41): `cc-butler--forward-pending-count' used to be the RAW
+`(length cc-butler--inbox)', so the ops session's own idle notification —
+pushed unfiltered by `cc-butler--queue-on-notification', same as the
+sibling test above — counted as 1 pending. `cc-butler--forward-backstop'
+fires exactly when ops just went idle, i.e. exactly when this self-event
+was just queued, so every backstop sweep saw count > 0 and woke ops with
+a false \"N worker events pending\" that `pending_events' then correctly
+found nothing to redeem — a self-sustaining false-alarm loop bounded only
+by `cc-butler-forward-backstop-interval' (default 3600s, matching the
+observed ~1-1.5h gaps). With only ops's own event queued, the count must
+be 0."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--butler "/ops/")
+        (cc-butler--steward nil)
+        (cc-butler--inbox
+         (list (list :time (current-time) :dir "/ops/" :name "ops"
+                     :body "Claude is waiting for your input"))))
+    (should (= 0 (cc-butler--forward-pending-count)))))
+
+(ert-deftest cc-butler-orchestrator/forward-pending-count-still-counts-real-events ()
+  "POSITIVE CONTROL for the fix above: a genuine worker event (a different
+`dir') must still be counted, or the fix would just be a check that
+always reports zero -- which would silence the backstop entirely rather
+than fixing what it wakes ops for. This is the same discriminating pair
+`tool-inbox-excludes-ops-own-notification' already exercises for the
+drain side; the count side needs its own copy since it used to compute
+this independently (that independence was the whole bug)."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--butler "/ops/")
+        (cc-butler--steward nil)
+        (cc-butler--inbox
+         (list (list :time (current-time) :dir "/ops/" :name "ops"
+                     :body "Claude is waiting for your input")
+               (list :time (current-time) :dir "/worker/" :name "worker"
+                     :body "needs input on auth"))))
+    ;; both entries present, but only the worker's counts
+    (should (= 1 (cc-butler--forward-pending-count)))))
+
+(ert-deftest cc-butler-orchestrator/forward-pending-count-and-tool-inbox-agree ()
+  "The actual defect class: two readers of `cc-butler--inbox' computing
+\"how many are pending\" independently and disagreeing. Assert them
+directly against each other, not just against a hand count -- this is
+the shape of guard that would have caught the original divergence."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--butler "/ops/")
+        (cc-butler--steward nil)
+        (cc-butler--inbox-drained nil)
+        (cc-butler--inbox
+         (list (list :time (current-time) :dir "/ops/" :name "ops"
+                     :body "Claude is waiting for your input")
+               (list :time (current-time) :dir "/worker/" :name "worker"
+                     :body "needs input on auth"))))
+    (let ((count (cc-butler--forward-pending-count)))
+      (cc-butler-tool-inbox)   ; drains and archives; count was taken first
+      (should (= count 1)))))
+
 (ert-deftest cc-butler-orchestrator/a-drain-archives-rather-than-discards ()
   "Emptying the queue must not mean losing its contents.  Delivery can still
 fail after the drain — the hook can be killed at its timeout, `jq' can be
