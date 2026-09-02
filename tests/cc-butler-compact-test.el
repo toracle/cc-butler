@@ -1525,6 +1525,32 @@ the guard check and the start call."
       (should (equal started '("/busy/"))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; cc-butler#125: --display-pct must never reconstruct a percentage from
+;;;; the stale `cc-butler-cleanup-context-window' constant.  Nil, not a
+;;;; guess, when the fresh statusline pct is unavailable.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/display-pct-returns-fresh-pct-when-available ()
+  "The positive control: when the statusline's own pct is available, it is
+returned unchanged."
+  (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+             (lambda (_d) (list :ctx 139538 :pct 14 :model "Opus-5"))))
+    (should (equal 14 (cc-butler-compact--display-pct "/d/")))))
+
+(ert-deftest cc-butler-compact/display-pct-nil-when-fresh-pct-unavailable ()
+  "cc-butler#125: when the fresh statusline pct is unknown, the function must
+return nil -- NOT reconstruct a percentage from ctx / `cc-butler-cleanup-
+context-window'.  That reconstruction used a stale ~200k constant against
+real ~1M windows and produced numbers roughly 5x too high (139538/200000 ~=
+70%% vs. the real 14%%)."
+  (let ((cc-butler-cleanup-context-window 200000))
+    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx nil :pct nil :model "Opus-5")))
+              ((symbol-function 'cc-butler-cleanup-context-for)
+               (lambda (_d) 139538)))
+      (should (null (cc-butler-compact--display-pct "/d/"))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; MCP tools
 ;;;; ------------------------------------------------------------------
 
