@@ -521,19 +521,14 @@ same number for text a caller reads."
 
 (defun cc-butler-compact--display-pct (dir)
   "DIR's best-known percentage of its context window used, or nil.
-Mirrors the exact hybrid signal `cc-butler-compact--over-threshold-p'
-gates on -- the statusline's own reported percentage first, falling back
-to CTX against `cc-butler-cleanup-context-window' -- so a number shown
-here is never out of step with what actually decided candidacy.  Nil,
-never a guess, when neither is known: an unknown size is not a number to
-display any more than it is a candidate to act on."
+The statusline's own freshly-read percentage, or nil when it is not
+currently known.  Deliberately does NOT reconstruct a percentage from CTX
+against `cc-butler-cleanup-context-window': that constant is a stale
+approximation of the true window size (see cc-butler#125) and dividing by
+it produced numbers several times too high.  Nil, never a guess: an
+unknown size is not a number to display."
   (let ((pct (plist-get (cc-butler-compact--statusline-fields-now dir) :pct)))
-    (if (integerp pct)
-        pct
-      (let ((ctx (cc-butler-cleanup-context-for dir)))
-        (and (integerp ctx)
-             (> cc-butler-cleanup-context-window 0)
-             (round (* 100 (/ (float ctx) cc-butler-cleanup-context-window))))))))
+    (and (integerp pct) pct)))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Pre-flight guards
