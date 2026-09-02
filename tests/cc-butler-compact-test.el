@@ -1364,60 +1364,87 @@ neither of us intended to answer, and idling (or forcing) never closes it."
 ;;;; ------------------------------------------------------------------
 
 ;;;; ------------------------------------------------------------------
-;;;; P3: percentage-first hybrid threshold
+;;;; P4: absolute-token threshold + severity tiers (2026-09-02)
+;;;;
+;;;; REGRESSION/REDESIGN: the gate used to be `cc-butler-compact-threshold-fraction'
+;;;; (60% of the model's context window), specifically so a large-window
+;;;; session well past a fixed 300k but still under 60% was NOT a candidate
+;;;; -- see the P3 tests this section replaced (git history). 정수님's call,
+;;;; 2026-09-02: that was too late in practice (600k on a ~1M window), and
+;;;; every current fleet session runs the same window size, so the
+;;;; window-relativity that motivated the fraction is no longer buying
+;;;; anything. The gate is `cc-butler-compact-threshold' (absolute, 300k)
+;;;; again; `cc-butler-compact-threshold-fraction' survives only for the
+;;;; informational PCT display. Two new absolute tiers,
+;;;; `cc-butler-compact-warning-threshold'/`-critical-threshold' (400k/700k),
+;;;; drive a purely visual escalation for a session that should have
+;;;; compacted at 300k and did not -- never a second gate.
 ;;;; ------------------------------------------------------------------
 
-(ert-deftest cc-butler-compact/over-threshold-37pct-not-flagged ()
-  "A session at 37%% of its window is NOT a candidate even when its absolute
-token count (371538) is well past the old 300k floor: the percentage is the
-honest signal across differently-sized windows."
-  (let ((cc-butler-compact-threshold-fraction 0.60))
-    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
-               (lambda (_d) (list :ctx 371538 :pct 37 :model "Opus-4.8"))))
+(ert-deftest cc-butler-compact/over-threshold-under-is-not-flagged ()
+  "Just under `cc-butler-compact-threshold' is not a candidate."
+  (let ((cc-butler-compact-threshold 300000))
+    (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 299999)))
       (should-not (cc-butler-compact--over-threshold-p "/d/")))))
 
-(ert-deftest cc-butler-compact/over-threshold-65pct-flagged ()
-  "At 65%% (>= the 0.60 fraction) the session is a candidate."
-  (let ((cc-butler-compact-threshold-fraction 0.60))
-    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
-               (lambda (_d) (list :ctx 130000 :pct 65 :model "Opus-4.8"))))
+(ert-deftest cc-butler-compact/over-threshold-at-boundary-is-flagged ()
+  "AT `cc-butler-compact-threshold' (not just past it) is a candidate --
+the gate is at/above, not strictly above."
+  (let ((cc-butler-compact-threshold 300000))
+    (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 300000)))
       (should (cc-butler-compact--over-threshold-p "/d/")))))
 
-(ert-deftest cc-butler-compact/over-threshold-falls-back-to-ctx-when-no-pct ()
-  "With no percentage on the statusline, fall back to CTX against the window:
-just over window*fraction is a candidate, just under is not."
-  (let ((cc-butler-compact-threshold-fraction 0.60)
-        (cc-butler-cleanup-context-window 200000))   ; * 0.60 = 120000
-    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
-               (lambda (_d) (list :ctx nil :pct nil :model "Opus-4.8"))))
-      (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 130000)))
-        (should (cc-butler-compact--over-threshold-p "/d/")))
-      (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 110000)))
-        (should-not (cc-butler-compact--over-threshold-p "/d/"))))))
+(ert-deftest cc-butler-compact/over-threshold-well-past-is-flagged ()
+  "371538 tokens -- well past 300k -- is a candidate. Direct inverse of the
+old fraction-based `over-threshold-37pct-not-flagged': that same absolute
+figure used to be EXCLUDED because it was only 37%% of a large window; the
+whole point of this redesign is that it is now INCLUDED."
+  (let ((cc-butler-compact-threshold 300000))
+    (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 371538)))
+      (should (cc-butler-compact--over-threshold-p "/d/")))))
 
-(ert-deftest cc-butler-compact/over-threshold-is-window-adaptive ()
-  "The SAME ctx yields opposite verdicts under different context windows —
-the point of a fraction rather than an absolute floor."
-  (let ((cc-butler-compact-threshold-fraction 0.60))
-    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
-               (lambda (_d) (list :ctx nil :pct nil :model "m")))
-              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 150000)))
-      (let ((cc-butler-cleanup-context-window 200000))   ; *0.6 = 120000 -> over
-        (should (cc-butler-compact--over-threshold-p "/d/")))
-      (let ((cc-butler-cleanup-context-window 300000))   ; *0.6 = 180000 -> under
-        (should-not (cc-butler-compact--over-threshold-p "/d/"))))))
+(ert-deftest cc-butler-compact/over-threshold-unknown-size-not-flagged ()
+  "An unknown context size is never a candidate -- honest absence, not a
+guess, same principle the old hybrid signal already upheld."
+  (let ((cc-butler-compact-threshold 300000))
+    (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) nil)))
+      (should-not (cc-butler-compact--over-threshold-p "/d/")))))
 
-(ert-deftest cc-butler-compact/candidates-use-percentage-not-absolute ()
-  "The sweep gate is the percentage: a session at 37%% is not swept even though
-its 371538 tokens exceed the old absolute 300k threshold (which would have
-listed it)."
-  (let ((cc-butler-compact-threshold-fraction 0.60)
-        (cc-butler-compact-threshold 300000))
+(ert-deftest cc-butler-compact/candidates-use-absolute-tokens ()
+  "The sweep gate is now the absolute figure: a session at 371538 tokens IS
+swept. Direct inverse of the old `candidates-use-percentage-not-absolute'."
+  (let ((cc-butler-compact-threshold 300000))
     (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () '((:dir "/d/"))))
-              ((symbol-function 'cc-butler-compact--statusline-fields-now)
-               (lambda (_d) (list :ctx 371538 :pct 37 :model "Opus-4.8")))
               ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 371538)))
-      (should (null (cc-butler-compact-candidates))))))
+      (should (equal '("/d/") (cc-butler-compact-candidates))))))
+
+(ert-deftest cc-butler-compact/severity-nil-under-warning ()
+  "Below the warning tier, severity is nil -- no escalation for an ordinary
+over-threshold-but-not-yet-swept session."
+  (let ((cc-butler-compact-warning-threshold 400000)
+        (cc-butler-compact-critical-threshold 700000))
+    (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 350000)))
+      (should (null (cc-butler-compact--severity-for "/d/"))))))
+
+(ert-deftest cc-butler-compact/severity-warning-at-boundary ()
+  "AT `cc-butler-compact-warning-threshold' is 'warning."
+  (let ((cc-butler-compact-warning-threshold 400000)
+        (cc-butler-compact-critical-threshold 700000))
+    (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 400000)))
+      (should (eq 'warning (cc-butler-compact--severity-for "/d/"))))))
+
+(ert-deftest cc-butler-compact/severity-critical-at-boundary ()
+  "AT `cc-butler-compact-critical-threshold' is 'critical, not 'warning --
+the higher tier must win, not just also match."
+  (let ((cc-butler-compact-warning-threshold 400000)
+        (cc-butler-compact-critical-threshold 700000))
+    (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 700000)))
+      (should (eq 'critical (cc-butler-compact--severity-for "/d/"))))))
+
+(ert-deftest cc-butler-compact/severity-unknown-size-is-nil ()
+  "An unknown context size is never a severity guess either."
+  (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) nil)))
+    (should (null (cc-butler-compact--severity-for "/d/")))))
 
 (ert-deftest cc-butler-compact/sweep-includes-butler-and-steward ()
   "The whole point: the butler and steward are candidates like anyone else.
@@ -1552,19 +1579,19 @@ blindly."
 ;;;; the stale flat `cc-butler-compact-threshold' it replaced
 ;;;; ------------------------------------------------------------------
 
-(ert-deftest cc-butler-compact/status-tool-footer-states-the-real-fraction-gate-not-the-stale-flat-constant ()
-  "Reproduces cc-butler#99: a session sitting at 37%% of a ~1M window
-\(369538 tokens\) is well under the real 60%% gate -- `--over-threshold-p'
-already gets this right and does not flag it -- but the footer used to
-print the stale flat `cc-butler-compact-threshold' (300k) regardless, a
-number this session's absolute token count sails past while nowhere near
-the real gate.  That is exactly the misreading that got a session
-compacted on 2026-08-25 under the false premise of \"over 300k\", when the
-real 60%%-of-window gate was not remotely close.  The footer must describe
-the real gate and must never print the flat constant as if it still
-means something."
+(ert-deftest cc-butler-compact/status-tool-footer-states-the-real-absolute-gate ()
+  "REDESIGN (2026-09-02) of the cc-butler#99 regression test this replaces:
+the lesson survives, the gate it is pinned to does not. cc-butler#99 was
+a footer printing a flat 300k constant while the REAL gate was a 60%%
+fraction nowhere close -- a displayed number drifting out of step with
+what actually gates. The gate is now `cc-butler-compact-threshold' (300k)
+again, genuinely -- so a session at 369538 tokens (well past it) MUST now
+flag OVER THRESHOLD, and the footer MUST state 300k, because that is what
+actually gated it. Printing anything else here would be the same
+cc-butler#99 failure mode in the opposite direction."
   (let ((cc-butler-compact-threshold 300000)
-        (cc-butler-compact-threshold-fraction 0.60))
+        (cc-butler-compact-warning-threshold 400000)
+        (cc-butler-compact-critical-threshold 700000))
     (cl-letf (((symbol-function 'cc-butler--sessions)
                (lambda () '((:dir "/d/"))))
               ((symbol-function 'cc-butler--display-name) (lambda (_d) "big-window-worker"))
@@ -1575,12 +1602,35 @@ means something."
               ((symbol-function 'cc-butler-compact--statusline-fields-now)
                (lambda (_d) (list :ctx 369538 :pct 37 :model "Opus-4.8"))))
       (let ((out (cc-butler-tool-session-status)))
-        ;; The real gate is correctly not tripped.
-        (should-not (string-match-p "OVER THRESHOLD" out))
-        ;; The footer must describe the real 60% gate...
-        (should (string-match-p "60%" out))
-        ;; ...and must never print the stale flat constant as a threshold.
-        (should-not (string-match-p "300k" out))))))
+        ;; The real (now absolute) gate correctly trips.
+        (should (string-match-p "OVER THRESHOLD" out))
+        ;; The footer must state the real gate that actually fired.
+        (should (string-match-p "300k" out))))))
+
+(ert-deftest cc-butler-compact/status-tool-marks-warning-and-critical-severity ()
+  "The COMPACTION column escalates WARNING/CRITICAL for a session over
+threshold and still uncompacted at 400k/700k -- the visual signal the
+400k/700k tiers exist for (a sweep that failed to catch it, e.g. an idle
+window that keeps getting reset)."
+  (let ((cc-butler-compact-threshold 300000)
+        (cc-butler-compact-warning-threshold 400000)
+        (cc-butler-compact-critical-threshold 700000))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () '((:dir "/warn/") (:dir "/crit/") (:dir "/ok/"))))
+              ((symbol-function 'cc-butler--display-name)
+               (lambda (d) (pcase d ("/warn/" "warn-worker") ("/crit/" "crit-worker") (_ "ok-worker"))))
+              ((symbol-function 'cc-butler-cleanup-context-for)
+               (lambda (d) (pcase d ("/warn/" 450000) ("/crit/" 740000) (_ 320000))))
+              ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
+              ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) "session is busy"))
+              ((symbol-function 'cc-butler-compact--statusline-fields-now) (lambda (_d) nil)))
+      (let ((out (cc-butler-tool-session-status)))
+        (should (string-match-p "warn-worker.*WARNING — OVER THRESHOLD" out))
+        (should (string-match-p "crit-worker.*CRITICAL — OVER THRESHOLD" out))
+        ;; 320000 is over the 300k gate but under both severity tiers -- no prefix.
+        (should (string-match-p "ok-worker.*OVER THRESHOLD" out))
+        (should-not (string-match-p "ok-worker.*WARNING\\|ok-worker.*CRITICAL" out))))))
 
 (ert-deftest cc-butler-compact/status-tool-pct-column-is-unknown-not-fabricated ()
   "When neither the statusline percentage nor a usable window is known, the
@@ -1657,18 +1707,14 @@ never a silent no-op that reads as success."
     (should (string-match-p "butler" (cc-butler-tool-compact-large-sessions)))))
 
 (ert-deftest cc-butler-compact/sweep-tool-nothing-started-states-the-real-gate ()
-  "cc-butler#99: the \"nothing started\" explanation must describe the real
-percentage gate, not the stale flat 300k constant that no longer gates
-anything -- reading the flat number here is what lets someone conclude a
-session must be under 300k when the real reason may be unrelated (busy,
-menu open) or the real gate is a different absolute figure entirely on a
-large-window model."
-  (let ((cc-butler-compact-threshold 300000)
-        (cc-butler-compact-threshold-fraction 0.60))
+  "REDESIGN of the cc-butler#99 regression test this replaces: the gate is
+`cc-butler-compact-threshold' (300k) again, genuinely, so the \"nothing
+started\" text correctly states 300k now -- it would be the cc-butler#99
+failure mode in reverse to keep hiding the real number here."
+  (let ((cc-butler-compact-threshold 300000))
     (cl-letf (((symbol-function 'cc-butler-compact-large-sessions) (lambda () nil)))
       (let ((out (cc-butler-tool-compact-large-sessions)))
-        (should (string-match-p "60%" out))
-        (should-not (string-match-p "300k" out))))))
+        (should (string-match-p "300k" out))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Fleet monitor: elisp reports, the steward decides
@@ -1721,17 +1767,16 @@ something that will never clear itself."
       (should (string-match-p "menu" (cc-butler-compact-fleet-summary))))))
 
 (ert-deftest cc-butler-compact/fleet-summary-states-the-real-gate-not-the-flat-constant ()
-  "cc-butler#99: the steward-facing ceiling report must describe the real
-60%% gate, not the stale flat 300k constant.  Set up the exact incident
-shape -- a large (~1M) window where the real gate (60% of window) sits far
-above the flat 300k figure -- so a report that still says \"over 300k\"
-would be actively misleading about why this session was flagged."
+  "REDESIGN of the cc-butler#99 regression test this replaces: the
+steward-facing ceiling report must describe whatever actually gated the
+list. The gate is `cc-butler-compact-threshold' (absolute, 300k) again,
+so the report correctly states 300k now — the cc-butler#99 lesson
+(never print a number divorced from what actually gates) is upheld by
+matching the header to the current real gate, not by avoiding 300k
+specifically."
   (cc-butler-compact-test--with-fleet '(("/b/" . 620000))
-    (let ((cc-butler-cleanup-context-window 1000000)  ; 60% of this is 600000
-          (cc-butler-compact-threshold-fraction 0.60))
-      (let ((out (cc-butler-compact-fleet-summary)))
-        (should (string-match-p "60%" out))
-        (should-not (string-match-p "300k" out))))))
+    (let ((out (cc-butler-compact-fleet-summary)))
+      (should (string-match-p "300k" out)))))
 
 (ert-deftest cc-butler-compact/monitor-notifies-and-queues ()
   "By default the steward is TOLD, not left to ask: the report is typed in

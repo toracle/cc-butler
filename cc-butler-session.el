@@ -733,12 +733,18 @@ where its block starts."
                                     (unless (string-empty-p forge) forge)))
                         "   "))
                  ;; Context-length feedback tag (e.g. "ctx 187k"), provided by
-                 ;; the cleaner module when loaded; highlighted once it crosses
-                 ;; the cleanup threshold so 200k candidates stand out.
+                 ;; the cleaner module when loaded.
                  (ctx (and (fboundp 'cc-butler-cleanup-context-tag)
                            (cc-butler-cleanup-context-tag sd)))
-                 (ctx-hot (and ctx (fboundp 'cc-butler-cleanup-context-over-threshold-p)
-                               (cc-butler-cleanup-context-over-threshold-p sd)))
+                 ;; Compaction-escalation severity (`cc-butler-compact--severity-for',
+                 ;; 400k/700k) — deliberately NOT `cc-butler-cleanup-context-over-threshold-p'
+                 ;; (200k, a different subsystem's cleanup-recommendation threshold
+                 ;; that this tag used to borrow only because they happened to
+                 ;; share a display slot). A session that should have compacted
+                 ;; at `cc-butler-compact-threshold' and did not gets 'warning/
+                 ;; 'critical here; anything else is the normal comment face.
+                 (ctx-severity (and ctx (fboundp 'cc-butler-compact--severity-for)
+                                    (cc-butler-compact--severity-for sd)))
                  ;; Which model the session is running (e.g. "Sonnet-5"),
                  ;; scraped from the same statusLine feed as `ctx'.
                  (model (and (fboundp 'cc-butler-cleanup-model-tag)
@@ -749,8 +755,11 @@ where its block starts."
                                        (and model
                                             (propertize model 'face 'font-lock-type-face))
                                        (and ctx
-                                            (propertize ctx 'face (if ctx-hot 'warning
-                                                                    'font-lock-comment-face)))))))
+                                            (propertize ctx 'face
+                                                        (pcase ctx-severity
+                                                          ('critical 'error)
+                                                          ('warning 'warning)
+                                                          (_ 'font-lock-comment-face))))))))
             (when segments
               (insert "   " (mapconcat #'identity segments "   ") "\n")))
           (insert "\n")
