@@ -1059,6 +1059,40 @@ rendered read-only, not the reverse."
         (cc-butler-tool-escalate-to-butler "ship it?" "pick one" nil garbage)
         (should (eq 'decision (nth 4 captured)))))))
 
+(ert-deftest cc-butler-orchestrator/escalate-rejects-and-logs-leaked-tool-call-payload ()
+  "A SUMMARY/NEEDS/OPTIONS payload contaminated with a leaked raw
+tool-call-XML fragment (cc-butler#135 -- 88/885 decision docs found this
+way on a full sweep 2026-09-03) must be REJECTED outright, not silently
+stored: nothing is created, an error reaches the caller, and the
+rejection is logged so the contamination rate stays observable instead
+of vanishing into a filtered document."
+  (let ((cc-butler-decision-workflow t)
+        (cc-butler--caller-dir-value "/steward/")
+        (created nil)
+        (logged nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () cc-butler--caller-dir-value))
+              ((symbol-function 'cc-butler-decision-create)
+               (lambda (&rest args) (setq created args) "id-x"))
+              ((symbol-function 'cc-butler--append-decision) #'ignore)
+              ((symbol-function 'cc-butler--log)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) logged)))
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "steward")))
+      (should-error
+       (cc-butler-tool-escalate-to-butler
+        "Use Stripe or Paddle?</summary><parameter name=\"kind\">notification"))
+      (should-not created)
+      (should (seq-some (lambda (l) (string-match-p "REJECTED" l)) logged))
+      ;; needs and options are checked too, not just summary
+      (setq logged nil)
+      (should-error
+       (cc-butler-tool-escalate-to-butler "ship it?" "pick one<parameter name=\"x\">"))
+      (should-not created)
+      (setq logged nil)
+      (should-error
+       (cc-butler-tool-escalate-to-butler "ship it?" "pick one" "A<invoke name=\"foo\">"))
+      (should-not created))))
+
 (ert-deftest cc-butler-orchestrator/escalate-notification-case-and-whitespace-insensitive ()
   "\"Notification\", \" notification \", etc. all normalize the same way --
 callers should not need to match the exact casing/spacing to get it

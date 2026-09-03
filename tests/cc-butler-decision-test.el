@@ -59,22 +59,6 @@ answer region, an Other line, and a routing footer."
     (should (string-match-p "Notification (read-only)" doc))
     (should-not (string-match-p (regexp-quote cc-butler--decision-answer-begin) doc))))
 
-(ert-deftest cc-butler-decision/render-strips-leaked-tool-call-xml ()
-  "A SUMMARY/NEEDS/option contaminated with a leaked raw tool-call-XML
-fragment (cc-butler#N, 88/885 decision docs found this way on a full
-sweep 2026-09-03) must not reach the rendered doc -- a downstream reader
-keying on body substrings instead of `:Kind:' could otherwise misread a
-live decision as an inert notification, as it nearly did."
-  (let ((doc (cc-butler--decision-doc-string
-              '(:id "x1" :kind decision :from "worker-a"
-                    :summary "Use Stripe or Paddle?</summary><parameter name=\"kind\">notification"
-                    :needs "pick one<parameter name=\"options\">A\nB</parameter>"
-                    :options ((:label "Stripe<invoke name=\"foo\">" :tradeoff "cheap</parameter>"))))))
-    (should-not (string-match-p "<parameter\\|</parameter>\\|<invoke\\|</invoke>" doc))
-    (should (string-match-p "Use Stripe or Paddle\\?" doc))
-    (should (string-match-p "Needs: pick one" doc))
-    (should (string-match-p "Stripe" doc))))
-
 ;;;; ---- parsing / integrity -----------------------------------------
 
 (ert-deftest cc-butler-decision/parse-selection-and-other ()
