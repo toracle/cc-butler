@@ -100,34 +100,6 @@ Then apply it live: `(load custom-file)', and re-arm with
 `(cc-butler--north-star-ensure-timer)' or just `M-x cc-butler-north-star-check'."
    :warning))
 
-(defvar cc-butler--north-star-last-sent-hash nil
-  "MD5 hash of `cc-butler-north-star-file' content as of the last
-successfully SENT nudge, or nil.
-
-nil deliberately means two different things at once, both resolved the
-same way: (a) fresh load/reload, no send has happened yet this Emacs
-session (this state is NOT persisted across reloads), and (b) not
-applicable, handled separately (see the file-absent case in
-`cc-butler--north-star-fire'). Either way, nil never compares equal to a
-real hash, so THE FIRST TICK AFTER EVERY (RE)ARM ALWAYS FIRES ONCE. This
-is a deliberate choice, not an accident of initializing to nil:
-
-An alternative was considered — eagerly seed this variable from the
-file's content at arm time (inside `cc-butler--north-star-ensure-timer'
-itself, which is already re-invoked after every hot reload) so a reload
-alone would never cost an extra send. That was rejected: it would treat
-\"content merely observed at arm time\" as if it had been sent, with
-no corresponding call to `cc-butler--send-input'. A real edit landing
-between that eager read and the next tick would then be silently
-swallowed — the exact failure shape requirement (1) above guards
-against, just relocated to reload time instead of send time. That risk
-was judged worse than the cost it would avoid.
-
-The accepted cost is therefore: at most one avoidable nudge per (re)arm
-event (module load, or a hot reload during development), a small,
-BOUNDED tax — a sharp improvement over the original bug (an unbounded
-avoidable nudge every single hour, forever, until manually cancelled).")
-
 (defconst cc-butler--north-star-template "\
 * 목표 이름
   :PROPERTIES:
@@ -178,26 +150,7 @@ north-star-macbook-m1-max.org처럼 서로 다른 fleet의 목표 파일이 나�
 원래 목표와 무관한 부수 작업(yak-shaving)에 머물러 있지는 않은지도 함께 점검할 것."
           cc-butler-north-star-file cc-butler--north-star-template))
 
-(defun cc-butler--north-star-file-hash ()
-  "MD5 of `cc-butler-north-star-file's current content, or nil if the
-file does not exist yet.
-
-Read exactly once per call, by design: the delta gate's decision and the
-post-send bookkeeping must both use the SAME hash value from the SAME
-read — never re-read-and-re-hash the file later (e.g. at a \"send
-succeeded\" point), or a real edit landing in the gap between the
-original read and that later point would be silently swallowed (the
-re-read would pick up the NEW content and get recorded as
-\"already sent\" even though it was never actually transmitted).
-`cc-butler--send-input' is synchronous here (no async success callback)
-so callers achieve this simply by calling this function once per tick
-and reusing the result — see `cc-butler--north-star-fire'."
-  (when (file-exists-p cc-butler-north-star-file)
-    (with-temp-buffer
-      (insert-file-contents cc-butler-north-star-file)
-      (md5 (buffer-string)))))
-
-(defun cc-butler--north-star-fire (&optional force)
+(defun cc-butler--north-star-fire ()
   "Nudge the butler to self-check active North Stars against their DoD.
 Mirrors `cc-butler--forward-backstop': only types into the butler's
 terminal when it looks idle (`cc-butler--forward-ops-free-p'), so an
@@ -205,26 +158,26 @@ hourly housekeeping ping cannot land mid-turn and scramble whatever the
 butler is actually doing.  Also refuses outright if `cc-butler-north-star-file'
 is still unnamespaced (see `cc-butler--north-star-file-namespaced-p') —
 this is the one gate that protects the manual `cc-butler-north-star-check'
-path too, since that command calls straight into this function rather
-than through `cc-butler--north-star-ensure-timer'.
+path too, since that command calls straight into this function.
 
-Also gated on content: skipped when `cc-butler-north-star-file's content
-is unchanged since the last successfully SENT nudge (see
-`cc-butler--north-star-last-sent-hash'), unless FORCE is non-nil — used
-by `cc-butler-north-star-check' so a human asking explicitly always gets
-an answer. When the file does not exist yet, the delta gate does not
-apply at all (there is nothing to diff against, and the file-absent
-nudge is itself the useful signal — see the prompt template's
-\"create it\" instructions) — this preserves the pre-existing
-unconditional-fire behavior for that case unchanged.
+No content gate: 정수님's own instruction is to self-check every hour,
+period. A prior version skipped the hourly nudge whenever the file's
+hash matched the last successfully sent one -- but this file records
+INTENT, not progress (see `north-star-file-holds-intent-not-progress'),
+so an unchanged file is not evidence that nothing worth checking
+happened; that gate silently zeroed the check's sensitivity to real
+worker progress that never touches this file at all (see governance's
+`a-change-detector-fails-two-ways-and-you-usually-only-test-one').
+Removed outright rather than extended with more detectors (new
+decision-mail or cross-session-message signals) -- the run-every-hour
+instruction is already fully satisfied by having no content gate, and
+the per-tick context cost is the butler's own to manage in the check
+prompt, not this function's problem to solve by filtering ticks.
 
-A tick skipped by the idle gate does NOT update the recorded hash: the
-same pending content is retried on the next tick.
-
-Returns `sent' on an actual send, `skipped-idle' or `skipped-delta' when
-gated, `skipped-unnamespaced' when the file path guard refuses, or nil
-when there is no live butler terminal at all (no butler designated, or
-its terminal buffer is gone)."
+Returns `sent' on an actual send, `skipped-idle' when gated,
+`skipped-unnamespaced' when the file path guard refuses, or nil when
+there is no live butler terminal at all (no butler designated, or its
+terminal buffer is gone)."
   (if (not (cc-butler--north-star-file-namespaced-p))
       (progn (cc-butler--north-star-warn-not-namespaced) 'skipped-unnamespaced)
     (when-let* ((butler cc-butler--butler)
@@ -232,26 +185,19 @@ its terminal buffer is gone)."
                 ((buffer-live-p buf)))
       (if (not (cc-butler--forward-ops-free-p butler))
           'skipped-idle
-        (let ((hash (cc-butler--north-star-file-hash)))
-          (if (and (not force) hash (equal hash cc-butler--north-star-last-sent-hash))
-              'skipped-delta
-            (cc-butler--send-input butler (cc-butler--north-star-prompt) t)
-            (when hash
-              (setq cc-butler--north-star-last-sent-hash hash))
-            'sent))))))
+        (cc-butler--send-input butler (cc-butler--north-star-prompt) t)
+        'sent))))
 
 ;;;###autoload
 (defun cc-butler-north-star-check ()
   "Nudge the butler to self-check active North Stars against their DoD
-right now, instead of waiting for the next scheduled tick.  Bypasses the
-content delta gate (a human asking explicitly always gets an answer) but
-still respects the idle gate the timer uses
-\(`cc-butler--forward-ops-free-p'\) — a human asking explicitly still
-should not get to type over the butler mid-turn.  Reports WHICH gate (if
-any) held it back, since a manual call deserves an answer, not the
-timer's silent no-op."
+right now, instead of waiting for the next scheduled tick.  Respects the
+same idle gate the timer uses (`cc-butler--forward-ops-free-p') — a
+human asking explicitly still should not get to type over the butler
+mid-turn.  Reports WHICH gate (if any) held it back, since a manual
+call deserves an answer, not the timer's silent no-op."
   (interactive)
-  (pcase (cc-butler--north-star-fire t)
+  (pcase (cc-butler--north-star-fire)
     ('sent (message "cc-butler: North Star check sent to the butler"))
     ('skipped-idle (message "cc-butler: North Star check skipped — the butler looks busy right now"))
     ('skipped-unnamespaced (message "cc-butler: North Star check skipped — cc-butler-north-star-file is unnamespaced, see *Warnings*"))
