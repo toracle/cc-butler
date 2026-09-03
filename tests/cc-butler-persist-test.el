@@ -168,5 +168,28 @@ handing back a false-ready session (cc-butler#8)."
       (cc-butler--resume-in "/tmp/some-resumed-worker/"))
     (should (equal waited-for (file-name-as-directory (expand-file-name "/tmp/some-resumed-worker/"))))))
 
+;;;; ---- restore batch survives one session's failure (2026-09-03) --------
+
+(ert-deftest cc-butler-persist/restore-sessions-isolates-per-session-errors ()
+  "One dead session erroring out of `cc-butler--resume-in' (e.g. a resume
+gate `cc-butler--wait-for-session-ready' does not recognize, timing out)
+must not abort the rest of the batch. Written against the pre-fix bare
+`dolist' this fails at 2/3 attempts — session B's error propagated out of
+the loop and C was never even tried (cc-butler#4/#5's root cause: today's
+crash-recovery lost 20 of 25 sessions to exactly this)."
+  (let* ((dirs (list "/tmp/restore-a/" "/tmp/restore-b/" "/tmp/restore-c/"))
+         (records (mapcar (lambda (d) (list :dir d :title "" :status "" :branch "" :butler nil)) dirs))
+         (attempted nil))
+    (cl-letf (((symbol-function 'cc-butler--load-roster) (lambda () records))
+              ((symbol-function 'cc-butler--dead-records) (lambda () records))
+              ((symbol-function 'cc-butler) #'ignore)
+              ((symbol-function 'cc-butler--resume-in)
+               (lambda (dir)
+                 (push dir attempted)
+                 (when (equal dir (cadr dirs))
+                   (error "simulated: stuck at resume gate")))))
+      (cc-butler-restore-sessions t))
+    (should (equal (nreverse attempted) dirs))))
+
 (provide 'cc-butler-persist-test)
 ;;; cc-butler-persist-test.el ends here
