@@ -349,7 +349,64 @@ the dir — `MEMORY.md' lives there too (cc-butler#36) and is not a note."
   (length (ignore-errors
             (directory-files (cc-butler-governance-memory-store) nil "\\`butler-.*\\.md\\'"))))
 
-(defun cc-butler-governance--render (slug description body type)
+(defconst cc-butler-governance--stamp-regexp "\\`(최초 기록: .+)\\'"
+  "A whole line that is a creation stamp.  Anchored to the WHOLE string, so it
+is applied to one line at a time and a line that merely quotes the shape
+mid-sentence cannot match it.")
+
+(defun cc-butler-governance--stamp-line (text)
+  "The creation stamp TEXT ends with, or nil.
+Only the LAST non-empty line can be a stamp.  A stamp-shaped line anywhere
+else is body text — someone quoting a stamp while writing ABOUT stamping —
+and treating it as this tool's own mark would promote a quotation into an
+attribution, which is the false attribution the whole design exists to
+avoid.  (Measured 2026-09-04: zero of the vault's 507 governance notes
+contain a line of this shape today, so this is a boundary being closed
+before it is crossed, not one already crossed.)"
+  (let ((last (car (last (split-string (string-trim-right (or text "")) "\n")))))
+    (when (and last (string-match-p cc-butler-governance--stamp-regexp last))
+      last)))
+
+(defun cc-butler-governance--existing-stamp (path)
+  "The creation stamp already in the note at PATH, or nil if it has none.
+The notes written before stamping existed have none, and must not gain one:
+whoever edits a legacy note today is not its first recorder."
+  (when (file-readable-p path)
+    (cc-butler-governance--stamp-line
+     (with-temp-buffer (insert-file-contents path) (buffer-string)))))
+
+(defun cc-butler-governance--strip-stamps (body)
+  "BODY with a trailing creation stamp removed, if it has one.
+Only a trailing stamp is removed, for the same reason only a trailing one is
+recognised: a stamp-shaped line elsewhere in BODY is the author's text and
+deleting it would be silent data loss."
+  (let* ((body (string-trim-right (or body "")))
+         (stamp (cc-butler-governance--stamp-line body)))
+    (string-trim
+     (if stamp (substring body 0 (- (length body) (length stamp))) body))))
+
+(defun cc-butler-governance--mint-stamp ()
+  "A creation stamp naming the calling session, or nil if it cannot be known.
+Written by the CODE from the MCP request's own session context, never by the
+calling model — the same reason `cc-butler--relay-attribution' is: asking a
+session to label itself is asking it to remember, and this cannot be
+forgotten.  The date comes from the machine clock, not from a model's belief
+about today, which is the one date in the vault that cannot drift.
+
+Deliberately weak and therefore always true: it claims only who STARTED the
+note, not who wrote any given sentence.  Per-change attribution would need a
+diff, and a line diff cannot tell a new block from a rewrite of someone
+else's paragraph — measured at 39.3% of authored edits, so it would misattribute
+about four edits in ten.  Nil when the session is unknown: no stamp beats a
+stamp that says `?'."
+  (let ((dir (and (fboundp 'cc-butler--caller-dir)
+                  (ignore-errors (cc-butler--caller-dir)))))
+    (when (and dir (fboundp 'cc-butler--who-dir))
+      (let ((who (ignore-errors (cc-butler--who-dir dir))))
+        (when (and (stringp who) (not (string-empty-p who)) (not (equal who "?")))
+          (format "(최초 기록: %s, %s)" who (format-time-string "%m-%d")))))))
+
+(defun cc-butler-governance--render (slug description body type &optional stamp)
   "The full file text for a principle, frontmatter included.
 Written here rather than by the caller so the schema cannot be got wrong —
 `name:' matching the generated note, the quoting of DESCRIPTION, and the
@@ -363,7 +420,9 @@ eventually get subtly wrong."
           "  node_type: memory\n"
           "  type: " (or type "feedback") "\n"
           "---\n\n"
-          (string-trim (or body "")) "\n"))
+          (cc-butler-governance--strip-stamps body)
+          "\n"
+          (if stamp (concat "\n" stamp "\n") "")))
 
 ;;;###autoload
 (defun cc-butler-governance-record (name description body &optional type)
@@ -386,7 +445,15 @@ source of truth."
       (user-error "Refusing to record an empty principle: %s" slug))
     (make-directory store t)
     (with-temp-file path
-      (insert (cc-butler-governance--render slug description body type)))
+      (insert (cc-butler-governance--render
+               slug description body type
+               ;; Minted only when the note is NEW.  `with-temp-file' truncates
+               ;; and the caller resubmits the whole body without ever having
+               ;; seen the stamp, so an update must read the old one back off
+               ;; disk or it is silently erased on the first edit.
+               (if existed
+                   (cc-butler-governance--existing-stamp path)
+                 (cc-butler-governance--mint-stamp)))))
     (cc-butler-governance-regenerate)
     (let* ((note (cc-butler-governance--memory-note slug))
            (verified (and (file-readable-p note)
