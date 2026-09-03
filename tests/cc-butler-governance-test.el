@@ -416,3 +416,131 @@ so this is report-only, never an auto-edit."
 
 (provide 'cc-butler-governance-test)
 ;;; cc-butler-governance-test.el ends here
+
+;;;; ------------------------------------------------------------------
+;;;; Creation stamps — who STARTED a note (never who wrote a sentence)
+;;;; ------------------------------------------------------------------
+
+(defmacro cc-butler-governance-test--as-session (label &rest body)
+  "Run BODY as if MCP session LABEL were the caller."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () "/tmp/fake-session"))
+             ((symbol-function 'cc-butler--who-dir) (lambda (_dir) ,label)))
+     ,@body))
+
+(defun cc-butler-governance-test--text (res)
+  (with-temp-buffer (insert-file-contents (plist-get res :path)) (buffer-string)))
+
+(ert-deftest cc-butler-governance/stamps-a-new-note-with-the-calling-session ()
+  "P1. A note that did not exist gets a creation stamp naming its caller."
+  (cc-butler-governance-test--with-store
+    (let ((text (cc-butler-governance-test--as-session "worker-a (sess-1)"
+                  (cc-butler-governance-test--text
+                   (cc-butler-governance-record "p" "d" "Body.")))))
+      (should (string-match-p "^(최초 기록: worker-a (sess-1), [0-9][0-9]-[0-9][0-9])$" text)))))
+
+(ert-deftest cc-butler-governance/an-update-keeps-the-original-creation-stamp ()
+  "P2. `with-temp-file' truncates and the caller resubmits a body it has never
+seen the stamp in, so an update must carry the ORIGINAL stamp forward — not
+mint a second one, and above all not silently erase the first."
+  (cc-butler-governance-test--with-store
+    (cc-butler-governance-test--as-session "worker-a (sess-1)"
+      (cc-butler-governance-record "p" "d" "First body."))
+    (let ((text (cc-butler-governance-test--as-session "worker-b (sess-2)"
+                  (cc-butler-governance-test--text
+                   (cc-butler-governance-record "p" "d" "Rewritten body.")))))
+      (should (string-match-p "Rewritten body\\." text))
+      (should (string-match-p "최초 기록: worker-a (sess-1)" text))
+      (should-not (string-match-p "worker-b" text)))))       ; the editor is not the recorder
+
+(ert-deftest cc-butler-governance/a-legacy-note-never-gains-a-stamp ()
+  "P3. The notes written before stamping existed have no first-recorder on
+record.  Whoever edits one today is not it — stamping them would be exactly
+the false attribution this design exists to avoid."
+  (cc-butler-governance-test--with-store
+    (let ((path (expand-file-name "p.md" (cc-butler-governance-store))))
+      (with-temp-file path (insert "---\nname: butler-p\n---\n\nLegacy body.\n"))
+      (let ((text (cc-butler-governance-test--as-session "worker-b (sess-2)"
+                    (cc-butler-governance-test--text
+                     (cc-butler-governance-record "p" "d" "Edited legacy body.")))))
+        (should (string-match-p "Edited legacy body\\." text))
+        (should-not (string-match-p "최초 기록" text))))))
+
+(ert-deftest cc-butler-governance/the-stamp-survives-regeneration ()
+  "P4. The memory note is a copy of the store file, so a stamp must round-trip."
+  (cc-butler-governance-test--with-store
+    (let* ((res (cc-butler-governance-test--as-session "worker-a (sess-1)"
+                  (cc-butler-governance-record "p" "d" "Body.")))
+           (note (plist-get res :verified)))
+      (should note)
+      (should (string-match-p
+               "최초 기록: worker-a (sess-1)"
+               (with-temp-buffer (insert-file-contents note) (buffer-string)))))))
+
+(ert-deftest cc-butler-governance/an-unknown-session-gets-no-stamp ()
+  "P5. Outside an MCP request there is no caller to name.  No stamp beats a
+stamp that says `?' — absence keeps people asking, a wrong answer stops them."
+  (cc-butler-governance-test--with-store
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () nil)))
+      (let ((text (cc-butler-governance-test--text
+                   (cc-butler-governance-record "p" "d" "Body."))))
+        (should (string-match-p "Body\\." text))
+        (should-not (string-match-p "최초 기록" text))))))
+
+(ert-deftest cc-butler-governance/a-stamp-pasted-into-the-body-is-not-duplicated ()
+  "A caller that copies the stamp back into BODY must not produce two."
+  (cc-butler-governance-test--with-store
+    (cc-butler-governance-test--as-session "worker-a (sess-1)"
+      (cc-butler-governance-record "p" "d" "Body."))
+    (let* ((text (cc-butler-governance-test--as-session "worker-b (sess-2)"
+                   (cc-butler-governance-test--text
+                    (cc-butler-governance-record
+                     "p" "d" "Body.\n\n(최초 기록: worker-a (sess-1), 01-01)"))))
+           (n 0) (start 0))
+      (while (string-match "최초 기록" text start)
+        (setq n (1+ n) start (match-end 0)))
+      (should (= n 1)))))
+
+(ert-deftest cc-butler-governance/a-quoted-stamp-in-the-body-is-not-promoted ()
+  "A note that WRITES ABOUT stamping quotes a stamp line.  Recognising the
+stamp anywhere in the file (rather than as the last line) promotes that
+quotation into an attribution — a legacy note would inherit a first recorder
+it never had, which is exactly the false attribution this design avoids."
+  (cc-butler-governance-test--with-store
+    (let ((path (expand-file-name "p.md" (cc-butler-governance-store)))
+          (quoting "About stamping.\n\n> (최초 기록: someone-else (sess-9), 01-01)\n\nEnd."))
+      (with-temp-file path
+        (insert "---\nname: butler-p\n---\n\n" quoting "\n"))
+      (let ((text (cc-butler-governance-test--as-session "worker-b (sess-2)"
+                    (cc-butler-governance-test--text
+                     (cc-butler-governance-record "p" "d" quoting)))))
+        (should (string-match-p "someone-else" text))          ; the quote survives
+        (should (string-match-p "^End\\.$" text))              ; and so does what follows
+        (should-not (string-match-p "worker-b" text))          ; no stamp minted for a legacy note
+        ;; the quoted line must not have become the note's own stamp
+        (should-not (cc-butler-governance--stamp-line text))))))
+
+(ert-deftest cc-butler-governance/a-quoted-stamp-is-never-stripped-from-the-body ()
+  "Stripping every stamp-shaped line, rather than only a trailing one, deletes
+the author's text silently.  Mutation guard: reverting --strip-stamps to
+`remove every matching line' must fail here."
+  (cc-butler-governance-test--with-store
+    (let* ((body "Intro.\n\n(최초 기록: quoted-example (sess-9), 01-01)\n\nOutro.")
+           (text (cc-butler-governance-test--as-session "worker-a (sess-1)"
+                   (cc-butler-governance-test--text
+                    (cc-butler-governance-record "p" "d" body)))))
+      (should (string-match-p "quoted-example" text))
+      (should (string-match-p "^Outro\\.$" text))
+      ;; and the note still gets its OWN stamp, appended after all of that
+      (should (string-match-p "최초 기록: worker-a (sess-1)"
+                              (or (cc-butler-governance--stamp-line text) ""))))))
+
+(ert-deftest cc-butler-governance/a-line-merely-containing-the-shape-is-not-a-stamp ()
+  "Mutation guard: unanchoring the stamp regexp makes a sentence that mentions
+a stamp read as one.  A stamp is a WHOLE line, never a substring."
+  (should-not (cc-butler-governance--stamp-line
+               "see (최초 기록: w (s), 01-01) above for the format"))
+  (should-not (cc-butler-governance--stamp-line
+               "prefix (최초 기록: w (s), 01-01)"))
+  (should (cc-butler-governance--stamp-line
+           "Body.\n\n(최초 기록: w (s), 01-01)")))
