@@ -256,6 +256,72 @@ be auto-accepted — only the exact folder-trust wording qualifies
           (should-not (cc-butler--trust-dialog-showing-p buf)))
       (kill-buffer buf))))
 
+;;;; ---- resume gate (cc-butler#4, 2026-09-03) --------------------------
+;;;; Claude Code's own `--continue' startup chooser, distinct from the
+;;;; folder-trust screen above. Unlike the trust dialog, the highlighted
+;;;; default here varies per session (confirmed live 2026-09-03), so
+;;;; detection must NOT require -- or assume anything about -- which
+;;;; option is highlighted.
+
+(defun cc-butler-session-test--insert-resume-gate (&optional highlight-as-is)
+  "Insert a synthetic resume-gate screen. With HIGHLIGHT-AS-IS non-nil,
+option 2 is the highlighted default instead of option 1 -- both are real,
+observed defaults (cc-butler#4)."
+  (insert "This session is 13h 25m old and 460.1k tokens\n")
+  (if highlight-as-is
+      (insert "  1. Resume from summary (recommended)\n❯ 2. Resume full session as-is\n  3. Don't ask me again\n")
+    (insert "❯ 1. Resume from summary (recommended)\n  2. Resume full session as-is\n  3. Don't ask me again\n")))
+
+(ert-deftest cc-butler-session/resume-gate-showing-p-detects-real-screen ()
+  "`cc-butler--resume-gate-showing-p' recognizes the resume-gate screen
+regardless of which option is highlighted."
+  (dolist (highlight-as-is '(nil t))
+    (let ((buf (get-buffer-create " *cc-butler-test-gate*")))
+      (unwind-protect
+          (progn
+            (with-current-buffer buf (cc-butler-session-test--insert-resume-gate highlight-as-is))
+            (should (cc-butler--resume-gate-showing-p buf)))
+        (kill-buffer buf)))))
+
+(ert-deftest cc-butler-session/resume-gate-showing-p-nil-on-normal-input-row ()
+  "Does not fire on an ordinary input row."
+  (let ((buf (get-buffer-create " *cc-butler-test-gate-2*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert (make-string 24 cc-butler--border-rule-char))
+            (insert "\n❯ \n")
+            (insert (make-string 24 cc-butler--border-rule-char)))
+          (should-not (cc-butler--resume-gate-showing-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/session-state-is-gate-when-gate-showing ()
+  "`cc-butler--session-state' reports `gate for a session parked at the
+resume gate even though its process is alive and `cc-butler--waiting-p'
+has no reason to be set -- the false-positive `running' report cc-butler#4
+is about (a 2026-07-21 mass restore reported \"16/16 recovered\" while 7
+sessions sat at this exact gate)."
+  (let ((buf (get-buffer-create " *cc-butler-test-gate-3*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (cc-butler-session-test--insert-resume-gate))
+          (let ((cc-butler--waiting (make-hash-table :test 'equal)))
+            (should (eq 'gate (cc-butler--session-state (list :dir "/worker/" :buffer buf))))))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/session-state-is-running-on-normal-input-row ()
+  "The common case: no gate, not waiting -> `running."
+  (let ((buf (get-buffer-create " *cc-butler-test-gate-4*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert (make-string 24 cc-butler--border-rule-char))
+            (insert "\n❯ \n")
+            (insert (make-string 24 cc-butler--border-rule-char)))
+          (let ((cc-butler--waiting (make-hash-table :test 'equal)))
+            (should (eq 'running (cc-butler--session-state (list :dir "/worker/" :buffer buf))))))
+      (kill-buffer buf))))
+
 (ert-deftest cc-butler-session/wait-for-ready-accepts-trust-dialog-then-proceeds ()
   "`cc-butler--wait-for-session-ready' recognizes the folder-trust screen,
 sends a bare Return to accept it (\"Yes, trust\" is pre-highlighted), and

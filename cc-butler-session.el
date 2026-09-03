@@ -243,6 +243,21 @@ current state read it from the screen or the transcript instead.")
   "Return the wait timestamp for DIR, or nil when it is not waiting."
   (gethash dir cc-butler--waiting))
 
+(defun cc-butler--session-state (s)
+  "Return `gate, `waiting, or `running for session plist S -- in that
+priority order.  A session parked at Claude Code's `--continue' startup
+resume gate (`cc-butler--resume-gate-showing-p') is not actually running
+even though its process is alive, and `cc-butler--waiting-p' can never
+catch it on its own: that flag is edge-triggered off a notification
+(`cc-butler--queue-on-notification') the gate never sends, so a gated
+session was reported plain \"running\" indefinitely (cc-butler#4 — a
+2026-07-21 mass restore reported \"16/16 recovered\" while 7 sessions sat
+at this exact gate)."
+  (let ((dir (plist-get s :dir)) (buf (plist-get s :buffer)))
+    (cond ((and buf (buffer-live-p buf) (cc-butler--resume-gate-showing-p buf)) 'gate)
+          ((cc-butler--waiting-p dir) 'waiting)
+          (t 'running))))
+
 (defun cc-butler--mark-waiting (dir)
   "Record that session DIR began awaiting user input (keep the earliest time)."
   (when (and dir (not (gethash dir cc-butler--waiting)))
@@ -1687,6 +1702,23 @@ one and auto-accepted (cc-butler#8)."
       (and (search-forward cc-butler--trust-dialog-marker nil t)
            (progn (goto-char (point-min))
                   (search-forward "❯ 1. Yes, I trust this folder" nil t))))))
+
+(defun cc-butler--resume-gate-showing-p (buf)
+  "Return non-nil if BUF's terminal currently shows Claude Code's
+`--continue' startup resume gate (\"Resume from summary\" vs \"Resume full
+session as-is\"). Both marker phrases are required, not just one -- and,
+unlike `cc-butler--trust-dialog-showing-p', this deliberately does NOT
+also require a specific option to be highlighted: confirmed live
+2026-09-03 across a 5-session sample that the pre-highlighted default
+varies per session (4 defaulted to \"Resume from summary\", 1 to \"Resume
+full session as-is\") -- so no caller may assume which numbered option is
+selected, or blindly send a fixed keystroke to answer this gate."
+  (with-current-buffer buf
+    (save-excursion
+      (goto-char (point-min))
+      (and (search-forward "1. Resume from summary" nil t)
+           (progn (goto-char (point-min))
+                  (search-forward "2. Resume full session as-is" nil t))))))
 
 (defun cc-butler--wait-for-session-ready (dir)
   "Block until DIR's session buffer shows a live input row (see
