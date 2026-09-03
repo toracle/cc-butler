@@ -131,8 +131,16 @@ Emacs just restarted) — must not error, just skip."
       (should (null (cc-butler-north-star-test--recorded-writes))))))
 
 ;;;; ------------------------------------------------------------------
-;;;; Delta gate: unconditional-resend bug (2026-08-27) and its fix
+;;;; No content gate: every idle tick fires, unconditionally
 ;;;; ------------------------------------------------------------------
+;;;; A delta gate here (2026-08-27 through #139's predecessor) skipped an
+;;;; hourly tick whenever the file's hash matched the last SENT one. That
+;;;; violated 정수님's own instruction ("매 1시간 스스로 물어라" -- self-check
+;;;; every hour, period) and, per `a-change-detector-fails-two-ways-and-
+;;;; you-usually-only-test-one', made the check insensitive to exactly the
+;;;; kind of progress that never touches this file. Removed outright
+;;;; (2026-09-04) rather than extended with more detectors -- see
+;;;; `cc-butler--north-star-fire''s docstring.
 
 (defmacro cc-butler-north-star-test--with-file (content &rest body)
   "Run BODY with a live idle stub terminal (see
@@ -141,8 +149,7 @@ Emacs just restarted) — must not error, just skip."
 \(or, when CONTENT is `:absent', to a path that does not exist\)."
   (declare (indent 1))
   `(cc-butler-north-star-test--with-stub-terminal
-     (let* ((cc-butler--north-star-last-sent-hash nil)
-            (path (make-temp-file "cc-butler-north-star-test-"))
+     (let* ((path (make-temp-file "cc-butler-north-star-test-"))
             (content ,content))
        (unwind-protect
            (progn
@@ -153,24 +160,28 @@ Emacs just restarted) — must not error, just skip."
                ,@body))
          (when (file-exists-p path) (delete-file path))))))
 
-(ert-deftest cc-butler-north-star/fire-skips-second-tick-with-no-content-delta ()
-  "THE BUG (2026-08-27): two ticks in a row with an UNCHANGED north-star
-file must not both send — the first tick establishes a baseline, the
-second must be gated out since nothing changed. Prior to the delta gate
-this failed: `cc-butler--north-star-fire' sent on every idle tick
-regardless of content, burning channel/context for nothing."
+(ert-deftest cc-butler-north-star/fire-sends-on-every-idle-tick-even-with-unchanged-content ()
+  "THE ACCEPTANCE CONDITION for removing the delta gate (2026-09-04): two
+ticks in a row on the AUTOMATIC path (`cc-butler--north-star-fire', no
+force argument -- what the hourly timer itself calls) with an UNCHANGED
+north-star file must BOTH send. Before this change the second tick
+returned `skipped-delta' and sent nothing -- 정수님's own instruction is
+to self-check every hour, period; an unchanged file is not evidence
+nothing worth checking happened, since this file records intent, not
+progress."
   (cc-butler-north-star-test--with-file "* goal one\n  :DOD: foo\n"
-    (cc-butler--north-star-fire)
-    (let ((writes-after-first (length (cc-butler-north-star-test--recorded-writes))))
-      (should (> writes-after-first 0))
-      (cc-butler--north-star-fire)
-      (should (= writes-after-first (length (cc-butler-north-star-test--recorded-writes)))))))
+    (should (eq 'sent (cc-butler--north-star-fire)))
+    (should (eq 'sent (cc-butler--north-star-fire)))
+    (should (= 2 (cl-count :return (cc-butler-north-star-test--recorded-writes)
+                            :key #'car)))))
 
 (ert-deftest cc-butler-north-star/fire-sends-again-when-content-genuinely-changes ()
-  "The reverse of the delta-gate test above, and the more important
-direction per the task owner: a fix that swallows real content changes
-along with the no-op case would be WORSE than the bug it fixes. Two
-ticks with genuinely DIFFERENT content between them must both send."
+  "Kept deliberately (not a delta-gate leftover): guards a DIFFERENT
+failure than the one above -- a future change that overcorrects and
+starts swallowing or debouncing genuinely new content, not just
+unchanged content. Two ticks with different content between them must
+both send; true with no content gate at all, and stays true if one is
+ever reintroduced correctly."
   (cc-butler-north-star-test--with-file "* goal one\n  :DOD: foo\n"
     (cc-butler--north-star-fire)
     (let ((writes-after-first (length (cc-butler-north-star-test--recorded-writes))))
@@ -180,56 +191,15 @@ ticks with genuinely DIFFERENT content between them must both send."
       (cc-butler--north-star-fire)
       (should (> (length (cc-butler-north-star-test--recorded-writes)) writes-after-first)))))
 
-(ert-deftest cc-butler-north-star/skipped-tick-does-not-record-hash ()
-  "A tick skipped by the IDLE gate must not update the recorded hash — the
-same pending content must still be considered unsent on the next tick
-\(requirement: record only on successful send\)."
-  (cc-butler-north-star-test--with-file "* goal one\n  :DOD: foo\n"
-    ;; Busy on the first tick: skipped by the idle gate, nothing recorded.
-    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
-               (lambda (_d) (float-time))))
-      (cc-butler--north-star-fire)
-      (should (null (cc-butler-north-star-test--recorded-writes))))
-    ;; Idle again (default): the still-pending content must now go out.
-    (cc-butler--north-star-fire)
-    (should (cl-some (lambda (w) (eq (car w) :string))
-                     (cc-butler-north-star-test--recorded-writes)))))
-
-(ert-deftest cc-butler-north-star/missing-file-always-fires-unchanged-behavior ()
-  "File-absent-on-first-run nudge behavior is intentional and unchanged by
-the delta gate: with no file to hash, every idle tick still fires (the
-delta gate does not apply — there is nothing to diff against, and the
-butler needs the repeated nudge to go create the file)."
+(ert-deftest cc-butler-north-star/missing-file-always-fires ()
+  "File-absent-on-first-run nudge behavior: with no file at all, every
+idle tick still fires -- the butler needs the repeated nudge to go
+investigate (see the prompt's stop-and-escalate instruction)."
   (cc-butler-north-star-test--with-file :absent
     (cc-butler--north-star-fire)
     (cc-butler--north-star-fire)
     (should (= 2 (cl-count :return (cc-butler-north-star-test--recorded-writes)
                             :key #'car)))))
-
-(ert-deftest cc-butler-north-star/check-command-bypasses-delta-gate ()
-  "The manual `cc-butler-north-star-check' command must bypass the delta
-gate (a human explicitly asking always gets an answer) while still
-respecting the idle gate."
-  (cc-butler-north-star-test--with-file "* goal one\n  :DOD: foo\n"
-    (cc-butler--north-star-fire) ; establish a baseline via the timer path
-    (let ((writes-after-first (length (cc-butler-north-star-test--recorded-writes))))
-      (should (> writes-after-first 0))
-      ;; Unchanged content — the automatic path would now skip.
-      (cc-butler-north-star-check)
-      (should (> (length (cc-butler-north-star-test--recorded-writes)) writes-after-first)))))
-
-(ert-deftest cc-butler-north-star/automatic-path-stays-silent-when-delta-gated ()
-  "The delta gate applies only to the AUTOMATIC (timer) path, and — like
-the pre-existing idle gate on that same path — is a silent no-op there,
-not a `message'. `cc-butler-north-star-check' bypasses the delta gate
-entirely (requirement: a human asking explicitly always gets an answer),
-so a delta-caused skip can only ever happen on the silent timer path."
-  (cc-butler-north-star-test--with-file "* goal one\n  :DOD: foo\n"
-    (cc-butler--north-star-fire) ; establish a baseline, idle butler
-    (let (msg)
-      (cl-letf (((symbol-function 'message) (lambda (fmt &rest args) (setq msg (apply #'format fmt args)))))
-        (cc-butler--north-star-fire)) ; unchanged content, timer path: gated, silent
-      (should (null msg)))))
 
 (ert-deftest cc-butler-north-star/check-command-distinguishes-busy-from-no-terminal ()
   "The manual command's skip message must say WHICH gate held it back:
