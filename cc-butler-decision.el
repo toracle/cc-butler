@@ -120,6 +120,22 @@ author (:origin, else :from) — never the last relayer; `Via' is the relay-path
      (if re (format ":Re: %s\n" re) "")
      ":END:\n")))
 
+(defun cc-butler--decision-sanitize (s)
+  "Truncate free-text S at the first leaked raw tool-call-XML marker, if any.
+cc-butler#N: callers occasionally pass a SUMMARY/NEEDS/option string that
+already contains a fragment of raw Anthropic tool-call markup (`<invoke
+...>', `<parameter name=\"...\">...'), apparently echoed rather than
+authored content -- what produces it is upstream of this renderer and
+unconfirmed. Stored verbatim, that fragment can fool a downstream reader
+keying on body substrings instead of the document's own `:Kind:' property
+(nearly closed 3 live decisions as inert notifications, 2026-09-03,
+88/885 decision docs found contaminated on full sweep). There is nothing
+genuine to recover past such a marker, so truncate rather than try to
+parse or repair it."
+  (if (and s (string-match "</?invoke\\b\\|</?parameter\\b" s))
+      (string-trim (substring s 0 (match-beginning 0)))
+    s))
+
 (defun cc-butler--decision-doc-string (msg)
   "Return the org document text rendering decision MSG.
 MSG: (:id :kind :from :reply-to :summary :needs :options).  `decision' kind is
@@ -127,9 +143,10 @@ answerable; `note'/`relay' render a read-only notification."
   (let* ((kind (or (plist-get msg :kind) 'decision))
          (id (or (plist-get msg :id) "?"))
          (to (or (plist-get msg :reply-to) (plist-get msg :from) "?"))
-         (summary (string-trim (or (plist-get msg :summary)
-                                   (plist-get msg :body) "")))
-         (needs (plist-get msg :needs))
+         (summary (cc-butler--decision-sanitize
+                   (string-trim (or (plist-get msg :summary)
+                                    (plist-get msg :body) ""))))
+         (needs (cc-butler--decision-sanitize (plist-get msg :needs)))
          (from (plist-get msg :from))
          (options (plist-get msg :options))
          (first (car (split-string summary "\n"))))
@@ -146,8 +163,9 @@ answerable; `note'/`relay' render a read-only notification."
               (dolist (o options)
                 (let ((tr (and (not (stringp o)) (plist-get o :tradeoff))))
                   (insert (format "  %c. %s%s\n" letter
-                                  (cc-butler--decision-option-label o)
-                                  (if tr (format " — %s" tr) "")))
+                                  (cc-butler--decision-sanitize
+                                   (cc-butler--decision-option-label o))
+                                  (if tr (format " — %s" (cc-butler--decision-sanitize tr)) "")))
                   (setq letter (1+ letter)))))
             (insert "\n" cc-butler--decision-answer-begin "\n")
             (let ((letter ?A))
