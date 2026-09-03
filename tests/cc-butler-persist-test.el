@@ -168,5 +168,54 @@ handing back a false-ready session (cc-butler#8)."
       (cc-butler--resume-in "/tmp/some-resumed-worker/"))
     (should (equal waited-for (file-name-as-directory (expand-file-name "/tmp/some-resumed-worker/"))))))
 
+;;;; ---- restore-sessions isolates one session's failure (2026-09-03) ------
+;;
+;; Regression coverage: this morning's fleet restore hit 24 dead records; the
+;; 2nd (`cc-butler-general' itself) signalled the `cc-butler--wait-for-
+;; session-ready' 5s timeout error, and because the `dolist' in
+;; `cc-butler-restore-sessions' had no per-iteration guard, that one error
+;; aborted the whole loop -- the other 22 were never even attempted.
+
+(ert-deftest cc-butler-persist/restore-sessions-isolates-one-failure ()
+  "A `cc-butler--resume-in' error on one dead record must not stop the rest
+from being resumed, and the failing one must be named in the report -- not
+silently swallowed. Calls `cc-butler-restore-sessions' itself (not the loop
+body in isolation), so the fix is exercised at the actual call site."
+  (let* ((tmpdir (file-name-as-directory (make-temp-file "cc-butler-persist-test" t)))
+         (cc-butler-roster-file (expand-file-name "roster.eld" tmpdir))
+         (dirs (list (expand-file-name "a/" tmpdir)
+                     (expand-file-name "b-slow/" tmpdir)
+                     (expand-file-name "c/" tmpdir)))
+         (cc-butler--butler nil)
+         attempted messages)
+    (unwind-protect
+        (progn
+          (dolist (d dirs) (make-directory d t))
+          (cl-letf (((symbol-function 'cc-butler--sessions)
+                     (lambda () nil))) ; all three are "dead" (none live)
+            (with-temp-file cc-butler-roster-file
+              (prin1 (list :saved (float-time)
+                            :sessions (mapcar (lambda (d) (list :dir d :title "" :status "" :branch ""))
+                                               dirs))
+                     (current-buffer))))
+          (cl-letf (((symbol-function 'cc-butler--resume-in)
+                     (lambda (dir)
+                       (push dir attempted)
+                       (when (equal dir (nth 1 dirs))
+                         (error "session did not show a live input row within 5s of launch"))))
+                    ((symbol-function 'cc-butler) #'ignore)
+                    ((symbol-function 'message)
+                     (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+            (cc-butler-restore-sessions t))
+          ;; ① resilience: all three were attempted despite the middle one erroring.
+          (should (= 3 (length attempted)))
+          (should (member (nth 0 dirs) attempted))
+          (should (member (nth 1 dirs) attempted))
+          (should (member (nth 2 dirs) attempted))
+          ;; ② reporting: the failing session is actually named, not a blank summary.
+          (should (seq-some (lambda (m) (string-match-p (regexp-quote (cc-butler--display-name (nth 1 dirs))) m))
+                             messages)))
+      (delete-directory tmpdir t))))
+
 (provide 'cc-butler-persist-test)
 ;;; cc-butler-persist-test.el ends here
