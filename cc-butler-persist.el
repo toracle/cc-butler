@@ -189,13 +189,22 @@ designation is restored too.  With FORCE (a prefix arg), skip the prompt."
           (yes-or-no-p (format "Resume %d recorded session(s) with `%s'? "
                                (length dead)
                                (mapconcat #'identity cc-butler-resume-args " "))))
-      (dolist (r dead)
-        (cc-butler--resume-in (plist-get r :dir))
-        (when (plist-get r :butler)
-          (setq cc-butler--butler
-                (file-name-as-directory (expand-file-name (plist-get r :dir))))))
-      (message "cc-butler: resuming %d session(s)…" (length dead))
-      (cc-butler)))))
+      (let (failed)
+        (dolist (r dead)
+          (condition-case err
+              (progn
+                (cc-butler--resume-in (plist-get r :dir))
+                (when (plist-get r :butler)
+                  (setq cc-butler--butler
+                        (file-name-as-directory (expand-file-name (plist-get r :dir))))))
+            (error (push (cons (plist-get r :dir) (error-message-string err)) failed))))
+        (cc-butler)
+        (if failed
+            (message "cc-butler: resumed %d/%d session(s); STUCK — %s"
+                     (- (length dead) (length failed)) (length dead)
+                     (mapconcat (lambda (f) (format "%s (%s)" (cc-butler--display-name (car f)) (cdr f)))
+                                (nreverse failed) ", "))
+          (message "cc-butler: resumed %d session(s)" (length dead))))))))
 
 (defun cc-butler--roster-hint (&rest _)
   "Note, on opening the manager, any recorded sessions that are not running."
