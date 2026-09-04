@@ -30,39 +30,15 @@
   (add-to-list 'load-path root)
   (require 'ert)
   ;; Isolate `cc-butler-ops-log-dir' from the real, live one for this whole
-  ;; batch run (cc-butler#137-class fix, 2026-09-04). Its default
-  ;; (`cc-butler-session.el') resolves to the developer's actual
-  ;; ~/.local/state/cc-butler/log/, and `cc-butler--log'/`cc-butler--log-message'
-  ;; are called from deep inside ordinary code paths this suite exercises
-  ;; (forward/backstop, inbox drain, escalate, ...) — so running the suite on
-  ;; a dev machine, outside a from-scratch CI container, wrote real ERT
-  ;; fixture lines (buffer names like *cc-butler-test-term*, placeholder dirs
-  ;; like /worker/, fixture bodies like "ship it?") straight into the live
-  ;; ops/msg logs. Measured before this fix: one full suite run added 29 ops
-  ;; lines + 14 msg lines to that day's real log files, all attributable to
-  ;; test fixtures. A handful of tests already redirect this var locally for
-  ;; their own log-file assertions (cc-butler-session-test.el,
-  ;; cc-butler-orchestrator-test.el, cc-butler-compact-test.el) — this `let'
-  ;; sits outside all of them and does not change their behavior; a `let'
-  ;; closer to point of use always wins over this one.
+  ;; batch run — its default is the developer's actual log dir, and
+  ;; ordinary code this suite exercises writes to it along the way.
   ;;
-  ;; `let', not `setq': the binding must be in place before any test file
-  ;; below is `require'd, and must last exactly as long as this process,
-  ;; which `ert-run-tests-batch-and-exit' terminates itself (via
-  ;; `kill-emacs') — a plain `setq' would need a matching restore that this
-  ;; function never returns to run.
-  ;;
-  ;; This file is `lexical-binding: t', and `cc-butler-session.el' (which
-  ;; `defcustom's this variable) has not loaded yet at this point — without
-  ;; declaring it special first, the `let' below would create a plain
-  ;; LEXICAL binding invisible to `cc-butler--log'/`cc-butler--log-message'
-  ;; (which reference it as a free, dynamically-scoped variable), and the
+  ;; The `defvar' must come first: this file is `lexical-binding: t' and
+  ;; the defcustom hasn't loaded yet, so without declaring the symbol
+  ;; special here, the `let' below would create a plain lexical binding —
+  ;; invisible to the dynamically-scoped code that logs to it — and the
   ;; later `defcustom' would then error trying to redeclare a
-  ;; still-in-scope lexical variable as dynamic ("Defining as dynamic an
-  ;; already lexical var"). The empty `defvar' marks it special with no
-  ;; value of its own, so the `let' dynamically binds it and the later
-  ;; `defcustom' — which never overrides an already-bound special variable
-  ;; — leaves this binding alone.
+  ;; still-in-scope lexical variable as dynamic.
   (defvar cc-butler-ops-log-dir)
   (let ((cc-butler-ops-log-dir
          (file-name-as-directory (make-temp-file "cc-butler-test-ops-log-" t))))

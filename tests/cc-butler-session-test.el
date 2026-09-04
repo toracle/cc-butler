@@ -1379,28 +1379,11 @@ to the SAME file in order — an append-only record, not one file per event."
                  (string-match (regexp-quote "cleanup") got))))))
 
 (ert-deftest cc-butler-session/ops-log-dir-is-not-the-real-default-during-a-test-run ()
-  "cc-butler#137-class fix, 2026-09-04: running the ERT suite must never
-write to the developer's real, live ops/msg log. `tests/run-tests.el'
-wraps the whole batch run in a `let' redirecting `cc-butler-ops-log-dir'
-to a throwaway temp directory -- this test proves that binding is
-actually active for tests running under it, rather than trusting the
-wrapper's presence in the source.
-
-Measured before this fix: one full suite run on a dev machine (outside a
-from-scratch CI container) added 29 lines to that day's real ops log and
-14 to its msg log, all attributable to ERT fixtures (buffer names like
-*cc-butler-test-term*, the placeholder dir /worker/, fixture bodies like
-\"ship it?\"). The individual tests in this file that already redirect
-`cc-butler-ops-log-dir' locally (`cc-butler-session-test--with-ops-log'
-and friends) protected THEMSELVES; nothing protected the ~550 other tests
-that call logging code incidentally along the way.
-
-Compares the CURRENT dynamic value against the defcustom's own recorded
-default expression (`standard-value') rather than hardcoding a path --
-this must differ under `run-tests.el', and must still equal the real
-default when this same assertion is imagined running standalone outside
-that wrapper (not tested here; that is what the wrapper's absence would
-look like, i.e. this test failing)."
+  "`tests/run-tests.el' redirects `cc-butler-ops-log-dir' away from the
+real live log for the whole batch run — proves that binding is actually
+active, not just present in the source. Compares against the defcustom's
+own `standard-value' rather than hardcoding a path, so it can't be
+silently defeated by a default-value change."
   (let ((real-default (eval (car (get 'cc-butler-ops-log-dir 'standard-value)) t)))
     (should-not (equal real-default cc-butler-ops-log-dir))))
 
