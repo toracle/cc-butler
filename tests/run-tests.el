@@ -29,11 +29,26 @@
   (add-to-list 'load-path here)
   (add-to-list 'load-path root)
   (require 'ert)
-  ;; `require' (not `load') so a test file already pulled in by a cross-test
-  ;; `require' (e.g. the shared mock/helpers) is not loaded — and redefined —
-  ;; a second time.
-  (dolist (f (sort (directory-files here t "-test\\.el\\'") #'string<))
-    (require (intern (file-name-base f)) f))
-  (ert-run-tests-batch-and-exit))
+  ;; Isolate `cc-butler-ops-log-dir' from the real, live one for this whole
+  ;; batch run — its default is the developer's actual log dir, and
+  ;; ordinary code this suite exercises writes to it along the way.
+  ;;
+  ;; The `defvar' must come first: this file is `lexical-binding: t' and
+  ;; the defcustom hasn't loaded yet, so without declaring the symbol
+  ;; special here, the `let' below would create a plain lexical binding —
+  ;; invisible to the dynamically-scoped code that logs to it — and the
+  ;; later `defcustom' would then error trying to redeclare a
+  ;; still-in-scope lexical variable as dynamic.
+  (defvar cc-butler-ops-log-dir)
+  (let ((cc-butler-ops-log-dir
+         (file-name-as-directory (make-temp-file "cc-butler-test-ops-log-" t))))
+    (add-hook 'kill-emacs-hook
+              (lambda () (ignore-errors (delete-directory cc-butler-ops-log-dir t))))
+    ;; `require' (not `load') so a test file already pulled in by a cross-test
+    ;; `require' (e.g. the shared mock/helpers) is not loaded — and
+    ;; redefined — a second time.
+    (dolist (f (sort (directory-files here t "-test\\.el\\'") #'string<))
+      (require (intern (file-name-base f)) f))
+    (ert-run-tests-batch-and-exit)))
 
 ;;; run-tests.el ends here

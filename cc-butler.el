@@ -41,6 +41,7 @@
 (require 'cc-butler-notifications)
 (require 'cc-butler-workspace)
 (require 'cc-butler-orchestrator)
+(require 'cc-butler-mcp-resilience)
 (require 'cc-butler-doc-panel)
 (require 'cc-butler-docs)
 (require 'cc-butler-persist)
@@ -52,6 +53,7 @@
 (require 'cc-butler-cleanup)
 (require 'cc-butler-compact)
 (require 'cc-butler-north-star)
+(require 'cc-butler-self-check)
 
 (require 'hydra)
 
@@ -68,7 +70,7 @@
   "
  _n_ext  _p_rev  _RET_ open  _SPC_ preview  _g_ refresh  _q_ quit
  _c_ new session   _N_ew topic   _K_ close topic   _h_ doctor   _l_og
- _B_utler   _S_teward   _b_ set butler   _i_nbox   _*_ north star check
+ _B_utler   _S_teward   _b_ set butler   _i_nbox   _*_ north star check   _!_ self-check
  doc panel:  _d_ toggle  _o_pen  _v_ reopen  _D_ remove
 "
   ("n" cc-butler-next)
@@ -86,6 +88,7 @@
   ("b" cc-butler-set-butler)
   ("i" cc-butler-inbox)
   ("*" cc-butler-north-star-check)
+  ("!" cc-butler-self-check)
   ("d" cc-butler-doc-toggle)
   ("o" cc-butler-doc-open)
   ("v" cc-butler-doc-reopen)
@@ -97,10 +100,11 @@
 
 (defconst cc-butler--modules
   '(cc-butler-session cc-butler-notifications cc-butler-workspace
-    cc-butler-orchestrator cc-butler-doc-panel cc-butler-docs cc-butler-persist
+    cc-butler-orchestrator cc-butler-mcp-resilience
+    cc-butler-doc-panel cc-butler-docs cc-butler-persist
     cc-butler-mail cc-butler-decision cc-butler-inbox cc-butler-governance
     cc-butler-provenance cc-butler-cleanup cc-butler-compact
-    cc-butler-north-star)
+    cc-butler-north-star cc-butler-self-check)
   "cc-butler modules, in dependency order.")
 
 (defconst cc-butler--dir
@@ -172,6 +176,85 @@ Callers must not read it as \"up to date\"."
         (when (eq 0 (ignore-errors (apply #'process-file "git" nil t nil args)))
           (let ((s (string-trim (buffer-string))))
             (unless (string-empty-p s) s)))))))
+
+(defun cc-butler--file-head-line (file &optional max)
+  "First non-blank-trimmed line of FILE (up to MAX bytes, default 512), or nil.
+A plain file read — no subprocess, nothing that can block on a lock."
+  (when (file-readable-p file)
+    (with-temp-buffer
+      (insert-file-contents file nil 0 (or max 512))
+      (goto-char (point-min))
+      (let ((line (string-trim (buffer-substring (point) (line-end-position)))))
+        (unless (string-empty-p line) line)))))
+
+(defun cc-butler--git-dir (dir)
+  "The git directory serving DIR, or nil.
+`.git' is usually a directory, but in a linked worktree or submodule it is a
+FILE containing \"gitdir: PATH\" — follow that one hop."
+  (let ((dotgit (expand-file-name ".git" dir)))
+    (cond
+     ((file-directory-p dotgit) dotgit)
+     ((file-regular-p dotgit)
+      (let ((line (cc-butler--file-head-line dotgit 4096)))
+        (when (and line (string-match "\\`gitdir:[ \t]*\\(.+\\)\\'" line))
+          (let ((target (expand-file-name (match-string 1 line)
+                                          (file-name-as-directory dir))))
+            (and (file-directory-p target) target))))))))
+
+(defun cc-butler--git-ref-hash (gitdir ref)
+  "Hash REF points to, from GITDIR's loose ref file or packed-refs, or nil.
+When GITDIR belongs to a linked worktree, refs live in the COMMON git dir —
+named by GITDIR's `commondir' file — not in GITDIR itself."
+  (let* ((commondir (expand-file-name "commondir" gitdir))
+         (common (or (and (file-regular-p commondir)
+                          (let ((rel (cc-butler--file-head-line commondir 4096)))
+                            (and rel (expand-file-name rel gitdir))))
+                     gitdir))
+         (loose (cc-butler--file-head-line (expand-file-name ref common))))
+    (if (and loose (string-match "\\`[0-9a-f]\\{40,\\}\\'" loose))
+        loose
+      (let ((packed (expand-file-name "packed-refs" common)))
+        (when (file-readable-p packed)
+          (with-temp-buffer
+            (insert-file-contents packed)
+            (goto-char (point-min))
+            (when (re-search-forward
+                   (concat "^\\([0-9a-f]\\{40,\\}\\)[ \t]+" (regexp-quote ref) "$")
+                   nil t)
+              (match-string 1))))))))
+
+(defun cc-butler--git-head (dir)
+  "Short description of DIR's git HEAD — \"abc1234 (main)\" — or nil.
+
+Read straight from the repository files (.git/HEAD, the loose ref,
+packed-refs) with plain file reads: NO subprocess, ever.  This runs inside a
+synchronous MCP tool handler on the daemon's single Lisp thread, where
+`shell-command-to-string' blocks in C with no timeout and `with-timeout'
+cannot interrupt it (timers cannot fire inside a blocked C call) — so a
+wedged .git/index.lock or a stalled filesystem would freeze every fleet
+session's terminal and every other MCP call at once.  Reading refs never
+takes the index lock and cannot wait on one.
+
+Nil means \"cannot determine\" — not a repo, unreadable, an odd state.
+Callers must degrade (drop the line, show nothing), never probe harder."
+  (ignore-errors
+    (let ((gitdir (cc-butler--git-dir dir)))
+      (when gitdir
+        (let ((head (cc-butler--file-head-line (expand-file-name "HEAD" gitdir))))
+          (cond
+           ((null head) nil)
+           ;; On a branch: HEAD is a symbolic ref.
+           ((string-match "\\`ref:[ \t]*\\(refs/[^ \t]+\\)\\'" head)
+            (let* ((ref (match-string 1 head))
+                   (hash (cc-butler--git-ref-hash gitdir ref)))
+              (when hash
+                (format "%s (%s)" (substring hash 0 7)
+                        (if (string-prefix-p "refs/heads/" ref)
+                            (substring ref (length "refs/heads/"))
+                          ref)))))
+           ;; Detached: HEAD is the hash itself (40 hex, or 64 under sha256).
+           ((string-match "\\`[0-9a-f]\\{40,\\}\\'" head)
+            (format "%s (detached)" (substring head 0 7)))))))))
 
 (defun cc-butler--source-revision (dir)
   "One-line description of the commit DIR is on, or nil if not determinable.
@@ -316,6 +399,141 @@ Returns a plist describing what happened, for `cc-butler-tool-reload-code'."
     (list :count (length cc-butler--modules) :dir dir :stale stale)))
 
 ;;;; ------------------------------------------------------------------
+;;;; What commit is the live daemon actually running, right now?
+;;;;
+;;;; `cc-butler-tool-reload-code' reports the source directory and git HEAD —
+;;;; but only in its own return value, at the moment it is explicitly called.
+;;;; A daemon restart (crash, OOM kill, systemd) re-runs init.el's `require'
+;;;; and silently reloads cc-butler from whatever this machine's mutable dev
+;;;; checkout happens to be sitting on at that instant.  Nobody necessarily
+;;;; calls reload after every restart, so that is invisible unless something
+;;;; asks.  This snapshots the answer once, at load/reload time, so it can be
+;;;; queried at any time afterward without shelling out per query.
+;;;; ------------------------------------------------------------------
+
+(defvar cc-butler--runtime-source-dir nil
+  "Directory cc-butler is actually running from, captured at load/reload
+time.  See `cc-butler--capture-runtime-source'.")
+
+(defvar cc-butler--runtime-commit-sha nil
+  "Full git SHA of `cc-butler--runtime-source-dir' HEAD as of the last
+load/reload, or nil if that directory is not a readable git checkout (or
+`git' is unavailable there).  Captured once per load — not re-derived per
+query — so a query never shells out; see `cc-butler--capture-runtime-source'.")
+
+(defvar cc-butler--runtime-commit-line nil
+  "`git log --oneline -1' description matching `cc-butler--runtime-commit-sha',
+or nil under the same conditions that leave that nil.")
+
+(defun cc-butler--capture-runtime-source ()
+  "Snapshot which commit cc-butler is loading from, right now.
+Called once at the bottom of this file, so it runs both on the initial
+`require' — the moment that matters most for a daemon restart, since
+init.el requires cc-butler fresh from whatever this machine's checkout
+happens to be on at that instant — and on every `cc-butler-reload' (which
+re-`load's this file first), so a deliberate hot-reload updates the answer
+instead of leaving it stale.  Leaves the vars nil on failure (not a git
+checkout, `git' missing) rather than signal, so a load can never fail
+because of this."
+  (setq cc-butler--runtime-source-dir (cc-butler-source-dir))
+  (setq cc-butler--runtime-commit-sha
+        (cc-butler--git cc-butler--runtime-source-dir "rev-parse" "HEAD"))
+  (setq cc-butler--runtime-commit-line
+        (cc-butler--source-revision cc-butler--runtime-source-dir)))
+
+(defun cc-butler--git-exit-code (dir &rest args)
+  "Run git ARGS in DIR; return its raw exit code, or nil if DIR is unusable.
+Unlike `cc-butler--git' (which folds every non-zero exit down to nil, for
+callers that only want stdout-on-success), some git subcommands use the
+exit code itself as the answer: `merge-base --is-ancestor' returns 0
+\(yes), 1 (no — a real, meaningful answer, not an error), or something else
+\(e.g. 128 for a ref git does not know about locally).  Callers that need to
+tell \"no\" apart from \"could not check\" must go through this, not
+`cc-butler--git'."
+  (when (file-directory-p dir)
+    (with-temp-buffer
+      (let ((default-directory (file-name-as-directory dir)))
+        (ignore-errors (apply #'process-file "git" nil t nil args))))))
+
+(defun cc-butler--commit-merged-p (dir sha)
+  "Whether SHA in DIR is an ancestor of DIR's locally known `origin/main'.
+Returns the symbol `merged', `unmerged', or `unknown' (a git error, SHA
+unknown to DIR, no `origin/main' remote-tracking ref there, etc — anything
+that is not a clean yes/no).
+
+Deliberately reads only already-fetched local remote-tracking state — does
+NOT fetch, so this stays instant and never blocks Emacs on the network.
+The tradeoff is the same one `cc-butler--source-behind' already documents:
+a stale local `origin/main' can only make this UNDER-report drift (answer
+`merged' or `unknown' when a fresh fetch would say `unmerged'), never the
+reverse.  That is a known, accepted limitation — fetching to close it would
+make this slow and network-dependent, which defeats the point."
+  (when (and dir sha)
+    (pcase (cc-butler--git-exit-code dir "merge-base" "--is-ancestor" sha "origin/main")
+      (0 'merged)
+      (1 'unmerged)
+      (_ 'unknown))))
+
+(cc-butler--capture-runtime-source)
+
+(defun cc-butler-runtime-source-oneline ()
+  "One-line `SHA-description — status' summary for embedding elsewhere (the
+dashboard).  Nil if the running commit is not determinable at all."
+  (when cc-butler--runtime-commit-sha
+    (format "%s — %s"
+            (or cc-butler--runtime-commit-line cc-butler--runtime-commit-sha)
+            (pcase (cc-butler--commit-merged-p cc-butler--runtime-source-dir
+                                                cc-butler--runtime-commit-sha)
+              ('merged "merged")
+              ('unmerged "⚠ UNMERGED")
+              (_ "ancestry unknown")))))
+
+(defun cc-butler-tool-runtime-source ()
+  "MCP tool: report the exact commit the LIVE daemon is running cc-butler
+from right now, and whether that commit is merged into `origin/main'.
+
+This is the standing answer to a question nothing else here answers except
+transiently: `reload_butler_code' only reports its source directory and
+HEAD in its own return string, at the moment someone explicitly calls it.
+A daemon restart (crash, OOM kill, systemd) re-runs init.el's `require' and
+silently reloads cc-butler from whatever this machine's mutable dev
+checkout happens to be sitting on at that instant — with no error, even
+when that is not the code anyone intended running.  This tool can be asked
+at any time afterward, cheaply, from the snapshot
+`cc-butler--capture-runtime-source' took at load/reload time — it does not
+shell out on every call.
+
+The merged/unmerged check compares against the LOCALLY known `origin/main'
+only (no network fetch — see `cc-butler--commit-merged-p'), so a stale
+remote-tracking ref can only hide real drift, never invent fake drift."
+  (let ((dir cc-butler--runtime-source-dir)
+        (sha cc-butler--runtime-commit-sha)
+        (line cc-butler--runtime-commit-line))
+    (if (not sha)
+        (format "Cannot determine the running commit: %s is not a readable git checkout, or `git' failed there."
+                (or dir "<unknown directory>"))
+      (concat
+       (format "Running cc-butler from: %s\nCommit: %s\n" dir (or line sha))
+       (pcase (cc-butler--commit-merged-p dir sha)
+         ('merged "Status: merged — this commit is reachable from origin/main.")
+         ('unmerged "⚠ UNMERGED — this commit is not reachable from origin/main. This is code that only ever lived on a branch (or was hot-loaded from one) and was never merged.")
+         (_ "Status: unknown — could not check ancestry against origin/main (no locally known origin/main ref, or a git error). This does NOT mean the commit is merged; it means the check could not run. Compared against whatever origin/main was last fetched locally — deliberately does not fetch, so this can be stale; that is a known, accepted limitation, not a bug."))))))
+
+;; Idempotent registration.
+(when (fboundp 'claude-code-ide-make-tool)
+  (setq claude-code-ide-mcp-server-tools
+        (seq-remove
+         (lambda (spec)
+           (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
+                   '("runtime_source")))
+         claude-code-ide-mcp-server-tools))
+  (claude-code-ide-make-tool
+   :function #'cc-butler-tool-runtime-source
+   :name "runtime_source"
+   :description "Report the exact git commit the LIVE daemon is running cc-butler from right now, and whether that commit is merged into origin/main (checked against locally-known state — no network fetch, so it is fast and never blocks). Answers a question nothing else answers except transiently: `reload_butler_code' only reports this in its own return value at the moment it is explicitly called, and a daemon restart (crash, OOM, systemd) silently reloads cc-butler from whatever a mutable dev checkout happens to be sitting on, with no error surfaced anywhere. Call this any time you need to verify what code is actually live — especially after suspecting a restart happened, or before trusting behavior that depends on recently-merged or recently-hot-loaded code."
+   :args nil))
+
+;;;; ------------------------------------------------------------------
 ;;;; MCP tool: hot-reload the control plane from disk
 ;;;; ------------------------------------------------------------------
 
@@ -330,14 +548,14 @@ a context, and nothing in this path is a substitute for it."
   (let* ((res (cc-butler-reload))
          (dir (plist-get res :dir))
          (stale (plist-get res :stale))
-         (head (string-trim
-                (or (ignore-errors
-                      (let ((default-directory dir))
-                        (shell-command-to-string "git log --oneline -1 2>/dev/null")))
-                    ""))))
+         ;; File reads only — `shell-command-to-string' here once put the
+         ;; whole daemon one wedged .git/index.lock away from a total freeze
+         ;; (single Lisp thread, no timeout, `with-timeout' can't interrupt
+         ;; a blocked C call).  See `cc-butler--git-head'.
+         (head (ignore-errors (cc-butler--git-head dir))))
     (concat
      (format "Reloaded %d cc-butler modules from %s" (plist-get res :count) dir)
-     (if (string-empty-p head) "" (format "\nSource is at: %s" head))
+     (if head (format "\nSource is at: %s" head) "")
      "\n\nThis loads whatever is ON DISK in that directory — it does not fetch. If you expected newer code, `git pull` there first and call this again. Note that directory is the one this Emacs actually loads from, which is not necessarily the checkout you have been editing."
      (if stale
          (format "\n\n⚠ STALE BYTE-CODE: %s are older than their .el source. Emacs prefers .elc on startup, so these will silently undo this reload the next time Emacs restarts. Delete them (or byte-recompile) in %s."

@@ -2,7 +2,7 @@
 
 ;;; Commentary:
 
-;; `governance/dod-vs-ultimate-goal.md' already states the discipline: when a
+;; `dod-vs-ultimate-goal' in the governance store already states the discipline: when a
 ;; session reports "done" or stalls out, judge it against its ULTIMATE goal,
 ;; not against how much effort went in — difficulty is not evidence of
 ;; completion.  Until now nothing made the butler actually apply that
@@ -21,9 +21,25 @@
 ;;; Code:
 
 (require 'cc-butler-orchestrator)
+(require 'cc-butler-governance)
+
+(defcustom cc-butler-fleet-name "x600"
+  "Identity of THIS cc-butler fleet, as opposed to some other fleet.
+The governance store (`cc-butler-governance-store') is shared across
+possibly-multiple cc-butler fleets — 정수님, 2026-08-13 — so anything
+fleet-specific must be namespaced by this rather than assuming the
+store is this fleet's alone.  Named per MACHINE/INSTANCE (this one is
+the Desk Mini X600), not per client project: an earlier \"monocle\"
+default was wrong for exactly the reason this variable exists — other
+fleets ALSO work on monocle, so a project name can't distinguish
+fleets; 정수님's own words, 2026-08-13, independently reaching the
+same conclusion this docstring already flagged."
+  :type 'string
+  :group 'cc-butler)
 
 (defcustom cc-butler-north-star-file
-  (expand-file-name "north-star.org" "~/projects/cc-butler-governance/")
+  (expand-file-name (format "north-star-%s.org" cc-butler-fleet-name)
+                     (cc-butler-governance-store))
   "Org file listing active goals and their Definition of Done.
 This default lives in the private governance store, not the public
 `toracle/cc-butler' checkout — goal descriptions routinely name real
@@ -50,6 +66,40 @@ actually uses; do not infer the running value from this default."
 (defvar cc-butler--north-star-timer nil
   "Repeating timer driving `cc-butler--north-star-fire', or nil before first use.")
 
+(defun cc-butler--north-star-file-namespaced-p (&optional file)
+  "Non-nil unless FILE (default `cc-butler-north-star-file') is still the
+generic, un-overridden basename \"north-star.org\" — the collision risk
+once `cc-butler-governance-dir' is a directory shared by more than one
+fleet. FILE lets `cc-butler-self-check--north-star-file' check an
+arbitrary path instead of only the currently configured one."
+  (not (equal (file-name-nondirectory (or file cc-butler-north-star-file))
+              "north-star.org")))
+
+(defun cc-butler--north-star-warn-not-namespaced ()
+  "Loudly warn that `cc-butler-north-star-file' needs a fleet-specific
+override, with the exact fix inline — a message that scrolls past in
+*Messages* is not enough for a misconfiguration this easy to miss, and
+the next person to hit this should not have to go spelunking for the fix."
+  (display-warning
+   'cc-butler-north-star
+   "cc-butler-north-star-file is still the generic \"north-star.org\" — refusing to run the North Star check.
+
+Set a fleet-specific override in THIS MACHINE's local custom.el (never
+committed anywhere — this is per-machine, not shared with other fleets):
+
+  (with-eval-after-load 'cc-butler-north-star
+    (setq cc-butler-north-star-file
+          (expand-file-name \"north-star-<your-fleet-id>.org\" cc-butler-governance-dir)))
+
+Convention: one file per machine/fleet, named after the machine — the two
+that already exist are north-star-macbook-m1-max.org and
+north-star-x600.org. Pick a similarly descriptive <your-fleet-id> for
+this machine.
+
+Then apply it live: `(load custom-file)', and re-arm with
+`(cc-butler--north-star-ensure-timer)' or just `M-x cc-butler-north-star-check'."
+   :warning))
+
 (defconst cc-butler--north-star-template "\
 * 목표 이름
   :PROPERTIES:
@@ -66,59 +116,108 @@ even on the very first run, before it has ever opened it.")
 
 (defun cc-butler--north-star-prompt ()
   "Build the nudge text sent to the butler's terminal.
-The template is always inlined, whether or not the file exists yet: on a
-missing file it is what the butler creates the first entry from (after
-asking 정수님 what the actual goal is — never guessing); on an existing
-file it is a standing reminder of the expected shape, since drift there
-is exactly the kind of thing nobody notices until the file is unusable."
+The template is always inlined, whether or not the file exists yet, but its
+role differs by case: on an existing file it is a standing reminder of the
+expected shape, since drift there is exactly the kind of thing nobody
+notices until the file is unusable. On a missing file the prompt does NOT
+tell the butler to create it — `cc-butler-governance-dir' is a directory
+shared across multiple fleets (e.g. `north-star-x600.org' and
+`north-star-macbook-m1-max.org' side by side), so a missing file almost
+always means `cc-butler-north-star-file' resolved to the wrong path, not
+that goals were never started; creating a new file there risks silently
+discarding another fleet's real goal history, or colliding with it
+outright. Instead the prompt tells the butler to stop and escalate to
+정수님 — never guessing, never fabricating a fresh file."
   (format "[North Star Check]
-%s 파일을 읽고 각 활성 목표를 점검할 것. 파일이 아직 없다면 아래 템플릿 형식으로
-새로 만들되, 실제 목표가 무엇인지 먼저 정수님께 물어볼 것 — 짐작으로 채우지 말 것.
+%s 파일을 읽고 각 활성 목표를 점검할 것. 파일이 없다면 새로 만들지 말고 즉시 멈출 것 —
+cc-butler-governance-dir는 여러 fleet이 함께 쓰는 저장소로, north-star-x600.org와
+north-star-macbook-m1-max.org처럼 서로 다른 fleet의 목표 파일이 나란히 존재한다.
+이런 상황에서 파일이 \"없다\"는 것은 대개 목표가 아직 없다는 뜻이 아니라 경로가
+잘못 설정되었다는 뜻이다. 여기서 새로 만들면 다른 fleet의 실제 목표/판단 이력을
+빈 파일로 조용히 덮어써 유실시키거나, 잘못된 경로가 다른 fleet의 디렉터리와 겹쳐
+그 fleet의 파일을 침범할 수 있다. escalate_to_butler로 정수님/steward에게 경로가
+잘못된 것 같다고 보고할 것 — 짐작으로 채우거나 새로 만들지 말 것.
 
-템플릿:
+아래 템플릿은 경로가 올바른 실제 파일이라면 각 항목이 어떤 모양이어야 하는지
+보여주는 참고 기준이지, 지금 새 파일을 만들라는 뜻이 아니다:
 %s
 
 각 활성 목표에 대해:
-1. 그 목표의 DoD가 실제로 충족되었는가? (\"어려움이 있었다\"는 완료의 증거가 아니다 — governance/dod-vs-ultimate-goal.md 기준 적용.)
+1. 그 목표의 DoD가 실제로 충족되었는가? (\"어려움이 있었다\"는 완료의 증거가 아니다 — governance store의 dod-vs-ultimate-goal 기준 적용.)
 2. 아직이라면 막힌 지점이 있는가? manager/enabler로서 시도할 수 있는 안전한 조치를 먼저 강구할 것.
 3. 판단이 불명확하면 escalate_to_butler로 정수님께 질문할 것 — 짐작으로 채우지 말 것.
+4. DoD가 충족된 목표는 이 파일에서 제거하고 완료 서사를 wb-para 프로젝트 노트로 아카이브할 것 — 진행 기록은 이 파일이 아니라 프로젝트 노트에 (governance: north-star-file-holds-intent-not-progress).
 원래 목표와 무관한 부수 작업(yak-shaving)에 머물러 있지는 않은지도 함께 점검할 것."
           cc-butler-north-star-file cc-butler--north-star-template))
 
 (defun cc-butler--north-star-fire ()
   "Nudge the butler to self-check active North Stars against their DoD.
 Mirrors `cc-butler--forward-backstop': only types into the butler's
-terminal when it looks idle (`cc-butler--forward-ops-free-p'), so a
+terminal when it looks idle (`cc-butler--forward-ops-free-p'), so an
 hourly housekeeping ping cannot land mid-turn and scramble whatever the
-butler is actually doing."
-  (when-let* ((butler cc-butler--butler)
-              (buf (get-buffer (claude-code-ide--get-buffer-name butler)))
-              ((buffer-live-p buf))
-              ((cc-butler--forward-ops-free-p butler)))
-    (cc-butler--send-input butler (cc-butler--north-star-prompt) t)))
+butler is actually doing.  Also refuses outright if `cc-butler-north-star-file'
+is still unnamespaced (see `cc-butler--north-star-file-namespaced-p') —
+this is the one gate that protects the manual `cc-butler-north-star-check'
+path too, since that command calls straight into this function.
+
+No content gate: 정수님's own instruction is to self-check every hour,
+period. A prior version skipped the hourly nudge whenever the file's
+hash matched the last successfully sent one -- but this file records
+INTENT, not progress (see `north-star-file-holds-intent-not-progress'),
+so an unchanged file is not evidence that nothing worth checking
+happened; that gate silently zeroed the check's sensitivity to real
+worker progress that never touches this file at all (see governance's
+`a-change-detector-fails-two-ways-and-you-usually-only-test-one').
+Removed outright rather than extended with more detectors (new
+decision-mail or cross-session-message signals) -- the run-every-hour
+instruction is already fully satisfied by having no content gate, and
+the per-tick context cost is the butler's own to manage in the check
+prompt, not this function's problem to solve by filtering ticks.
+
+Returns `sent' on an actual send, `skipped-idle' when gated,
+`skipped-unnamespaced' when the file path guard refuses, or nil when
+there is no live butler terminal at all (no butler designated, or its
+terminal buffer is gone)."
+  (if (not (cc-butler--north-star-file-namespaced-p))
+      (progn (cc-butler--north-star-warn-not-namespaced) 'skipped-unnamespaced)
+    (when-let* ((butler cc-butler--butler)
+                (buf (get-buffer (claude-code-ide--get-buffer-name butler)))
+                ((buffer-live-p buf)))
+      (if (not (cc-butler--forward-ops-free-p butler))
+          'skipped-idle
+        (cc-butler--send-input butler (cc-butler--north-star-prompt) t)
+        'sent))))
 
 ;;;###autoload
 (defun cc-butler-north-star-check ()
   "Nudge the butler to self-check active North Stars against their DoD
-right now, instead of waiting for the next scheduled tick.  Still
-respects the same idle gate the timer uses
-\(`cc-butler--forward-ops-free-p'\) — a human asking explicitly still
-should not get to type over the butler mid-turn — but reports why when
-that gate holds it back, since a manual call deserves an answer, not the
-timer's silent no-op."
+right now, instead of waiting for the next scheduled tick.  Respects the
+same idle gate the timer uses (`cc-butler--forward-ops-free-p') — a
+human asking explicitly still should not get to type over the butler
+mid-turn.  Reports WHICH gate (if any) held it back, since a manual
+call deserves an answer, not the timer's silent no-op."
   (interactive)
-  (if (cc-butler--north-star-fire)
-      (message "cc-butler: North Star check sent to the butler")
-    (message "cc-butler: North Star check skipped — no butler designated, its terminal isn't live, or it looks busy right now")))
+  (pcase (cc-butler--north-star-fire)
+    ('sent (message "cc-butler: North Star check sent to the butler"))
+    ('skipped-idle (message "cc-butler: North Star check skipped — the butler looks busy right now"))
+    ('skipped-unnamespaced (message "cc-butler: North Star check skipped — cc-butler-north-star-file is unnamespaced, see *Warnings*"))
+    (_ (message "cc-butler: North Star check skipped — no butler designated, or its terminal isn't live"))))
 
 (defun cc-butler--north-star-ensure-timer ()
-  "(Re)register the North Star timer; idempotent for hot reloads."
-  (when (timerp cc-butler--north-star-timer)
-    (cancel-timer cc-butler--north-star-timer))
-  (setq cc-butler--north-star-timer
-        (run-with-timer cc-butler-north-star-interval
-                         cc-butler-north-star-interval
-                         #'cc-butler--north-star-fire)))
+  "(Re)register the North Star timer; idempotent for hot reloads.
+Refuses to arm at all when `cc-butler-north-star-file' is still the
+generic \"north-star.org\" basename — see `cc-butler--north-star-warn-not-namespaced'
+for the fix.  A timer that would just fire into a permanent no-op is
+worse than no timer: it looks armed in `timer-list' while doing nothing,
+which is its own kind of silent failure."
+  (if (not (cc-butler--north-star-file-namespaced-p))
+      (cc-butler--north-star-warn-not-namespaced)
+    (when (timerp cc-butler--north-star-timer)
+      (cancel-timer cc-butler--north-star-timer))
+    (setq cc-butler--north-star-timer
+          (run-with-timer cc-butler-north-star-interval
+                           cc-butler-north-star-interval
+                           #'cc-butler--north-star-fire))))
 
 (cc-butler--north-star-ensure-timer)
 

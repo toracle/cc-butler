@@ -24,7 +24,7 @@ documents are not queued.  Faithful: assert the resulting data, not any call."
            '(:id "n1" :kind note :from "steward" :reply-to "steward" :summary "CI green"))
           (let ((items (cc-butler-inbox-items)))
             (should (= 2 (length items)))
-            (should (= 2 (cc-butler-inbox-count)))
+            (should (= 1 (cc-butler-inbox-count)))   ; decision only — the note is not answer-required
             (let ((d (seq-find (lambda (i) (eq 'decision (plist-get i :kind))) items))
                   (n (seq-find (lambda (i) (eq 'note (plist-get i :kind))) items)))
               (should d)

@@ -8,8 +8,8 @@
 ;; Compaction is a four-step terminal dance that no single prompt can perform:
 ;; switch the session to a cheap model, answer the "switch model?" confirmation
 ;; that Claude Code raises because switching discards the prompt cache, run
-;; `/compact', and put the original model back.  `governance/context-ceiling-
-;; and-compaction.md' is the standing rule; this file is its mechanism.
+;; `/compact', and put the original model back.  `context-ceiling-and-compaction'
+;; in the governance store is the standing rule; this file is its mechanism.
 ;;
 ;; It exists because an LLM cannot reliably drive it.  Each step needs a
 ;; *separate* submission (a multi-line body is pasted and submitted once, so
@@ -53,24 +53,48 @@
 ;;;; ------------------------------------------------------------------
 
 (defcustom cc-butler-compact-threshold 300000
-  "Input-token count above which a session is a compaction candidate.
-Read from the statusline `CTX:' marker via `cc-butler-cleanup-context-for'.
-Higher than `cc-butler-cleanup-context-threshold' on purpose: that one
-surfaces a worker for cleanup (externalize and tear down), this one is the
-cheaper in-place remedy that also applies to the butler itself."
+  "Absolute context tokens at/above which a session is a compaction candidate.
+The SOLE gate — see `cc-butler-compact--over-threshold-p'.
+
+RE-LIVE (2026-09-02, 정수님's direct call): this was retired 2026-08-25
+after a session got compacted under the false premise \"over 300k\" while
+the real gate was `cc-butler-compact-threshold-fraction' (60%% of window),
+nowhere close — see cc-butler#99. It is deliberately un-retired now,
+because 60%%-of-a-~1M-window (600k) was judged too late in practice, and
+because every current fleet session runs the same window size, so an
+absolute figure no longer mis-scales the way it did when this was first
+retired. The cc-butler#99 lesson still holds and is the reason this
+change matters: NEVER let a displayed number drift out of step with
+whatever actually gates — see `cc-butler-compact--over-threshold-p',
+which reads this variable directly, and the regression tests that assert
+displayed text matches it."
+  :type 'integer :group 'cc-butler)
+
+(defcustom cc-butler-compact-warning-threshold 400000
+  "Absolute context tokens above which a session that FAILED to compact gets
+an escalated visual WARNING — display only, never a second gate.
+
+Under normal operation a session compacts at `cc-butler-compact-threshold'
+\(300k\) and never reaches this. Reaching it means the sweep did not catch
+it (its idle window keeps getting reset by an incoming firehose, as
+happens to the steward) and the fleet operator needs to notice. See
+`cc-butler-compact--severity-for'."
+  :type 'integer :group 'cc-butler)
+
+(defcustom cc-butler-compact-critical-threshold 700000
+  "As `cc-butler-compact-warning-threshold', one tier further escalated.
+See `cc-butler-compact--severity-for'."
   :type 'integer :group 'cc-butler)
 
 (defcustom cc-butler-compact-threshold-fraction 0.60
-  "Fraction of the model context window at/above which a session is a compaction
-candidate.  The PREFERRED signal is the statusline's own used-percentage
-\(the `<pct>%' in CTX:<n> <pct>% MODEL:...); when that percentage is absent it
-falls back to CTX / `cc-butler-cleanup-context-window'.
+  "Fraction of the model context window used for the INFORMATIONAL percentage
+shown alongside a session's context figure (`cc-butler-compact--display-pct',
+`cc-butler-compact--threshold-pct') — never for gating.
 
-This is the primary gate, replacing the absolute `cc-butler-compact-threshold':
-an absolute token count mis-scales across models with different context windows
-— a large-window model at 37%% of its window is not a compaction candidate even
-though it is well past a fixed 300k — so the percentage is the honest signal.
-`cc-butler-compact-threshold' is kept for compatibility but no longer gates."
+Until 2026-09-02 this fraction was the sole compaction gate; the gate is
+now the absolute `cc-butler-compact-threshold' (see its docstring for
+why). This variable survives only to render a human-readable percentage
+next to the token figure; changing it affects no behavior."
   :type 'number :group 'cc-butler)
 
 (defcustom cc-butler-compact-model "sonnet"
@@ -192,11 +216,13 @@ signal that the prompt-cache confirmation is up and waiting for a choice."
          (cl-some (lambda (l) (string-match-p option l)) lines)
          t)))
 
-(defun cc-butler-compact--input-line (screen)
-  "Return text sitting in SCREEN's input box, or nil when it is empty.
+(defun cc-butler-compact--input-box-row (screen)
+  "Return the raw input-box row drawn on SCREEN, or nil when no box is drawn.
 The box is the non-rule line sandwiched between two rules; the last such
-sandwich wins, since scrollback can hold older boxes.  The `❯' prompt and
-its padding are stripped."
+sandwich wins, since scrollback can hold older boxes.  Presence and content
+are different questions: a screen with no box at all (still starting, just
+cleared, chrome scrolled away) is not the same finding as a box that is
+empty, and the restore gate needs the distinction."
   (let ((lines (split-string (or screen "") "\n"))
         found)
     (cl-loop for (a b c) on lines
@@ -205,9 +231,43 @@ its padding are stripped."
                        (cc-butler-compact--rule-p c)
                        (not (cc-butler-compact--rule-p b)))
              do (setq found b))
-    (when found
-      (let ((s (cc-butler-compact--strip found)))
-        (unless (string-empty-p s) s)))))
+    found))
+
+(defun cc-butler-compact--input-line (screen)
+  "Return text sitting in SCREEN's input box, or nil when it is empty.
+See `cc-butler-compact--input-box-row' for how the box is found.  The `❯'
+prompt and its padding are stripped."
+  (when-let ((found (cc-butler-compact--input-box-row screen)))
+    (let ((s (cc-butler-compact--strip found)))
+      (unless (string-empty-p s) s))))
+
+(defconst cc-butler-compact--busy-hint-regexp "esc to interrupt"
+  "The hint Claude Code paints on its spinner line while a turn is running.
+A running turn — `/compact' very much included — shows a live progress line
+\(\"✶ Compacting… (esc to interrupt)\") above the input box; once the turn
+ends the line is repainted in the past tense with the hint gone (see the
+idle fixture: \"✻ Brewed for 3m 25s\").  This is a WORDING anchor where
+`cc-butler-compact--menu-p' deliberately uses structure, because running and
+idle screens are structurally identical here: both draw the same empty input
+box and statusline, and the hint is the one element the CLI itself adds and
+removes with the turn.  It is CLI chrome (not model-authored text, so no
+locale/re-wording drift) — but chrome can still change across CLI versions,
+and the failure direction of a missed match is typing into a busy session,
+so the restore gate never trusts this alone: it also requires an input box
+and no menu, and the timeout backstop in
+`cc-butler-compact--poll-restore-wait' bounds the opposite miss.")
+
+(defun cc-butler-compact--busy-p (screen)
+  "Non-nil when SCREEN shows a turn in flight (the spinner's interrupt hint).
+Confined to the same live tail as `cc-butler-compact--menu-p', so an old
+hint sitting in scrollback — or prose that merely mentions it — does not
+read as busy forever."
+  (let* ((all (split-string (or screen "") "\n"))
+         (lines (last all (min (length all) cc-butler-compact-menu-lines))))
+    (and (cl-some (lambda (l)
+                    (string-match-p cc-butler-compact--busy-hint-regexp l))
+                  lines)
+         t)))
 
 (defun cc-butler-compact--typed-text (dir)
   "Return the text actually TYPED into DIR's input box, or nil if empty.
@@ -414,6 +474,31 @@ a session on the wrong one."
         (cc-butler--transcript-model dir)
         remembered)))
 
+(defun cc-butler-compact--model-for-status-line (dir)
+  "Return the model name to show in `session_status' for DIR, or nil if
+unknowable.
+
+Uses the same TTL-cached reader the sessions-list tag uses
+\(`cc-butler-cleanup-model-for'\), but gives it the transcript as a
+fallback source the way `cc-butler-compact--model-for-restore' does for
+the compaction driver.  This is what fixes a coordinator's OWN MODEL
+column going stale mid-turn: its own statusline is covered by the turn's
+progress indicator and structurally cannot be screen-scraped while it is
+running, so without a fallback the TTL cache would keep serving whatever
+was scraped before the turn started, indefinitely.
+
+When the returned name is merely the sticky last-known value — not a live
+scrape, not transcript-confirmed — it is visibly marked with a trailing
+`~' so a caller can tell a genuinely fresh answer apart from a guess, per
+the steward's explicit requirement.  This only happens at the same cadence
+the scrape itself runs at (once per TTL-refresh cycle), never once per
+call regardless of TTL."
+  (let ((name (cc-butler-cleanup-model-for dir #'cc-butler--transcript-model)))
+    (when (stringp name)
+      (if (cc-butler-cleanup-model-fresh-p dir)
+          name
+        (concat name "~")))))
+
 (defun cc-butler-compact--context-now (dir)
   "Read DIR's current context size, bypassing the TTL cache.  See above."
   (when (boundp 'cc-butler-cleanup--context-cache)
@@ -428,20 +513,47 @@ reads only this session's statusline, not an echo in scrollback."
     (cc-butler-cleanup--statusline-fields out)))
 
 (defun cc-butler-compact--over-threshold-p (dir)
-  "Non-nil when DIR is at/above the compaction threshold (hybrid signal).
-Prefers the statusline's own used-percentage (at/above
-`cc-butler-compact-threshold-fraction' of the window); when the percentage is
-absent, falls back to the context-token
-figure against `cc-butler-cleanup-context-window'.  Returns nil when neither is
-known — an unknown size is not a candidate (honest, never a guess)."
-  (let ((pct (plist-get (cc-butler-compact--statusline-fields-now dir) :pct))
-        (frac cc-butler-compact-threshold-fraction))
-    (if (integerp pct)
-        (>= pct (* 100 frac))
-      (let ((ctx (cc-butler-cleanup-context-for dir)))
-        (and (integerp ctx)
-             (> cc-butler-cleanup-context-window 0)
-             (> ctx (* cc-butler-cleanup-context-window frac)))))))
+  "Non-nil when DIR's context is at/above `cc-butler-compact-threshold'
+\(absolute tokens\). Returns nil when the size is unknown — an unknown size
+is not a candidate, never a guess.
+
+Was a statusline-percentage/`cc-butler-compact-threshold-fraction' hybrid
+until 2026-09-02; see `cc-butler-compact-threshold's docstring for why
+that changed. Absolute tokens no longer need the statusline's own live
+read to be honest, so this reads the cached `cc-butler-cleanup-context-for'
+directly, same accessor `cc-butler-compact--severity-for' below uses."
+  (let ((ctx (cc-butler-cleanup-context-for dir)))
+    (and (integerp ctx) (>= ctx cc-butler-compact-threshold))))
+
+(defun cc-butler-compact--severity-for (dir)
+  "Visual escalation tier for DIR's current context, or nil.
+'critical at/above `cc-butler-compact-critical-threshold', 'warning
+at/above `cc-butler-compact-warning-threshold', nil below both or when the
+size is unknown. Purely a display signal for a session that should have
+compacted at `cc-butler-compact-threshold' already and did not — it never
+gates compaction itself (see `cc-butler-compact--over-threshold-p')."
+  (let ((ctx (cc-butler-cleanup-context-for dir)))
+    (and (integerp ctx)
+         (cond ((>= ctx cc-butler-compact-critical-threshold) 'critical)
+               ((>= ctx cc-butler-compact-warning-threshold) 'warning)))))
+
+(defun cc-butler-compact--threshold-pct ()
+  "The compaction gate as a whole percentage, for display only.
+Never used for gating -- `cc-butler-compact--over-threshold-p' reads
+`cc-butler-compact-threshold-fraction' directly; this just formats the
+same number for text a caller reads."
+  (round (* 100 cc-butler-compact-threshold-fraction)))
+
+(defun cc-butler-compact--display-pct (dir)
+  "DIR's best-known percentage of its context window used, or nil.
+The statusline's own freshly-read percentage, or nil when it is not
+currently known.  Deliberately does NOT reconstruct a percentage from CTX
+against `cc-butler-cleanup-context-window': that constant is a stale
+approximation of the true window size (see cc-butler#125) and dividing by
+it produced numbers several times too high.  Nil, never a guess: an
+unknown size is not a number to display."
+  (let ((pct (plist-get (cc-butler-compact--statusline-fields-now dir) :pct)))
+    (and (integerp pct) pct)))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Pre-flight guards
@@ -501,21 +613,38 @@ stops a second compaction racing the same session.")
 (defvar cc-butler-compact--inhibit-timers nil
   "When non-nil, schedule no real timers (tests drive polls by hand).")
 
+(defun cc-butler-compact--timer-live-p (timer)
+  "Non-nil when TIMER still counts as \"a poll is scheduled to revisit this\".
+`t' is the placeholder `cc-butler-compact--schedule-poll' stores under
+`cc-butler-compact--inhibit-timers' (tests drive polls by hand), and must
+keep counting as live.  A real timer object must additionally still be
+PENDING (`timer-list'): a one-shot poll timer that has already fired stays
+recorded in the state plist as an object, and a fired timer whose callback
+died before re-arming is precisely the abandonment
+`cc-butler-compact--orphaned-p' exists to notice — treating the corpse as
+a live watcher made the reaper refuse exactly the entries that most
+needed reaping."
+  (or (eq timer t)
+      (and (timerp timer) (memq timer timer-list))))
+
 (defun cc-butler-compact--orphaned-p (dir st)
   "Non-nil when ST (DIR's in-flight compaction state) looks abandoned.
 Age alone is refused as a signal on purpose — it would happily reap a
 compaction that is genuinely still running (a very large context, a slow
-`/compact').  Requires ALL of: no `:timer' recorded (a poll is scheduled —
-real or, under `cc-butler-compact--inhibit-timers', its test placeholder —
-means the machine is still watching this entry and will conclude it on its
-own), old enough that a live compaction would long since have timed out,
+`/compact').  Requires ALL of: no LIVE `:timer' recorded (a still-pending
+timer — or, under `cc-butler-compact--inhibit-timers', its test
+placeholder — means the machine is still watching this entry and will
+conclude it on its own; a timer object that already fired without
+re-arming is a corpse, not a watcher — see
+`cc-butler-compact--timer-live-p'), old enough that a live compaction
+would long since have timed out,
 AND the terminal itself corroborates abandonment rather than being
 mid-dance — sitting at an ordinary idle waiting point with no menu open and
 nothing pending, which an actual in-flight switch/compact/restore would not
 be showing."
   (let ((sent (plist-get st :sent-time)))
     (and (numberp sent)
-         (not (plist-get st :timer))
+         (not (cc-butler-compact--timer-live-p (plist-get st :timer)))
          (> (- (float-time) sent) cc-butler-compact-state-max-age)
          (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
            (or (not (buffer-live-p buf))
@@ -834,23 +963,28 @@ seconds from now; `cc-butler-compact-cancel' calls it off."
     (if (and (cc-butler--waiting-p dir)
              (not (cc-butler-compact--blocked-reason dir)))
         (progn (cc-butler-compact-session dir) 'started)
-      (cc-butler-compact--queue-idle-poll dir deadline)
+      (cc-butler-compact--queue-idle-poll dir deadline (float-time))
       (cc-butler--log "compact: %s │ queued — waiting for a safe idle point" name)
       'queued)))
 
-(defun cc-butler-compact--queue-idle-poll (dir deadline)
+(defun cc-butler-compact--queue-idle-poll (dir deadline &optional queued-at)
   "Arrange the next idle check for DIR, giving up at DEADLINE.
-The queue entry is recorded whether or not a real timer is scheduled, so
-that `cc-butler-compact-waiting-p' and `cc-butler-compact-cancel' describe
+QUEUED-AT is when the compaction was first queued, carried along so the
+give-up report can say how long was actually waited.  The queue entry is
+recorded whether or not a real timer is scheduled, so that
+`cc-butler-compact-waiting-p' and `cc-butler-compact-cancel' describe
 the same state under test as in production."
   (puthash dir (or (unless cc-butler-compact--inhibit-timers
                      (run-with-timer cc-butler-compact-poll-interval nil
-                                     #'cc-butler-compact--idle-poll dir deadline))
+                                     #'cc-butler-compact--idle-poll dir deadline
+                                     queued-at))
                    t)                   ; queued, but driven by hand (tests)
            cc-butler-compact--pending))
 
-(defun cc-butler-compact--idle-poll (dir deadline)
-  "One idle-wait tick: start the compaction once DIR is safely idle."
+(defun cc-butler-compact--idle-poll (dir deadline &optional queued-at)
+  "One idle-wait tick: start the compaction once DIR is safely idle.
+QUEUED-AT is when the compaction was first queued (see
+`cc-butler-compact--queue-idle-poll')."
   (remhash dir cc-butler-compact--pending)
   (let ((name (cc-butler--display-name dir)))
     (cond
@@ -858,7 +992,14 @@ the same state under test as in production."
       (cc-butler--log "compact: %s │ session vanished while queued" name))
      ((> (float-time) deadline)
       (cc-butler--log "compact: %s │ gave up waiting for idle (nothing typed)" name)
-      (message "cc-butler compact: %s — gave up waiting for a safe idle point" name))
+      (message "cc-butler compact: %s — gave up waiting for a safe idle point" name)
+      ;; The log line above is evidence; it is not DELIVERY.  A queued
+      ;; compaction is a promise to whoever requested it, and a promise
+      ;; that evaporates with only a log line is a silent failure — on
+      ;; 2026-08-24 two queued compactions (285k and 291k) gave up and
+      ;; nobody learned of it until a human read the ops file.  Tell the
+      ;; ops session through the same channel the fleet monitor uses.
+      (cc-butler-compact--report-give-up dir name queued-at))
      (t
       ;; The queue entry was already dropped above, so anything that throws
       ;; between there and the re-queue below loses the compaction outright —
@@ -874,7 +1015,7 @@ the same state under test as in production."
                     "could not determine whether it is safe"))))
         (if why
             ;; Still busy, or something new is in the way; keep waiting.
-            (cc-butler-compact--queue-idle-poll dir deadline)
+            (cc-butler-compact--queue-idle-poll dir deadline queued-at)
           (condition-case err
               (cc-butler-compact-session dir)
             (error (cc-butler--log "compact: %s │ queued start failed: %s" name
@@ -946,19 +1087,39 @@ because those do not resolve on their own the way busy does."
       (message "cc-butler compact: %s — started (ctx %s)" name (or ctx "?")))))
 
 (defun cc-butler-compact--poll (dir)
-  "One poll tick: answer a modal, advance a phase, or time out."
+  "One poll tick: answer a modal, advance a phase, or time out.
+
+The dispatch is guarded as a whole: this runs as a ONE-SHOT timer
+callback, and the phase handlers read the terminal through paths that can
+signal (`cc-butler--read-output''s `cc-butler-session-io-timeout' bound,
+a window borrow refused, a vanished buffer racing the check above).  An
+error escaping a timer callback is merely logged by Emacs and the timer
+is already spent — nothing ever re-arms, so before this guard the state
+entry survived with its fired timer still recorded in `:timer', which
+also defeated `cc-butler-compact--orphaned-p''s lazy reaping (a dead
+timer object is truthy).  The session then read as \"compaction already
+in flight\" forever — until an operator found `cc-butler-compact-reset'
+or restarted Emacs.  Same shape as cc-butler#18, one layer up: there the
+SEND could throw and strand the lock; here the READS can.  Conclude
+through `cc-butler-compact--finish' like every other give-up path, so
+the lock always releases and the failure reaches the log."
   (when-let ((st (gethash dir cc-butler-compact--state)))
     (let ((phase (plist-get st :phase))
           (sent (plist-get st :sent-time)))
-      (cond
-       ((not (get-buffer (claude-code-ide--get-buffer-name dir)))
-        (cc-butler-compact--finish dir "session vanished mid-compaction — aborted"))
-       ((eq phase 'switching)   (cc-butler-compact--poll-switch dir st sent))
-       ((eq phase 'compacting)  (cc-butler-compact--poll-compact dir st sent))
-       ((eq phase 'restore-wait)
-        (cc-butler-compact--poll-restore-wait dir st sent))
-       ((eq phase 'restoring)   (cc-butler-compact--poll-restore dir st sent))
-       (t (cc-butler-compact--finish dir "unknown phase %S — stopped" phase))))))
+      (condition-case err
+          (cond
+           ((not (get-buffer (claude-code-ide--get-buffer-name dir)))
+            (cc-butler-compact--finish dir "session vanished mid-compaction — aborted"))
+           ((eq phase 'switching)   (cc-butler-compact--poll-switch dir st sent))
+           ((eq phase 'compacting)  (cc-butler-compact--poll-compact dir st sent))
+           ((eq phase 'restore-wait)
+            (cc-butler-compact--poll-restore-wait dir st sent))
+           ((eq phase 'restoring)   (cc-butler-compact--poll-restore dir st sent))
+           (t (cc-butler-compact--finish dir "unknown phase %S — stopped" phase)))
+        (error
+         (cc-butler-compact--finish
+          dir "poll failed while %S (%s) — stopped, lock released"
+          phase (error-message-string err)))))))
 
 (defun cc-butler-compact--poll-switch (dir st sent)
   "Wait for the switch to `cc-butler-compact-model', answering the modal."
@@ -1046,8 +1207,47 @@ for the same reason (cc-butler#18): a throw after the lock is (re)set to
             arg (error-message-string err)))))
     (cc-butler-compact--step dir 'restoring (format "/model %s" arg))))
 
+(defun cc-butler-compact--restore-block-reason (dir st)
+  "Return why the restore must NOT be typed into DIR right now, or nil if idle.
+
+This is the restore gate, and it reads the SCREEN — deliberately not
+`cc-butler--waiting-p'.  That flag is edge-triggered (set only when a
+session posts a notification) with no reconciliation, so it fails this
+caller in BOTH directions: a missed edge leaves it nil forever and the
+restore strands on the timeout (\"compacted but model NOT restored\" —
+observed five-plus times in the ledger, three of six compactions on the
+night of 2026-08-11), while a session parked waiting since before the
+compaction reads t THROUGHOUT the compaction — the driver's own typing
+never clears it — so the gate waves the restore through even while
+`/compact' is still visibly running, which is exactly the 2026-07-23
+freeze this hold exists to prevent.
+
+Idle is judged POSITIVELY from what is painted right now: the screen must
+be readable, show no in-flight turn (`cc-butler-compact--busy-p' — the one
+signal that separates a running `/compact' from an idle prompt, since both
+draw the same empty input box), show no open menu, have an input box drawn
+at all, and hold no unsubmitted text that is not this driver's own restore
+command (our own typed-but-unsubmitted `/model' must pass — resubmitting it
+is precisely how `cc-butler-compact--send-restore' recovers a lost Return).
+An unreadable screen is \"not yet\", never \"go\", for the same reason as
+`cc-butler-compact--menu-block-reason': the cost of holding is another
+poll; the cost of typing into an unseen state is the freeze."
+  (let ((screen (cc-butler--read-output dir 40)))
+    (cond
+     ((null screen)
+      "the screen could not be read — refusing to type into an unseen state")
+     ((cc-butler-compact--busy-p screen)
+      "a turn is still in flight — the interrupt hint is on screen")
+     ((cc-butler-compact--menu-p screen)
+      "an interactive menu/wizard is open")
+     ((not (cc-butler-compact--input-box-row screen))
+      "no input box is drawn on the screen")
+     ((and (cc-butler-compact--pending-input-p dir)
+           (not (cc-butler-compact--own-input dir st)))
+      "operator input is sitting unsubmitted in the box"))))
+
 (defun cc-butler-compact--poll-restore-wait (dir st sent)
-  "Hold the model restore until DIR is idle, then send it.
+  "Hold the model restore until DIR's screen shows it idle, then send it.
 
 `/compact' can still be running when the compact phase stops watching, and
 typing `/model' into a session that is mid-work is what caused the
@@ -1056,21 +1256,32 @@ confirmation modal appeared long after the restore step's own timeout had
 fired and stopped polling.  Nothing was left watching, and the session sat
 on an unanswered dialog for two and a half hours.
 
-Sending only from a waiting point keeps the modal inside the window that is
-actually being watched.  The wait is bounded by `cc-butler-compact-timeout'
-and answers any modal that is already up while it waits."
-  (let ((arg (plist-get st :orig-arg)))
+Sending only from an observed-idle screen keeps the modal inside the window
+that is actually being watched.  Idleness is read directly off the terminal
+by `cc-butler-compact--restore-block-reason' — see there for why the
+`cc-butler--waiting-p' flag this used to consult is wrong in both
+directions.  The wait is bounded by `cc-butler-compact-timeout' and answers
+any modal that is already up while it waits."
+  (let ((arg (plist-get st :orig-arg))
+        (why (cc-butler-compact--restore-block-reason dir st)))
     (cond
      ((cc-butler-compact--answer-modal dir st "pre-restore")
       (cc-butler-compact--schedule-poll dir))
-     ((cc-butler--waiting-p dir)
+     ((not why)
       (cc-butler-compact--send-restore dir st arg))
      ((> (- (float-time) sent) cc-butler-compact-timeout)
       (cc-butler-compact--finish
-       dir "compacted (%s) but model NOT restored — session never reached a waiting point; still on %s, wanted %s"
-       (or (plist-get st :note) "no delta observed")
+       dir "compacted (%s) but model NOT restored — session never reached a waiting point (%s); still on %s, wanted %s"
+       (or (plist-get st :note) "no delta observed") why
        (or (cc-butler-compact--model-now dir) "?") arg))
-     (t (cc-butler-compact--schedule-poll dir)))))
+     (t
+      ;; Log the hold once per distinct reason, not per poll — observable
+      ;; without being noise.
+      (unless (equal why (plist-get st :hold-reason))
+        (cc-butler-compact--set-state dir :hold-reason why)
+        (cc-butler--log "compact: %s │ restore held — %s"
+                        (cc-butler--display-name dir) why))
+      (cc-butler-compact--schedule-poll dir)))))
 
 (defun cc-butler-compact--poll-restore (dir st sent)
   "Wait for the original model to come back, answering the modal."
@@ -1078,7 +1289,13 @@ and answers any modal that is already up while it waits."
         (arg (plist-get st :orig-arg)))
     (cond
      ((cc-butler-compact--model-is-p tag arg)
-      (cc-butler-compact--finish dir "compacted (%s); model restored to %s"
+      ;; "driver-sent restore": phase `restoring' is only entered after this
+      ;; driver actually dispatched the /model command (--send-restore), so
+      ;; this outcome line names the path.  A "model restored" with no
+      ;; preceding "restoring (sent ...)" step line and no this suffix was a
+      ;; human hand-restore, not the machine — the ops log mirror makes that
+      ;; distinction provable after the fact.
+      (cc-butler-compact--finish dir "compacted (%s); model restored to %s (driver-sent restore)"
                                  (or (plist-get st :note) "no delta observed") tag))
      ((cc-butler-compact--answer-modal dir st "model restore")
       (cc-butler-compact--schedule-poll dir))
@@ -1138,8 +1355,8 @@ and answers any modal that is already up while it waits."
 
 (defun cc-butler-compact-candidates ()
   "Return dirs of sessions over the compaction threshold, largest first.
-Candidacy is `cc-butler-compact--over-threshold-p' (the percentage-first hybrid
-gate); ordering is by context-token size so an interrupted sweep did the most
+Candidacy is `cc-butler-compact--over-threshold-p' (absolute-token gate);
+ordering is by context-token size so an interrupted sweep did the most
 important work first.  Includes the butler and the steward by design."
   (let (out)
     (dolist (s (cc-butler--sessions))
@@ -1151,7 +1368,8 @@ important work first.  Includes the butler and the steward by design."
 
 ;;;###autoload
 (defun cc-butler-compact-large-sessions ()
-  "Compact every session whose context exceeds `cc-butler-compact-threshold'.
+  "Compact every session at/above `cc-butler-compact-threshold' (absolute
+tokens; see `cc-butler-compact--over-threshold-p').
 
 The butler and the steward are included — they are the long-lived sessions
 that grow without bound, and excluding them would leave the biggest context
@@ -1208,6 +1426,18 @@ standing situation is restated occasionally rather than constantly.  A
 CHANGED set always reports immediately regardless."
   :type 'number :group 'cc-butler)
 
+(defcustom cc-butler-compact-monitor-watchdog-factor 3
+  "How many missed intervals before the watchdog treats the monitor as dead.
+The monitor's timer has died silently before (a reload racing a load-time
+error, or something else that leaves `cc-butler-compact-monitor-mode' at t
+while its `run-with-timer' has quietly stopped firing) with nothing
+surfacing it for days.  When the last tick is older than
+`cc-butler-compact-monitor-interval' times this factor, the watchdog
+re-arms the mode — see `cc-butler-compact--monitor-watchdog-maybe-rearm'.
+Kept well above 1 so an ordinary slow scan or a busy daemon does not
+trip it."
+  :type 'number :group 'cc-butler)
+
 (defcustom cc-butler-compact-monitor-notify 'submit
   "How the monitor delivers its report to the steward.
 
@@ -1254,6 +1484,19 @@ session versus retire a finished one — is exactly what gets forgotten."
 (defvar cc-butler-compact--monitor-timer nil
   "Timer running the fleet compaction scan, or nil.")
 
+(defvar cc-butler-compact--monitor-last-tick nil
+  "`float-time' of the monitor's last completed scan, or nil if it has
+never ticked.  Set unconditionally at the top of
+`cc-butler-compact--monitor-scan', including a tick that finds zero
+candidates and reports nothing — a quiet fleet is not the same evidence
+as a dead timer, and only this variable tells them apart.")
+
+(defvar cc-butler-compact--monitor-armed-at nil
+  "`float-time' when `cc-butler-compact-monitor-mode' was last turned on,
+or nil if it never has been.  Baseline for staleness before the first
+tick lands, so a freshly (re)armed monitor is not flagged stale during
+its own first `cc-butler-compact-monitor-interval'.")
+
 (defun cc-butler-compact-fleet-summary ()
   "Return a report of sessions that want compacting, or nil when none.
 
@@ -1264,10 +1507,12 @@ way, so the steward can tell \"do it\" from \"wait\" without going to look."
   (let (rows)
     (dolist (dir (cc-butler-compact-candidates))
       (let* ((ctx (cc-butler-cleanup-context-for dir))
+             (pct (cc-butler-compact--display-pct dir))
              (why (cc-butler-compact--blocked-reason dir)))
-        (push (format "- %s (%.0fk) — %s"
+        (push (format "- %s (%.0fk, %s) — %s"
                       (cc-butler--display-name dir)
                       (/ (or ctx 0) 1000.0)
+                      (if (integerp pct) (format "%d%%" pct) "?")
                       (cond ((cc-butler-compact-waiting-p dir)
                              "compaction already queued, waiting for it to go idle")
                             ((null why) "ready: compact_session now")
@@ -1276,7 +1521,7 @@ way, so the steward can tell \"do it\" from \"wait\" without going to look."
                             (t why)))
               rows)))
     (when rows
-      (format "🧠 Context ceiling: %d session(s) over %.0fk and wanting attention:\n%s\n\nWhat you can do — yours to time, since each one interrupts whatever that session does next:\n%s"
+      (format "🧠 Context ceiling: %d session(s) at/above %.0fk tokens and wanting attention:\n%s\n\nWhat you can do — yours to time, since each one interrupts whatever that session does next:\n%s"
               (length rows) (/ cc-butler-compact-threshold 1000.0)
               (mapconcat #'identity (nreverse rows) "\n")
               cc-butler-compact-remedies))))
@@ -1284,7 +1529,12 @@ way, so the steward can tell \"do it\" from \"wait\" without going to look."
 (defun cc-butler-compact--monitor-scan ()
   "One monitor tick: report new or long-standing candidates to the steward.
 No-op when there is no session to report to — a scan with nobody listening
-is just a way to be wrong later."
+is just a way to be wrong later.
+
+Records `cc-butler-compact--monitor-last-tick' first, unconditionally —
+before the no-ops-session no-op below — so a tick that finds nothing to
+report still counts as evidence the monitor is alive."
+  (setq cc-butler-compact--monitor-last-tick (float-time))
   (when (cc-butler--ops-dir)
     (let* ((dirs (cc-butler-compact-candidates))
            (names (sort (mapcar #'cc-butler--display-name dirs) #'string<))
@@ -1328,6 +1578,33 @@ target is safely idle.  Returns non-nil if it was actually typed."
                       (cond (typed "notified") (ops "queued only") (t "no ops session")))
       typed)))
 
+(defun cc-butler-compact--report-give-up (dir name queued-at)
+  "Tell the ops session that DIR's queued compaction gave up un-run.
+NAME is DIR's display name; QUEUED-AT is when the compaction was queued,
+or nil when unknown (an entry queued before this report existed).
+
+Reuses `cc-butler-compact--report-to-ops' — the same queue-plus-type
+channel the fleet monitor speaks through — because the failure mode this
+answers is precisely a message that exists only in the log: the requester
+asked for a compaction, the wait timed out, and the only trace was an
+ops-file line nobody was reading.  The report carries what the requester
+needs in order to act: which session, how large it still is, how long was
+waited, and that nothing was typed (so the session was left untouched,
+not half-compacted)."
+  (let* ((ctx (cc-butler-cleanup-context-for dir))
+         (waited (and (numberp queued-at)
+                      (max 0 (round (- (float-time) queued-at))))))
+    (cc-butler-compact--report-to-ops
+     (format (concat "⚠️ Compaction GAVE UP: %s was queued but never reached a"
+                     " safe idle point%s. Nothing was typed into it and it was"
+                     " NOT compacted — it is still at %s. If it still needs"
+                     " shrinking, call compact_session %s again; use force=true"
+                     " if it never goes idle.")
+             name
+             (if waited (format " within %d min" (max 1 (round waited 60))) "")
+             (if (integerp ctx) (format "%.0fk" (/ ctx 1000.0)) "an unknown size")
+             name))))
+
 ;;;###autoload
 (define-minor-mode cc-butler-compact-monitor-mode
   "Periodically tell the steward which sessions want compacting or closing.
@@ -1352,13 +1629,15 @@ the ceiling with nobody reading."
   (setq cc-butler-compact--monitor-timer nil
         cc-butler-compact--last-report nil)
   (when cc-butler-compact-monitor-mode
-    (setq cc-butler-compact--monitor-timer
+    (setq cc-butler-compact--monitor-armed-at (float-time)
+          cc-butler-compact--monitor-last-tick nil
+          cc-butler-compact--monitor-timer
           (run-with-timer cc-butler-compact-monitor-interval
                           cc-butler-compact-monitor-interval
                           #'cc-butler-compact--monitor-scan))
-    (cc-butler--log "compact monitor │ on (every %ds, threshold %.0fk, notify %s)"
+    (cc-butler--log "compact monitor │ on (every %ds, threshold %dk tokens, notify %s)"
                     cc-butler-compact-monitor-interval
-                    (/ cc-butler-compact-threshold 1000.0)
+                    (/ cc-butler-compact-threshold 1000)
                     (or cc-butler-compact-monitor-notify "queue-only"))))
 
 ;; Start with cc-butler itself.  Idempotent: `cc-butler-reload' re-runs this
@@ -1367,36 +1646,140 @@ the ceiling with nobody reading."
 (cc-butler-compact-monitor-mode 1)
 
 ;;;; ------------------------------------------------------------------
+;;;; Monitor watchdog: the monitor's own timer has died silently before —
+;;;; `cc-butler-compact-monitor-mode' stayed t while its `run-with-timer'
+;;;; quietly stopped firing, for days, with nothing surfacing it.  These
+;;;; two pieces make that visible and self-correcting:
+;;;;
+;;;;  - a diagnostic (tick age), surfaced in `session_status' so it is not
+;;;;    something you have to know to go looking for;
+;;;;  - a watchdog that piggybacks on a channel independently proven to
+;;;;    survive whatever killed the timer: butler/steward's own per-turn
+;;;;    hooks (`cc-butler--pending-events-hook-payload' /
+;;;;    `cc-butler--pending-decisions-hook-payload').  A second
+;;;;    `run-with-timer' would be no safer than the first if the same
+;;;;    thing that silenced one silences the other.
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-compact--monitor-tick-age ()
+  "Seconds since the monitor last ticked, or nil if it never has (including
+never having been armed at all — `cc-butler-compact--monitor-armed-at' also
+nil).  Prefers the last actual tick over the arm time, so a freshly
+(re)armed monitor is not treated as already-stale before its first
+interval elapses."
+  (let ((baseline (or cc-butler-compact--monitor-last-tick
+                      cc-butler-compact--monitor-armed-at)))
+    (and baseline (- (float-time) baseline))))
+
+(defun cc-butler-compact--monitor-stale-p ()
+  "Non-nil when the monitor is supposed to be running but has not ticked
+in over `cc-butler-compact-monitor-watchdog-factor' intervals — the signal
+that its timer has died while `cc-butler-compact-monitor-mode' still
+reads t.  Nil (never stale) when the mode is deliberately off: a human
+turning it off is not a fault to correct."
+  (and cc-butler-compact-monitor-mode
+       (let ((age (cc-butler-compact--monitor-tick-age)))
+         (and age (> age (* cc-butler-compact-monitor-interval
+                            cc-butler-compact-monitor-watchdog-factor))))))
+
+(defun cc-butler-compact--format-age (seconds)
+  "Render SECONDS as a short age string: \"Nm\", \"Nh\", or \"Nd\"."
+  (cond ((< seconds 60) "under 1m")
+        ((< seconds 3600) (format "%dm" (round (/ seconds 60))))
+        ((< seconds 86400) (format "%dh" (round (/ seconds 3600))))
+        (t (format "%dd" (round (/ seconds 86400))))))
+
+(defun cc-butler-compact--monitor-status-line ()
+  "One line describing the fleet monitor's own health, for `session_status'.
+The monitor reporting nothing is ambiguous by itself — a healthy fleet
+and a dead timer both produce silence — so this names the one fact that
+tells them apart: when it last actually ticked."
+  (let ((age (cc-butler-compact--monitor-tick-age)))
+    (cond
+     ((not cc-butler-compact-monitor-mode) "compact monitor: OFF")
+     ((null age)
+      "compact monitor: on, has not ticked yet")
+     ((cc-butler-compact--monitor-stale-p)
+      (format "compact monitor: STALE — last tick %s ago (expected every %s); watchdog will re-arm it on the next steward/butler turn"
+              (cc-butler-compact--format-age age)
+              (cc-butler-compact--format-age cc-butler-compact-monitor-interval)))
+     (t (format "compact monitor: alive, last tick %s ago (every %s)"
+                (cc-butler-compact--format-age age)
+                (cc-butler-compact--format-age cc-butler-compact-monitor-interval))))))
+
+(defun cc-butler-compact--monitor-watchdog-maybe-rearm ()
+  "Re-arm the fleet monitor if its timer has gone silently dead, and say so.
+
+Returns a short string when it actually fired (for a per-turn hook payload
+to surface), or nil the overwhelming majority of the time when the
+monitor is fine — same quiet-unless-it-matters convention as
+`cc-butler-compact-fleet-summary'.
+
+`(cc-butler-compact-monitor-mode 1)' is safe to call unconditionally per
+its own docstring: the mode body always cancels any existing timer before
+arming a new one, so this cannot leave two scans running.  Deliberately
+NOT another `run-with-timer' on the side — if whatever silenced the
+original timer can silence a structurally identical one the same way,
+that adds nothing.  This instead rides a channel independently confirmed
+to have kept firing throughout the last known outage: the per-turn hook
+that calls it."
+  (when (cc-butler-compact--monitor-stale-p)
+    (let ((age (cc-butler-compact--monitor-tick-age)))
+      (cc-butler-compact-monitor-mode 1)
+      (cc-butler--log "compact monitor │ WATCHDOG: last tick %s ago (expected every %ds, threshold %dx) — re-armed a fresh timer"
+                      (cc-butler-compact--format-age age)
+                      cc-butler-compact-monitor-interval
+                      cc-butler-compact-monitor-watchdog-factor)
+      (format "🐕 Compact monitor watchdog: its timer had gone silent for %s and was just re-armed. This should not recur — if it does, `cc-butler-compact-monitor-mode' is dying repeatedly and wants investigating, not just re-arming."
+              (cc-butler-compact--format-age age)))))
+
+;;;; ------------------------------------------------------------------
 ;;;; MCP tools — the whole point: the LLM calls one function
 ;;;; ------------------------------------------------------------------
 
 (defun cc-butler-compact--status-line (dir)
-  "One status row for DIR: name, context size, model, and readiness."
+  "One status row for DIR: name, context size, used%, model, and readiness.
+The COMPACTION field is prefixed WARNING/CRITICAL (see
+`cc-butler-compact--severity-for') when a session is still over threshold
+and uncompacted at 400k/700k — a display escalation for a sweep that
+failed to catch it, layered on top of the base OVER THRESHOLD/blocked/ok
+text, never a second gate."
   (let* ((name (cc-butler--display-name dir))
          (ctx (cc-butler-cleanup-context-for dir))
-         (model (cc-butler-cleanup-model-for dir))
-         (why (cc-butler-compact--blocked-reason dir)))
-    (format "%-36s %9s  %-10s  %-13s  %s"
+         (pct (cc-butler-compact--display-pct dir))
+         (model (cc-butler-compact--model-for-status-line dir))
+         (why (cc-butler-compact--blocked-reason dir))
+         (over (cc-butler-compact--over-threshold-p dir))
+         (severity (cc-butler-compact--severity-for dir))
+         (base (cond ((and over (not why)) "OVER THRESHOLD — compactable now")
+                     (over (format "OVER THRESHOLD — blocked: %s" why))
+                     (why (format "blocked: %s" why))
+                     (t "ok"))))
+    (format "%-36s %9s %6s  %-10s  %-13s  %s"
             name
             (if (integerp ctx) (format "%.0fk" (/ ctx 1000.0)) "?")
+            (if (integerp pct) (format "%d%%" pct) "?")
             (or model "?")
             (if (cc-butler--waiting-p dir) "WAITING" "running")
-            (let ((over (cc-butler-compact--over-threshold-p dir)))
-              (cond ((and over (not why)) "OVER THRESHOLD — compactable now")
-                    (over (format "OVER THRESHOLD — blocked: %s" why))
-                    (why (format "blocked: %s" why))
-                    (t "ok"))))))
+            (pcase severity
+              ('critical (concat "CRITICAL — " base))
+              ('warning (concat "WARNING — " base))
+              (_ base)))))
 
 (defun cc-butler-tool-session-status ()
-  "MCP tool: per-session context size, model, and compaction readiness."
+  "MCP tool: per-session context size, used%, model, and compaction readiness."
   (let ((rows (mapcar (lambda (s) (cc-butler-compact--status-line (plist-get s :dir)))
-                      (cc-butler--sessions))))
+                      (cc-butler--sessions)))
+        (monitor (cc-butler-compact--monitor-status-line)))
     (if (null rows)
-        "No live sessions."
-      (concat (format "%-36s %9s  %-10s  %-13s  %s\n" "SESSION" "CONTEXT" "MODEL" "STATE" "COMPACTION")
+        (concat "No live sessions.\n\n" monitor)
+      (concat (format "%-36s %9s %6s  %-10s  %-13s  %s\n" "SESSION" "CONTEXT" "PCT" "MODEL" "STATE" "COMPACTION")
               (string-join rows "\n")
-              (format "\n\nThreshold: %.0fk. A context figure is what the session's statusline last reported, not a live measurement; \"?\" means the statusline is not installed there."
-                      (/ cc-butler-compact-threshold 1000.0))))))
+              (format "\n\nThreshold: %dk tokens (`cc-butler-compact-threshold') — the compaction gate, an absolute figure since every fleet session currently runs the same context window. PCT is informational only (used-percentage of the assumed window, `cc-butler-compact-threshold-fraction'), never the gate. COMPACTION is prefixed WARNING/CRITICAL at %dk/%dk tokens when a session is still over threshold and uncompacted — a display escalation for a sweep that missed it, not a second gate. A context/PCT figure is what the session's statusline last reported, not a live measurement; \"?\" means it is not known there — never a computed-looking guess.\n%s"
+                      (/ cc-butler-compact-threshold 1000)
+                      (/ cc-butler-compact-warning-threshold 1000)
+                      (/ cc-butler-compact-critical-threshold 1000)
+                      monitor)))))
 
 (defun cc-butler-tool-compact-session (name &optional force)
   "MCP tool: compact the session called NAME.
@@ -1426,8 +1809,8 @@ waiting is the wrong answer when nothing is ever going to make it idle
   "MCP tool: compact every session over the threshold, butler/steward included."
   (let ((started (cc-butler-compact-large-sessions)))
     (if (null started)
-        (format "Nothing started. Either no session is over %.0fk, or the ones that are are busy or have something open — session_status shows the per-session reason."
-                (/ cc-butler-compact-threshold 1000.0))
+        (format "Nothing started. Either no session is at/above %dk tokens (the compaction gate — see CONTEXT in session_status), or the ones that are are busy or have something open — session_status shows the per-session reason."
+                (/ cc-butler-compact-threshold 1000))
       (format "Compaction started for %d session(s): %s. Each runs asynchronously; poll session_status."
               (length started)
               (string-join (mapcar #'cc-butler--display-name started) ", ")))))

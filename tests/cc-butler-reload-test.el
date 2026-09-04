@@ -59,7 +59,7 @@ the reload, so it has to be surfaced rather than discovered later."
 out in the response rather than left as a silent trap."
   (cl-letf (((symbol-function 'cc-butler-reload)
              (lambda () (list :count 3 :dir "/x/" :stale '("cc-butler-mail.elc"))))
-            ((symbol-function 'shell-command-to-string) (lambda (&rest _) "")))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil)))
     (let ((out (cc-butler-tool-reload-code)))
       (should (string-match-p "STALE" out))
       (should (string-match-p "cc-butler-mail.elc" out)))))
@@ -69,12 +69,101 @@ out in the response rather than left as a silent trap."
 concluding a merge reached the fleet when nothing was pulled."
   (cl-letf (((symbol-function 'cc-butler-reload)
              (lambda () (list :count 3 :dir "/x/" :stale nil)))
-            ((symbol-function 'shell-command-to-string) (lambda (&rest _) "abc123 some commit\n")))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) "abc123f (main)")))
     (let ((out (cc-butler-tool-reload-code)))
       (should (string-match-p "does not fetch" out))
-      (should (string-match-p "abc123" out))
+      (should (string-match-p "abc123f" out))
       ;; and the tool-list caveat, which is the other recurring wrong conclusion
       (should (string-match-p "/mcp" out)))))
+
+;;;; ------------------------------------------------------------------
+;;;; Reading git HEAD without a subprocess — the daemon must never block
+;;;; ------------------------------------------------------------------
+;;
+;; The reload report's HEAD line used to come from `shell-command-to-string',
+;; which blocks in C with no timeout — and `with-timeout' cannot interrupt a
+;; blocked C call, so a wedged .git/index.lock or a stalled filesystem would
+;; freeze the single Lisp thread: every fleet session's terminal, every MCP
+;; call.  The fix reads .git/HEAD (and the ref files) directly; these tests
+;; pin that reader.  `call-process' below is fine — batch tests, not the
+;; daemon.
+
+(defun cc-butler-test--git (dir &rest args)
+  "Run git ARGS in DIR for fixture setup; error if git fails."
+  (let ((default-directory dir))
+    (unless (eq 0 (apply #'call-process "git" nil nil nil args))
+      (error "fixture git %s failed in %s" args dir))))
+
+(defun cc-butler-test--make-git-repo ()
+  "Create a one-commit fixture repo on branch main; return (DIR . FULL-HASH)."
+  (let ((dir (file-name-as-directory (make-temp-file "cc-git-head" t))))
+    (cc-butler-test--git dir "init" "-q")
+    (cc-butler-test--git dir "symbolic-ref" "HEAD" "refs/heads/main")
+    (cc-butler-test--git dir "config" "user.email" "test@test")
+    (cc-butler-test--git dir "config" "user.name" "test")
+    (cc-butler-test--git dir "commit" "-q" "--allow-empty" "-m" "initial")
+    (cons dir
+          (let ((default-directory dir))
+            (with-temp-buffer
+              (call-process "git" nil t nil "rev-parse" "HEAD")
+              (string-trim (buffer-string)))))))
+
+(ert-deftest cc-butler-git-head/reads-branch-head-from-files ()
+  "Normal repo on a branch: short hash and branch name, from file reads alone."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (hash (cdr fix)))
+    (should (equal (cc-butler--git-head dir)
+                   (format "%s (main)" (substring hash 0 7))))))
+
+(ert-deftest cc-butler-git-head/detached-head-still-yields-the-hash ()
+  "Detached HEAD is a hash in .git/HEAD, not a ref — report it, don't error."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (hash (cdr fix)))
+    (cc-butler-test--git dir "checkout" "-q" "--detach")
+    (should (equal (cc-butler--git-head dir)
+                   (format "%s (detached)" (substring hash 0 7))))))
+
+(ert-deftest cc-butler-git-head/resolves-a-packed-ref ()
+  "After `git pack-refs' the loose ref file is gone and the hash lives in
+packed-refs — the state every gc'd repo ends up in."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (hash (cdr fix)))
+    (cc-butler-test--git dir "pack-refs" "--all")
+    (should-not (file-exists-p (expand-file-name ".git/refs/heads/main" dir)))
+    (should (equal (cc-butler--git-head dir)
+                   (format "%s (main)" (substring hash 0 7))))))
+
+(ert-deftest cc-butler-git-head/follows-a-dotgit-file-into-a-worktree ()
+  "In a linked worktree `.git' is a FILE naming the real gitdir, and the refs
+live in the common dir.  cc-butler's own fleet loads from worktrees, so this
+is not an edge case here."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (hash (cdr fix))
+         (wt (expand-file-name "wt" (make-temp-file "cc-git-wt" t))))
+    (cc-butler-test--git dir "worktree" "add" "-q" "-b" "side" wt)
+    (should (equal (cc-butler--git-head wt)
+                   (format "%s (side)" (substring hash 0 7))))))
+
+(ert-deftest cc-butler-git-head/not-a-repo-degrades-to-nil-not-an-error ()
+  "Nil means \"cannot determine\"; the reload report drops the line and goes
+on.  Blocking or erroring while trying harder is the failure this replaced."
+  (let ((dir (file-name-as-directory (make-temp-file "cc-no-repo" t))))
+    (should-not (cc-butler--git-head dir))
+    (should-not (cc-butler--git-head (expand-file-name "absent" dir)))))
+
+(ert-deftest cc-butler-git-head/tool-report-omits-the-line-when-unknown ()
+  "The report must still work with no HEAD available — placeholder behavior,
+never a probe that can hang the daemon."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 3 :dir "/x/" :stale nil)))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil)))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should (string-match-p "Reloaded 3 cc-butler modules" out))
+      (should-not (string-match-p "Source is at:" out)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Which source directory loads — one place decides
@@ -161,7 +250,7 @@ spelled out here.  Which copy just got reloaded, and whether it is behind, is
 the thing that caller is least able to find out for itself."
   (cl-letf (((symbol-function 'cc-butler-reload)
              (lambda () (list :count 3 :dir "/x/" :stale nil)))
-            ((symbol-function 'shell-command-to-string) (lambda (&rest _) ""))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
             ((symbol-function 'cc-butler--source-diagnostics)
              (lambda () '((warn . "SOURCE-STATE-MARKER")))))
     (should (string-match-p "SOURCE-STATE-MARKER" (cc-butler-tool-reload-code)))))
@@ -247,6 +336,156 @@ keep in step, and no way to see one without the other."
              (lambda () '((warn . "SOURCE-STATE-MARKER")))))
     (let ((text (mapconcat #'cdr (cc-butler--launch-preflight-diagnostics) "\n")))
       (should (string-match-p "SOURCE-STATE-MARKER" text)))))
+
+;;;; ------------------------------------------------------------------
+;;;; What commit is the live daemon actually running, right now?
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-runtime-source/exit-code-tells-ancestor-from-non-ancestor-from-error ()
+  "`merge-base --is-ancestor' answers 0/1/other, and 1 (\"no\") is a real,
+meaningful answer, not an error — `cc-butler--commit-merged-p' must not
+collapse it into the same bucket as \"could not check\"."
+  (cl-letf (((symbol-function 'cc-butler--git-exit-code) (lambda (&rest _) 0)))
+    (should (eq (cc-butler--commit-merged-p "/x/" "abc") 'merged)))
+  (cl-letf (((symbol-function 'cc-butler--git-exit-code) (lambda (&rest _) 1)))
+    (should (eq (cc-butler--commit-merged-p "/x/" "abc") 'unmerged)))
+  (cl-letf (((symbol-function 'cc-butler--git-exit-code) (lambda (&rest _) 128)))
+    (should (eq (cc-butler--commit-merged-p "/x/" "abc") 'unknown)))
+  (cl-letf (((symbol-function 'cc-butler--git-exit-code) (lambda (&rest _) nil)))
+    (should (eq (cc-butler--commit-merged-p "/x/" "abc") 'unknown)))
+  ;; missing dir/sha never reaches git at all
+  (should-not (cc-butler--commit-merged-p nil "abc"))
+  (should-not (cc-butler--commit-merged-p "/x/" nil)))
+
+(ert-deftest cc-butler-runtime-source/exit-code-against-a-real-git-repo ()
+  "End-to-end against a real repo, not a mock — the thing a mocked exit code
+cannot catch is a wrong argument order or a wrong flag to `git' itself.
+SHA1 is set up as the locally-known `origin/main'; SHA2 is a later commit
+built on top of it that was never pushed anywhere."
+  (skip-unless (executable-find "git"))
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-runtime-source" t)))
+         (git (lambda (&rest args)
+                (let ((default-directory dir))
+                  (apply #'call-process "git" nil nil nil args)))))
+    (funcall git "init" "-q")
+    (funcall git "config" "user.email" "test@example.com")
+    (funcall git "config" "user.name" "Test")
+    (write-region "a" nil (expand-file-name "f" dir))
+    (funcall git "add" "f")
+    (funcall git "commit" "-q" "-m" "first")
+    (let ((sha1 (cc-butler--git dir "rev-parse" "HEAD")))
+      ;; No real remote is needed: `merge-base --is-ancestor' only reads
+      ;; refs, and a remote-tracking ref is just a ref.
+      (funcall git "update-ref" "refs/remotes/origin/main" sha1)
+      (write-region "b" nil (expand-file-name "f" dir))
+      (funcall git "add" "f")
+      (funcall git "commit" "-q" "-m" "second")
+      (let ((sha2 (cc-butler--git dir "rev-parse" "HEAD")))
+        ;; sha1 IS origin/main -> trivially an ancestor of itself.
+        (should (eq (cc-butler--commit-merged-p dir sha1) 'merged))
+        ;; sha2 is a child of origin/main, never merged back into it.
+        (should (eq (cc-butler--commit-merged-p dir sha2) 'unmerged))))))
+
+(ert-deftest cc-butler-runtime-source/capture-snapshots-source-dir-and-commit ()
+  "The snapshot reads `cc-butler-source-dir' (not the raw load location), so
+a deliberate `cc-butler-use-checkout' switch is reflected too."
+  (let (cc-butler--runtime-source-dir
+        cc-butler--runtime-commit-sha
+        cc-butler--runtime-commit-line)
+    (cl-letf (((symbol-function 'cc-butler-source-dir) (lambda () "/some/dir/"))
+              ((symbol-function 'cc-butler--git)
+               (lambda (dir &rest args)
+                 (should (equal dir "/some/dir/"))
+                 (when (equal args '("rev-parse" "HEAD")) "deadbeef")))
+              ((symbol-function 'cc-butler--source-revision)
+               (lambda (dir) (should (equal dir "/some/dir/")) "deadbee fix the thing")))
+      (cc-butler--capture-runtime-source)
+      (should (equal cc-butler--runtime-source-dir "/some/dir/"))
+      (should (equal cc-butler--runtime-commit-sha "deadbeef"))
+      (should (equal cc-butler--runtime-commit-line "deadbee fix the thing")))))
+
+(ert-deftest cc-butler-runtime-source/capture-leaves-vars-nil-when-not-a-checkout ()
+  "A directory that is not a git checkout (or has no git) must not leave a
+stale answer sitting around looking current."
+  (let (cc-butler--runtime-source-dir
+        cc-butler--runtime-commit-sha
+        cc-butler--runtime-commit-line)
+    (cl-letf (((symbol-function 'cc-butler-source-dir) (lambda () "/nope/"))
+              ((symbol-function 'cc-butler--git) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler--source-revision) (lambda (_) nil)))
+      (cc-butler--capture-runtime-source)
+      (should-not cc-butler--runtime-commit-sha)
+      (should-not cc-butler--runtime-commit-line))))
+
+(ert-deftest cc-butler-runtime-source/tool-reports-merged-plainly ()
+  (let ((cc-butler--runtime-source-dir "/src/")
+        (cc-butler--runtime-commit-sha "deadbeef")
+        (cc-butler--runtime-commit-line "deadbee fix the thing"))
+    (cl-letf (((symbol-function 'cc-butler--commit-merged-p) (lambda (&rest _) 'merged)))
+      (let ((out (cc-butler-tool-runtime-source)))
+        (should (string-match-p "/src/" out))
+        (should (string-match-p "deadbee fix the thing" out))
+        (should (string-match-p "merged" out))
+        (should-not (string-match-p "UNMERGED" out))))))
+
+(ert-deftest cc-butler-runtime-source/tool-flags-unmerged-loudly ()
+  "This is the exact incident this tool exists for: code that was only ever
+hot-loaded from a branch, never merged.  It must not be easy to miss."
+  (let ((cc-butler--runtime-source-dir "/src/")
+        (cc-butler--runtime-commit-sha "deadbeef")
+        (cc-butler--runtime-commit-line "deadbee add kind param"))
+    (cl-letf (((symbol-function 'cc-butler--commit-merged-p) (lambda (&rest _) 'unmerged)))
+      (let ((out (cc-butler-tool-runtime-source)))
+        (should (string-match-p "⚠ UNMERGED" out))
+        (should (string-match-p "not reachable from origin/main" out))))))
+
+(ert-deftest cc-butler-runtime-source/tool-distinguishes-unknown-from-merged ()
+  "A `git' error or a missing local `origin/main' ref must read as \"could
+not check\", never as a silent pass."
+  (let ((cc-butler--runtime-source-dir "/src/")
+        (cc-butler--runtime-commit-sha "deadbeef")
+        (cc-butler--runtime-commit-line "deadbee x"))
+    (cl-letf (((symbol-function 'cc-butler--commit-merged-p) (lambda (&rest _) 'unknown)))
+      (let ((out (cc-butler-tool-runtime-source)))
+        (should (string-match-p "unknown" out))
+        (should-not (string-match-p "⚠ UNMERGED" out))
+        (should-not (string-match-p "Status: merged" out))))))
+
+(ert-deftest cc-butler-runtime-source/tool-says-so-when-the-commit-is-not-determinable ()
+  (let (cc-butler--runtime-source-dir
+        cc-butler--runtime-commit-sha
+        cc-butler--runtime-commit-line)
+    (let ((out (cc-butler-tool-runtime-source)))
+      (should (string-match-p "Cannot determine" out)))))
+
+(ert-deftest cc-butler-runtime-source/oneline-is-nil-when-not-determinable ()
+  (let (cc-butler--runtime-source-dir
+        cc-butler--runtime-commit-sha
+        cc-butler--runtime-commit-line)
+    (should-not (cc-butler-runtime-source-oneline))))
+
+(ert-deftest cc-butler-runtime-source/oneline-names-the-commit-and-status ()
+  (let ((cc-butler--runtime-source-dir "/src/")
+        (cc-butler--runtime-commit-sha "deadbeef")
+        (cc-butler--runtime-commit-line "deadbee fix the thing"))
+    (cl-letf (((symbol-function 'cc-butler--commit-merged-p) (lambda (&rest _) 'unmerged)))
+      (let ((line (cc-butler-runtime-source-oneline)))
+        (should (string-match-p "deadbee fix the thing" line))
+        (should (string-match-p "UNMERGED" line))))))
+
+(ert-deftest cc-butler-runtime-source/tool-is-registered-with-no-arguments ()
+  "Matches the pattern other read-only status tools (`pending_decisions',
+`list_claude_sessions') follow: no caller-supplied argument, because there
+is nothing here for a caller to legitimately choose — it always reports the
+one thing that is actually running."
+  (let ((spec (seq-find (lambda (s)
+                          (equal (plist-get (claude-code-ide--normalize-tool-spec s) :name)
+                                 "runtime_source"))
+                        (bound-and-true-p claude-code-ide-mcp-server-tools))))
+    (when spec   ; only when claude-code-ide is present to register against
+      (let ((norm (claude-code-ide--normalize-tool-spec spec)))
+        (should (eq (plist-get norm :function) #'cc-butler-tool-runtime-source))
+        (should-not (plist-get norm :args))))))
 
 (provide 'cc-butler-reload-test)
 ;;; cc-butler-reload-test.el ends here

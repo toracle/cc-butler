@@ -50,6 +50,19 @@
    "\n")
   "The prompt-cache confirmation raised by /model.")
 
+(defconst cc-butler-compact-test--busy-screen
+  (string-join
+   '("✶ Compacting conversation… (esc to interrupt)"
+     ""
+     "──────────────────────────────────────────────"
+     "❯ "
+     "──────────────────────────────────────────────"
+     "  CTX:203356 20% >200k MODEL:Sonnet-5")
+   "\n")
+  "A session mid-turn: the spinner's interrupt hint above an empty input box.
+Structurally identical to the idle screen apart from that hint line — which
+is exactly why the restore gate must key on it.")
+
 ;;;; ------------------------------------------------------------------
 ;;;; Screen reading
 ;;;; ------------------------------------------------------------------
@@ -66,6 +79,35 @@ not mistaken for one."
            "무엇을 할까요?\n❯ 1. 예, 전환합니다\n  2. 아니오"))
   ;; Prose containing digits is not a menu.
   (should-not (cc-butler-compact--menu-p "step 1. do it\nthen finish")))
+
+(ert-deftest cc-butler-compact/busy-detected-by-the-interrupt-hint ()
+  "A running turn is recognized by the spinner's interrupt hint; the idle
+screen (past-tense spinner line, hint gone) and the modal are not busy.
+Running and idle screens draw the same empty input box, so the hint is the
+one signal that separates a still-running /compact from an idle prompt."
+  (should (cc-butler-compact--busy-p cc-butler-compact-test--busy-screen))
+  (should-not (cc-butler-compact--busy-p cc-butler-compact-test--idle-screen))
+  (should-not (cc-butler-compact--busy-p cc-butler-compact-test--typed-screen))
+  (should-not (cc-butler-compact--busy-p cc-butler-compact-test--modal-screen))
+  (should-not (cc-butler-compact--busy-p nil)))
+
+(ert-deftest cc-butler-compact/busy-hint-in-deep-scrollback-is-ignored ()
+  "The hint is only live inside the screen tail; an old one that scrolled far
+up (or prose quoting it) must not read as busy forever."
+  (let ((screen (string-join
+                 (append '("✶ Reticulating… (esc to interrupt)")
+                         (make-list (* 2 cc-butler-compact-menu-lines) "output")
+                         '("─────" "❯ " "─────"))
+                 "\n")))
+    (should-not (cc-butler-compact--busy-p screen))))
+
+(ert-deftest cc-butler-compact/input-box-presence-is-not-content ()
+  "Box drawn vs box empty are different findings: an empty box on the idle
+screen is still PRESENT, and a screen with no box at all is absent."
+  (should (cc-butler-compact--input-box-row cc-butler-compact-test--idle-screen))
+  (should (cc-butler-compact--input-box-row cc-butler-compact-test--typed-screen))
+  (should-not (cc-butler-compact--input-box-row "no box here at all"))
+  (should-not (cc-butler-compact--input-box-row nil)))
 
 (ert-deftest cc-butler-compact/input-line-distinguishes-empty-from-typed ()
   "The text between the input-box rules is extracted with the prompt stripped;
@@ -679,44 +721,114 @@ so a stale frame cannot draw a stray answer onto the screen behind it."
 was STILL RUNNING and typed /model opus into a busy session.  The modal
 appeared long after the restore step's own 90s clock had expired, so nothing
 was polling by the time it came up.  The restore must not be typed at all
-until the session is at a waiting point."
+while the SCREEN shows the turn still running."
   (cc-butler-compact-test--with-session "w"
     (cc-butler-compact-session "w")
     (setq cc-butler-compact-test--model "Sonnet-5")
     (cc-butler-compact--poll "w")            ; -> /compact
-    ;; /compact overruns its timeout and the session is still working.
-    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
-      (cc-butler-compact--set-state
-       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
-      (cc-butler-compact--poll "w")
-      ;; Nothing typed: the restore is held, not fired into a busy session.
-      (should (equal (cc-butler-compact-test--sent-in-order)
-                     '("/model sonnet" "/compact")))
-      (should (cc-butler-compact--active-p "w"))
-      (cc-butler-compact--poll "w")
-      (should (equal (length cc-butler-compact-test--sent) 2)))
+    ;; /compact overruns its timeout and the screen shows it still working.
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--busy-screen)
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (cc-butler-compact--poll "w")
+    ;; Nothing typed: the restore is held, not fired into a busy session.
+    (should (equal (cc-butler-compact-test--sent-in-order)
+                   '("/model sonnet" "/compact")))
+    (should (cc-butler-compact--active-p "w"))
+    (cc-butler-compact--poll "w")
+    (should (equal (length cc-butler-compact-test--sent) 2))
     ;; The turn ends; now the restore goes out, inside a watched window.
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--idle-screen)
     (cc-butler-compact--poll "w")
     (should (equal (cc-butler-compact-test--sent-in-order)
                    '("/model sonnet" "/compact" "/model claude-opus-4-8")))))
 
+(ert-deftest cc-butler-compact/restore-held-even-when-the-waiting-flag-says-t ()
+  "The empty half of the 2026-07-23 protection: a session parked waiting since
+BEFORE the compaction has `cc-butler--waiting-p' t throughout — the driver's
+own typing never clears the flag — so the old flag gate waved the restore
+into a still-running /compact.  The screen says busy; busy wins over the
+flag."
+  (cc-butler-compact-test--with-session "w"
+    ;; The harness's `cc-butler--waiting-p' stub already returns non-nil —
+    ;; that IS the parked-session case; make it explicit and loud anyway.
+    (cl-letf (((symbol-function 'cc-butler--waiting-p)
+               (lambda (_d) (float-time))))
+      (cc-butler-compact-session "w")
+      (setq cc-butler-compact-test--model "Sonnet-5")
+      (cc-butler-compact--poll "w")          ; -> /compact
+      ;; Context has dropped, so the machine moves to restore — but the
+      ;; screen still shows /compact running.
+      (setq cc-butler-compact-test--ctx 90000
+            cc-butler-compact-test--screen cc-butler-compact-test--busy-screen)
+      (cc-butler-compact--poll "w")
+      (should (equal (cc-butler-compact-test--sent-in-order)
+                     '("/model sonnet" "/compact")))
+      (should (cc-butler-compact--active-p "w"))
+      (cc-butler-compact--poll "w")          ; still busy, still held
+      (should (equal (length cc-butler-compact-test--sent) 2))
+      ;; The screen goes idle; only now is the restore typed.
+      (setq cc-butler-compact-test--screen cc-butler-compact-test--idle-screen)
+      (cc-butler-compact--poll "w")
+      (should (equal (cc-butler-compact-test--sent-in-order)
+                     '("/model sonnet" "/compact" "/model claude-opus-4-8"))))))
+
+(ert-deftest cc-butler-compact/restore-fires-on-an-idle-screen-without-the-flag ()
+  "The stranding half: `cc-butler--waiting' is edge-triggered with no
+reconciliation, so a missed notification edge leaves it nil forever and the
+old flag gate held an IDLE session until the timeout — \"compacted but model
+NOT restored\", three of six compactions on the night of 2026-08-11.  An
+idle screen must let the restore through even when the flag was never set."
+  (cc-butler-compact-test--with-session "w"
+    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
+      (cc-butler-compact-session "w")
+      (setq cc-butler-compact-test--model "Sonnet-5")
+      (cc-butler-compact--poll "w")          ; -> /compact
+      (setq cc-butler-compact-test--ctx 90000)
+      (cc-butler-compact--poll "w")          ; idle screen -> restore goes out
+      (should (equal (cc-butler-compact-test--sent-in-order)
+                     '("/model sonnet" "/compact" "/model claude-opus-4-8"))))))
+
+(ert-deftest cc-butler-compact/unreadable-screen-holds-the-restore ()
+  "A screen that cannot be read is \"not yet\", never \"go\" — same
+conservative direction as `cc-butler-compact--menu-block-reason'.  The
+timeout backstop still ends it explicitly rather than hanging forever."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")            ; -> /compact
+    (setq cc-butler-compact-test--ctx 90000
+          cc-butler-compact-test--screen nil)
+    (cc-butler-compact--poll "w")            ; held: nothing seen, nothing typed
+    (should (equal (cc-butler-compact-test--sent-in-order)
+                   '("/model sonnet" "/compact")))
+    (should (cc-butler-compact--active-p "w"))
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (let ((msg (cc-butler-compact--poll "w")))
+      (should (string-match-p "NOT restored" msg))
+      (should (string-match-p "could not be read" msg)))
+    (should-not (cc-butler-compact--active-p "w"))))
+
 (ert-deftest cc-butler-compact/held-restore-still-gives-up-eventually ()
-  "Holding for idle must not become its own way to hang: a session that never
-reaches a waiting point ends the compaction with an explicit failure."
+  "Holding for idle must not become its own way to hang: a session whose
+screen never goes idle ends the compaction with an explicit failure naming
+the last blocker."
   (cc-butler-compact-test--with-session "w"
     (cc-butler-compact-session "w")
     (setq cc-butler-compact-test--model "Sonnet-5")
     (cc-butler-compact--poll "w")
-    (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil)))
-      (cc-butler-compact--set-state
-       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
-      (cc-butler-compact--poll "w")          ; -> held in restore-wait
-      (cc-butler-compact--set-state
-       "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
-      (let ((msg (cc-butler-compact--poll "w")))
-        (should (string-match-p "NOT restored" msg))
-        (should (string-match-p "waiting point" msg)))
-      (should-not (cc-butler-compact--active-p "w")))))
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--busy-screen)
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (cc-butler-compact--poll "w")            ; -> held in restore-wait
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (let ((msg (cc-butler-compact--poll "w")))
+      (should (string-match-p "NOT restored" msg))
+      (should (string-match-p "waiting point" msg))
+      (should (string-match-p "in flight" msg)))
+    (should-not (cc-butler-compact--active-p "w"))))
 
 (ert-deftest cc-butler-compact/never-walks-away-from-a-standing-modal ()
   "REGRESSION (2026-07-23): giving up is recoverable; abandoning a session
@@ -928,6 +1040,53 @@ even with the waiting flag set idle."
 ;;;; Self-compaction: the butler must be able to target ITSELF
 ;;;; ------------------------------------------------------------------
 
+(ert-deftest cc-butler-compact/a-throwing-poll-releases-the-in-flight-lock ()
+  "REGRESSION (2026-08-24, warmble-jumble's stuck in-flight flag): the poll
+runs as a ONE-SHOT timer callback, and its phase handlers reach the
+terminal through paths that can signal (`cc-butler--read-output''s
+io-timeout bound, a refused window borrow).  An error escaping the
+callback meant no re-arm, no finish, and a state entry left holding its
+fired timer — the session read as \"compaction already in flight\"
+forever.  Any throw must conclude through `--finish': lock released,
+failure logged."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")             ; phase `switching'
+    (should (cc-butler-compact--active-p "w"))
+    (cl-letf (((symbol-function 'cc-butler-compact--model-now)
+               (lambda (d)
+                 (error "Timed out reading session %s's output after 8s" d))))
+      ;; Must not signal out of the tick, and must not strand the lock.
+      (cc-butler-compact--poll "w"))
+    (should-not (cc-butler-compact--active-p "w"))))
+
+(ert-deftest cc-butler-compact/orphan-reaping-heals-a-fired-timer-corpse ()
+  "A one-shot poll timer that fired without re-arming stays in `:timer' as
+a dead OBJECT — truthy, so the old `(not :timer)' test read the corpse as
+a live watcher and refused to reap exactly the entries that most needed
+it (the machine is provably not coming back for them).  A dead timer must
+count as \"no timer\" for `cc-butler-compact--orphaned-p'."
+  (cc-butler-compact-test--with-session "w"
+    (let ((dead (run-with-timer 9999 nil #'ignore)))
+      (cancel-timer dead)                       ; no longer pending — same as fired
+      (cc-butler-compact--set-state
+       "w" :phase 'switching
+       :sent-time (- (float-time) (1+ cc-butler-compact-state-max-age))
+       :timer dead))
+    ;; Terminal corroborates abandonment (idle screen, no menu, nothing
+    ;; pending — the harness default), so merely asking must heal it.
+    (should-not (cc-butler-compact--active-p "w"))))
+
+(ert-deftest cc-butler-compact/test-placeholder-timer-still-counts-as-watched ()
+  "The inverse guard: under `cc-butler-compact--inhibit-timers' the
+schedule stores `t' instead of a timer, and hand-driven entries must NOT
+be reaped as orphans no matter how old — a test driving the machine
+slowly is not an abandoned compaction."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-state-max-age)))
+    (should (cc-butler-compact--active-p "w"))))
+
 (ert-deftest cc-butler-compact/busy-session-is-queued-not-refused ()
   "A session can only call a tool from inside its own turn, and a session
 inside its own turn is busy — so refusing busy made self-compaction
@@ -971,6 +1130,72 @@ and must still have had nothing typed into it."
       (cc-butler-compact--idle-poll "w" (- (float-time) 1))
       (should-not cc-butler-compact-test--sent)
       (should-not (cc-butler-compact-waiting-p "w")))))
+
+(ert-deftest cc-butler-compact/give-up-reaches-the-requester-not-just-the-log ()
+  "REGRESSION (2026-08-24): dealmatch (285k) and monocle-skills (291k) were
+queued for compaction, timed out, and logged `gave up waiting for idle' —
+and NOBODY was told.  The steward discovered both only by reading the ops
+file by hand.  A requested action must not evaporate silently: the give-up
+must land in the ops inbox (the `pending_events' drain) carrying what the
+requester needs to act — which session, its size, how long was waited, and
+that nothing was typed."
+  (cc-butler-compact-test--with-session "w"
+    (let ((cc-butler--inbox nil))
+      (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+                ((symbol-function 'cc-butler--ops-dir) (lambda () nil))
+                ((symbol-function 'cc-butler--sessions) (lambda () nil)))
+        (cc-butler-compact-session-when-idle "w")
+        (cc-butler-compact--idle-poll "w" (- (float-time) 1)
+                                      (- (float-time) 300))
+        (should (= (length cc-butler--inbox) 1))
+        (let ((body (plist-get (car cc-butler--inbox) :body)))
+          (should (string-match-p "\\bw\\b" body))            ; which session
+          (should (string-match-p "400k" body))               ; how large it still is
+          (should (string-match-p "5 min" body))              ; how long it waited
+          (should (string-match-p "[Nn]othing was typed" body))
+          (should (string-match-p "NOT compacted" body)))))))
+
+(ert-deftest cc-butler-compact/give-up-with-unknown-queue-time-still-reports ()
+  "An idle-wait entry queued before this report existed (or re-queued by a
+path that lost the timestamp) carries no queued-at — the report must still
+be delivered, just without claiming a duration it does not know."
+  (cc-butler-compact-test--with-session "w"
+    (let ((cc-butler--inbox nil))
+      (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+                ((symbol-function 'cc-butler--ops-dir) (lambda () nil))
+                ((symbol-function 'cc-butler--sessions) (lambda () nil)))
+        (cc-butler-compact-session-when-idle "w")
+        ;; Old-shape call: no queued-at.
+        (cc-butler-compact--idle-poll "w" (- (float-time) 1))
+        (should (= (length cc-butler--inbox) 1))
+        (let ((body (plist-get (car cc-butler--inbox) :body)))
+          (should (string-match-p "NOT compacted" body))
+          (should-not (string-match-p "[0-9]+ min" body)))))))
+
+(ert-deftest cc-butler-compact/give-up-report-is-typed-at-an-idle-ops-session ()
+  "The give-up report goes through the same channel as the fleet monitor:
+queued for the next `pending_events' drain ALWAYS, and additionally typed
+into the ops session when it is safely idle — a report that waits to be
+asked for is a report nobody reads."
+  (cc-butler-compact-test--with-session "w"
+    (let ((cc-butler--inbox nil)
+          typed)
+      (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+                ((symbol-function 'cc-butler--ops-dir) (lambda () "ops"))
+                ((symbol-function 'cc-butler--sessions) (lambda () nil))
+                ((symbol-function 'cc-butler-compact--blocked-reason)
+                 (lambda (_d &optional _i) nil))
+                ((symbol-function 'cc-butler--send-input)
+                 (lambda (dir text &optional submit)
+                   (push (list dir text submit) typed) t)))
+        (cc-butler-compact-session-when-idle "w")
+        (cc-butler-compact--idle-poll "w" (- (float-time) 1)
+                                      (- (float-time) 300))
+        (should cc-butler--inbox)
+        (should (= (length typed) 1))
+        (should (equal (nth 0 (car typed)) "ops"))
+        (should (nth 2 (car typed)))                          ; submitted
+        (should (string-match-p "GAVE UP" (nth 1 (car typed))))))))
 
 (ert-deftest cc-butler-compact/a-throwing-idle-poll-keeps-the-compaction-queued ()
   "REGRESSION (2026-07-31): the poll drops the queue entry FIRST and only then
@@ -1139,60 +1364,87 @@ neither of us intended to answer, and idling (or forcing) never closes it."
 ;;;; ------------------------------------------------------------------
 
 ;;;; ------------------------------------------------------------------
-;;;; P3: percentage-first hybrid threshold
+;;;; P4: absolute-token threshold + severity tiers (2026-09-02)
+;;;;
+;;;; REGRESSION/REDESIGN: the gate used to be `cc-butler-compact-threshold-fraction'
+;;;; (60% of the model's context window), specifically so a large-window
+;;;; session well past a fixed 300k but still under 60% was NOT a candidate
+;;;; -- see the P3 tests this section replaced (git history). 정수님's call,
+;;;; 2026-09-02: that was too late in practice (600k on a ~1M window), and
+;;;; every current fleet session runs the same window size, so the
+;;;; window-relativity that motivated the fraction is no longer buying
+;;;; anything. The gate is `cc-butler-compact-threshold' (absolute, 300k)
+;;;; again; `cc-butler-compact-threshold-fraction' survives only for the
+;;;; informational PCT display. Two new absolute tiers,
+;;;; `cc-butler-compact-warning-threshold'/`-critical-threshold' (400k/700k),
+;;;; drive a purely visual escalation for a session that should have
+;;;; compacted at 300k and did not -- never a second gate.
 ;;;; ------------------------------------------------------------------
 
-(ert-deftest cc-butler-compact/over-threshold-37pct-not-flagged ()
-  "A session at 37%% of its window is NOT a candidate even when its absolute
-token count (371538) is well past the old 300k floor: the percentage is the
-honest signal across differently-sized windows."
-  (let ((cc-butler-compact-threshold-fraction 0.60))
-    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
-               (lambda (_d) (list :ctx 371538 :pct 37 :model "Opus-4.8"))))
+(ert-deftest cc-butler-compact/over-threshold-under-is-not-flagged ()
+  "Just under `cc-butler-compact-threshold' is not a candidate."
+  (let ((cc-butler-compact-threshold 300000))
+    (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 299999)))
       (should-not (cc-butler-compact--over-threshold-p "/d/")))))
 
-(ert-deftest cc-butler-compact/over-threshold-65pct-flagged ()
-  "At 65%% (>= the 0.60 fraction) the session is a candidate."
-  (let ((cc-butler-compact-threshold-fraction 0.60))
-    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
-               (lambda (_d) (list :ctx 130000 :pct 65 :model "Opus-4.8"))))
+(ert-deftest cc-butler-compact/over-threshold-at-boundary-is-flagged ()
+  "AT `cc-butler-compact-threshold' (not just past it) is a candidate --
+the gate is at/above, not strictly above."
+  (let ((cc-butler-compact-threshold 300000))
+    (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 300000)))
       (should (cc-butler-compact--over-threshold-p "/d/")))))
 
-(ert-deftest cc-butler-compact/over-threshold-falls-back-to-ctx-when-no-pct ()
-  "With no percentage on the statusline, fall back to CTX against the window:
-just over window*fraction is a candidate, just under is not."
-  (let ((cc-butler-compact-threshold-fraction 0.60)
-        (cc-butler-cleanup-context-window 200000))   ; * 0.60 = 120000
-    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
-               (lambda (_d) (list :ctx nil :pct nil :model "Opus-4.8"))))
-      (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 130000)))
-        (should (cc-butler-compact--over-threshold-p "/d/")))
-      (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 110000)))
-        (should-not (cc-butler-compact--over-threshold-p "/d/"))))))
+(ert-deftest cc-butler-compact/over-threshold-well-past-is-flagged ()
+  "371538 tokens -- well past 300k -- is a candidate. Direct inverse of the
+old fraction-based `over-threshold-37pct-not-flagged': that same absolute
+figure used to be EXCLUDED because it was only 37%% of a large window; the
+whole point of this redesign is that it is now INCLUDED."
+  (let ((cc-butler-compact-threshold 300000))
+    (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 371538)))
+      (should (cc-butler-compact--over-threshold-p "/d/")))))
 
-(ert-deftest cc-butler-compact/over-threshold-is-window-adaptive ()
-  "The SAME ctx yields opposite verdicts under different context windows —
-the point of a fraction rather than an absolute floor."
-  (let ((cc-butler-compact-threshold-fraction 0.60))
-    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
-               (lambda (_d) (list :ctx nil :pct nil :model "m")))
-              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 150000)))
-      (let ((cc-butler-cleanup-context-window 200000))   ; *0.6 = 120000 -> over
-        (should (cc-butler-compact--over-threshold-p "/d/")))
-      (let ((cc-butler-cleanup-context-window 300000))   ; *0.6 = 180000 -> under
-        (should-not (cc-butler-compact--over-threshold-p "/d/"))))))
+(ert-deftest cc-butler-compact/over-threshold-unknown-size-not-flagged ()
+  "An unknown context size is never a candidate -- honest absence, not a
+guess, same principle the old hybrid signal already upheld."
+  (let ((cc-butler-compact-threshold 300000))
+    (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) nil)))
+      (should-not (cc-butler-compact--over-threshold-p "/d/")))))
 
-(ert-deftest cc-butler-compact/candidates-use-percentage-not-absolute ()
-  "The sweep gate is the percentage: a session at 37%% is not swept even though
-its 371538 tokens exceed the old absolute 300k threshold (which would have
-listed it)."
-  (let ((cc-butler-compact-threshold-fraction 0.60)
-        (cc-butler-compact-threshold 300000))
+(ert-deftest cc-butler-compact/candidates-use-absolute-tokens ()
+  "The sweep gate is now the absolute figure: a session at 371538 tokens IS
+swept. Direct inverse of the old `candidates-use-percentage-not-absolute'."
+  (let ((cc-butler-compact-threshold 300000))
     (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () '((:dir "/d/"))))
-              ((symbol-function 'cc-butler-compact--statusline-fields-now)
-               (lambda (_d) (list :ctx 371538 :pct 37 :model "Opus-4.8")))
               ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 371538)))
-      (should (null (cc-butler-compact-candidates))))))
+      (should (equal '("/d/") (cc-butler-compact-candidates))))))
+
+(ert-deftest cc-butler-compact/severity-nil-under-warning ()
+  "Below the warning tier, severity is nil -- no escalation for an ordinary
+over-threshold-but-not-yet-swept session."
+  (let ((cc-butler-compact-warning-threshold 400000)
+        (cc-butler-compact-critical-threshold 700000))
+    (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 350000)))
+      (should (null (cc-butler-compact--severity-for "/d/"))))))
+
+(ert-deftest cc-butler-compact/severity-warning-at-boundary ()
+  "AT `cc-butler-compact-warning-threshold' is 'warning."
+  (let ((cc-butler-compact-warning-threshold 400000)
+        (cc-butler-compact-critical-threshold 700000))
+    (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 400000)))
+      (should (eq 'warning (cc-butler-compact--severity-for "/d/"))))))
+
+(ert-deftest cc-butler-compact/severity-critical-at-boundary ()
+  "AT `cc-butler-compact-critical-threshold' is 'critical, not 'warning --
+the higher tier must win, not just also match."
+  (let ((cc-butler-compact-warning-threshold 400000)
+        (cc-butler-compact-critical-threshold 700000))
+    (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 700000)))
+      (should (eq 'critical (cc-butler-compact--severity-for "/d/"))))))
+
+(ert-deftest cc-butler-compact/severity-unknown-size-is-nil ()
+  "An unknown context size is never a severity guess either."
+  (cl-letf (((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) nil)))
+    (should (null (cc-butler-compact--severity-for "/d/")))))
 
 (ert-deftest cc-butler-compact/sweep-includes-butler-and-steward ()
   "The whole point: the butler and steward are candidates like anyone else.
@@ -1273,6 +1525,32 @@ the guard check and the start call."
       (should (equal started '("/busy/"))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; cc-butler#125: --display-pct must never reconstruct a percentage from
+;;;; the stale `cc-butler-cleanup-context-window' constant.  Nil, not a
+;;;; guess, when the fresh statusline pct is unavailable.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/display-pct-returns-fresh-pct-when-available ()
+  "The positive control: when the statusline's own pct is available, it is
+returned unchanged."
+  (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+             (lambda (_d) (list :ctx 139538 :pct 14 :model "Opus-5"))))
+    (should (equal 14 (cc-butler-compact--display-pct "/d/")))))
+
+(ert-deftest cc-butler-compact/display-pct-nil-when-fresh-pct-unavailable ()
+  "cc-butler#125: when the fresh statusline pct is unknown, the function must
+return nil -- NOT reconstruct a percentage from ctx / `cc-butler-cleanup-
+context-window'.  That reconstruction used a stale ~200k constant against
+real ~1M windows and produced numbers roughly 5x too high (139538/200000 ~=
+70%% vs. the real 14%%)."
+  (let ((cc-butler-cleanup-context-window 200000))
+    (cl-letf (((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx nil :pct nil :model "Opus-5")))
+              ((symbol-function 'cc-butler-cleanup-context-for)
+               (lambda (_d) 139538)))
+      (should (null (cc-butler-compact--display-pct "/d/"))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; MCP tools
 ;;;; ------------------------------------------------------------------
 
@@ -1287,7 +1565,7 @@ row must therefore carry a size, a model, and why it can or cannot compact."
                (lambda (d) (if (equal d "/butler/") "butler" "worker")))
               ((symbol-function 'cc-butler-cleanup-context-for)
                (lambda (d) (if (equal d "/butler/") 480466 152222)))
-              ((symbol-function 'cc-butler-cleanup-model-for) (lambda (_d) "Opus-4.8"))
+              ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
               ((symbol-function 'cc-butler--waiting-p) (lambda (_d) (float-time)))
               ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil)))
       (let ((out (cc-butler-tool-session-status)))
@@ -1304,7 +1582,7 @@ blindly."
   (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () '((:dir "/w/"))))
             ((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
             ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 400000))
-            ((symbol-function 'cc-butler-cleanup-model-for) (lambda (_d) "Opus-4.8"))
+            ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
             ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
             ((symbol-function 'cc-butler-compact--blocked-reason)
              (lambda (_d) "session is busy")))
@@ -1317,10 +1595,88 @@ blindly."
   (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () '((:dir "/w/"))))
             ((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
             ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) nil))
-            ((symbol-function 'cc-butler-cleanup-model-for) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) nil))
             ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
             ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil)))
     (should (string-match-p "?" (cc-butler-tool-session-status)))))
+
+;;;; ------------------------------------------------------------------
+;;;; cc-butler#99: the footer must state the real fraction gate, never
+;;;; the stale flat `cc-butler-compact-threshold' it replaced
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/status-tool-footer-states-the-real-absolute-gate ()
+  "REDESIGN (2026-09-02) of the cc-butler#99 regression test this replaces:
+the lesson survives, the gate it is pinned to does not. cc-butler#99 was
+a footer printing a flat 300k constant while the REAL gate was a 60%%
+fraction nowhere close -- a displayed number drifting out of step with
+what actually gates. The gate is now `cc-butler-compact-threshold' (300k)
+again, genuinely -- so a session at 369538 tokens (well past it) MUST now
+flag OVER THRESHOLD, and the footer MUST state 300k, because that is what
+actually gated it. Printing anything else here would be the same
+cc-butler#99 failure mode in the opposite direction."
+  (let ((cc-butler-compact-threshold 300000)
+        (cc-butler-compact-warning-threshold 400000)
+        (cc-butler-compact-critical-threshold 700000))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () '((:dir "/d/"))))
+              ((symbol-function 'cc-butler--display-name) (lambda (_d) "big-window-worker"))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 369538))
+              ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
+              ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--statusline-fields-now)
+               (lambda (_d) (list :ctx 369538 :pct 37 :model "Opus-4.8"))))
+      (let ((out (cc-butler-tool-session-status)))
+        ;; The real (now absolute) gate correctly trips.
+        (should (string-match-p "OVER THRESHOLD" out))
+        ;; The footer must state the real gate that actually fired.
+        (should (string-match-p "300k" out))))))
+
+(ert-deftest cc-butler-compact/status-tool-marks-warning-and-critical-severity ()
+  "The COMPACTION column escalates WARNING/CRITICAL for a session over
+threshold and still uncompacted at 400k/700k -- the visual signal the
+400k/700k tiers exist for (a sweep that failed to catch it, e.g. an idle
+window that keeps getting reset)."
+  (let ((cc-butler-compact-threshold 300000)
+        (cc-butler-compact-warning-threshold 400000)
+        (cc-butler-compact-critical-threshold 700000))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () '((:dir "/warn/") (:dir "/crit/") (:dir "/ok/"))))
+              ((symbol-function 'cc-butler--display-name)
+               (lambda (d) (pcase d ("/warn/" "warn-worker") ("/crit/" "crit-worker") (_ "ok-worker"))))
+              ((symbol-function 'cc-butler-cleanup-context-for)
+               (lambda (d) (pcase d ("/warn/" 450000) ("/crit/" 740000) (_ 320000))))
+              ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
+              ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) "session is busy"))
+              ((symbol-function 'cc-butler-compact--statusline-fields-now) (lambda (_d) nil)))
+      (let ((out (cc-butler-tool-session-status)))
+        (should (string-match-p "warn-worker.*WARNING — OVER THRESHOLD" out))
+        (should (string-match-p "crit-worker.*CRITICAL — OVER THRESHOLD" out))
+        ;; 320000 is over the 300k gate but under both severity tiers -- no prefix.
+        (should (string-match-p "ok-worker.*OVER THRESHOLD" out))
+        (should-not (string-match-p "ok-worker.*WARNING\\|ok-worker.*CRITICAL" out))))))
+
+(ert-deftest cc-butler-compact/status-tool-pct-column-is-unknown-not-fabricated ()
+  "When neither the statusline percentage nor a usable window is known, the
+displayed percentage must say so honestly rather than print a computed-
+looking number -- the same honest-refusal `cc-butler-compact--over-
+threshold-p' already applies to gating must apply to what is shown, per
+the standing rule that an unknown size is not a candidate for a guess.
+Checked on the per-row line itself (not the whole tool output, whose
+footer legitimately names the gate percentage)."
+  (let ((cc-butler-cleanup-context-window 0))  ; window itself unusable
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 150000))
+              ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
+              ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--statusline-fields-now) (lambda (_d) nil)))
+      (let ((row (cc-butler-compact--status-line "/w/")))
+        (should (string-match-p "150k" row))       ; ctx IS known
+        ;; but no numeric percentage may appear -- it is not computable.
+        (should-not (string-match-p "[0-9]+%" row))))))
 
 (ert-deftest cc-butler-compact/compact-tool-resolves-a-session-by-name ()
   "compact_session takes the name the LLM already has, not a directory."
@@ -1376,6 +1732,16 @@ never a silent no-op that reads as success."
             ((symbol-function 'cc-butler--display-name) (lambda (_d) "butler")))
     (should (string-match-p "butler" (cc-butler-tool-compact-large-sessions)))))
 
+(ert-deftest cc-butler-compact/sweep-tool-nothing-started-states-the-real-gate ()
+  "REDESIGN of the cc-butler#99 regression test this replaces: the gate is
+`cc-butler-compact-threshold' (300k) again, genuinely, so the \"nothing
+started\" text correctly states 300k now -- it would be the cc-butler#99
+failure mode in reverse to keep hiding the real number here."
+  (let ((cc-butler-compact-threshold 300000))
+    (cl-letf (((symbol-function 'cc-butler-compact-large-sessions) (lambda () nil)))
+      (let ((out (cc-butler-tool-compact-large-sessions)))
+        (should (string-match-p "300k" out))))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Fleet monitor: elisp reports, the steward decides
 ;;;; ------------------------------------------------------------------
@@ -1425,6 +1791,18 @@ something that will never clear itself."
     (cl-letf (((symbol-function 'cc-butler-compact--blocked-reason)
                (lambda (_d &optional _i) "an interactive menu/wizard is open")))
       (should (string-match-p "menu" (cc-butler-compact-fleet-summary))))))
+
+(ert-deftest cc-butler-compact/fleet-summary-states-the-real-gate-not-the-flat-constant ()
+  "REDESIGN of the cc-butler#99 regression test this replaces: the
+steward-facing ceiling report must describe whatever actually gated the
+list. The gate is `cc-butler-compact-threshold' (absolute, 300k) again,
+so the report correctly states 300k now — the cc-butler#99 lesson
+(never print a number divorced from what actually gates) is upheld by
+matching the header to the current real gate, not by avoiding 300k
+specifically."
+  (cc-butler-compact-test--with-fleet '(("/b/" . 620000))
+    (let ((out (cc-butler-compact-fleet-summary)))
+      (should (string-match-p "300k" out)))))
 
 (ert-deftest cc-butler-compact/monitor-notifies-and-queues ()
   "By default the steward is TOLD, not left to ask: the report is typed in
@@ -1516,6 +1894,144 @@ still gets through, so a blocked steward is not left uninformed."
         (cc-butler-compact--monitor-scan)
         (should cc-butler--inbox)        ; still reported to the queue
         (should-not sent)))))            ; but nothing typed
+
+;;;; ------------------------------------------------------------------
+;;;; Monitor watchdog: the timer has died silently before (`t' mode
+;;;; variable, dead `run-with-timer', nothing surfacing it for days) —
+;;;; these prove the diagnostic and the self-heal, isolated from the real
+;;;; global timer so tests cannot leak one.
+;;;; ------------------------------------------------------------------
+
+(defmacro cc-butler-compact-test--with-monitor-state (&rest body)
+  "Run BODY with the monitor's tick-tracking state reset and isolated,
+never touching the real global timer."
+  (declare (indent 0))
+  `(let ((cc-butler-compact-monitor-mode t)
+         (cc-butler-compact-monitor-interval 900)
+         (cc-butler-compact-monitor-watchdog-factor 3)
+         (cc-butler-compact--monitor-last-tick nil)
+         (cc-butler-compact--monitor-armed-at nil))
+     ,@body))
+
+(ert-deftest cc-butler-compact/monitor-tick-age-nil-when-never-armed ()
+  "Before the mode has ever been turned on, there is no baseline to age —
+absence of evidence, not evidence of a dead timer."
+  (cc-butler-compact-test--with-monitor-state
+    (should-not (cc-butler-compact--monitor-tick-age))))
+
+(ert-deftest cc-butler-compact/monitor-tick-age-uses-armed-at-before-first-tick ()
+  "A freshly (re)armed monitor is not stale before its own first interval —
+age is measured from when it was armed, not treated as infinite."
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-armed-at (- (float-time) 10))
+    (let ((age (cc-butler-compact--monitor-tick-age)))
+      (should age)
+      (should (< (abs (- age 10)) 2)))))
+
+(ert-deftest cc-butler-compact/monitor-scan-records-a-tick-even-with-nothing-to-report ()
+  "A zero-candidate tick is still evidence the monitor is alive — this is
+the whole point: silence from a healthy fleet and silence from a dead
+timer must not look the same on disk."
+  (cc-butler-compact-test--with-monitor-state
+    (cc-butler-compact-test--with-fleet '(("/w/" . 10000))
+      (should-not cc-butler-compact--monitor-last-tick)
+      (cc-butler-compact--monitor-scan)
+      (should cc-butler-compact--monitor-last-tick)
+      (should (< (cc-butler-compact--monitor-tick-age) 2)))))
+
+(ert-deftest cc-butler-compact/monitor-not-stale-just-after-a-tick ()
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick (float-time))
+    (should-not (cc-butler-compact--monitor-stale-p))))
+
+(ert-deftest cc-butler-compact/monitor-stale-past-the-watchdog-factor ()
+  "Past interval * factor with no tick, the monitor is presumed dead."
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick
+          (- (float-time) (* 3.5 cc-butler-compact-monitor-interval)))
+    (should (cc-butler-compact--monitor-stale-p))))
+
+(ert-deftest cc-butler-compact/monitor-not-stale-below-the-watchdog-factor ()
+  "Two missed intervals is a slow tick, not a dead timer — the factor
+exists precisely so an ordinary delay does not trip the watchdog."
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick
+          (- (float-time) (* 2 cc-butler-compact-monitor-interval)))
+    (should-not (cc-butler-compact--monitor-stale-p))))
+
+(ert-deftest cc-butler-compact/monitor-never-stale-when-deliberately-off ()
+  "A human turning the monitor off is not a fault for the watchdog to
+correct — the mode variable being nil must short-circuit staleness."
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact-monitor-mode nil
+          cc-butler-compact--monitor-last-tick
+          (- (float-time) (* 100 cc-butler-compact-monitor-interval)))
+    (should-not (cc-butler-compact--monitor-stale-p))))
+
+(ert-deftest cc-butler-compact/monitor-status-line-reports-off ()
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact-monitor-mode nil)
+    (should (string-match-p "OFF" (cc-butler-compact--monitor-status-line)))))
+
+(ert-deftest cc-butler-compact/monitor-status-line-reports-not-yet-ticked ()
+  (cc-butler-compact-test--with-monitor-state
+    (should (string-match-p "has not ticked" (cc-butler-compact--monitor-status-line)))))
+
+(ert-deftest cc-butler-compact/monitor-status-line-reports-alive ()
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick (float-time))
+    (let ((line (cc-butler-compact--monitor-status-line)))
+      (should (string-match-p "alive" line))
+      (should-not (string-match-p "STALE" line)))))
+
+(ert-deftest cc-butler-compact/monitor-status-line-reports-stale ()
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick
+          (- (float-time) (* 10 cc-butler-compact-monitor-interval)))
+    (should (string-match-p "STALE" (cc-butler-compact--monitor-status-line)))))
+
+(ert-deftest cc-butler-compact/session-status-surfaces-monitor-line ()
+  "The diagnostic must be reachable without deep code-reading — session_status
+is the tool an operator (or the steward) actually calls."
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick
+          (- (float-time) (* 10 cc-butler-compact-monitor-interval)))
+    (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () nil)))
+      (should (string-match-p "STALE" (cc-butler-tool-session-status))))))
+
+(ert-deftest cc-butler-compact/watchdog-does-nothing-when-not-stale ()
+  "The overwhelming majority case: a healthy monitor, no action, no noise."
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick (float-time))
+    (let (rearmed)
+      (cl-letf (((symbol-function 'cc-butler-compact-monitor-mode)
+                 (lambda (&rest _) (push t rearmed))))
+        (should-not (cc-butler-compact--monitor-watchdog-maybe-rearm))
+        (should-not rearmed)))))
+
+(ert-deftest cc-butler-compact/watchdog-rearms-and-reports-when-stale ()
+  "The self-heal: past the staleness threshold, the watchdog calls the
+mode function to re-arm — never a second `run-with-timer' of its own —
+logs loudly, and returns a string a human reading the turn would notice."
+  (cc-butler-compact-test--with-monitor-state
+    (setq cc-butler-compact--monitor-last-tick
+          (- (float-time) (* 10 cc-butler-compact-monitor-interval)))
+    (let (rearmed logged)
+      (cl-letf (((symbol-function 'cc-butler-compact-monitor-mode)
+                 (lambda (&rest args) (push args rearmed)))
+                ((symbol-function 'cc-butler--log)
+                 (lambda (fmt &rest args) (push (apply #'format fmt args) logged))))
+        (let ((out (cc-butler-compact--monitor-watchdog-maybe-rearm)))
+          (should out)
+          (should (string-match-p "re-armed" out))
+          (should (equal rearmed '((1))))
+          (should logged)
+          (should (string-match-p "WATCHDOG" (car logged))))))))
+
+;; Wiring into the per-turn hook payloads (`cc-butler--pending-events-hook-payload'
+;; / `cc-butler--pending-decisions-hook-payload' / `cc-butler--compact-monitor-watchdog-check')
+;; is tested in tests/cc-butler-orchestrator-test.el, next to those functions'
+;; other tests — this file covers the pure monitor-state logic above.
 
 ;;;; ------------------------------------------------------------------
 ;;;; Restoring a model without a closed list of families
@@ -1672,6 +2188,20 @@ the pre-flight read had to become a separate caller instead."
       (should (equal "Opus-5" (cc-butler-compact--model-now "/d/")))
       (should (= 1 calls)))))
 
+(ert-deftest cc-butler-compact/model-now-still-nil-on-failed-scrape-no-fallback-consulted ()
+  "GUARD for the new `fallback-fn' parameter on `cc-butler-cleanup-model-for':
+`--model-now' must call it with no fallback, so a failed scrape with nothing
+cached still returns bare nil and never touches a transcript or any other
+fallback source.  FRESHNESS OVER AVAILABILITY -- this is the test that would
+catch an accidental regression of that contract."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-function (lambda (_s) nil))
+        (transcript-calls 0))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model)
+               (lambda (_d) (setq transcript-calls (1+ transcript-calls)) "claude-opus-5")))
+      (should (null (cc-butler-compact--model-now "/d/")))
+      (should (= 0 transcript-calls)))))
+
 (ert-deftest cc-butler-compact/restore-model-falls-back-to-transcript ()
   "Cases 1-4: the screen cannot say (mid-turn, just restarted, or a window too
 narrow to render MODEL:).  The pre-flight read wants AVAILABILITY, so it falls
@@ -1712,6 +2242,161 @@ the behaviour we want to keep for a genuinely unknown model."
       ;; nothing ever known -> nil -> the driver refuses
       (clrhash cc-butler-cleanup--model-cache)
       (should (null (cc-butler-compact--model-for-restore "/e/"))))))
+
+(ert-deftest cc-butler-compact/restore-model-remembered-fallback-still-a-plain-string ()
+  "GUARD for the new `fallback-fn' parameter and the separate freshness
+cache: `--model-for-restore''s remembered-value read pulls straight from
+`cc-butler-cleanup--model-cache', whose `(TIMESTAMP . NAME)' shape was
+deliberately left untouched.  This pins that it still hands back a plain
+string, not some other shape, so a session is never asked to `/model' to
+something that is not a name."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-function (lambda (_s) nil)))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model) (lambda (_d) nil)))
+      (puthash "/d/" (cons (float-time) "Opus-4.8") cc-butler-cleanup--model-cache)
+      (let ((result (cc-butler-compact--model-for-restore "/d/")))
+        (should (stringp result))
+        (should (equal "Opus-4.8" result))))))
+
+;;;; ---- session_status's own-turn model fix ---------------------------
+;;;; cc-butler-compact--model-for-status-line gives the display path the
+;;;; driver's 3-source order (screen -> transcript -> remembered), and
+;;;; marks the remembered/sticky case visibly so it is never mistaken for
+;;;; a fresh or transcript-confirmed answer.
+
+(ert-deftest cc-butler-compact/status-line-model-fresh-screen-no-marker ()
+  "A legible screen scrape is used as-is, no marker appended."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 60)
+        (cc-butler-cleanup-model-function (lambda (_s) "claude-sonnet-5")))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model)
+               (lambda (_d) (error "transcript must not be consulted when the screen answers"))))
+      (should (equal "claude-sonnet-5" (cc-butler-compact--model-for-status-line "/d/"))))))
+
+(ert-deftest cc-butler-compact/status-line-model-screen-fails-transcript-confirms-no-marker ()
+  "Screen illegible (e.g. own status mid-turn), transcript answers: the
+transcript is authoritative, not a guess, so still no marker -- but the
+name reflects the transcript, not the screen."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 60)
+        (cc-butler-cleanup-model-function (lambda (_s) nil)))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model)
+               (lambda (_d) "claude-opus-5")))
+      (should (equal "claude-opus-5" (cc-butler-compact--model-for-status-line "/d/"))))))
+
+(ert-deftest cc-butler-compact/status-line-model-both-fail-last-known-gets-marker ()
+  "Screen illegible AND no transcript signal, but a last-known value is
+cached: it is still shown (availability over refusing), but visibly marked
+with a trailing `~' so it is never mistaken for a fresh or transcript-
+confirmed answer."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 0)
+        (cc-butler-cleanup-model-function (lambda (_s) "claude-sonnet-5")))
+    ;; seed a last-known value via a real fresh scrape first
+    (should (equal "claude-sonnet-5" (cc-butler-compact--model-for-status-line "/d/")))
+    ;; now the screen and the transcript both go quiet
+    (setq cc-butler-cleanup-model-function (lambda (_s) nil))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model) (lambda (_d) nil)))
+      (should (equal "claude-sonnet-5~" (cc-butler-compact--model-for-status-line "/d/"))))))
+
+(ert-deftest cc-butler-compact/status-line-model-nothing-ever-known-is-nil ()
+  "Screen, transcript, and cache all empty: nil, which `--status-line' then
+renders as the existing \"?\" unknown marker -- never a fabricated name."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 0)
+        (cc-butler-cleanup-model-function (lambda (_s) nil)))
+    (cl-letf (((symbol-function 'cc-butler--transcript-model) (lambda (_d) nil)))
+      (should (null (cc-butler-compact--model-for-status-line "/d/"))))))
+
+(ert-deftest cc-butler-compact/status-line-renders-unknown-model-as-question-mark ()
+  "End-to-end through `--status-line': an unknown model renders as \"?\",
+matching how an unknown context/pct already render, per the existing
+`(or model \"?\")' handling."
+  (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
+            ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) nil))
+            ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil)))
+    (let ((row (cc-butler-compact--status-line "/w/")))
+      (should (string-match-p "\\?" row)))))
+
+;;;; ---- outcomes on disk (ops log mirror) ----------------------------
+
+(defmacro cc-butler-compact-test--with-ops-log-on-disk (&rest body)
+  "Run BODY inside `--with-session' \"w\" but with the REAL `cc-butler--log'
+(the session macro stubs it to `ignore') pointed at a throwaway ops-log dir
+and a throwaway log buffer, both cleaned up afterwards."
+  (declare (indent 0))
+  `(let* ((tmp (make-temp-file "cc-butler-compact-ops" t))
+          (cc-butler-ops-log-dir (expand-file-name "log/" tmp))
+          (cc-butler-log-buffer-name " *cc-butler-compact-ops-test-log*")
+          (real-log (symbol-function 'cc-butler--log)))
+     (unwind-protect
+         (cc-butler-compact-test--with-session "w"
+           (cl-letf (((symbol-function 'cc-butler--log) real-log))
+             ,@body))
+       (when (get-buffer cc-butler-log-buffer-name)
+         (kill-buffer cc-butler-log-buffer-name))
+       (delete-directory tmp t))))
+
+(defun cc-butler-compact-test--ops-log-string ()
+  "Contents of today's ops log file, or nil if it was never written."
+  (let ((file (cc-butler--log-file)))
+    (and (file-exists-p file)
+         (with-temp-buffer (insert-file-contents file) (buffer-string)))))
+
+(ert-deftest cc-butler-compact/driver-restore-leaves-disk-evidence ()
+  "A machine-performed restore is provable from disk alone: the ops file
+holds the driver's own \"restoring (sent /model ...)\" step line AND the
+outcome line names the path (\"driver-sent restore\").  A hand-typed /model
+leaves neither — so their absence reads as \"not the machine\", which is the
+distinction the stranding audit needed and could previously only get from a
+volatile buffer."
+  (cc-butler-compact-test--with-ops-log-on-disk
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")            ; -> /compact
+    (setq cc-butler-compact-test--ctx 90000)
+    (cc-butler-compact--poll "w")            ; -> /model claude-opus-4-8
+    (setq cc-butler-compact-test--model "Opus-4.8")
+    (cc-butler-compact--poll "w")            ; -> restored, finish
+    (should-not (cc-butler-compact--active-p "w"))
+    (let ((got (cc-butler-compact-test--ops-log-string)))
+      (should got)
+      (should (string-match-p (regexp-quote "restoring (sent /model claude-opus-4-8)") got))
+      (should (string-match-p (regexp-quote "model restored to Opus-4.8 (driver-sent restore)") got)))))
+
+(ert-deftest cc-butler-compact/failure-outcome-lands-on-disk ()
+  "A restore failure is written to the daily ops file as surely as a
+success — a log where only successes survive the process makes the failure
+rate look like zero (the 1066 stranding evidence lived in a volatile
+buffer for exactly this reason).
+
+The restore-wait gate reads the SCREEN, not `cc-butler--waiting-p' (see
+`cc-butler-compact--restore-block-reason' — that flag was retired from this
+path for the reasons documented there), so what must hold the restore open
+here is a screen that never goes idle, not a stubbed flag.  Same setup as
+`cc-butler-compact/held-restore-still-gives-up-eventually', just proved
+through the on-disk ops log instead of the in-memory return value."
+  (cc-butler-compact-test--with-ops-log-on-disk
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--busy-screen)
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (cc-butler-compact--poll "w")          ; -> held in restore-wait
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (cc-butler-compact--poll "w")          ; -> gives up: NOT restored
+    (should-not (cc-butler-compact--active-p "w"))
+    (let ((got (cc-butler-compact-test--ops-log-string)))
+      (should got)
+      (should (string-match-p "NOT restored" got)))))
 
 (provide 'cc-butler-compact-test)
 ;;; cc-butler-compact-test.el ends here

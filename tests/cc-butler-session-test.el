@@ -639,12 +639,65 @@ which is the likeliest time to hit this at all."
   (require 'cc-butler-persist)
   (let ((order nil))
     (cl-letf (((symbol-function 'claude-code-ide) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler--configure-session) (lambda (_d) nil))
               ((symbol-function 'cc-butler--ensure-pty-size)
                (lambda (_d) (push 'sized order)))
               ((symbol-function 'cc-butler--wait-for-session-ready)
                (lambda (_d) (push 'waited order))))
       (cc-butler--resume-in "/tmp/some-worker/"))
     (should (equal (nreverse order) '(sized waited)))))
+
+(ert-deftest cc-butler-session/resume-also-installs-the-refit-hook ()
+  "THE BUG: `cc-butler--resume-in' used to skip `cc-butler--configure-session'
+entirely, so a resumed session never got the persistent
+`window-configuration-change-hook' that keeps refitting its PTY to the
+largest window on later layout changes -- only the one-shot launch-time
+floor. It looked fine right after a restore, then quietly shrank on the
+next window split/switch with nothing to catch it. This is the
+guard-invocation check: called with the right DIR, not just \"does the
+session eventually work\"."
+  (require 'cc-butler-persist)
+  (let ((called nil))
+    (cl-letf (((symbol-function 'claude-code-ide) (lambda (&rest _) nil))
+              ((symbol-function 'cc-butler--configure-session)
+               (lambda (d) (push d called)))
+              ((symbol-function 'cc-butler--ensure-pty-size) #'ignore)
+              ((symbol-function 'cc-butler--wait-for-session-ready) #'ignore))
+      (cc-butler--resume-in "/tmp/some-worker/"))
+    (should (equal called '("/tmp/some-worker/")))))
+
+;;;; ---- border-line-p: a titled border's trailing run ----------------
+
+(ert-deftest cc-butler-session/border-line-p-accepts-one-trailing-rule-char ()
+  "THE BUG (2026-09-01): a top border with a topic title embedded can leave
+as little as ONE trailing ─ before the terminal edge -- how much survives
+is whatever the terminal WIDTH leaves over after subtracting the title,
+which has no reason to land on 2+. Requiring two silently broke
+`cc-butler--find-input-line' (and everything built on it -- context,
+model, the whole statusline read) for any session whose title happened
+to render that way, for as long as that title stayed set."
+  (with-temp-buffer
+    (insert "───────────────────────── some longer topic title here ─")
+    (goto-char (point-min))
+    (should (cc-butler--border-line-p))))
+
+(ert-deftest cc-butler-session/border-line-p-still-accepts-a-plain-rule ()
+  "The ordinary case (no title, both ends pure rule) must keep working --
+this is not a case relaxing the check should ever touch."
+  (with-temp-buffer
+    (insert "──────────────────────────────────────────────")
+    (goto-char (point-min))
+    (should (cc-butler--border-line-p))))
+
+(ert-deftest cc-butler-session/border-line-p-rejects-ordinary-text ()
+  "Relaxing the trailing-run length must not make ordinary prose read as a
+border -- `cc-butler--border-rule-char' (U+2500) essentially never
+appears in real text, so even a lone trailing char stays a safe signal,
+but this pins that a normal line still does not match."
+  (with-temp-buffer
+    (insert "이것은 그냥 평범한 대화 텍스트입니다.")
+    (goto-char (point-min))
+    (should-not (cc-butler--border-line-p))))
 
 (ert-deftest cc-butler-session/refit-reapplies-the-floor ()
   "A refit is sized from a window, so it can drop back under the floor the
@@ -1498,6 +1551,369 @@ dir — not redraw everything, not guess."
     (cl-letf (((symbol-function 'cc-butler--dir-for-buffer) (lambda (_buf) nil)))
       (cc-butler--on-title-change))
     (should (= 0 (hash-table-count cc-butler--dirty-dirs)))))
+
+;;;; ---- ops log on-disk mirror ---------------------------------------
+
+(defmacro cc-butler-session-test--with-ops-log (&rest body)
+  "Run BODY with the ops-log mirror pointed at a throwaway directory and
+the log buffer at a throwaway name, both cleaned up afterwards."
+  (declare (indent 0))
+  `(let* ((cc-butler-ops-log-dir
+           (expand-file-name "log/" (make-temp-file "cc-butler-ops-test" t)))
+          (cc-butler-log-buffer-name " *cc-butler-ops-test-log*"))
+     (unwind-protect
+         (progn ,@body)
+       (when (get-buffer cc-butler-log-buffer-name)
+         (kill-buffer cc-butler-log-buffer-name))
+       (delete-directory (file-name-directory
+                          (directory-file-name cc-butler-ops-log-dir))
+                         t))))
+
+(defun cc-butler-session-test--ops-file-string ()
+  "Return the contents of today's ops log file, or nil if absent."
+  (let ((file (cc-butler--log-file)))
+    (and (file-exists-p file)
+         (with-temp-buffer
+           (insert-file-contents file)
+           (buffer-string)))))
+
+(ert-deftest cc-butler-session/log-mirrors-line-to-daily-file ()
+  "Given a fresh ops-log dir, When `cc-butler--log' runs, Then the same
+formatted line lands in today's ops-YYYY-MM-DD.log — compact/cleanup
+outcomes no longer live only in a buffer that dies with the process."
+  (cc-butler-session-test--with-ops-log
+    (cc-butler--log "compact: %s │ %s" "worker-a" "done (model restored)")
+    (let ((got (cc-butler-session-test--ops-file-string)))
+      (should got)
+      (should (string-match-p
+               "compact: worker-a │ done (model restored)"
+               (regexp-quote got)))
+      ;; the line carries a timestamp, same format as the buffer
+      (should (string-match-p "\\`\\[[0-9]\\{2\\}:[0-9]\\{2\\}:[0-9]\\{2\\}\\] " got)))))
+
+(ert-deftest cc-butler-session/log-survives-unwritable-mirror-dir ()
+  "Given an ops-log dir that cannot exist (a path under a regular file),
+When `cc-butler--log' runs, Then no error propagates and the buffer sink
+still gets the line — the mirror is an audit layer, never a precondition."
+  (let* ((blocker (make-temp-file "cc-butler-ops-blocker"))  ; a FILE
+         (cc-butler-ops-log-dir (expand-file-name "sub/" blocker))
+         (cc-butler-log-buffer-name " *cc-butler-ops-test-log*"))
+    (unwind-protect
+        (progn
+          (cc-butler--log "cleanup: %s │ %s" "worker-b" "externalized")
+          (with-current-buffer cc-butler-log-buffer-name
+            (should (string-match-p "cleanup: worker-b │ externalized"
+                                    (buffer-string)))))
+      (when (get-buffer cc-butler-log-buffer-name)
+        (kill-buffer cc-butler-log-buffer-name))
+      (delete-file blocker))))
+
+(ert-deftest cc-butler-session/log-accumulates-in-same-daily-file ()
+  "Given several `cc-butler--log' calls on the same day, Then they append
+to the SAME file in order — an append-only record, not one file per event."
+  (cc-butler-session-test--with-ops-log
+    (cc-butler--log "compact: %s │ start" "worker-c")
+    (cc-butler--log "compact: %s │ compacted but model NOT restored" "worker-c")
+    (cc-butler--log "cleanup: %s │ ok" "worker-c")
+    ;; exactly one file in the mirror dir
+    (should (= 1 (length (directory-files cc-butler-ops-log-dir nil "\\`ops-"))))
+    (let ((got (cc-butler-session-test--ops-file-string)))
+      (should (= 3 (with-temp-buffer
+                     (insert got)
+                     (count-lines (point-min) (point-max)))))
+      ;; order preserved: start before outcome before cleanup
+      (should (< (string-match (regexp-quote "start") got)
+                 (string-match (regexp-quote "NOT restored") got)
+                 (string-match (regexp-quote "cleanup") got))))))
+
+(ert-deftest cc-butler-session/ops-log-dir-is-not-the-real-default-during-a-test-run ()
+  "`tests/run-tests.el' redirects `cc-butler-ops-log-dir' away from the
+real live log for the whole batch run — proves that binding is actually
+active, not just present in the source. Compares against the defcustom's
+own `standard-value' rather than hardcoding a path, so it can't be
+silently defeated by a default-value change."
+  (let ((real-default (eval (car (get 'cc-butler-ops-log-dir 'standard-value)) t)))
+    (should-not (equal real-default cc-butler-ops-log-dir))))
+
+;;;; ---- ops log vs message log: a quoted event must not re-count -----
+;;;;
+;;;; REGRESSION for the live 2026-08-26 incident: investigating a compact
+;;;; anomaly, a suspicious ops-log LINE got quoted verbatim into a relay
+;;;; message body -- and because `cc-butler--log' used to write that whole
+;;;; multi-line body straight into the ops log, the quoted line became a
+;;;; second, indistinguishable occurrence of the very event being
+;;;; investigated. Butler and steward independently hit this (count 23 vs
+;;;; actual 22) -- observing the log inflated the thing being observed.
+
+(defun cc-butler-session-test--msg-file-string ()
+  "Return the contents of today's message log file, or nil if absent."
+  (let ((file (cc-butler--msg-log-file)))
+    (and (file-exists-p file)
+         (with-temp-buffer
+           (insert-file-contents file)
+           (buffer-string)))))
+
+(defun cc-butler-session-test--ops-grep-count (needle)
+  "Count lines in today's ops log containing NEEDLE, or 0 if the file is absent."
+  (let ((got (cc-butler-session-test--ops-file-string)))
+    (if (not got) 0
+      (with-temp-buffer
+        (insert got)
+        (goto-char (point-min))
+        (let ((n 0))
+          (while (search-forward needle nil t) (setq n (1+ n)))
+          n)))))
+
+(ert-deftest cc-butler-session/quoted-log-line-in-a-report-body-does-not-recount ()
+  "A worker report whose BODY happens to contain something that looks
+exactly like a real ops-log line for a DIFFERENT event kind must not make
+that event kind's count go up in the ops log -- reproduces the 2026-08-26
+incident directly: `cc-butler--inbox-push' (report_to_steward's legacy-
+transport path) is the exact call site that carried it live."
+  (cc-butler-session-test--with-ops-log
+    (cc-butler--log "compact: worker-x │ start (ctx 100)")   ; one real event
+    (should (= 1 (cc-butler-session-test--ops-grep-count "compact:")))
+    (let ((cc-butler--inbox nil))
+      (cc-butler--inbox-push
+       "/worker-y/"
+       "investigating a compact anomaly, quoting the suspicious line: [12:34:56] compact: worker-x │ start (ctx 100)"))
+    ;; The quote sat inside a report body -- it must not be read back as a
+    ;; second real compact event.
+    (should (= 1 (cc-butler-session-test--ops-grep-count "compact:")))))
+
+(ert-deftest cc-butler-session/a-real-second-compact-event-still-counts ()
+  "Positive control for the test above: this is not a filter that happens
+to swallow every occurrence of `compact:' -- a GENUINE second compact
+event, logged the normal way (not embedded in a report body), still counts.
+Without this, a broken implementation that discarded all `compact:' lines
+unconditionally would pass the negative test above for the wrong reason."
+  (cc-butler-session-test--with-ops-log
+    (cc-butler--log "compact: worker-x │ start (ctx 100)")
+    (cc-butler--log "compact: worker-x │ compacted (ctx 12000 -> 400)")
+    (should (= 2 (cc-butler-session-test--ops-grep-count "compact:")))))
+
+(ert-deftest cc-butler-session/report-body-lands-whole-in-the-message-log ()
+  "The report body is not discarded -- it is still evidence -- it just
+does not live in the ops event stream any more. The full multi-line body
+must be recoverable from the message log."
+  (cc-butler-session-test--with-ops-log
+    (let ((cc-butler--inbox nil)
+          (body "line one of the report\nline two, with a compact: lookalike\nline three"))
+      (cc-butler--inbox-push "/worker-z/" body)
+      (let ((got (cc-butler-session-test--msg-file-string)))
+        (should got)
+        ;; exactly one JSON object, i.e. one physical line in the file
+        (should (= 1 (with-temp-buffer (insert got) (count-lines (point-min) (point-max)))))
+        (let ((record (json-parse-string got :object-type 'alist)))
+          (should (equal (alist-get 'kind record) "report"))
+          (should (equal (alist-get 'body record) body)))))))
+
+(ert-deftest cc-butler-session/multiline-body-does-not-break-ops-log-line-structure ()
+  "A multi-line report body must not fragment the ops log into extra,
+unprefixed lines -- the ops log gets exactly one short gist line per event,
+regardless of how many lines the body itself contains."
+  (cc-butler-session-test--with-ops-log
+    (let ((cc-butler--inbox nil))
+      (cc-butler--inbox-push "/worker-w/" "five\nseparate\nlines\nof\nreport"))
+    (let ((got (cc-butler-session-test--ops-file-string)))
+      (should (= 1 (with-temp-buffer (insert got) (count-lines (point-min) (point-max)))))
+      ;; the gist, not the raw body, is what landed
+      (should (string-match-p "report ([0-9]+ chars, see msg log)" got))
+      (should-not (string-match-p "separate" got)))))
+
+(ert-deftest cc-butler-session/inbox-push-guard-actually-calls-the-message-log ()
+  "Dedicated invocation check, kept separate from the outcome tests above
+on purpose (same reasoning as the forward-ops-free-p tests from the
+previous fix): confirm `cc-butler--log-message' is actually invoked by
+`cc-butler--inbox-push', not merely that file contents happen to look
+right -- a future edit that quietly dropped the call could still leave
+the ops-log tests above passing by accident if nothing then LOOKS for the
+body anywhere."
+  (cc-butler-session-test--with-ops-log
+    (let ((cc-butler--inbox nil) (calls nil))
+      (cl-letf (((symbol-function 'cc-butler--log-message)
+                 (lambda (kind from to body) (push (list kind from to body) calls))))
+        (cc-butler--inbox-push "/worker-v/" "some body"))
+      (should (= 1 (length calls)))
+      (should (equal (nth 0 (car calls)) "report")))))
+
+;;;; ------------------------------------------------------------------
+;;;; ghostel event-pipe deadlock workaround (cc-butler#104)
+;;;; ------------------------------------------------------------------
+;;
+;; Full-blown integration testing of an actual OS-level pipe resize is not
+;; practical under `emacs -Q --batch' (there is no live ghostel session, no
+;; native pty, and no guarantee the sandbox even permits `F_SETPIPE_SZ').
+;; These tests instead pin the CONTRACT that matters for condition 3 of
+;; cc-butler#104: whatever goes wrong, session launch is never blocked and
+;; never sees a signal escape this function — only mock/stub the resize
+;; machinery, never a real subprocess.
+
+(ert-deftest cc-butler-session/pipe-mitigation-noop-on-non-ghostel-backend ()
+  "Given a non-ghostel terminal backend (vterm/eat — no native event pipe
+exists to resize), When the mitigation runs, Then it does not even look for
+`python3' or spawn a process — there is nothing to mitigate."
+  (let ((claude-code-ide-terminal-backend 'vterm)
+        (looked-for-python nil))
+    (cl-letf (((symbol-function 'executable-find)
+               (lambda (p) (setq looked-for-python (equal p "python3")) nil))
+              ((symbol-function 'make-process)
+               (lambda (&rest _) (error "should not spawn a process for a non-ghostel backend"))))
+      (should (null (cc-butler--mitigate-ghostel-event-pipe-deadlock)))
+      (should (null looked-for-python)))))
+
+(ert-deftest cc-butler-session/pipe-mitigation-degrades-when-python3-missing ()
+  "Given the ghostel backend but no `python3' on PATH, When the mitigation
+runs, Then it logs exactly one warning and returns without signaling or
+spawning a process — degrade to the default pipe, never block launch."
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (log-calls 0))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) nil))
+              ((symbol-function 'cc-butler--log)
+               (lambda (&rest _) (cl-incf log-calls) nil))
+              ((symbol-function 'make-process)
+               (lambda (&rest _) (error "should not spawn without python3"))))
+      (should (null (cc-butler--mitigate-ghostel-event-pipe-deadlock)))
+      (should (= 1 log-calls)))))
+
+(ert-deftest cc-butler-session/pipe-mitigation-survives-make-process-erroring ()
+  "Given `make-process' itself signals (the underlying resize plumbing is
+broken in some unforeseen way), When the mitigation runs, Then the error is
+caught here — it never escapes to the launch caller — and exactly one
+warning is logged. This is condition 3 of cc-butler#104: the cure must
+never be worse than the disease."
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (log-calls 0))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/python3"))
+              ((symbol-function 'cc-butler--log)
+               (lambda (&rest _) (cl-incf log-calls) nil))
+              ((symbol-function 'make-process)
+               (lambda (&rest _) (error "simulated: resize plumbing broken"))))
+      (should (null (cc-butler--mitigate-ghostel-event-pipe-deadlock)))
+      (should (= 1 log-calls)))))
+
+(ert-deftest cc-butler-session/pipe-mitigation-spawns-async-not-sync ()
+  "Given the ghostel backend and `python3' available, When the mitigation
+runs, Then it shells out via `make-process' (async) — never `call-process'
+\(sync, which could itself hang the command loop, exactly the failure this
+workaround exists to avoid) — passing this Emacs process's own pid and the
+configured target size as argv."
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (cc-butler-ghostel-event-pipe-size 1048576)
+        (spawn-command nil))
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/python3"))
+              ((symbol-function 'call-process)
+               (lambda (&rest _) (error "must not use a synchronous call-process")))
+              ((symbol-function 'make-process)
+               (lambda (&rest args) (setq spawn-command (plist-get args :command)) 'fake-proc)))
+      (cc-butler--mitigate-ghostel-event-pipe-deadlock)
+      (should spawn-command)
+      (should (equal (list (car spawn-command) (cadr spawn-command))
+                     '("python3" "-c")))
+      (should (equal (nth 2 spawn-command) cc-butler--ghostel-pipe-resize-script))
+      (should (equal (nth 3 spawn-command) (number-to-string (emacs-pid))))
+      (should (equal (nth 4 spawn-command) "1048576")))))
+
+;; The two sentinel tests below deliberately drive a REAL child process
+;; (a trivial `sh -c exit N') through the REAL Emacs process machinery
+;; rather than stubbing `process-status'/`process-exit-status'/
+;; `process-buffer' — those are primitives, and faking them with `cl-letf'
+;; tripped native-comp's subr-trampoline machinery in batch mode (an
+;; environment quirk, not something worth working around by faking less
+;; safely). Swapping only the :command — the resize payload — for a
+;; trivial shell command keeps the test fast, dependency-free, and still
+;; exercises the actual sentinel this code registers.
+
+(defmacro cc-butler-test--with-real-sentinel (shell-command &rest body)
+  "Run BODY after the REAL sentinel
+`cc-butler--mitigate-ghostel-event-pipe-deadlock' registers via
+`make-process' has fired for real, following a real child process running
+SHELL-COMMAND to exit.  `log-calls' counts `cc-butler--log' invocations
+made while running BODY and while waiting for the process to exit."
+  (declare (indent 1))
+  `(let ((claude-code-ide-terminal-backend 'ghostel)
+         (log-calls 0)
+         (orig-make-process (symbol-function 'make-process))
+         proc)
+     (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/python3"))
+               ((symbol-function 'cc-butler--log)
+                (lambda (&rest _) (cl-incf log-calls) nil))
+               ((symbol-function 'make-process)
+                (lambda (&rest args)
+                  (setq proc
+                        (apply orig-make-process
+                               (plist-put (copy-sequence args) :command ,shell-command))))))
+       (cc-butler--mitigate-ghostel-event-pipe-deadlock)
+       (should (process-live-p proc))
+       (let ((deadline (+ (float-time) 5)))
+         (while (and (process-live-p proc) (< (float-time) deadline))
+           (accept-process-output proc 0.05))))
+     ,@body))
+
+(ert-deftest cc-butler-session/pipe-mitigation-sentinel-logs-on-nonzero-exit ()
+  "Given the spawned resize helper exits non-zero (a real resize it
+attempted actually failed), When its sentinel fires, Then a warning is
+logged — a recurrence of cc-butler#104's conditions stays observable
+instead of silent, per condition 3's \"ideally with a single logged
+warning\"."
+  (cc-butler-test--with-real-sentinel '("sh" "-c" "echo boom 1>&2; exit 1")
+    (should (= 1 log-calls))))
+
+(ert-deftest cc-butler-session/pipe-mitigation-sentinel-quiet-on-clean-exit ()
+  "Given the spawned resize helper exits 0 (nothing to resize, or resized
+cleanly), When its sentinel fires, Then nothing is logged — finding
+nothing to do, or succeeding, is not a failure worth surfacing."
+  (cc-butler-test--with-real-sentinel '("sh" "-c" "exit 0")
+    (should (= 0 log-calls))))
+
+(ert-deftest cc-butler-session/pipe-mitigation-sentinel-survives-second-call-on-dead-buffer ()
+  "Given the sentinel fires twice for the same process (real subprocess
+sentinels can be invoked more than once, e.g. `signal' then `exit') and the
+first call already killed the process buffer, When the second call runs,
+Then it must not signal trying to read the now-dead buffer — the workaround
+exists to keep a real failure observable, so a sentinel that itself errors
+on a repeat call defeats its own purpose.  (Deliberately does not reuse
+`cc-butler-test--with-real-sentinel': that macro's BODY runs after its
+`cl-letf' closes, so a second, manual sentinel call made from BODY would hit
+the real, unmocked `cc-butler--log' and this test could not tell a silent
+signal apart from a real second log line.)"
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (log-calls 0)
+        (orig-make-process (symbol-function 'make-process))
+        proc)
+    (cl-letf (((symbol-function 'executable-find) (lambda (_) "/usr/bin/python3"))
+              ((symbol-function 'cc-butler--log)
+               (lambda (&rest _) (cl-incf log-calls) nil))
+              ((symbol-function 'make-process)
+               (lambda (&rest args)
+                 (setq proc
+                       (apply orig-make-process
+                              (plist-put (copy-sequence args) :command
+                                         '("sh" "-c" "echo boom 1>&2; exit 1")))))))
+      (cc-butler--mitigate-ghostel-event-pipe-deadlock)
+      (should (process-live-p proc))
+      (let ((deadline (+ (float-time) 5)))
+        (while (and (process-live-p proc) (< (float-time) deadline))
+          (accept-process-output proc 0.05)))
+      (should (= 1 log-calls))
+      (should-not (buffer-live-p (process-buffer proc)))
+      (funcall (process-sentinel proc) proc "exit abnormally\n")
+      (should (= 2 log-calls)))))
+
+(ert-deftest cc-butler-session/configure-session-fires-the-pipe-mitigation ()
+  "Given a session launch, When the deferred buffer-config timer fires
+\(`cc-butler--configure-session'), Then it also fires the cc-butler#104
+pipe-resize mitigation on the same delay — the workaround is wired into the
+one shared launch path, not an opt-in a caller could forget."
+  (let ((mitigated nil))
+    (cl-letf (((symbol-function 'run-at-time)
+               (lambda (_secs _repeat fn) (funcall fn)))
+              ((symbol-function 'cc-butler--configure-session-buffer) #'ignore)
+              ((symbol-function 'claude-code-ide--get-buffer-name) (lambda (_d) "x"))
+              ((symbol-function 'cc-butler--mitigate-ghostel-event-pipe-deadlock)
+               (lambda () (setq mitigated t))))
+      (cc-butler--configure-session "/tmp/some-worker/"))
+    (should mitigated)))
 
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here

@@ -124,17 +124,25 @@
              (state (if (cc-butler--waiting-p dir) "WAITING" "running"))
              (branch (let ((b (plist-get s :branch))) (if (string-empty-p b) "-" b)))
              (pr (let ((f (plist-get s :forge))) (if (string-empty-p f) "-" f)))
+             ;; :osc (live harness-pushed activity) and :status (a note a
+             ;; session deliberately left via `set_session_info') are
+             ;; different facts -- see the same distinction documented at
+             ;; `cc-butler-tool-list-sessions'.  Both get their own column so
+             ;; a parked-with-a-reason session doesn't render identically to
+             ;; one idling with nothing to say.
              (act (let ((o (plist-get s :osc))) (if (string-empty-p o) "-" o)))
+             (status (let ((st (plist-get s :status))) (if (string-empty-p st) "-" st)))
              (model (or (and (fboundp 'cc-butler-cleanup-model-tag)
                               (cc-butler-cleanup-model-tag dir))
                         "-")))
-        (push (format "| %s%s | %s | %s | %s | %s | %s |"
+        (push (format "| %s%s | %s | %s | %s | %s | %s | %s |"
                       (cc-butler-docs--cell (cc-butler--display-name dir))
                       tag state
                       (cc-butler-docs--cell branch)
                       (cc-butler-docs--cell pr)
                       (cc-butler-docs--cell model)
-                      (cc-butler-docs--cell act))
+                      (cc-butler-docs--cell act)
+                      (cc-butler-docs--cell status))
               rows)))
     (nreverse rows)))
 
@@ -148,11 +156,15 @@
   (let ((rows (cc-butler-docs--session-rows)))
     (concat
      "#+TITLE: Butler dashboard\n#+STARTUP: overview\n"
-     (format "Last updated: %s\n\n" (format-time-string "[%Y-%m-%d %a %H:%M]"))
+     (format "Last updated: %s\n" (format-time-string "[%Y-%m-%d %a %H:%M]"))
+     (if (fboundp 'cc-butler-runtime-source-oneline)
+         (let ((line (cc-butler-runtime-source-oneline)))
+           (if line (format "Source: %s\n\n" line) "\n"))
+       "\n")
      "* Sessions\n"
-     "| Session | State | Branch | PR | Model | Activity |\n"
-     "|---------+-------+--------+----+-------+----------|\n"
-     (if rows (concat (string-join rows "\n") "\n") "| (none) | - | - | - | - | - |\n")
+     "| Session | State | Branch | PR | Model | Activity | Status |\n"
+     "|---------+-------+--------+----+-------+----------+--------|\n"
+     (if rows (concat (string-join rows "\n") "\n") "| (none) | - | - | - | - | - | - |\n")
      "\n* Overview\n"
      (if (and cc-butler-docs--overview
               (not (string-empty-p (string-trim cc-butler-docs--overview))))
@@ -290,7 +302,7 @@ The Sessions table is always regenerated from live cc-butler state."
 (claude-code-ide-make-tool
  :function #'cc-butler-tool-dashboard
  :name "butler_dashboard"
- :description "Update the butler's at-a-glance dashboard (docs/dashboard.org under the butler home). The per-session status table (running/waiting, branch, PR, current activity) is regenerated automatically from live session state — you do NOT supply it. You supply the human judgment: a short OVERVIEW of the current situation and the list of OPEN DECISIONS awaiting input. Call it whenever the big picture changes so the snapshot stays current. Omitting an argument keeps its previous text."
+ :description "Update the butler's at-a-glance dashboard (docs/dashboard.org under the butler home). The per-session status table (running/waiting, branch, PR, model, live activity, and any status note left via set_session_info) is regenerated automatically from live session state — you do NOT supply it. You supply the human judgment: a short OVERVIEW of the current situation and the list of OPEN DECISIONS awaiting input. Call it whenever the big picture changes so the snapshot stays current. Omitting an argument keeps its previous text."
  :args '((:name "overview"
                 :type string
                 :description "Short free-text overview of the current situation across all sessions. Optional; omit to keep the previous overview."

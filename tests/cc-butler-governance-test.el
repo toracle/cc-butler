@@ -69,6 +69,43 @@ back, so pin the property itself rather than trusting the declaration."
     (let ((cc-butler-governance--load-dir "/checkout-b/"))
       (should (equal (cc-butler-governance-store) "/checkout-b/governance/")))))
 
+(ert-deftest cc-butler-governance/memory-dir-is-derived-not-frozen-at-load-order ()
+  "REGRESSION (2026-08-31, live 8 days on this fleet): `cc-butler-governance-memory-dir'
+used to be a `defcustom' default computed once, at definition time, from
+`cc-butler--claude-memory-dir'/`cc-butler-home'.  If either was not yet
+loaded at that moment (a load-order race, not misconfiguration) it
+silently froze onto a hardcoded fallback path from a DIFFERENT fleet
+machine and never self-corrected, even after both symbols became
+available later in the same session.  The accessor must re-derive on
+every call instead of trusting a value captured once."
+  (let ((cc-butler-governance-memory-dir nil))
+    (let* ((cc-butler-home "/home-a/butler")
+           (a (cc-butler-governance-memory-store)))
+      (let* ((cc-butler-home "/home-b/butler")
+             (b (cc-butler-governance-memory-store)))
+        (should-not (equal a b))))))
+
+;;;; ------------------------------------------------------------------
+;;;; Frontmatter description parsing
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/frontmatter-description-survives-a-leading-blank-line ()
+  "REGRESSION (2026-09-01): the parser assumed line 1 is the opening `---'
+and skipped it unconditionally with `forward-line 1', then searched for
+the NEXT `^---$' as the close. A file with a leading blank line (blank
+line 1, `---' on line 2) made that skip land ON the opening delimiter
+itself, which the search then matched as its own close, collapsing the
+frontmatter range to nothing and silently losing the description. A
+real store note (`a-guard-that-cannot-fail-is-theatre') hit exactly
+this shape and dropped out of the recallable index."
+  (let ((f (make-temp-file "gov-blank-line")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert "\n---\nname: butler-x\ndescription: \"Hello\"\n---\nbody\n"))
+          (should (equal (cc-butler-governance--frontmatter-description f) "Hello")))
+      (delete-file f))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Recording a principle
 ;;;; ------------------------------------------------------------------
@@ -293,5 +330,217 @@ a gap exists right now."
     (let ((out (cc-butler-tool-regenerate-governance)))
       (should (string-match-p "0 .*un-indexed" out)))))
 
+;;;; ------------------------------------------------------------------
+;;;; Bidirectional index validation (2026-08-05, steward-reported)
+;;;;
+;;;; regenerate_governance checked store -> index only (missing entries).
+;;;; Reproduced live: recording a principle, merging it into a duplicate,
+;;;; then deleting the original's store file + memory note left a dangling
+;;;; MEMORY.md line behind, and separately an in-place description update
+;;;; left the OLD wording sitting in the index -- in both cases the tool
+;;;; reported "0 un-indexed" / "Nothing was missing from the index".
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/regenerate-prunes-a-dangling-index-link ()
+  "REGRESSION (2026-08-05): a principle recorded, then merged into a
+duplicate and deleted by hand (store file AND memory note both removed),
+left its MEMORY.md line behind. Index -> store was never checked, so the
+dangling line survived every regenerate. A line whose slug no longer names
+a store principle must be pruned."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
+    (cc-butler-governance-regenerate)
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (should (string-match-p "\\[a-rule\\](butler-a-rule\\.md)"
+                              (with-temp-buffer (insert-file-contents index) (buffer-string))))
+      ;; Simulate the hand-cleanup: the principle is gone from the store
+      ;; and its generated note is gone from memory, but nobody touched
+      ;; MEMORY.md.
+      (delete-file (expand-file-name "a-rule.md" store))
+      (delete-file (expand-file-name "butler-a-rule.md" mem))
+      (cc-butler-governance-regenerate)
+      (should-not (string-match-p "\\[a-rule\\](butler-a-rule\\.md)"
+                                  (with-temp-buffer (insert-file-contents index) (buffer-string)))))))
+
+(ert-deftest cc-butler-governance/prune-never-touches-a-non-generated-line ()
+  "Pruning must only ever remove lines shaped exactly like this store's own
+generated entries (`- [slug](butler-slug.md) -- ...'). A hand-written entry
+in any other shape -- even one pointing at a file that does not exist -- is
+none of this store's business and must survive untouched."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem))
+          (hand-written "- [steward-only-note](steward-only-note.md) — points at nothing, on purpose\n"))
+      (with-temp-file index (insert hand-written))
+      (cc-butler-governance-regenerate)
+      (should (string-match-p (regexp-quote hand-written)
+                              (with-temp-buffer (insert-file-contents index) (buffer-string)))))))
+
+(ert-deftest cc-butler-governance/regenerate-tool-reports-pruned-dangling-links ()
+  "The tool's report text must say what it actually checked and found -- not
+just \"0 un-indexed\", which reads as if index->store were also verified
+when it was not."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
+    (cc-butler-tool-regenerate-governance)
+    (delete-file (expand-file-name "a-rule.md" store))
+    (delete-file (expand-file-name "butler-a-rule.md" mem))
+    (let ((out (cc-butler-tool-regenerate-governance)))
+      (should (string-match-p "dangling" out))
+      (should (string-match-p "a-rule" out)))))
+
+(ert-deftest cc-butler-governance/regenerate-tool-reports-stale-descriptions ()
+  "REGRESSION (2026-08-05): a principle's description was updated in place
+\(as `record_principle' does\) -- the store note and generated memory note
+both got the new wording, but the MEMORY.md index line, never touched by
+the add-only sync, kept the OLD description. `regenerate_governance' must
+surface this drift instead of reporting a clean index. The line itself is
+NOT rewritten automatically: on disk, drift from an update is
+indistinguishable from a human's deliberate curation of that line (see
+`cc-butler-governance/regenerate-does-not-duplicate-an-already-curated-entry'),
+so this is report-only, never an auto-edit."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "original description" "body" "feedback")))
+    (cc-butler-governance-regenerate)
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "revised description" "body" "feedback")))
+    (let ((out (cc-butler-tool-regenerate-governance)))
+      (should (string-match-p "a-rule" out))
+      (should (string-match-p "no longer match\\|stale\\|drift" out))
+      (should (string-match-p "original description"
+                              (with-temp-buffer
+                                (insert-file-contents (expand-file-name "MEMORY.md" mem))
+                                (buffer-string)))))))
+
 (provide 'cc-butler-governance-test)
 ;;; cc-butler-governance-test.el ends here
+
+;;;; ------------------------------------------------------------------
+;;;; Creation stamps — who STARTED a note (never who wrote a sentence)
+;;;; ------------------------------------------------------------------
+
+(defmacro cc-butler-governance-test--as-session (label &rest body)
+  "Run BODY as if MCP session LABEL were the caller."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () "/tmp/fake-session"))
+             ((symbol-function 'cc-butler--who-dir) (lambda (_dir) ,label)))
+     ,@body))
+
+(defun cc-butler-governance-test--text (res)
+  (with-temp-buffer (insert-file-contents (plist-get res :path)) (buffer-string)))
+
+(ert-deftest cc-butler-governance/stamps-a-new-note-with-the-calling-session ()
+  "P1. A note that did not exist gets a creation stamp naming its caller."
+  (cc-butler-governance-test--with-store
+    (let ((text (cc-butler-governance-test--as-session "worker-a (sess-1)"
+                  (cc-butler-governance-test--text
+                   (cc-butler-governance-record "p" "d" "Body.")))))
+      (should (string-match-p "^(최초 기록: worker-a (sess-1), [0-9][0-9]-[0-9][0-9])$" text)))))
+
+(ert-deftest cc-butler-governance/an-update-keeps-the-original-creation-stamp ()
+  "P2. `with-temp-file' truncates and the caller resubmits a body it has never
+seen the stamp in, so an update must carry the ORIGINAL stamp forward — not
+mint a second one, and above all not silently erase the first."
+  (cc-butler-governance-test--with-store
+    (cc-butler-governance-test--as-session "worker-a (sess-1)"
+      (cc-butler-governance-record "p" "d" "First body."))
+    (let ((text (cc-butler-governance-test--as-session "worker-b (sess-2)"
+                  (cc-butler-governance-test--text
+                   (cc-butler-governance-record "p" "d" "Rewritten body.")))))
+      (should (string-match-p "Rewritten body\\." text))
+      (should (string-match-p "최초 기록: worker-a (sess-1)" text))
+      (should-not (string-match-p "worker-b" text)))))       ; the editor is not the recorder
+
+(ert-deftest cc-butler-governance/a-legacy-note-never-gains-a-stamp ()
+  "P3. The notes written before stamping existed have no first-recorder on
+record.  Whoever edits one today is not it — stamping them would be exactly
+the false attribution this design exists to avoid."
+  (cc-butler-governance-test--with-store
+    (let ((path (expand-file-name "p.md" (cc-butler-governance-store))))
+      (with-temp-file path (insert "---\nname: butler-p\n---\n\nLegacy body.\n"))
+      (let ((text (cc-butler-governance-test--as-session "worker-b (sess-2)"
+                    (cc-butler-governance-test--text
+                     (cc-butler-governance-record "p" "d" "Edited legacy body.")))))
+        (should (string-match-p "Edited legacy body\\." text))
+        (should-not (string-match-p "최초 기록" text))))))
+
+(ert-deftest cc-butler-governance/the-stamp-survives-regeneration ()
+  "P4. The memory note is a copy of the store file, so a stamp must round-trip."
+  (cc-butler-governance-test--with-store
+    (let* ((res (cc-butler-governance-test--as-session "worker-a (sess-1)"
+                  (cc-butler-governance-record "p" "d" "Body.")))
+           (note (plist-get res :verified)))
+      (should note)
+      (should (string-match-p
+               "최초 기록: worker-a (sess-1)"
+               (with-temp-buffer (insert-file-contents note) (buffer-string)))))))
+
+(ert-deftest cc-butler-governance/an-unknown-session-gets-no-stamp ()
+  "P5. Outside an MCP request there is no caller to name.  No stamp beats a
+stamp that says `?' — absence keeps people asking, a wrong answer stops them."
+  (cc-butler-governance-test--with-store
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () nil)))
+      (let ((text (cc-butler-governance-test--text
+                   (cc-butler-governance-record "p" "d" "Body."))))
+        (should (string-match-p "Body\\." text))
+        (should-not (string-match-p "최초 기록" text))))))
+
+(ert-deftest cc-butler-governance/a-stamp-pasted-into-the-body-is-not-duplicated ()
+  "A caller that copies the stamp back into BODY must not produce two."
+  (cc-butler-governance-test--with-store
+    (cc-butler-governance-test--as-session "worker-a (sess-1)"
+      (cc-butler-governance-record "p" "d" "Body."))
+    (let* ((text (cc-butler-governance-test--as-session "worker-b (sess-2)"
+                   (cc-butler-governance-test--text
+                    (cc-butler-governance-record
+                     "p" "d" "Body.\n\n(최초 기록: worker-a (sess-1), 01-01)"))))
+           (n 0) (start 0))
+      (while (string-match "최초 기록" text start)
+        (setq n (1+ n) start (match-end 0)))
+      (should (= n 1)))))
+
+(ert-deftest cc-butler-governance/a-quoted-stamp-in-the-body-is-not-promoted ()
+  "A note that WRITES ABOUT stamping quotes a stamp line.  Recognising the
+stamp anywhere in the file (rather than as the last line) promotes that
+quotation into an attribution — a legacy note would inherit a first recorder
+it never had, which is exactly the false attribution this design avoids."
+  (cc-butler-governance-test--with-store
+    (let ((path (expand-file-name "p.md" (cc-butler-governance-store)))
+          (quoting "About stamping.\n\n> (최초 기록: someone-else (sess-9), 01-01)\n\nEnd."))
+      (with-temp-file path
+        (insert "---\nname: butler-p\n---\n\n" quoting "\n"))
+      (let ((text (cc-butler-governance-test--as-session "worker-b (sess-2)"
+                    (cc-butler-governance-test--text
+                     (cc-butler-governance-record "p" "d" quoting)))))
+        (should (string-match-p "someone-else" text))          ; the quote survives
+        (should (string-match-p "^End\\.$" text))              ; and so does what follows
+        (should-not (string-match-p "worker-b" text))          ; no stamp minted for a legacy note
+        ;; the quoted line must not have become the note's own stamp
+        (should-not (cc-butler-governance--stamp-line text))))))
+
+(ert-deftest cc-butler-governance/a-quoted-stamp-is-never-stripped-from-the-body ()
+  "Stripping every stamp-shaped line, rather than only a trailing one, deletes
+the author's text silently.  Mutation guard: reverting --strip-stamps to
+`remove every matching line' must fail here."
+  (cc-butler-governance-test--with-store
+    (let* ((body "Intro.\n\n(최초 기록: quoted-example (sess-9), 01-01)\n\nOutro.")
+           (text (cc-butler-governance-test--as-session "worker-a (sess-1)"
+                   (cc-butler-governance-test--text
+                    (cc-butler-governance-record "p" "d" body)))))
+      (should (string-match-p "quoted-example" text))
+      (should (string-match-p "^Outro\\.$" text))
+      ;; and the note still gets its OWN stamp, appended after all of that
+      (should (string-match-p "최초 기록: worker-a (sess-1)"
+                              (or (cc-butler-governance--stamp-line text) ""))))))
+
+(ert-deftest cc-butler-governance/a-line-merely-containing-the-shape-is-not-a-stamp ()
+  "Mutation guard: unanchoring the stamp regexp makes a sentence that mentions
+a stamp read as one.  A stamp is a WHOLE line, never a substring."
+  (should-not (cc-butler-governance--stamp-line
+               "see (최초 기록: w (s), 01-01) above for the format"))
+  (should-not (cc-butler-governance--stamp-line
+               "prefix (최초 기록: w (s), 01-01)"))
+  (should (cc-butler-governance--stamp-line
+           "Body.\n\n(최초 기록: w (s), 01-01)")))

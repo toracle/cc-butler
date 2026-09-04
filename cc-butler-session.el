@@ -22,6 +22,7 @@
 (require 'claude-code-ide-mcp-server)
 (require 'subr-x)
 (require 'seq)
+(require 'json)
 
 ;;;; ------------------------------------------------------------------
 ;;;; Channel launch flag (shared by the topic/session launchers)
@@ -225,8 +226,18 @@ forwarded worker events.  It is pinned to the top of the list.")
 
 (defvar cc-butler--waiting (make-hash-table :test 'equal)
   "Map a session working-dir -> float-time when it began awaiting user input.
-Sessions present here sort to the top of the list as an approval queue,
-oldest request first (FIFO); absence means the session is not waiting.")
+Absence means the session is not considered waiting.  A waiting session is
+marked visually in the list (⏳, `warning' face) but no longer reordered:
+`cc-butler--ordered' keeps workers in a fixed alphabetical order regardless
+of state, so rows do not shift under the cursor when a wait flips mid-move
+\(the old sort-waiting-to-the-top FIFO queue was removed; see the regression
+note in tests/cc-butler-session-test.el).
+
+Note the flag is edge-triggered — set only when a session posts a
+notification (`cc-butler--queue-on-notification') and cleared only by a few
+explicit actions — with no reconciliation against the terminal, so it can
+be stale in either direction.  Judgements that need the session's actual
+current state read it from the screen or the transcript instead.")
 
 (defun cc-butler--waiting-p (dir)
   "Return the wait timestamp for DIR, or nil when it is not waiting."
@@ -468,18 +479,98 @@ envelope and a relayed terminal message render a path the same way.")
 (define-derived-mode cc-butler-log-mode special-mode "cc-butler-Log"
   "Major mode for the cc-butler butler<->worker message log.")
 
+(defcustom cc-butler-ops-log-dir
+  (expand-file-name
+   "cc-butler/log/"
+   (let ((xdg (getenv "XDG_STATE_HOME")))
+     (if (and xdg (not (string-empty-p xdg))) xdg
+       (expand-file-name ".local/state" "~"))))
+  "Directory of the on-disk mirror of the cc-butler operations log.
+Every `cc-butler--log' line (compact/cleanup outcomes, message routing,
+session events) is appended to a daily plain-text file here,
+ops-YYYY-MM-DD.log, so operational evidence survives the Emacs process
+instead of living only in the `cc-butler-log-buffer-name' buffer.
+
+Defaults under `$XDG_STATE_HOME' (falling back to ~/.local/state) — the
+same derivation as `cc-butler-mail-dir', duplicated rather than reused
+because cc-butler-mail requires this module, so the log layer cannot
+require mail back."
+  :type 'directory
+  :group 'cc-butler)
+
+(defun cc-butler--log-file ()
+  "Return today's on-disk ops log file under `cc-butler-ops-log-dir'."
+  (expand-file-name (format-time-string "ops-%Y-%m-%d.log")
+                    cc-butler-ops-log-dir))
+
+(defun cc-butler--log-mirror (line)
+  "Append LINE to today's ops log file.  Non-fatal: any failure is
+swallowed (`ignore-errors') — the mirror is an audit layer, never a
+precondition, so a full disk or an unwritable directory must not break
+the operation being logged.  Returns LINE, or nil if the write failed."
+  (ignore-errors
+    (make-directory cc-butler-ops-log-dir t)
+    (write-region (concat line "\n") nil (cc-butler--log-file)
+                  'append 'silent)
+    line))
+
+(defun cc-butler--msg-log-file ()
+  "Return today's on-disk message-body log file under `cc-butler-ops-log-dir'."
+  (expand-file-name (format-time-string "msg-%Y-%m-%d.log")
+                    cc-butler-ops-log-dir))
+
+(defun cc-butler--log-message (kind from to body)
+  "Append a full-body message record to today's message log, one JSON
+object per physical line, always.  KIND identifies the caller (e.g.
+\"report\", \"relay\", \"escalate\"), FROM/TO are display-name strings (TO
+may be nil), and BODY is the arbitrary, possibly multi-line text this
+record exists to preserve without discarding it (see `cc-butler--log',
+whose own ops-log line stays a short single-line gist -- this is where the
+full body actually lives).
+
+Why JSON rather than this codebase's existing `prin1'/`.eld' journal
+convention (`cc-butler--mail-journal'): verified empirically that Emacs's
+default string printer does NOT escape embedded newlines --
+`(prin1-to-string \"a\\nb\")' prints the literal newline character, not a
+`\\n' escape sequence -- so a line-based read of an .eld journal (a human
+skimming it, or any tool that is not doing a proper `read') hits exactly
+the multi-line ambiguity this fix exists to close. `json-encode' does
+escape control characters inside strings, so a record here is safe under
+naive line-based scanning by construction, not by a convention the reader
+has to already know. (This means `cc-butler--mail-journal' carries the
+same latent gap for a multi-line message body -- out of scope for this
+fix; flagged, not silently left for the next person to rediscover.)
+
+Non-fatal like `cc-butler--log-mirror': an audit layer, never a
+precondition for the operation being logged."
+  (ignore-errors
+    (make-directory cc-butler-ops-log-dir t)
+    (write-region
+     (concat (json-encode (list (cons 'time (format-time-string "%FT%T"))
+                                 (cons 'kind kind)
+                                 (cons 'from (or from ""))
+                                 (cons 'to (or to ""))
+                                 (cons 'body (or body ""))))
+             "\n")
+     nil (cc-butler--msg-log-file) 'append 'silent)))
+
 (defun cc-butler--log (fmt &rest args)
-  "Append a timestamped FMT/ARGS line to `cc-butler-log-buffer-name'."
-  (let ((buf (get-buffer-create cc-butler-log-buffer-name)))
-    (with-current-buffer buf
-      (unless (derived-mode-p 'cc-butler-log-mode) (cc-butler-log-mode))
-      (let ((inhibit-read-only t))
-        (save-excursion
-          (goto-char (point-max))
-          (insert (format-time-string "[%H:%M:%S] ")
-                  (apply #'format fmt args) "\n")))
-      (dolist (w (get-buffer-window-list buf nil t))
-        (set-window-point w (point-max))))))
+  "Append a timestamped FMT/ARGS line to `cc-butler-log-buffer-name',
+mirrored on disk via `cc-butler--log-mirror' (one line, two sinks —
+the buffer for live watching, the daily file for evidence that
+outlives the process)."
+  (let ((line (concat (format-time-string "[%H:%M:%S] ")
+                      (apply #'format fmt args))))
+    (cc-butler--log-mirror line)
+    (let ((buf (get-buffer-create cc-butler-log-buffer-name)))
+      (with-current-buffer buf
+        (unless (derived-mode-p 'cc-butler-log-mode) (cc-butler-log-mode))
+        (let ((inhibit-read-only t))
+          (save-excursion
+            (goto-char (point-max))
+            (insert line "\n")))
+        (dolist (w (get-buffer-window-list buf nil t))
+          (set-window-point w (point-max)))))))
 
 (defun cc-butler-show-log ()
   "Pop to the cc-butler message-log buffer."
@@ -489,14 +580,21 @@ envelope and a relayed terminal message render a path the same way.")
 (defun cc-butler--inbox-push (dir body)
   "Record a worker event from session DIR with BODY into the butler inbox.
 The worker's name and session id are attached, and the event is teed to
-the cc-butler log."
+the cc-butler log -- a short gist to the ops log (events only, kept
+grep-safe and single-line), the full BODY to the message log
+(`cc-butler--log-message'), never both -- an arbitrary, possibly
+multi-line worker report body must not land verbatim in the ops event
+stream (2026-08-27: a log line quoted back into a relay message got
+re-logged as if the event it described had happened a second time)."
   (push (list :time (current-time)
               :dir dir
               :name (cc-butler--display-name dir)
               :id (cc-butler--session-id dir)
               :body (or body ""))
         cc-butler--inbox)
-  (cc-butler--log "%s → butler │ %s" (cc-butler--who-dir dir) (or body "")))
+  (cc-butler--log "%s → butler │ report (%d chars, see msg log)"
+                  (cc-butler--who-dir dir) (length (or body "")))
+  (cc-butler--log-message "report" (cc-butler--who-dir dir) "butler" body))
 
 ;; The steward is designated in `cc-butler-orchestrator' (loaded after this
 ;; file); forward-declare it so the list UI can pin/label it.
@@ -635,12 +733,18 @@ where its block starts."
                                     (unless (string-empty-p forge) forge)))
                         "   "))
                  ;; Context-length feedback tag (e.g. "ctx 187k"), provided by
-                 ;; the cleaner module when loaded; highlighted once it crosses
-                 ;; the cleanup threshold so 200k candidates stand out.
+                 ;; the cleaner module when loaded.
                  (ctx (and (fboundp 'cc-butler-cleanup-context-tag)
                            (cc-butler-cleanup-context-tag sd)))
-                 (ctx-hot (and ctx (fboundp 'cc-butler-cleanup-context-over-threshold-p)
-                               (cc-butler-cleanup-context-over-threshold-p sd)))
+                 ;; Compaction-escalation severity (`cc-butler-compact--severity-for',
+                 ;; 400k/700k) — deliberately NOT `cc-butler-cleanup-context-over-threshold-p'
+                 ;; (200k, a different subsystem's cleanup-recommendation threshold
+                 ;; that this tag used to borrow only because they happened to
+                 ;; share a display slot). A session that should have compacted
+                 ;; at `cc-butler-compact-threshold' and did not gets 'warning/
+                 ;; 'critical here; anything else is the normal comment face.
+                 (ctx-severity (and ctx (fboundp 'cc-butler-compact--severity-for)
+                                    (cc-butler-compact--severity-for sd)))
                  ;; Which model the session is running (e.g. "Sonnet-5"),
                  ;; scraped from the same statusLine feed as `ctx'.
                  (model (and (fboundp 'cc-butler-cleanup-model-tag)
@@ -651,8 +755,11 @@ where its block starts."
                                        (and model
                                             (propertize model 'face 'font-lock-type-face))
                                        (and ctx
-                                            (propertize ctx 'face (if ctx-hot 'warning
-                                                                    'font-lock-comment-face)))))))
+                                            (propertize ctx 'face
+                                                        (pcase ctx-severity
+                                                          ('critical 'error)
+                                                          ('warning 'warning)
+                                                          (_ 'font-lock-comment-face))))))))
             (when segments
               (insert "   " (mapconcat #'identity segments "   ") "\n")))
           (insert "\n")
@@ -968,14 +1075,177 @@ previews.  Return BUF."
                 #'cc-butler--session-refit-on-change nil t)))
   buf)
 
+;;;; ------------------------------------------------------------------
+;;;; WORKAROUND: ghostel event-pipe deadlock (cc-butler#104) — remove
+;;;; this whole section (and its one call site below) once fixed upstream
+;;;; ------------------------------------------------------------------
+;;
+;; 2026-08-24 incident: the Emacs daemon froze fleet-wide for 101 minutes.
+;; Confirmed root cause (see cc-butler#104 for the full writeup): ghostel's
+;; native pty reader thread (NativeProcess.zig:loopOnce) holds `term_mutex'
+;; across a *blocking* write into its event pipe to Emacs (64KB default, no
+;; O_NONBLOCK).  A busy session can fill that pipe faster than Emacs drains
+;; it; once full, the reader thread blocks in `write' while still holding
+;; the mutex, and the next Lisp-side screen read that needs the same mutex
+;; (`ghostel--redraw', which cc-butler's own polling triggers every ~3s
+;; while watching a compaction) parks the entire Emacs command loop — every
+;; timer, filter, and session, not just the busy one.  It only recovered
+;; because a human ran an external script to enlarge the live pipe by hand
+;; (`F_SETPIPE_SZ' to 1MB).  The real fix — not holding the mutex across a
+;; blocking write — belongs upstream in ghostel; as of this writing there is
+;; no known upstream issue for it (checked the `dakra/ghostel' tracker) —
+;; filing one is separate follow-up, not part of this workaround.
+;;
+;; This only buys headroom (a fuller pipe takes longer to hit, not never),
+;; it does not remove the deadlock.  Delete it once ghostel stops holding
+;; the mutex across the write, or grows its own pipe.
+
+(defcustom cc-butler-ghostel-event-pipe-size (* 1024 1024)
+  "Target size in bytes for a ghostel native event pipe, via `F_SETPIPE_SZ'.
+1MB — matches the manual recovery size used during the 2026-08-24 incident
+(cc-butler#104).  See `cc-butler--mitigate-ghostel-event-pipe-deadlock'."
+  :type 'integer
+  :group 'cc-butler)
+
+(defconst cc-butler--ghostel-pipe-resize-script
+  "import os, sys, fcntl
+F_SETPIPE_SZ, F_GETPIPE_SZ = 1031, 1032
+try:
+    pid, size = int(sys.argv[1]), int(sys.argv[2])
+except (IndexError, ValueError):
+    sys.exit(2)
+fdroot = '/proc/%d/fd' % pid
+try:
+    names = os.listdir(fdroot)
+except OSError as e:
+    print('cannot list %s: %s' % (fdroot, e), file=sys.stderr)
+    sys.exit(1)
+pipes = {}
+for n in names:
+    try:
+        target = os.readlink('%s/%s' % (fdroot, n))
+    except OSError:
+        continue
+    if not target.startswith('pipe:['):
+        continue
+    try:
+        info = open('/proc/%d/fdinfo/%s' % (pid, n)).read()
+    except OSError:
+        continue
+    flag_lines = [l for l in info.splitlines() if l.startswith('flags')]
+    if not flag_lines:
+        continue
+    fl = int(flag_lines[0].split()[1], 8) & 3
+    pipes.setdefault(target, []).append((int(n), fl))
+resized, failed = 0, 0
+for target, ends in pipes.items():
+    accesses = {a for _, a in ends}
+    # ghostel's native module dups BOTH a read end and a write end of its
+    # event pipe into Emacs's own fd table; a plain subprocess pipe only
+    # ever has one end here.  That two-sided signature is how this finds
+    # 'our' pipes without ever knowing their fd numbers ahead of time.
+    if not (os.O_RDONLY in accesses and os.O_WRONLY in accesses):
+        continue
+    read_fd = next(f for f, a in ends if a == os.O_RDONLY)
+    try:
+        fd = os.open('%s/%d' % (fdroot, read_fd), os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        continue
+    cur = None
+    try:
+        cur = fcntl.fcntl(fd, F_GETPIPE_SZ)
+        if cur < size:
+            fcntl.fcntl(fd, F_SETPIPE_SZ, size)
+            resized += 1
+            # per-pipe success line: which fd, and what it grew from/to —
+            # so a partial run (budget exhausted partway through) still
+            # says exactly which pipes are and are not fixed, not just a count.
+            print('fd %d: resized %d -> %d' % (read_fd, cur, size))
+    except OSError as e:
+        failed += 1
+        print('fd %d: failed at size %s: %s' % (read_fd, cur if cur is not None else '?', e),
+              file=sys.stderr)
+    finally:
+        os.close(fd)
+print('resized=%d failed=%d candidates=%d' % (resized, failed, len(pipes)))
+sys.exit(1 if failed else 0)
+"
+  "Body of the Python helper `cc-butler--mitigate-ghostel-event-pipe-deadlock'
+shells out to.  Emacs Lisp has neither a way to read the raw fd number
+behind a process object (no `process-fd' primitive — confirmed absent on
+Emacs 30) nor an `fcntl' primitive to call `F_SETPIPE_SZ' itself, so the
+actual syscall has to happen in a child process.  Takes PID and SIZE as
+argv, resizes every ghostel event pipe it finds on PID's own fd table that
+is still smaller than SIZE, and exits non-zero only if a resize it
+attempted actually failed (finding none to resize is not a failure).")
+
+(defun cc-butler--mitigate-ghostel-event-pipe-deadlock ()
+  "WORKAROUND for cc-butler#104 (ghostel event-pipe deadlock) — see the
+section comment above for the full mechanism.  Best-effort and
+asynchronous; MUST NEVER prevent a session from starting.  Every failure
+mode below — no `python3' on PATH, a non-ghostel backend, the resize call
+itself erroring, an unexpected Lisp error while shelling out — is caught
+here and degrades to \"the session runs with the default, deadlock-prone
+64KB pipe\", never a thrown signal that could unwind session launch.  A
+genuine failure gets exactly one `cc-butler--log' line so a recurrence is
+observable instead of silent; finding nothing to do is not logged.
+
+Cannot target only the newly-launched session's own pipe (elisp cannot
+read the fd number behind its process object — see
+`cc-butler--ghostel-pipe-resize-script'), so the helper script scans and
+enlarges every ghostel event pipe it finds on this Emacs process
+\(`(emacs-pid)') below `cc-butler-ghostel-event-pipe-size'.  That is a
+superset of \"just this session,\" but harmless: `F_GETPIPE_SZ' is checked
+before any resize, so an already-large pipe is a no-op, and catching any
+other session still on the small default closes the same gap for it too.
+
+Shells out via `make-process' (async) rather than `call-process' (sync) so
+a hung or slow resize cannot itself block the command loop — the exact
+failure this workaround exists to avoid.  Resizing this process's OWN fds
+via `F_SETPIPE_SZ' needs no privilege escalation, unlike the incident's
+manual recovery (which resized a DIFFERENT process's fds from outside it,
+and needed sudo once past the pipe-user-pages soft limit); if it fails
+here anyway — e.g. this uid is already over that limit — the failure is
+caught and logged, never escalated to sudo."
+  (condition-case err
+      (if (not (eq (bound-and-true-p claude-code-ide-terminal-backend) 'ghostel))
+          nil ;; nothing to mitigate under vterm/eat — no event pipe exists
+        (if (not (executable-find "python3"))
+            (cc-butler--log "ghostel pipe-resize workaround (cc-butler#104): no `python3' on PATH — skipping; sessions keep the default 64KB event pipe and stay deadlock-prone under load")
+          (let ((buf (generate-new-buffer " *cc-butler-ghostel-pipe-resize*")))
+            (make-process
+             :name "cc-butler-ghostel-pipe-resize"
+             :buffer buf
+             :command (list "python3" "-c" cc-butler--ghostel-pipe-resize-script
+                             (number-to-string (emacs-pid))
+                             (number-to-string cc-butler-ghostel-event-pipe-size))
+             :noquery t
+             :sentinel
+             (lambda (proc _event)
+               (when (memq (process-status proc) '(exit signal))
+                 (unless (eq 0 (process-exit-status proc))
+                   (cc-butler--log "ghostel pipe-resize workaround (cc-butler#104) reported a problem (exit %s): %s — some sessions may still be on the default 64KB event pipe"
+                                    (process-exit-status proc)
+                                    (if (buffer-live-p (process-buffer proc))
+                                        (string-trim (with-current-buffer (process-buffer proc) (buffer-string)))
+                                      "(output buffer already gone — sentinel ran more than once)")))
+                 (when (buffer-live-p (process-buffer proc))
+                   (kill-buffer (process-buffer proc)))))))))
+    (error
+     (cc-butler--log "ghostel pipe-resize workaround (cc-butler#104) failed to start: %s — session proceeds with the default 64KB event pipe"
+                      (error-message-string err)))))
+
 (defun cc-butler--configure-session (dir)
   "Apply the uniform config to session DIR's buffer once it exists (deferred,
-since the launch is async)."
+since the launch is async).  Also fires the cc-butler#104 ghostel pipe-resize
+workaround (`cc-butler--mitigate-ghostel-event-pipe-deadlock') on the same
+delay, since it needs the native pty/event-pipe to actually exist too."
   (run-at-time
    0.5 nil
    (lambda ()
      (cc-butler--configure-session-buffer
-      (get-buffer (claude-code-ide--get-buffer-name dir))))))
+      (get-buffer (claude-code-ide--get-buffer-name dir)))
+     (cc-butler--mitigate-ghostel-event-pipe-deadlock))))
 
 (defun cc-butler--launch-preflight-diagnostics ()
   "Return a list of (SEVERITY . MESSAGE) launch-environment problems.
@@ -1205,14 +1475,25 @@ sampled.")
 of color. Not required to be PURELY the rule character — Claude Code
 sometimes draws a short title (a branch/topic name) embedded in the
 middle of the top border (confirmed 2026-07-21, e.g. \"───── some-topic
-──\"), so this checks framing, not purity."
+──\"), so this checks framing, not purity.
+
+The trailing run can be as short as ONE rule char, not two: how much
+border survives after the title is whatever the terminal WIDTH leaves
+over once the title text is subtracted, and that arithmetic has no
+reason to land on 2+ (confirmed 2026-09-01: a session with a longer topic
+title — \"침몰한 함대 복원 및 업무 재개\" — rendered with exactly one
+trailing ─, which a 2-char suffix requirement rejected outright, so
+`cc-butler--find-input-line' never found the sandwich below it and every
+downstream read — context, model, the whole statusline — silently read
+as unknown for that session specifically, indefinitely, since a session
+with a fixed title renders the same short suffix every time)."
   (let ((text (string-trim (buffer-substring-no-properties
                              (line-beginning-position) (line-end-position))))
         (rule3 (make-string 3 cc-butler--border-rule-char))
-        (rule2 (make-string 2 cc-butler--border-rule-char)))
+        (rule1 (char-to-string cc-butler--border-rule-char)))
     (and (> (length text) 3)
          (string-prefix-p rule3 text)
-         (string-suffix-p rule2 text))))
+         (string-suffix-p rule1 text))))
 
 (defun cc-butler--find-input-line (start end)
   "Search START..END for the input row: the single line sandwiched

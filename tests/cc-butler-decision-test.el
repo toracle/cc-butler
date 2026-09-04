@@ -169,8 +169,8 @@ indicator — driven by arrival, with no agent turn involved."
 same physical location as a decision — it stays visible until `r' closes
 it (moves to done/). It is NOT counted by the ⚖ indicator: a note needs
 no answer, so counting it would reproduce the exact backlog-inflation
-bug the indicator's age display exists to surface — see governance
-escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes."
+bug the indicator's age display exists to surface — see the governance
+note titled escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes."
   (cc-butler-decision-test--with-arrival
     (cc-butler--mail-file-deliver
      "정수님" '(:id "n9" :kind note :from "steward" :summary "CI is green"))
@@ -241,6 +241,42 @@ indicator and the pending_decisions backlog line -- is 1, not 2."
       (should (= 2 (length (directory-files (cc-butler--decision-open-dir) nil
                                              cc-butler--decision-org-re))))
       (should (= 1 (length (car (cc-butler--decision-open-files-and-oldest))))))))
+
+(ert-deftest cc-butler-decision/open-files-excludes-non-decision-kinds ()
+  "Given open/ holds one `decision' and one `note' (both physically
+present), `cc-butler--decision-open-files' -- what feeds `n'/`p'
+navigation (`cc-butler--decision-move') -- lists only the decision, so
+manual navigation never lands on a document with no answer region to
+respond to."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cc-butler-decision-create "/worker/" "please decide X" nil nil 'decision)
+      (cc-butler-decision-create "/worker/" "FYI: status update" nil nil 'note)
+      (cc-butler--decision-on-arrival)
+      (should (= 2 (length (directory-files (cc-butler--decision-open-dir) nil
+                                             cc-butler--decision-org-re))))
+      (let ((files (cc-butler--decision-open-files)))
+        (should (= 1 (length files)))
+        (should (eq 'decision (cc-butler--decision-file-kind (car files))))))))
+
+(ert-deftest cc-butler-decision/answer-next-skips-note-lands-on-decision ()
+  "Given open/ holds a `note' created BEFORE a `decision' (so the note sorts
+first by filename/arrival order), `cc-butler-decision-answer-next' opens
+the DECISION file, not the note -- \"go to the next thing that needs an
+answer\" must never land on a document with no answer region."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cc-butler-decision-create "/worker/" "FYI: status update" nil nil 'note)
+      (cc-butler-decision-create "/worker/" "please decide X" nil nil 'decision)
+      (cc-butler--decision-on-arrival)
+      (let ((create-lockfiles nil) (buf nil))
+        (unwind-protect
+            (progn
+              (cc-butler-decision-answer-next)
+              (setq buf (current-buffer))
+              (should (eq 'decision (cc-butler--decision-file-kind (buffer-file-name))))
+              (should (string-match-p "please decide X" (buffer-string))))
+          (when (and buf (buffer-live-p buf)) (kill-buffer buf)))))))
 
 ;;;; ---- open/ backlog staleness (count + oldest age) ------------------
 ;;;; The existing arrival tests above use fake ids ("d9"/"n9") that don't

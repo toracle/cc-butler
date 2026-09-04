@@ -311,6 +311,38 @@ lines must not make the scan stop EARLIER and discard the model."
     (should (= 222 (plist-get fields :ctx)))
     (should (equal "Sonnet-5" (plist-get fields :model)))))
 
+;;;; ---- titled top border: a short trailing run --------------------
+
+;; PROVENANCE: this top-border line is the VERBATIM text captured read-only
+;; from a live session (the butler session, captured 2026-09-01 via
+;; `read_session_output' / `cc-butler--read-output') whose topic title left
+;; exactly ONE trailing ─ before the terminal's right edge.  `cc-butler--
+;; border-line-p' required a 2-char trailing run, so this line was never
+;; recognized as a border at all -- `cc-butler--find-input-line' then found
+;; no sandwich below it, and the whole statusline read (:ctx/:pct/:model)
+;; came back nil indefinitely, for as long as that same title stayed set.
+(defconst cc-butler-cleanup-test--titled-border-one-trailing-char
+  "───────────────────────────────────────────────────────────────────────────────────────────────────────── 침몰한 함대 복원 및 업무 재개 ─"
+  "A real top-border line whose title leaves only one trailing ─.")
+
+(ert-deftest cc-butler-cleanup/statusline-fields-reads-below-a-titled-border-with-one-trailing-char ()
+  "THE BUG (2026-09-01): a topic title long enough to leave only ONE
+trailing border char on the top border must still anchor the input box --
+requiring two silently broke context/model reading for any session whose
+title happened to render that way, with nothing on the surface pointing
+at the border check specifically."
+  (let ((fields (cc-butler-cleanup--statusline-fields
+                 (string-join
+                  (list cc-butler-cleanup-test--titled-border-one-trailing-char
+                        "❯ "
+                        "──────────────────────────────────────────────"
+                        "  CTX:116481 12% MODEL:Opus-5"
+                        "  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent")
+                  "\n"))))
+    (should (= 116481 (plist-get fields :ctx)))
+    (should (= 12 (plist-get fields :pct)))
+    (should (equal "Opus-5" (plist-get fields :model)))))
+
 ;;;; ---- last-known-value persistence (no flicker) -------------------
 
 (ert-deftest cc-butler-cleanup/context-keeps-last-known-on-nil-read ()
@@ -394,6 +426,54 @@ model name, mirroring the context tag's no-flicker behavior."
       (should (equal "claude-sonnet-5" (cc-butler-cleanup-model-for "/w/")))
       (setq reading "claude-opus-4-8")
       (should (equal "opus-4-8" (cc-butler-cleanup-model-tag "/w/"))))))
+
+;;;; ---- fallback-fn and freshness marking ----------------------------
+
+(ert-deftest cc-butler-cleanup/model-for-uses-fallback-fn-when-scrape-fails ()
+  "When the fresh scrape comes back nil and a `fallback-fn' is given, its
+answer is used and cached as fresh -- this is what lets the display path
+recover a coordinator's own model mid-turn, when its own statusline is
+covered and cannot be scraped."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 0)
+        (cc-butler-cleanup-model-function (lambda (_s) nil)))
+    (should (equal "claude-opus-5"
+                   (cc-butler-cleanup-model-for
+                    "/w/" (lambda (_d) "claude-opus-5"))))
+    (should (cc-butler-cleanup-model-fresh-p "/w/"))))
+
+(ert-deftest cc-butler-cleanup/model-for-falls-back-to-last-known-when-fallback-fn-also-nil ()
+  "When BOTH the scrape and the `fallback-fn' come back nil, the old
+last-known name is still returned -- but now marked NOT fresh, so a caller
+can tell a sticky guess apart from a confirmed answer."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 0)
+        (reading "claude-sonnet-5"))
+    (let ((cc-butler-cleanup-model-function (lambda (_s) reading)))
+      ;; seed a last-known value with a real scrape first
+      (should (equal "claude-sonnet-5" (cc-butler-cleanup-model-for "/w/")))
+      (should (cc-butler-cleanup-model-fresh-p "/w/"))
+      ;; now both the scrape and the fallback come back empty
+      (setq reading nil)
+      (should (equal "claude-sonnet-5"
+                     (cc-butler-cleanup-model-for "/w/" (lambda (_d) nil))))
+      (should-not (cc-butler-cleanup-model-fresh-p "/w/")))))
+
+(ert-deftest cc-butler-cleanup/model-for-no-fallback-fn-behaves-exactly-as-before ()
+  "Existing callers that omit `fallback-fn' (e.g. the sessions-list tag, and
+`cc-butler-compact--model-now') see no behavior change: a failed scrape
+still just falls back to the last-known name, nothing more."
+  (let ((cc-butler-cleanup--model-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--model-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-model-ttl 0)
+        (reading "claude-sonnet-5"))
+    (let ((cc-butler-cleanup-model-function (lambda (_s) reading)))
+      (should (equal "claude-sonnet-5" (cc-butler-cleanup-model-for "/w/")))
+      (setq reading nil)
+      (should (equal "claude-sonnet-5" (cc-butler-cleanup-model-for "/w/")))
+      (should-not (cc-butler-cleanup-model-fresh-p "/w/")))))
 
 ;;;; ---- trigger gating ----------------------------------------------
 
