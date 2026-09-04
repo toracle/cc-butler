@@ -1441,6 +1441,32 @@ values -- flagged here, not fixed, since nothing observed exercises it."
                  (format "  needs: %s\n" (string-trim needs))))
        nil file t 'silent))))
 
+(defconst cc-butler--report-tag-strings
+  '("<summary>" "</summary>" "<status>" "</status>" "<needs>" "</needs>")
+  "Tag-shaped substrings that must never appear literally inside a
+`report_to_steward'/`escalate_to_butler' string argument.  Seeing one here
+means the caller emitted tool-call-looking XML as plain text instead of
+using separate parameters -- observed in the wild as fragments like
+`</summary><parameter name=\"status\">' landing verbatim in the steward's
+queue and 정수님's decision document.  Rejecting (rather than silently
+relocating the text) is deliberate: a summary that legitimately quotes one
+of these tags as an example would have its content silently rewritten by
+an auto-move, which is worse than an occasional false-positive rejection
+the caller can see and fix.")
+
+(defun cc-butler--reject-embedded-tags (params)
+  "Error if any (NAME . VALUE) pair in PARAMS contains a tag from
+`cc-butler--report-tag-strings'.  Names the exact tag and the exact
+parameter it was found in, so the caller can fix the call instead of
+guessing which field is corrupted."
+  (dolist (pair params)
+    (let ((name (car pair)) (value (cdr pair)))
+      (when (stringp value)
+        (dolist (tag cc-butler--report-tag-strings)
+          (when (string-match-p (regexp-quote tag) value)
+            (error "%s contains the literal tag %s -- pass summary/status/needs/options as separate arguments, not embedded tags inside one string"
+                   name tag)))))))
+
 (defun cc-butler--escalate-kind (kind)
   "Normalize an `escalate_to_butler' KIND string to `decision' or `note'.
 Anything other than exactly \"notification\" (trimmed, case-insensitive)
@@ -1495,6 +1521,9 @@ turn; an escalation arriving between prompts would otherwise sit until
 the next one."
   (unless (and summary (stringp summary) (not (string-empty-p (string-trim summary))))
     (error "A decision summary is required"))
+  (cc-butler--reject-embedded-tags (list (cons "summary" summary)
+                                          (cons "needs" needs)
+                                          (cons "options" options)))
   (let* ((self (cc-butler--caller-dir))
          (s (string-trim summary))
          (n (and needs (stringp needs)
@@ -1838,6 +1867,9 @@ alias for already-connected callers."
   (let ((self (cc-butler--caller-dir)))
     (unless self
       (error "No calling session context for this report"))
+    (cc-butler--reject-embedded-tags (list (cons "summary" summary)
+                                            (cons "status" status)
+                                            (cons "needs" needs)))
     (let* ((parts (delq nil
                         (list (and (stringp summary) (not (string-empty-p summary)) summary)
                               (and (stringp status) (not (string-empty-p status))
