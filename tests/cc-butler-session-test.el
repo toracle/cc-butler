@@ -259,11 +259,17 @@ be auto-accepted — only the exact folder-trust wording qualifies
 ;;;; ---- v2.1.260+ trust-dialog shape (2026-09-05) --------------------
 
 (defun cc-butler-session-test--insert-trust-dialog-new-shape (&optional yes-selected)
-  "Insert the v2.1.260+ folder-trust screen (captured live 2026-09-05).
+  "Insert the v2.1.260+ folder-trust screen, verbatim from a real capture
+(`emacsclient --eval' against the actual `monocle-wiki-engine-sdd' session,
+2026-09-05) — border, \"Accessing workspace:\" header and directory line
+included, since `cc-butler--trust-dialog-marker-present-p' now requires
+that real framing (cc-butler#8 PR #151 review), not just the marker text.
 When YES-SELECTED is non-nil, insert it with the highlight already moved
-onto \"Yes, I trust this folder\" (the post-Down state); otherwise the
-as-rendered default (\"No, exit\" highlighted)."
+onto \"Yes, I trust this folder\" (the post-Down state, also captured
+live); otherwise the as-rendered default (\"No, exit\" highlighted)."
   (insert (make-string 24 cc-butler--border-rule-char) "\n")
+  (insert " Accessing workspace:\n\n")
+  (insert " /Users/jeongsoopark/projects/monocle-wiki-engine-sdd\n\n")
   (insert " Quick safety check: Is this a project you created or one you trust? (Like your own code, a\n")
   (insert " well-known open source project, or work from your team). If not, take a moment to review what's in\n")
   (insert " this folder first.\n\n")
@@ -277,6 +283,56 @@ as-rendered default (\"No, exit\" highlighted)."
       (insert "❯ No, exit\n")
       (insert "  Yes, I trust this folder\n")))
   (insert "\n Enter to confirm · Esc to cancel\n"))
+
+(defun cc-butler-session-test--insert-quoted-dialog-in-conversation ()
+  "Insert a screen where the trust dialog was DISCUSSED earlier in
+scrollback, not shown now — the actual verbatim shape of a real dispatch
+message relayed during cc-butler#8's own investigation (2026-09-05: x600
+reproduced this exact false positive against a first, border-framing-based
+fix — see `cc-butler--live-screen-tail-start'), reproducing the marker AND
+both `❯ No, exit' / \"Yes, I trust this folder\" lines, wrapped in ordinary
+sender/prose text the way a relayed message renders in a session's
+terminal. Below the quote, enough plain live-screen filler is inserted to
+push the whole quote out of `cc-butler--live-screen-tail-lines' — i.e. the
+scrollback-vs-live-bottom situation the detectors must now tell apart, not
+merely a border-less version of the same near-top screen."
+  (insert " [스튜어드] 🔴 정정 — 내 배차문에 결함이 있었다.\n\n")
+  (insert "**실측 원문** (2026-09-05, `monocle-wiki-engine-sdd` 세션):\n")
+  (insert "```\n")
+  (insert " Quick safety check: Is this a project you created or one you trust? (Like your own code, a\n")
+  (insert " well-known open source project, or work from your team). If not, take a moment to review what's in\n")
+  (insert " this folder first.\n\n")
+  (insert " Claude Code'll be able to read, edit, and execute files here.\n\n")
+  (insert " Security guide\n\n")
+  (insert " ❯ No, exit\n")
+  (insert "   Yes, I trust this folder\n\n")
+  (insert " Enter to confirm · Esc to cancel\n")
+  (insert "```\n")
+  (insert "이대로 두면 세션을 죽인다.\n\n")
+  ;; Live bottom of the screen, well past the quote — a normal idle input
+  ;; row, the way scrollback actually looks once a session keeps working.
+  (dotimes (_ cc-butler--live-screen-tail-lines)
+    (insert "…\n"))
+  (insert (make-string 24 cc-butler--border-rule-char) "\n")
+  (insert "❯ \n")
+  (insert (make-string 24 cc-butler--border-rule-char) "\n"))
+
+(defun cc-butler-session-test--insert-trust-dialog-reordered-options ()
+  "Insert a HYPOTHETICAL future trust-dialog shape: the marker, live at the
+bottom of the screen, with `❯ No, exit' highlighted — but a THIRD option
+sits between it and \"Yes, I trust this folder\", so that line is no longer
+the very next one. Nothing currently ships this; it exists only to prove
+`cc-butler--trust-dialog-new-shape-p' really requires adjacency and isn't
+just checking \"No, exit\" is followed eventually by \"Yes\" somewhere on
+screen — the same class of drift butler flagged (a fourth dialog shape,
+the resume-mode wizard, showed up within the same night this bug was
+found) makes an option reorder a real, not far-fetched, future case."
+  (insert " Quick safety check: Is this a project you created or one you trust?\n\n")
+  (insert " Claude Code'll be able to read, edit, and execute files here.\n\n")
+  (insert "❯ No, exit\n")
+  (insert "  Don't ask me again\n")
+  (insert "  Yes, I trust this folder\n\n")
+  (insert " Enter to confirm · Esc to cancel\n"))
 
 (defun cc-butler-session-test--insert-mcp-classifier-prompt ()
   "Insert the Auto Mode classifier confirmation screen (captured live
@@ -315,6 +371,55 @@ than the trust-dialog false-negative that started this, cc-butler#8)."
           (should-not (cc-butler--trust-dialog-new-shape-p buf))
           (should-not (cc-butler--trust-dialog-showing-p buf))
           (should-not (cc-butler--trust-dialog-marker-present-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/trust-dialog-marker-present-p-nil-on-quoted-conversation ()
+  "A screen where the trust dialog is being QUOTED in chat (the marker AND
+the `❯ No, exit' / \"Yes, I trust this folder\" lines all present, verbatim,
+from relaying this very bug — cc-butler#8 PR #151 review, x600 reproduced
+this exact false positive live) must NOT read as the marker being present,
+let alone as the dialog showing: all three detectors return nil, because
+the quote sits above the live screen tail
+(`cc-butler--live-screen-tail-start'), not inside it. This is the opposite
+direction from the classifier lookalike above — that one had the
+`❯'/Yes-No shape without the marker; this one has the marker (and the
+shape) without being at the live bottom of the screen."
+  (let ((buf (get-buffer-create " *cc-butler-test-trust-quoted*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (cc-butler-session-test--insert-quoted-dialog-in-conversation))
+          (should-not (cc-butler--trust-dialog-marker-present-p buf))
+          (should-not (cc-butler--trust-dialog-new-shape-p buf))
+          (should-not (cc-butler--trust-dialog-showing-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/trust-dialog-new-shape-p-nil-on-reordered-options ()
+  "`cc-butler--trust-dialog-new-shape-p' requires \"Yes, I trust this
+folder\" as the line IMMEDIATELY after `❯ No, exit', not merely present
+somewhere after it — a screen with a third option in between (marker live
+at the bottom, framing intact) must not match."
+  (let ((buf (get-buffer-create " *cc-butler-test-trust-reordered*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (cc-butler-session-test--insert-trust-dialog-reordered-options))
+          (should (cc-butler--trust-dialog-marker-present-p buf))
+          (should-not (cc-butler--trust-dialog-new-shape-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/trust-dialog-showing-p-nil-when-old-shape-marker-is-scrollback ()
+  "`cc-butler--trust-dialog-showing-p' must also fail closed when the old
+shape's own marker sits in scrollback rather than live at the bottom —
+the same live-tail scoping applies to it as to the new-shape detector, not
+just to `cc-butler--trust-dialog-marker-present-p' in isolation."
+  (let ((buf (get-buffer-create " *cc-butler-test-trust-old-scrollback*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert " Quick safety check: quoted from an old bug report, not a live dialog.\n\n")
+            (dotimes (_ cc-butler--live-screen-tail-lines) (insert "…\n"))
+            (insert "❯ 1. Yes, I trust this folder\n"))
+          (should-not (cc-butler--trust-dialog-marker-present-p buf))
+          (should-not (cc-butler--trust-dialog-showing-p buf)))
       (kill-buffer buf))))
 
 (ert-deftest cc-butler-session/accept-trust-dialog-new-shape-confirms-landing-before-return ()
@@ -370,10 +475,19 @@ have shipped)."
   "`cc-butler--accept-trust-dialog-new-shape' errors on a directory with no
 live cc-butler-managed session buffer, rather than silently acting on (or
 creating) one — this function is only for freeing an already-open, stuck
-session, never for a directory that has not been launched yet."
+session, never for a directory that has not been launched yet. Asserts on
+the actual error MESSAGE, not just \"some error\": `should-error' alone
+would also pass if the explicit guard were deleted and Emacs happened to
+signal a different, unrelated error further down (e.g. from passing nil
+to a buffer-taking call) — that is not evidence the guard exists."
   (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
              (lambda (_d) " *cc-butler-test-trust-nonexistent-buf*")))
-    (should-error (cc-butler--accept-trust-dialog-new-shape "/some/unlaunched/dir/"))))
+    (should
+     (string-match-p
+      "no terminal buffer for /some/unlaunched/dir/"
+      (condition-case e
+          (progn (cc-butler--accept-trust-dialog-new-shape "/some/unlaunched/dir/") "")
+        (error (error-message-string e)))))))
 
 (ert-deftest cc-butler-session/accept-trust-dialog-new-shape-nil-on-old-shape ()
   "The old (`❯ 1. Yes, I trust this folder') shape is handled elsewhere

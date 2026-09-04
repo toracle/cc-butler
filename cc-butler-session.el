@@ -1392,20 +1392,61 @@ deleted from cc-butler-orchestrator.el on 2026-07-24 — see
 `cc-butler--input-state')."
   )
 
-(defun cc-butler--trust-dialog-showing-p (buf)
-  "Return non-nil if BUF's terminal currently shows the folder-trust
-screen (`cc-butler--trust-dialog-marker') with \"Yes, I trust this
-folder\" as the highlighted/default option. Both the marker phrase AND
-the exact option wording are required — a dialog that merely mentions
-trust, or shares the numbered-option shape for an unrelated first-run
-warning (e.g. an MCP permission prompt), must not be mistaken for this
-one and auto-accepted (cc-butler#8)."
+(defconst cc-butler--live-screen-tail-lines 25
+  "How many lines up from the bottom of a terminal buffer count as \"live\"
+for detectors that must not fire on scrollback. Same value and rationale
+as `cc-butler-compact-menu-lines' (cc-butler-compact.el: \"Scrollback is
+full of numbered lists that Claude wrote; only the bottom of the screen is
+a live dialog\") — kept as its own constant here because
+cc-butler-session.el is the lower-level module cc-butler-compact.el
+depends on, not the reverse, so this file cannot reference that one's
+variable directly. See `cc-butler--live-screen-tail-start'.")
+
+(defun cc-butler--live-screen-tail-start (buf)
+  "Return the position in BUF that starts the last
+`cc-butler--live-screen-tail-lines' lines — the live bottom of the screen,
+as opposed to scrollback.
+
+A first cut at this (2026-09-05) anchored on a real box border found
+within a lookback window above the marker instead of on position, and
+x600 reproduced a real false positive against it: a worker's own terminal
+buffer showed the trust-dialog marker purely from quoting cc-butler#8's
+own bug discussion in a relayed chat message, and that quote still passed
+the border check. Position is the fix, not another content heuristic —
+cc-butler-compact--menu-p already solved exactly this class of problem
+(a structurally-real-looking match sitting in scrollback) the same way,
+and this reuses its narrowing rather than inventing a second kind
+(cc-butler#8 PR #151 review)."
   (with-current-buffer buf
     (save-excursion
-      (goto-char (point-min))
-      (and (search-forward cc-butler--trust-dialog-marker nil t)
-           (progn (goto-char (point-min))
-                  (search-forward "❯ 1. Yes, I trust this folder" nil t))))))
+      (goto-char (point-max))
+      (forward-line (- cc-butler--live-screen-tail-lines))
+      (point))))
+
+(defun cc-butler--trust-dialog-marker-present-p (buf)
+  "Non-nil only if BUF's trust marker (`cc-butler--trust-dialog-marker')
+appears within the live screen tail (`cc-butler--live-screen-tail-start')
+— not merely present as a substring anywhere in the buffer, which would
+also match the marker sitting in earlier scrollback (e.g. quoted while
+discussing this very bug)."
+  (with-current-buffer buf
+    (save-excursion
+      (goto-char (cc-butler--live-screen-tail-start buf))
+      (search-forward cc-butler--trust-dialog-marker nil t))))
+
+(defun cc-butler--trust-dialog-showing-p (buf)
+  "Return non-nil if BUF's terminal currently shows the folder-trust
+screen (`cc-butler--trust-dialog-marker-present-p') with \"Yes, I trust
+this folder\" as the highlighted/default option. Both the live-tail-scoped
+marker AND the exact option wording are required — a dialog that merely
+mentions trust, or shares the numbered-option shape for an unrelated
+first-run warning (e.g. an MCP permission prompt), must not be mistaken
+for this one and auto-accepted (cc-butler#8)."
+  (and (cc-butler--trust-dialog-marker-present-p buf)
+       (with-current-buffer buf
+         (save-excursion
+           (goto-char (cc-butler--live-screen-tail-start buf))
+           (search-forward "❯ 1. Yes, I trust this folder" nil t)))))
 
 ;;;; ---- v2.1.260+ trust-dialog shape (2026-09-05) --------------------
 ;;;; Claude Code v2.1.260 changed the trust screen: the numbering is gone,
@@ -1419,36 +1460,26 @@ one and auto-accepted (cc-butler#8)."
 ;;;; dialog sitting right here" — new-directory sessions looked broken
 ;;;; rather than merely waiting.
 
-(defun cc-butler--trust-dialog-marker-present-p (buf)
-  "Non-nil if BUF merely contains the trust marker, regardless of shape —
-used only to distinguish \"this is some other prompt entirely\" (no
-marker, e.g. an MCP permission confirmation, see the lookalike test) from
-\"this is the trust dialog but in a shape we don't recognize\" (marker
-present, neither `cc-butler--trust-dialog-showing-p' nor
-`cc-butler--trust-dialog-new-shape-p' matches) — the latter must fail
-loudly rather than silently falling through to a timeout."
-  (with-current-buffer buf
-    (save-excursion
-      (goto-char (point-min))
-      (search-forward cc-butler--trust-dialog-marker nil t))))
-
 (defun cc-butler--trust-dialog-new-shape-p (buf)
   "Non-nil if BUF shows the v2.1.260+ trust dialog with its DEFAULT
 selection (\"No, exit\" highlighted) — the shape it renders in before any
-key has been pressed. Requires all three conditions together: the trust
-marker, the literal `❯ No, exit' line, and \"Yes, I trust this folder\" as
-the very next line — captured verbatim from a live 2026-09-05 screen (see
-PR body / x600's EVIDENCE doc). A prompt that merely resembles this shape
-(❯ plus Yes/No wording, e.g. an MCP permission confirmation) must not
-match — that prompt has no `Quick safety check:' marker at all."
-  (with-current-buffer buf
-    (save-excursion
-      (goto-char (point-min))
-      (and (search-forward cc-butler--trust-dialog-marker nil t)
-           (progn (goto-char (point-min))
-                  (search-forward "❯ No, exit" nil t))
-           (progn (forward-line 1)
-                  (looking-at-p "[ \t]*Yes, I trust this folder"))))))
+key has been pressed. Requires all three conditions together, all scoped
+to the live screen tail (`cc-butler--live-screen-tail-start'): the trust
+marker (`cc-butler--trust-dialog-marker-present-p'), the literal `❯ No,
+exit' line, and \"Yes, I trust this folder\" as the very next line —
+captured verbatim from a live 2026-09-05 screen (see PR body / x600's
+EVIDENCE doc). A prompt that merely resembles this shape (❯ plus Yes/No
+wording, e.g. an MCP permission confirmation) must not match — that
+prompt has no `Quick safety check:' marker at all. Nor may a conversation
+QUOTING this exact dialog text match — scrollback sits above the live
+tail, not inside it (cc-butler#8 PR #151 review)."
+  (and (cc-butler--trust-dialog-marker-present-p buf)
+       (with-current-buffer buf
+         (save-excursion
+           (goto-char (cc-butler--live-screen-tail-start buf))
+           (and (search-forward "❯ No, exit" nil t)
+                (progn (forward-line 1)
+                       (looking-at-p "[ \t]*Yes, I trust this folder")))))))
 
 (defun cc-butler--trust-dialog-new-shape-yes-selected-p (buf)
   "Non-nil only once the highlight (❯) has actually LANDED on \"Yes, I
