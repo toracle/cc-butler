@@ -726,23 +726,23 @@ when all three are empty."
   "Combined payload for the steward's pending_events hook: an urgent
 check_inbox block, the drained worker-event queue, a fleet dialog check,
 and a compact-monitor watchdog check. Any subset may be absent; returns
-\"\" when all four are empty."
-  (let* ((inbox (cc-butler--inbox-urgent-block "steward"))
-         (events (cc-butler-tool-inbox))
-         (has-events (not (equal events "No pending worker events.")))
-         ;; Guarded like `ceiling' below, and for a sharper reason: this walks
-         ;; every session and reads every screen, so it is a larger error
-         ;; surface than the drain that precedes it — and it runs AFTER that
-         ;; drain.  An unguarded failure here would take the drained events
-         ;; down with it.  A missing nudge is a small loss; a swallowed worker
-         ;; report is not.
+\"\" when all four are empty.
+
+The slow checks run first and the destructive drains
+(`cc-butler--inbox-urgent-block', `cc-butler-tool-inbox') run last: the
+caller is a shell hook with its own timeout, external to Emacs, so a
+drain that already ran before a slow check blows that budget would
+strand an already-cleared, undelivered report."
+  (let* (;; Best-effort and the slowest of the four (walks every session's
+         ;; screen) — kept ahead of the destructive reads below on purpose.
          (dialogs (ignore-errors (cc-butler--fleet-dialog-summary)))
          ;; cc-butler-compact loads after this module, so reach it late.
-         ;; Same bargain as the fleet dialog check: elisp reports what is
-         ;; over the context ceiling, the steward decides when to act.
          (ceiling (and (fboundp 'cc-butler-compact-fleet-summary)
                        (ignore-errors (cc-butler-compact-fleet-summary))))
-         (watchdog (cc-butler--compact-monitor-watchdog-check)))
+         (watchdog (cc-butler--compact-monitor-watchdog-check))
+         (inbox (cc-butler--inbox-urgent-block "steward"))
+         (events (cc-butler-tool-inbox))
+         (has-events (not (equal events "No pending worker events."))))
     (mapconcat #'identity
                (delq nil (list inbox (and has-events events) dialogs ceiling watchdog))
                "\n\n")))

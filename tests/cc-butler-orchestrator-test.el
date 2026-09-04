@@ -272,6 +272,27 @@ exactly the events text, with no stray separators."
       "- [12:00] worker-a: done: PR #42" nil
     (should (equal "- [12:00] worker-a: done: PR #42" (cc-butler--pending-events-hook-payload)))))
 
+(ert-deftest cc-butler-orchestrator/pending-events-payload-drains-inbox-only-after-slow-steps ()
+  "The destructive drain must run LAST, after the slow fleet-wide checks —
+otherwise a caller-side hook timeout during the slow dialog scan strands
+an already-cleared, undelivered report. Proven structurally: the slow
+step must observe the inbox still populated when it runs."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--butler "/ops/")
+        (cc-butler--steward nil)
+        (cc-butler--inbox-drained nil)
+        (cc-butler--inbox
+         (list (list :time (current-time) :dir "/worker/" :name "worker"
+                     :body "needs input on auth")))
+        (inbox-len-at-dialog-time -1))
+    (cl-letf (((symbol-function 'cc-butler--inbox-urgent-block) (lambda (_agent) nil))
+              ((symbol-function 'cc-butler--fleet-dialog-summary)
+               (lambda () (setq inbox-len-at-dialog-time (length cc-butler--inbox)) nil))
+              ((symbol-function 'cc-butler-compact-fleet-summary) (lambda () nil))
+              ((symbol-function 'cc-butler--compact-monitor-watchdog-check) (lambda () nil)))
+      (cc-butler--pending-events-hook-payload))
+    (should (= 1 inbox-len-at-dialog-time))))
+
 ;;;; ---- compact-monitor watchdog check -----------------------------------
 ;;;; The fleet monitor's own `run-with-timer' has died silently before —
 ;;;; `cc-butler-compact-monitor-mode' stayed t while the timer quietly
