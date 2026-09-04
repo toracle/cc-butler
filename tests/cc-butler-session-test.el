@@ -1378,6 +1378,15 @@ to the SAME file in order — an append-only record, not one file per event."
                  (string-match (regexp-quote "NOT restored") got)
                  (string-match (regexp-quote "cleanup") got))))))
 
+(ert-deftest cc-butler-session/ops-log-dir-is-not-the-real-default-during-a-test-run ()
+  "`tests/run-tests.el' redirects `cc-butler-ops-log-dir' away from the
+real live log for the whole batch run — proves that binding is actually
+active, not just present in the source. Compares against the defcustom's
+own `standard-value' rather than hardcoding a path, so it can't be
+silently defeated by a default-value change."
+  (let ((real-default (eval (car (get 'cc-butler-ops-log-dir 'standard-value)) t)))
+    (should-not (equal real-default cc-butler-ops-log-dir))))
+
 ;;;; ---- ops log vs message log: a quoted event must not re-count -----
 ;;;;
 ;;;; REGRESSION for the live 2026-08-26 incident: investigating a compact
