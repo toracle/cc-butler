@@ -510,6 +510,7 @@ precondition, so a full disk or an unwritable directory must not break
 the operation being logged.  Returns LINE, or nil if the write failed."
   (ignore-errors
     (make-directory cc-butler-ops-log-dir t)
+    (cc-butler--ops-log-rotate)
     (write-region (concat line "\n") nil (cc-butler--log-file)
                   'append 'silent)
     line))
@@ -518,6 +519,56 @@ the operation being logged.  Returns LINE, or nil if the write failed."
   "Return today's on-disk message-body log file under `cc-butler-ops-log-dir'."
   (expand-file-name (format-time-string "msg-%Y-%m-%d.log")
                     cc-butler-ops-log-dir))
+
+(defcustom cc-butler-ops-log-retention-days 14
+  "Days a dated ops/msg log file is kept before rotation deletes it.
+Only ever applies to files dated after `cc-butler-ops-log-rotation-epoch'
+-- see that defcustom's docstring. 14 days: long enough to cover a
+delayed review the following week, short enough that this log stops
+repeating the unbounded-growth pattern the 2026-09-04 retention audit
+found."
+  :type 'integer
+  :group 'cc-butler)
+
+(defcustom cc-butler-ops-log-rotation-epoch "2026-09-04"
+  "Rotation never deletes a dated log file dated at or before this date.
+Disposal of files that already existed when rotation shipped is a
+human decision, not one this code makes silently -- only a file dated
+AFTER this date is ever eligible for automatic deletion."
+  :type 'string
+  :group 'cc-butler)
+
+(defvar cc-butler--ops-log-last-rotated nil
+  "Date string rotation last ran for.  Guards `cc-butler--ops-log-rotate'
+to at most once per day.")
+
+(defun cc-butler--ops-log-dated-files ()
+  "Return (FILE . DATE) for every dated ops/msg log file in
+`cc-butler-ops-log-dir', DATE as a YYYY-MM-DD string parsed from the name."
+  (when (file-directory-p cc-butler-ops-log-dir)
+    (delq nil
+          (mapcar (lambda (f)
+                    (when (string-match
+                           "/\\(?:ops\\|msg\\)-\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)\\.log\\'"
+                           f)
+                      (cons f (match-string 1 f))))
+                  (directory-files cc-butler-ops-log-dir t)))))
+
+(defun cc-butler--ops-log-rotate ()
+  "Delete dated ops/msg log files past `cc-butler-ops-log-retention-days',
+never a file dated at or before `cc-butler-ops-log-rotation-epoch'.
+Runs at most once per day; safe to call from every log write."
+  (let ((today (format-time-string "%F")))
+    (unless (equal cc-butler--ops-log-last-rotated today)
+      (setq cc-butler--ops-log-last-rotated today)
+      (ignore-errors
+        (dolist (pair (cc-butler--ops-log-dated-files))
+          (let ((date (cdr pair)))
+            (when (and (string> date cc-butler-ops-log-rotation-epoch)
+                       (> (- (time-to-days (current-time))
+                             (time-to-days (date-to-time (concat date "T00:00:00"))))
+                          cc-butler-ops-log-retention-days))
+              (delete-file (car pair)))))))))
 
 (defun cc-butler--log-message (kind from to body)
   "Append a full-body message record to today's message log, one JSON
@@ -545,6 +596,7 @@ Non-fatal like `cc-butler--log-mirror': an audit layer, never a
 precondition for the operation being logged."
   (ignore-errors
     (make-directory cc-butler-ops-log-dir t)
+    (cc-butler--ops-log-rotate)
     (write-region
      (concat (json-encode (list (cons 'time (format-time-string "%FT%T"))
                                  (cons 'kind kind)

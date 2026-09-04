@@ -1667,5 +1667,48 @@ one shared launch path, not an opt-in a caller could forget."
       (cc-butler--configure-session "/tmp/some-worker/"))
     (should mitigated)))
 
+;;;; ------------------------------------------------------------------
+;;;; forward-only ops/msg log rotation
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-session/ops-log-rotate-never-touches-files-at-or-before-the-epoch ()
+  "A file dated at or before the rotation epoch is never deleted by this
+code, no matter how far past the retention window it is -- disposal of
+what already existed when rotation shipped is a human decision."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-butler-rotate-test-" t)))
+         (cc-butler-ops-log-dir dir)
+         (cc-butler-ops-log-rotation-epoch "2026-09-04")
+         (cc-butler-ops-log-retention-days 1)
+         (cc-butler--ops-log-last-rotated nil)
+         (old-file (expand-file-name "ops-2020-01-01.log" dir)))
+    (write-region "" nil old-file)
+    (cc-butler--ops-log-rotate)
+    (should (file-exists-p old-file))))
+
+(ert-deftest cc-butler-session/ops-log-rotate-deletes-past-retention-files-created-after-the-epoch ()
+  "A file dated after the epoch and past the retention window is deleted."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-butler-rotate-test-" t)))
+         (cc-butler-ops-log-dir dir)
+         (cc-butler-ops-log-rotation-epoch "2020-01-01")
+         (cc-butler-ops-log-retention-days 1)
+         (cc-butler--ops-log-last-rotated nil)
+         (stale-file (expand-file-name "ops-2020-01-05.log" dir)))
+    (write-region "" nil stale-file)
+    (cc-butler--ops-log-rotate)
+    (should-not (file-exists-p stale-file))))
+
+(ert-deftest cc-butler-session/ops-log-rotate-keeps-files-within-the-retention-window ()
+  "A recent, post-epoch file inside the retention window is kept."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-butler-rotate-test-" t)))
+         (cc-butler-ops-log-dir dir)
+         (cc-butler-ops-log-rotation-epoch "2020-01-01")
+         (cc-butler-ops-log-retention-days 3650)
+         (cc-butler--ops-log-last-rotated nil)
+         (recent-file (expand-file-name
+                       (format-time-string "ops-%Y-%m-%d.log") dir)))
+    (write-region "" nil recent-file)
+    (cc-butler--ops-log-rotate)
+    (should (file-exists-p recent-file))))
+
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here
