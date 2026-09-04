@@ -256,6 +256,140 @@ be auto-accepted — only the exact folder-trust wording qualifies
           (should-not (cc-butler--trust-dialog-showing-p buf)))
       (kill-buffer buf))))
 
+;;;; ---- v2.1.260+ trust-dialog shape (2026-09-05) --------------------
+
+(defun cc-butler-session-test--insert-trust-dialog-new-shape (&optional yes-selected)
+  "Insert the v2.1.260+ folder-trust screen (captured live 2026-09-05).
+When YES-SELECTED is non-nil, insert it with the highlight already moved
+onto \"Yes, I trust this folder\" (the post-Down state); otherwise the
+as-rendered default (\"No, exit\" highlighted)."
+  (insert (make-string 24 cc-butler--border-rule-char) "\n")
+  (insert " Quick safety check: Is this a project you created or one you trust? (Like your own code, a\n")
+  (insert " well-known open source project, or work from your team). If not, take a moment to review what's in\n")
+  (insert " this folder first.\n\n")
+  (insert " Claude Code'll be able to read, edit, and execute files here.\n\n")
+  (insert " Security guide\n\n")
+  (if yes-selected
+      (progn
+        (insert "  No, exit\n")
+        (insert "❯ Yes, I trust this folder\n"))
+    (progn
+      (insert "❯ No, exit\n")
+      (insert "  Yes, I trust this folder\n")))
+  (insert "\n Enter to confirm · Esc to cancel\n"))
+
+(defun cc-butler-session-test--insert-mcp-classifier-prompt ()
+  "Insert the Auto Mode classifier confirmation screen (captured live
+2026-09-05) — shares the `❯' + Yes/No shape with the trust dialog but
+carries none of its wording, and MUST NOT be mistaken for it (cc-butler#8)."
+  (insert (make-string 24 cc-butler--border-rule-char) "\n")
+  (insert " Auto mode classifier requires confirmation for this command.\n")
+  (insert " 3 consecutive actions were blocked. Please review the transcript before continuing.\n\n")
+  (insert " Latest blocked action: Blocked by classifier\n\n")
+  (insert " Do you want to proceed?\n")
+  (insert "❯ 1. Yes\n")
+  (insert "  2. Yes, allow reading from /Users/.../services from this project\n")
+  (insert "  3. No\n\n")
+  (insert " Esc to cancel · Tab to amend\n"))
+
+(ert-deftest cc-butler-session/trust-dialog-new-shape-p-detects-real-screen ()
+  "`cc-butler--trust-dialog-new-shape-p' recognizes the v2.1.260+
+folder-trust screen in its as-rendered (\"No, exit\" highlighted) state."
+  (let ((buf (get-buffer-create " *cc-butler-test-trust-new*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (cc-butler-session-test--insert-trust-dialog-new-shape))
+          (should (cc-butler--trust-dialog-new-shape-p buf))
+          (should-not (cc-butler--trust-dialog-new-shape-yes-selected-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/trust-dialog-new-shape-p-nil-on-mcp-classifier-lookalike ()
+  "The Auto Mode classifier confirmation shares `❯' + Yes/No wording but
+has no `Quick safety check:' marker — must not be mistaken for the trust
+dialog (a false positive here would auto-approve a blocked command, worse
+than the trust-dialog false-negative that started this, cc-butler#8)."
+  (let ((buf (get-buffer-create " *cc-butler-test-trust-mcp-classifier*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (cc-butler-session-test--insert-mcp-classifier-prompt))
+          (should-not (cc-butler--trust-dialog-new-shape-p buf))
+          (should-not (cc-butler--trust-dialog-showing-p buf))
+          (should-not (cc-butler--trust-dialog-marker-present-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-new-shape-confirms-landing-before-return ()
+  "`cc-butler--accept-trust-dialog-new-shape' sends Down, re-reads the
+screen, and only sends Return once the highlight is confirmed to have
+landed on \"Yes, I trust this folder\" — not merely after sending Down
+(2026-09-05 steward correction: send confirmation is not landing
+confirmation)."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-trust-new-accept*"))
+        (down-count 0) (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (cc-butler-session-test--insert-trust-dialog-new-shape))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down)
+                     (lambda (&optional _buf)
+                       (cl-incf down-count)
+                       (with-current-buffer term-buf
+                         (erase-buffer)
+                         (cc-butler-session-test--insert-trust-dialog-new-shape t))))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda () (cl-incf return-count))))
+            (should (cc-butler--accept-trust-dialog-new-shape "/worker/"))
+            (should (= 1 down-count))
+            (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-new-shape-errors-without-return-when-down-does-not-land ()
+  "If Down is sent but the highlight does NOT move (a dropped keypress,
+wrong terminal mode, etc.), `cc-butler--accept-trust-dialog-new-shape'
+must error loudly and must NOT send Return — a Return here would land on
+\"No, exit\" and kill the session (2026-09-05 steward correction: this is
+the exact bug an earlier, unconfirmed-landing draft of this function would
+have shipped)."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-trust-new-stuck*"))
+        (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (cc-butler-session-test--insert-trust-dialog-new-shape))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down) (lambda (&optional _buf) nil))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda () (cl-incf return-count))))
+            (should-error (cc-butler--accept-trust-dialog-new-shape "/worker/"))
+            (should (= 0 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-new-shape-rejects-non-target-directory ()
+  "`cc-butler--accept-trust-dialog-new-shape' errors on a directory with no
+live cc-butler-managed session buffer, rather than silently acting on (or
+creating) one — this function is only for freeing an already-open, stuck
+session, never for a directory that has not been launched yet."
+  (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+             (lambda (_d) " *cc-butler-test-trust-nonexistent-buf*")))
+    (should-error (cc-butler--accept-trust-dialog-new-shape "/some/unlaunched/dir/"))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-new-shape-nil-on-old-shape ()
+  "The old (`❯ 1. Yes, I trust this folder') shape is handled elsewhere
+(`cc-butler--trust-dialog-showing-p' / `cc-butler--wait-for-session-ready')
+— this function must recognize it as \"not mine\" and return nil rather
+than erroring."
+  (let ((buf (get-buffer-create " *cc-butler-test-trust-old-via-new-fn*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (cc-butler-session-test--insert-trust-dialog))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t)))
+            (should-not (cc-butler--accept-trust-dialog-new-shape "/worker/"))))
+      (kill-buffer buf))))
+
 (ert-deftest cc-butler-session/wait-for-ready-accepts-trust-dialog-then-proceeds ()
   "`cc-butler--wait-for-session-ready' recognizes the folder-trust screen,
 sends a bare Return to accept it (\"Yes, trust\" is pre-highlighted), and
