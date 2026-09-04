@@ -1218,13 +1218,8 @@ be 0."
     (should (= 0 (cc-butler--forward-pending-count)))))
 
 (ert-deftest cc-butler-orchestrator/forward-cadence-is-five-minutes ()
-  "DECISION LOCK (정수님, 2026-09-04): the steward checks its inbox on a
-5-minute cadence, not 10/60. Measured before the change (3 days of
-ops/msg logs + steward transcript): report→steward arrival median 6.7min,
-p90 13min, quantized by the 600s defer window; events that hit `ops busy'
-waited median 23-42min for the 3600s backstop. Both knobs are bounded at
-300s so a report never waits more than ~5min for a wake once ops is free.
-Guards against a silent revert to the old constants; tune deliberately."
+  "Decision lock (2026-09-04): the steward's inbox-check cadence stays at
+or under 5 minutes. Guards against a silent revert to the old 600s/3600s."
   (should (<= cc-butler-forward-defer-window 300))
   (should (<= cc-butler-forward-backstop-interval 300)))
 

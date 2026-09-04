@@ -1176,25 +1176,16 @@ monitor's interval)."
 
 (defcustom cc-butler-forward-defer-window 300
   "Seconds a `deferred' event waits before it may escalate to a push.
-Was 600s (2026-08-10 starting point).  Retuned to 300s on 2026-09-04 by
-정수님 after measurement: with the 600s window, report→steward arrival
-ran median 6.7min / p90 13min (3 days of ops+msg logs against the
-steward transcript), quantized by this window because the steward's
-prompts mostly come from these very nudges.  The steward now works on a
-5-minute cadence; see `cc-butler-forward-backstop-interval'."
+300s as of 2026-09-04 (was 600s) — the steward's inbox-check cadence;
+see `cc-butler-forward-backstop-interval'."
   :type 'number :group 'cc-butler)
 
 (defcustom cc-butler-forward-backstop-interval 300
   "Seconds between backstop sweeps (`cc-butler--forward-backstop'), the
 bounded worst-case latency for a wake-worthy event that arrived while
-the ops session was busy.  Was 3600s (2026-08-10 starting point).
-Retuned to 300s on 2026-09-04 by 정수님: events parked as `ops busy,
-queued for backstop' were waiting median 23-42min, and on busy days the
-\"no push within the interval\" skip made the backstop fire less, not
-more.  At 300s this IS the steward's 5-minute inbox schedule — one
-bounded sweep per 5min, still gated on the ops session being free.  It
-is a separate defcustom precisely so tuning it never silently retunes
-the compaction monitor, and vice versa."
+the ops session was busy.  300s as of 2026-09-04 (was 3600s).  Separate
+defcustom from the compaction monitor's interval so tuning one never
+silently retunes the other."
   :type 'number :group 'cc-butler)
 
 (defvar cc-butler--forward-deferred (make-hash-table :test #'equal)
