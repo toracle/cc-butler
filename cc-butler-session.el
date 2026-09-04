@@ -1673,15 +1673,25 @@ deleted from cc-butler-orchestrator.el on 2026-07-24 — see
 `cc-butler--input-state')."
   )
 
-(defconst cc-butler--live-screen-tail-lines 25
+(defun cc-butler--live-screen-tail-lines ()
   "How many lines up from the bottom of a terminal buffer count as \"live\"
-for detectors that must not fire on scrollback. Same value and rationale
-as `cc-butler-compact-menu-lines' (cc-butler-compact.el: \"Scrollback is
-full of numbered lists that Claude wrote; only the bottom of the screen is
-a live dialog\") — kept as its own constant here because
-cc-butler-session.el is the lower-level module cc-butler-compact.el
-depends on, not the reverse, so this file cannot reference that one's
-variable directly. See `cc-butler--live-screen-tail-start'.")
+for detectors that must not fire on scrollback.
+
+Delegates to `cc-butler-compact-menu-lines' (cc-butler-compact.el:
+\"Scrollback is full of numbered lists that Claude wrote; only the bottom
+of the screen is a live dialog\") when that variable is loaded, so the two
+modules share one number instead of two constants that can silently drift
+apart (cc-butler#8 PR follow-up review — an earlier version of this file
+kept a separate `defconst' here on the mistaken belief that
+cc-butler-session.el cannot reference cc-butler-compact.el; it already did,
+elsewhere in this file, via the same `fboundp'-guarded soft dependency
+used below, e.g. `cc-butler-compact--severity-for'). The literal 25
+fallback exists only so this file has no load-order requirement on
+cc-butler-compact.el, not because the two numbers are meant to differ.
+See `cc-butler--live-screen-tail-start'."
+  (if (boundp 'cc-butler-compact-menu-lines)
+      cc-butler-compact-menu-lines
+    25))
 
 (defun cc-butler--live-screen-tail-start (buf)
   "Return the position in BUF that starts the last
@@ -1701,7 +1711,7 @@ and this reuses its narrowing rather than inventing a second kind
   (with-current-buffer buf
     (save-excursion
       (goto-char (point-max))
-      (forward-line (- cc-butler--live-screen-tail-lines))
+      (forward-line (- (cc-butler--live-screen-tail-lines)))
       (point))))
 
 (defun cc-butler--trust-dialog-marker-present-p (buf)
@@ -1856,12 +1866,17 @@ vanishes (cc-butler#8).
 Along the way, if the one-time folder-trust screen is showing (always
 true on a directory Claude Code has never opened before — the exact
 scenario 정수님's original report was about, a fresh environment full of
-new directories), accept it once (a bare Return; \"Yes, trust\" is the
-pre-highlighted default) and keep polling for the real input row
+new directories), accept it once and keep polling for the real input row
 afterward, rather than timing out on a session that is actually alive
-and just waiting for a yes/no answer. Accepted at most once per call —
-never re-sent if the screen is still transitioning — so a slow render
-can't cause a second Return to land on whatever comes next.
+and just waiting for a yes/no answer. Tries the v2.1.260+ shape first
+via `cc-butler--accept-trust-dialog-new-shape' (Down, re-confirm landing,
+then Return — see that function; it also errors loudly if the trust
+marker is present but neither shape matches, instead of silently
+retrying until timeout), then falls back to the pre-v2.1.260 shape (a
+bare Return; \"Yes, trust\" was the pre-highlighted default there).
+Accepted at most once per call — never re-sent if the screen is still
+transitioning — so a slow render can't cause a second Return to land on
+whatever comes next.
 
 Claude Code itself eventually auto-accepts this screen if left alone
 (confirmed: it does NOT hang forever, but takes 15-65s, unbounded and
@@ -1884,11 +1899,14 @@ is worse off than one told plainly that it didn't."
                                                   (forward-line -40)
                                                   (point))))
                       (cc-butler--find-input-line start (point-max)))))
-        (if (and (not trust-accepted) (cc-butler--trust-dialog-showing-p buf))
-            (progn
-              (with-current-buffer buf (claude-code-ide--terminal-send-return))
-              (setq trust-accepted t))
-          (sleep-for 0.1))))))
+        (cond
+         (trust-accepted (sleep-for 0.1))
+         ((cc-butler--accept-trust-dialog-new-shape dir)
+          (setq trust-accepted t))
+         ((cc-butler--trust-dialog-showing-p buf)
+          (with-current-buffer buf (claude-code-ide--terminal-send-return))
+          (setq trust-accepted t))
+         (t (sleep-for 0.1)))))))
 
 (defun cc-butler--launch-session (dir)
   "The ONE path every role launches through — butler, steward, and workers —
