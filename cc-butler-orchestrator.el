@@ -1116,8 +1116,8 @@ false \"N worker events pending\", and `pending_events' then correctly
 found nothing deliverable — a self-sustaining false-alarm loop, roughly
 once per `cc-butler-forward-backstop-interval', that would recur forever
 because nothing ever consumed the count the backstop was reading (see
-`cc-butler--forward-backstop-interval's docstring: default 3600s, which
-matches the ~1-1.5h gaps actually observed). One function, shared by
+`cc-butler-forward-backstop-interval's docstring: 3600s at the time, which
+matched the ~1-1.5h gaps actually observed). One function, shared by
 both, so they cannot disagree again."
   (let ((events (reverse cc-butler--inbox))
         (ops (cc-butler--ops-dir)))
@@ -1174,18 +1174,27 @@ that split `cc-butler-forward-backstop-interval' from the compaction
 monitor's interval)."
   :type 'number :group 'cc-butler)
 
-(defcustom cc-butler-forward-defer-window 600
+(defcustom cc-butler-forward-defer-window 300
   "Seconds a `deferred' event waits before it may escalate to a push.
-Starting point, not a settled constant — tune in operation."
+Was 600s (2026-08-10 starting point).  Retuned to 300s on 2026-09-04 by
+정수님 after measurement: with the 600s window, report→steward arrival
+ran median 6.7min / p90 13min (3 days of ops+msg logs against the
+steward transcript), quantized by this window because the steward's
+prompts mostly come from these very nudges.  The steward now works on a
+5-minute cadence; see `cc-butler-forward-backstop-interval'."
   :type 'number :group 'cc-butler)
 
-(defcustom cc-butler-forward-backstop-interval 3600
+(defcustom cc-butler-forward-backstop-interval 300
   "Seconds between backstop sweeps (`cc-butler--forward-backstop'), the
 bounded worst-case latency for a wake-worthy event that arrived while
-the ops session was busy.  Initial value 3600s is an operating STARTING
-POINT (decided 2026-08-10), expected to be tuned in operation — it is a
-separate defcustom precisely so tuning it never silently retunes the
-compaction monitor, and vice versa."
+the ops session was busy.  Was 3600s (2026-08-10 starting point).
+Retuned to 300s on 2026-09-04 by 정수님: events parked as `ops busy,
+queued for backstop' were waiting median 23-42min, and on busy days the
+\"no push within the interval\" skip made the backstop fire less, not
+more.  At 300s this IS the steward's 5-minute inbox schedule — one
+bounded sweep per 5min, still gated on the ops session being free.  It
+is a separate defcustom precisely so tuning it never silently retunes
+the compaction monitor, and vice versa."
   :type 'number :group 'cc-butler)
 
 (defvar cc-butler--forward-deferred (make-hash-table :test #'equal)

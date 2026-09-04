@@ -1206,7 +1206,7 @@ fires exactly when ops just went idle, i.e. exactly when this self-event
 was just queued, so every backstop sweep saw count > 0 and woke ops with
 a false \"N worker events pending\" that `pending_events' then correctly
 found nothing to redeem — a self-sustaining false-alarm loop bounded only
-by `cc-butler-forward-backstop-interval' (default 3600s, matching the
+by `cc-butler-forward-backstop-interval' (3600s at the time, matching the
 observed ~1-1.5h gaps). With only ops's own event queued, the count must
 be 0."
   (let ((cc-butler-message-transport 'in-memory)
@@ -1216,6 +1216,17 @@ be 0."
          (list (list :time (current-time) :dir "/ops/" :name "ops"
                      :body "Claude is waiting for your input"))))
     (should (= 0 (cc-butler--forward-pending-count)))))
+
+(ert-deftest cc-butler-orchestrator/forward-cadence-is-five-minutes ()
+  "DECISION LOCK (정수님, 2026-09-04): the steward checks its inbox on a
+5-minute cadence, not 10/60. Measured before the change (3 days of
+ops/msg logs + steward transcript): report→steward arrival median 6.7min,
+p90 13min, quantized by the 600s defer window; events that hit `ops busy'
+waited median 23-42min for the 3600s backstop. Both knobs are bounded at
+300s so a report never waits more than ~5min for a wake once ops is free.
+Guards against a silent revert to the old constants; tune deliberately."
+  (should (<= cc-butler-forward-defer-window 300))
+  (should (<= cc-butler-forward-backstop-interval 300)))
 
 (ert-deftest cc-butler-orchestrator/forward-pending-count-still-counts-real-events ()
   "POSITIVE CONTROL for the fix above: a genuine worker event (a different
