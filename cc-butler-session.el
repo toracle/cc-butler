@@ -538,6 +538,23 @@ AFTER this date is ever eligible for automatic deletion."
   :type 'string
   :group 'cc-butler)
 
+(defcustom cc-butler-ops-log-size-cap-mb 50
+  "Total on-disk size cap (MB), on top of `cc-butler-ops-log-retention-days',
+for files dated after `cc-butler-ops-log-rotation-epoch' -- a second,
+independent guard against a single unusually heavy day outrunning the
+day-based cap before its 14 days are up. Applies only to that eligible
+set: a file at or before the epoch is never counted toward the cap or
+deleted to satisfy it, same guarantee as the age-based rotation.  When
+exceeded, the oldest eligible files are deleted first until back under
+the cap.
+
+50MB: the current 14-day accumulation is ~17MB, and the heaviest single
+day observed so far was ~2.8MB -- this leaves roughly 10x headroom over
+the worst single-day spike seen to date, while still bounding the
+worst case instead of leaving it open-ended."
+  :type 'integer
+  :group 'cc-butler)
+
 (defvar cc-butler--ops-log-last-rotated nil
   "Date string rotation last ran for.  Guards `cc-butler--ops-log-rotate'
 to at most once per day.")
@@ -554,21 +571,41 @@ to at most once per day.")
                       (cons f (match-string 1 f))))
                   (directory-files cc-butler-ops-log-dir t)))))
 
+(defun cc-butler--ops-log-file-age-days (date)
+  "Days between DATE (a YYYY-MM-DD string) and today."
+  (- (time-to-days (current-time))
+     (time-to-days (date-to-time (concat date "T00:00:00")))))
+
+(defun cc-butler--ops-log-total-size (pairs)
+  "Sum on-disk byte size of the files in PAIRS, a list of (FILE . DATE)."
+  (apply #'+ (mapcar (lambda (p) (or (file-attribute-size
+                                       (file-attributes (car p)))
+                                      0))
+                      pairs)))
+
 (defun cc-butler--ops-log-rotate ()
-  "Delete dated ops/msg log files past `cc-butler-ops-log-retention-days',
-never a file dated at or before `cc-butler-ops-log-rotation-epoch'.
-Runs at most once per day; safe to call from every log write."
+  "Delete dated ops/msg log files past `cc-butler-ops-log-retention-days'
+or past `cc-butler-ops-log-size-cap-mb', never a file dated at or
+before `cc-butler-ops-log-rotation-epoch'. The age pass runs first;
+whatever survives it is the eligible set the size cap then prunes,
+oldest first. Runs at most once per day; safe to call from every log
+write."
   (let ((today (format-time-string "%F")))
     (unless (equal cc-butler--ops-log-last-rotated today)
       (setq cc-butler--ops-log-last-rotated today)
       (ignore-errors
-        (dolist (pair (cc-butler--ops-log-dated-files))
-          (let ((date (cdr pair)))
-            (when (and (string> date cc-butler-ops-log-rotation-epoch)
-                       (> (- (time-to-days (current-time))
-                             (time-to-days (date-to-time (concat date "T00:00:00"))))
-                          cc-butler-ops-log-retention-days))
-              (delete-file (car pair)))))))))
+        (let (eligible)
+          (dolist (pair (cc-butler--ops-log-dated-files))
+            (when (string> (cdr pair) cc-butler-ops-log-rotation-epoch)
+              (if (> (cc-butler--ops-log-file-age-days (cdr pair))
+                     cc-butler-ops-log-retention-days)
+                  (delete-file (car pair))
+                (push pair eligible))))
+          (setq eligible (sort eligible (lambda (a b) (string< (cdr a) (cdr b)))))
+          (let ((cap-bytes (* cc-butler-ops-log-size-cap-mb 1024 1024)))
+            (while (and eligible
+                        (> (cc-butler--ops-log-total-size eligible) cap-bytes))
+              (delete-file (car (pop eligible))))))))))
 
 (defun cc-butler--log-message (kind from to body)
   "Append a full-body message record to today's message log, one JSON
