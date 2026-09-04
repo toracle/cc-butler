@@ -273,24 +273,10 @@ exactly the events text, with no stray separators."
     (should (equal "- [12:00] worker-a: done: PR #42" (cc-butler--pending-events-hook-payload)))))
 
 (ert-deftest cc-butler-orchestrator/pending-events-payload-drains-inbox-only-after-slow-steps ()
-  "cc-butler#137-class fix: the destructive drain (`cc-butler-tool-inbox') must
-run LAST in `cc-butler--pending-events-hook-payload' -- after the slow,
-best-effort fleet-wide checks (dialog scan, ceiling, watchdog), not before
-them.
-
-Why this matters: the hook script that calls this payload via
-`emacsclient --eval' is killed by Claude Code's own hook-level timeout --
-external to Emacs, untouched by the `ignore-errors' already wrapping the
-dialog scan. If the drain runs FIRST, a slow dialog scan (it walks and
-reads every session's screen) that blows that budget loses an
-already-cleared, never-delivered worker report permanently: the queue is
-empty in Emacs, the caller never saw the text, and there is no recovery
-path (real incident, 2026-09-03 19:41, steward->butler, a different send
-path but the same shape -- sender-side success, no recipient-side trace).
-
-Confirmation here is structural, not a return value: the slow step must
-observe the inbox STILL POPULATED when it runs, proving the drain has not
-happened yet."
+  "The destructive drain must run LAST, after the slow fleet-wide checks —
+otherwise a caller-side hook timeout during the slow dialog scan strands
+an already-cleared, undelivered report. Proven structurally: the slow
+step must observe the inbox still populated when it runs."
   (let ((cc-butler-message-transport 'in-memory)
         (cc-butler--butler "/ops/")
         (cc-butler--steward nil)
