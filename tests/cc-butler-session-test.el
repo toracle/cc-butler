@@ -1667,5 +1667,46 @@ one shared launch path, not an opt-in a caller could forget."
       (cc-butler--configure-session "/tmp/some-worker/"))
     (should mitigated)))
 
+;;;; ------------------------------------------------------------------
+;;;; inbox queue persistence across restarts
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-session/inbox-queue-survives-a-simulated-restart ()
+  "The confirmed-loss scenario this exists to fix: an Emacs restart while
+`cc-butler--inbox' still holds an undrained worker event must not lose it.
+Push an event, simulate a restart by wiping the in-memory queue, then
+reload -- the event must come back."
+  (let* ((cc-butler-inbox-queue-file
+          (make-temp-file "cc-butler-inbox-queue-test-" nil ".eld"))
+         (cc-butler--inbox nil))
+    (cc-butler--inbox-push "/worker-restart/" "undrained report")
+    (should cc-butler--inbox)
+    (setq cc-butler--inbox nil)
+    (cc-butler--inbox-queue-load)
+    (should (= 1 (length cc-butler--inbox)))
+    (should (equal (plist-get (car cc-butler--inbox) :body) "undrained report"))
+    (delete-file cc-butler-inbox-queue-file)))
+
+(ert-deftest cc-butler-session/inbox-queue-drained-items-do-not-survive-a-simulated-restart ()
+  "The persisted file mirrors the LIVE queue, not a history: once an item
+is drained from `cc-butler--inbox', its disk copy must be gone too, not
+left behind to reappear on the next restart."
+  (let* ((cc-butler-inbox-queue-file
+          (make-temp-file "cc-butler-inbox-queue-test-" nil ".eld"))
+         (cc-butler--inbox nil))
+    (cc-butler--inbox-push "/worker-drain/" "will be drained")
+    (should cc-butler--inbox)
+    (setq cc-butler--inbox nil)
+    (cc-butler--inbox-queue-save)          ; what the real drain site does
+    (cc-butler--inbox-queue-load)
+    (should-not cc-butler--inbox)
+    (delete-file cc-butler-inbox-queue-file)))
+
+(ert-deftest cc-butler-session/inbox-queue-warn-threshold-matches-drained-keep-precedent ()
+  "Decision lock (2026-09-04): the backlog-warning threshold reuses
+`cc-butler-drained-keep' as its number -- this fleet's existing precedent
+for a small bounded event window -- rather than an arbitrary new one."
+  (should (= cc-butler-inbox-queue-warn-threshold cc-butler-drained-keep)))
+
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here
