@@ -726,23 +726,39 @@ when all three are empty."
   "Combined payload for the steward's pending_events hook: an urgent
 check_inbox block, the drained worker-event queue, a fleet dialog check,
 and a compact-monitor watchdog check. Any subset may be absent; returns
-\"\" when all four are empty."
-  (let* ((inbox (cc-butler--inbox-urgent-block "steward"))
-         (events (cc-butler-tool-inbox))
-         (has-events (not (equal events "No pending worker events.")))
-         ;; Guarded like `ceiling' below, and for a sharper reason: this walks
-         ;; every session and reads every screen, so it is a larger error
-         ;; surface than the drain that precedes it — and it runs AFTER that
-         ;; drain.  An unguarded failure here would take the drained events
-         ;; down with it.  A missing nudge is a small loss; a swallowed worker
-         ;; report is not.
+\"\" when all four are empty.
+
+Computation order is deliberate and load-bearing (cc-butler#137-class
+fix, 2026-09-04): the SLOW, best-effort checks run FIRST, and the two
+DESTRUCTIVE drains (`cc-butler--inbox-urgent-block', `cc-butler-tool-inbox')
+run LAST, immediately before formatting the return value. The caller is a
+shell hook invoking this via `emacsclient --eval' under Claude Code's own
+hook-level timeout -- external to Emacs, and not something `ignore-errors'
+can catch. If a drain ran first and the slow dialog scan (it walks and
+reads every session's screen) then blew that budget, the mutation would
+already be committed inside Emacs with no way to tell the caller ever saw
+the reply -- an already-cleared, undelivered worker report, gone for good.
+Draining last shrinks that lost-reply window to the time it takes to
+format and return, whatever the slow checks cost. Confirmation here is
+structural (this ordering), not a return value from the drain itself --
+see `cc-butler-orchestrator/pending-events-payload-drains-inbox-only-after-slow-steps'."
+  (let* (;; Guarded, and best-effort: this walks every session and reads
+         ;; every screen, so it is the largest error/time surface of the
+         ;; four. A missing nudge is a small loss; that is exactly why it
+         ;; runs BEFORE anything destructive, not after.
          (dialogs (ignore-errors (cc-butler--fleet-dialog-summary)))
          ;; cc-butler-compact loads after this module, so reach it late.
          ;; Same bargain as the fleet dialog check: elisp reports what is
          ;; over the context ceiling, the steward decides when to act.
          (ceiling (and (fboundp 'cc-butler-compact-fleet-summary)
                        (ignore-errors (cc-butler-compact-fleet-summary))))
-         (watchdog (cc-butler--compact-monitor-watchdog-check)))
+         (watchdog (cc-butler--compact-monitor-watchdog-check))
+         ;; Destructive reads last: nothing slow remains between here and
+         ;; the return, so a caller-side timeout can no longer strand an
+         ;; already-drained report.
+         (inbox (cc-butler--inbox-urgent-block "steward"))
+         (events (cc-butler-tool-inbox))
+         (has-events (not (equal events "No pending worker events."))))
     (mapconcat #'identity
                (delq nil (list inbox (and has-events events) dialogs ceiling watchdog))
                "\n\n")))

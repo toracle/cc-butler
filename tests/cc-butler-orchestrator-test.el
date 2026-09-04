@@ -272,6 +272,41 @@ exactly the events text, with no stray separators."
       "- [12:00] worker-a: done: PR #42" nil
     (should (equal "- [12:00] worker-a: done: PR #42" (cc-butler--pending-events-hook-payload)))))
 
+(ert-deftest cc-butler-orchestrator/pending-events-payload-drains-inbox-only-after-slow-steps ()
+  "cc-butler#137-class fix: the destructive drain (`cc-butler-tool-inbox') must
+run LAST in `cc-butler--pending-events-hook-payload' -- after the slow,
+best-effort fleet-wide checks (dialog scan, ceiling, watchdog), not before
+them.
+
+Why this matters: the hook script that calls this payload via
+`emacsclient --eval' is killed by Claude Code's own hook-level timeout --
+external to Emacs, untouched by the `ignore-errors' already wrapping the
+dialog scan. If the drain runs FIRST, a slow dialog scan (it walks and
+reads every session's screen) that blows that budget loses an
+already-cleared, never-delivered worker report permanently: the queue is
+empty in Emacs, the caller never saw the text, and there is no recovery
+path (real incident, 2026-09-03 19:41, steward->butler, a different send
+path but the same shape -- sender-side success, no recipient-side trace).
+
+Confirmation here is structural, not a return value: the slow step must
+observe the inbox STILL POPULATED when it runs, proving the drain has not
+happened yet."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--butler "/ops/")
+        (cc-butler--steward nil)
+        (cc-butler--inbox-drained nil)
+        (cc-butler--inbox
+         (list (list :time (current-time) :dir "/worker/" :name "worker"
+                     :body "needs input on auth")))
+        (inbox-len-at-dialog-time -1))
+    (cl-letf (((symbol-function 'cc-butler--inbox-urgent-block) (lambda (_agent) nil))
+              ((symbol-function 'cc-butler--fleet-dialog-summary)
+               (lambda () (setq inbox-len-at-dialog-time (length cc-butler--inbox)) nil))
+              ((symbol-function 'cc-butler-compact-fleet-summary) (lambda () nil))
+              ((symbol-function 'cc-butler--compact-monitor-watchdog-check) (lambda () nil)))
+      (cc-butler--pending-events-hook-payload))
+    (should (= 1 inbox-len-at-dialog-time))))
+
 ;;;; ---- compact-monitor watchdog check -----------------------------------
 ;;;; The fleet monitor's own `run-with-timer' has died silently before —
 ;;;; `cc-butler-compact-monitor-mode' stayed t while the timer quietly
