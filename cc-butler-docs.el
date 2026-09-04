@@ -38,6 +38,7 @@
 (require 'cc-butler-session)
 (require 'cc-butler-orchestrator)
 (require 'cc-butler-doc-panel)
+(require 'cc-butler-persist)
 (require 'claude-code-ide)
 (require 'subr-x)
 
@@ -118,10 +119,13 @@
   (let (rows)
     (dolist (s (cc-butler--ordered (cc-butler--sessions)))
       (let* ((dir (plist-get s :dir))
+             (sstate (cc-butler--session-state s))
              (tag (cond ((equal dir cc-butler--butler) " (butler)")
-                        ((cc-butler--waiting-p dir) " (waiting)")
+                        ((eq sstate 'gate) " (gate)")
+                        ((eq sstate 'waiting) " (waiting)")
                         (t "")))
-             (state (if (cc-butler--waiting-p dir) "WAITING" "running"))
+             (state (pcase sstate
+                      ('gate "GATE") ('waiting "WAITING") ('running "running")))
              (branch (let ((b (plist-get s :branch))) (if (string-empty-p b) "-" b)))
              (pr (let ((f (plist-get s :forge))) (if (string-empty-p f) "-" f)))
              ;; :osc (live harness-pushed activity) and :status (a note a
@@ -146,6 +150,25 @@
               rows)))
     (nreverse rows)))
 
+(defun cc-butler-docs--stale-session-rows ()
+  "Return Org table rows for roster-recorded sessions that are not
+currently live -- appended after the live rows so a dashboard refresh
+during a partial recovery does not overwrite the table down to just
+whichever sessions happen to be up yet, silently erasing the record of
+the rest (cc-butler#5: `butler_dashboard' called with 2/16 sessions live
+during the 2026-07-21 recovery clobbered the table to 2 rows -- the
+fallback the recovery runbook itself points to, destroyed by the act of
+consulting it)."
+  (let (rows)
+    (dolist (r (cc-butler--dead-records))
+      (let ((dir (plist-get r :dir)))
+        (push (format "| %s (offline) | OFFLINE | %s | - | - | - | %s |"
+                      (cc-butler-docs--cell (or (plist-get r :name) (cc-butler--display-name dir)))
+                      (cc-butler-docs--cell (or (plist-get r :branch) ""))
+                      (cc-butler-docs--cell (or (plist-get r :status) "")))
+              rows)))
+    (nreverse rows)))
+
 (defvar cc-butler-docs--overview nil
   "The butler's free-text overview, shown on the dashboard.")
 (defvar cc-butler-docs--decisions nil
@@ -153,7 +176,7 @@
 
 (defun cc-butler-docs--render-dashboard ()
   "Render the dashboard Org document from live state + butler-set text."
-  (let ((rows (cc-butler-docs--session-rows)))
+  (let ((rows (append (cc-butler-docs--session-rows) (cc-butler-docs--stale-session-rows))))
     (concat
      "#+TITLE: Butler dashboard\n#+STARTUP: overview\n"
      (format "Last updated: %s\n" (format-time-string "[%Y-%m-%d %a %H:%M]"))
@@ -274,9 +297,11 @@ The Sessions table is always regenerated from live cc-butler state."
   (when (and decisions (stringp decisions))
     (setq cc-butler-docs--decisions decisions))
   (cc-butler-docs--ensure-index)
-  (let ((file (cc-butler-docs--write-dashboard)))
-    (format "Dashboard updated (%d live sessions): %s"
+  (let ((file (cc-butler-docs--write-dashboard))
+        (offline (length (cc-butler--dead-records))))
+    (format "Dashboard updated (%d live session(s)%s): %s"
             (length (cc-butler--sessions))
+            (if (> offline 0) (format ", %d offline (kept in table)" offline) "")
             (abbreviate-file-name file))))
 
 ;; Idempotent (re)registration.
