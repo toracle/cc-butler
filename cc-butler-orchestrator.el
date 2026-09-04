@@ -1116,8 +1116,8 @@ false \"N worker events pending\", and `pending_events' then correctly
 found nothing deliverable — a self-sustaining false-alarm loop, roughly
 once per `cc-butler-forward-backstop-interval', that would recur forever
 because nothing ever consumed the count the backstop was reading (see
-`cc-butler--forward-backstop-interval's docstring: default 3600s, which
-matches the ~1-1.5h gaps actually observed). One function, shared by
+`cc-butler-forward-backstop-interval's docstring: 3600s at the time, which
+matched the ~1-1.5h gaps actually observed). One function, shared by
 both, so they cannot disagree again."
   (let ((events (reverse cc-butler--inbox))
         (ops (cc-butler--ops-dir)))
@@ -1174,18 +1174,18 @@ that split `cc-butler-forward-backstop-interval' from the compaction
 monitor's interval)."
   :type 'number :group 'cc-butler)
 
-(defcustom cc-butler-forward-defer-window 600
+(defcustom cc-butler-forward-defer-window 300
   "Seconds a `deferred' event waits before it may escalate to a push.
-Starting point, not a settled constant — tune in operation."
+300s as of 2026-09-04 (was 600s) — the steward's inbox-check cadence;
+see `cc-butler-forward-backstop-interval'."
   :type 'number :group 'cc-butler)
 
-(defcustom cc-butler-forward-backstop-interval 3600
+(defcustom cc-butler-forward-backstop-interval 300
   "Seconds between backstop sweeps (`cc-butler--forward-backstop'), the
 bounded worst-case latency for a wake-worthy event that arrived while
-the ops session was busy.  Initial value 3600s is an operating STARTING
-POINT (decided 2026-08-10), expected to be tuned in operation — it is a
-separate defcustom precisely so tuning it never silently retunes the
-compaction monitor, and vice versa."
+the ops session was busy.  300s as of 2026-09-04 (was 3600s).  Separate
+defcustom from the compaction monitor's interval so tuning one never
+silently retunes the other."
   :type 'number :group 'cc-butler)
 
 (defvar cc-butler--forward-deferred (make-hash-table :test #'equal)
