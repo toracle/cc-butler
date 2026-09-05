@@ -1723,6 +1723,61 @@ footer legitimately names the gate percentage)."
         ;; but no numeric percentage may appear -- it is not computable.
         (should-not (string-match-p "[0-9]+%" row))))))
 
+;;;; ---- CONTEXT freshness marking on the status row (cc-butler#8 follow-up)
+;;;; Real incident, 2026-09-05: a session read 314k/157%/OVER THRESHOLD for
+;;;; 6.5 hours while a dialog blocked its statusline, then 326k/33%/ok the
+;;;; moment it cleared -- indistinguishable in the table from a genuinely
+;;;; fresh reading. `--display-pct' already can't fabricate a percentage
+;;;; (cc-butler#125); these mark CONTEXT (and therefore anything derived
+;;;; from it, like OVER THRESHOLD) with the same `~' MODEL already uses.
+
+(ert-deftest cc-butler-compact/status-line-marks-stale-context-with-tilde ()
+  "A carried-forward (not-fresh) CONTEXT reading gets a trailing `~' — the
+real incident's own number (326k), so a stale figure is never visually
+identical to a fresh self-report."
+  (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
+            ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 326000))
+            ((symbol-function 'cc-butler-cleanup-context-fresh-p) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
+            ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--statusline-fields-now) (lambda (_d) nil)))
+    (let ((row (cc-butler-compact--status-line "/w/")))
+      (should (string-match-p "326k~" row)))))
+
+(ert-deftest cc-butler-compact/status-line-omits-tilde-when-context-is-fresh ()
+  "The ordinary case — a live, confirmed-this-cycle CONTEXT reading — shows
+no staleness marker."
+  (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
+            ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 326000))
+            ((symbol-function 'cc-butler-cleanup-context-fresh-p) (lambda (_d) t))
+            ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
+            ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--statusline-fields-now) (lambda (_d) nil)))
+    (let ((row (cc-butler-compact--status-line "/w/")))
+      (should (string-match-p "326k" row))
+      (should-not (string-match-p "326k~" row)))))
+
+(ert-deftest cc-butler-compact/status-line-over-threshold-still-fires-on-stale-context ()
+  "The explicit decision this PR encodes (steward review): OVER THRESHOLD
+and severity are NOT suppressed just because CONTEXT is stale — a session
+over threshold before a dialog covered its screen does not become an
+acceptable risk merely because it went unconfirmed. The row still says
+OVER THRESHOLD; the `~' says only that the number backing it is
+unconfirmed this cycle, not that the risk itself is retracted."
+  (let ((cc-butler-compact-threshold 300000))
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 326000))
+              ((symbol-function 'cc-butler-cleanup-context-fresh-p) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
+              ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--statusline-fields-now) (lambda (_d) nil)))
+      (let ((row (cc-butler-compact--status-line "/w/")))
+        (should (string-match-p "326k~" row))
+        (should (string-match-p "OVER THRESHOLD" row))))))
+
 (ert-deftest cc-butler-compact/compact-tool-resolves-a-session-by-name ()
   "compact_session takes the name the LLM already has, not a directory."
   (let (target)

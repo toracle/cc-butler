@@ -1885,14 +1885,28 @@ alternative to answering it directly.
 
 Signals an error on timeout rather than returning silently: a caller
 that believes launch succeeded when the session never became reachable
-is worse off than one told plainly that it didn't."
+is worse off than one told plainly that it didn't. The timeout error
+carries the screen's own text, not just the generic complaint — the
+trust-dialog paths above already fail loudly with on-screen text when
+their own marker is present but unrecognized; this is that same
+principle for the case where NO marker is present at all (a login
+prompt, the resume-mode wizard's \"Resume from summary / full\" choice,
+or whatever the next such prompt turns out to be). Growing the shape list
+cannot close this class — new prompts keep appearing — so the fix is at
+this end: whatever the screen actually shows when the wait gives up, put
+it in the error (cc-butler#8 follow-up, steward review, 2026-09-05: two
+of that one night's three misleading-timeout causes were exactly this)."
   (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir)))
         (trust-accepted nil))
     (unless (buffer-live-p buf)
       (error "cc-butler: no terminal buffer for %s right after launch" dir))
     (with-timeout (cc-butler-launch-ready-timeout
-                   (error "cc-butler: session %s did not show a live input row within %ss of launch (cc-butler#8)"
-                          (cc-butler--display-name dir) cc-butler-launch-ready-timeout))
+                   (error "cc-butler: session %s did not show a live input row within %ss of launch (cc-butler#8). Screen:\n%s"
+                          (cc-butler--display-name dir) cc-butler-launch-ready-timeout
+                          (if (buffer-live-p buf)
+                              (with-current-buffer buf
+                                (buffer-substring-no-properties (point-min) (point-max)))
+                            "(terminal buffer no longer live)")))
       (while (not (with-current-buffer buf
                     (cc-butler--refresh-terminal-text buf)
                     (let ((start (save-excursion (goto-char (point-max))

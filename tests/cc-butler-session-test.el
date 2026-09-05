@@ -187,7 +187,14 @@ timeout when the row is already there."
   "`cc-butler--wait-for-session-ready' signals a loud error — rather than
 returning as if launch succeeded — when no input row ever appears within
 `cc-butler-launch-ready-timeout'. Silently returning here would hand a
-caller a false-ready session (cc-butler#8)."
+caller a false-ready session (cc-butler#8).
+
+The error carries the screen's own text (cc-butler#8 follow-up, steward
+review: this is the fix for the class of prompt that shows NO trust
+marker at all — a login prompt, the resume-mode wizard — where the old
+and new trust detectors both correctly stay silent and the wait falls
+straight through to this generic timeout; growing the shape list cannot
+close that class, but putting the actual screen in the error does)."
   (let ((term-buf (get-buffer-create " *cc-butler-test-ready-term-2*")))
     (unwind-protect
         (progn
@@ -196,7 +203,12 @@ caller a false-ready session (cc-butler#8)."
                      (lambda (_d) (buffer-name term-buf)))
                     ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
                     (cc-butler-launch-ready-timeout 0.3))
-            (should-error (cc-butler--wait-for-session-ready "/worker/"))))
+            (let ((msg (condition-case err
+                           (progn (cc-butler--wait-for-session-ready "/worker/") nil)
+                         (error (error-message-string err)))))
+              (should msg)
+              (should (string-match-p "did not show a live input row" msg))
+              (should (string-match-p "still starting up" msg)))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
 ;;;; ---- folder-trust dialog (cc-butler#8, 2026-07-21) ----------------
