@@ -64,6 +64,99 @@ out in the response rather than left as a silent trap."
       (should (string-match-p "STALE" out))
       (should (string-match-p "cc-butler-mail.elc" out)))))
 
+;;;; ------------------------------------------------------------------
+;;;; defcustom/defvar drift — the only detector for a changed default
+;;;; that a reload could not apply, because `defcustom'/`defvar' never
+;;;; overwrite an already-bound symbol. No ERT test can substitute for
+;;;; this: a test always loads into a fresh, unbound symbol, so the new
+;;;; default always applies there regardless of what a live daemon does
+;;;; (2026-09-05: `cc-butler-launch-ready-timeout' raised 5->8 in source,
+;;;; stayed live at 5 across a real reload, while every test stayed
+;;;; green). These tests cover the DETECTOR itself, not that live case.
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-test--write-fixture-module (dir contents)
+  "Write CONTENTS to a fresh temp .el file under DIR; return its path."
+  (let ((file (make-temp-file (expand-file-name "cc-butler-drift-fixture-" dir) nil ".el")))
+    (write-region contents nil file)
+    file))
+
+(ert-deftest cc-butler-reload/defcustom-forms-in-file-finds-defcustom-and-defvar-with-value ()
+  "Only top-level `defcustom' and `defvar'-WITH-a-value forms count — a bare
+`(defvar x)' sets no default to drift from, and unrelated forms (defun,
+comments, defconst) must not be mistaken for one."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defcustom cc-butler-test--drift-a 1 \"doc\")
+(defvar cc-butler-test--drift-b 2 \"doc\")
+(defvar cc-butler-test--drift-c)
+(defconst cc-butler-test--drift-d 4)
+(defun cc-butler-test--drift-fn () nil)
+")))
+    (should (equal (cc-butler--defcustom-forms-in-file file)
+                   '((cc-butler-test--drift-a . 1)
+                     (cc-butler-test--drift-b . 2))))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-empty-when-live-matches-code-default ()
+  "No drift when the live value equals what the file's default form
+evaluates to — the common, healthy case."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defcustom cc-butler-test--drift-match 8 \"doc\")\n")))
+    (defvar cc-butler-test--drift-match)
+    (setq cc-butler-test--drift-match 8)
+    (unwind-protect
+        (should-not (cc-butler--defcustom-drift file))
+      (makunbound 'cc-butler-test--drift-match))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-catches-the-launch-ready-timeout-shape ()
+  "The exact live regression this detector exists for: source now says one
+default, but the live symbol is still bound to the OLD one (as happens
+when `defcustom' sees an already-bound symbol and leaves it alone).
+Modeled directly on `cc-butler-launch-ready-timeout' raised 5->8 while a
+prior reload's binding stayed at 5."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defcustom cc-butler-test--drift-stuck 8 \"doc\")\n")))
+    (defvar cc-butler-test--drift-stuck)
+    (setq cc-butler-test--drift-stuck 5)
+    (unwind-protect
+        (should (equal (cc-butler--defcustom-drift file)
+                        '((cc-butler-test--drift-stuck 5 8))))
+      (makunbound 'cc-butler-test--drift-stuck))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-skips-unbound-symbols ()
+  "A symbol not yet `boundp' cannot have drifted — the next load sets it
+fresh from the file's own default, so it needs no reporting."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defcustom cc-butler-test--drift-never-loaded 8 \"doc\")\n")))
+    (should-not (boundp 'cc-butler-test--drift-never-loaded))
+    (should-not (cc-butler--defcustom-drift file))))
+
+(ert-deftest cc-butler-reload/tool-output-surfaces-defcustom-drift-loudly ()
+  "The MCP caller cannot inspect live variable bindings itself — a drift
+must be spelled out in the reload response, the same way a stale .elc
+already is, not left for someone to discover independently."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 3 :dir "/x/" :stale nil
+                               :defcustom-drift '((cc-butler-launch-ready-timeout 5 8)))))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil)))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should (string-match-p "cc-butler-launch-ready-timeout" out))
+      (should (string-match-p "live=5" out))
+      (should (string-match-p "code-default=8" out)))))
+
+(ert-deftest cc-butler-reload/tool-output-quiet-when-no-defcustom-drift ()
+  "No drift, no warning — an always-on warning is one nobody reads (the
+2026-09-05 lesson from #156's uncommitted-checkout warning firing on
+build-artifact noise every call)."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 3 :dir "/x/" :stale nil :defcustom-drift nil)))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil)))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should-not (string-match-p "code-default" out)))))
+
 (ert-deftest cc-butler-reload/tool-says-it-does-not-fetch ()
   "`reload_butler' loads what is on disk.  Saying so prevents the caller
 concluding a merge reached the fleet when nothing was pulled."
