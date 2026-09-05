@@ -98,7 +98,7 @@ looked up via `cc-butler--dir-by-name'."
 
 (defcustom cc-butler-matrix-bridge-auth-source-token-host "matrix-bridge-token"
   "`auth-source' host key under which this machine's bearer token is
-stored, e.g. in ~/.authinfo.gpg:
+stored, e.g. in ~/.authinfo (plaintext, mode 600):
   machine matrix-bridge-token login bridge password <token>"
   :type 'string
   :group 'cc-butler-matrix-bridge)
