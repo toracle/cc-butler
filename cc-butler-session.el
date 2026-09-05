@@ -507,11 +507,17 @@ require mail back."
   "Append LINE to today's ops log file.  Non-fatal: any failure is
 swallowed (`ignore-errors') — the mirror is an audit layer, never a
 precondition, so a full disk or an unwritable directory must not break
-the operation being logged.  Returns LINE, or nil if the write failed."
+the operation being logged.  Returns LINE, or nil if the write failed.
+
+Dir/file created 0700/0600 via `with-file-modes' -- see
+`cc-butler--log-escalation-drain' for why (this directory holds the
+same class of secret-carrying content) and why the mode is set before
+creation rather than chmod'd after."
   (ignore-errors
-    (make-directory cc-butler-ops-log-dir t)
-    (write-region (concat line "\n") nil (cc-butler--log-file)
-                  'append 'silent)
+    (with-file-modes #o700 (make-directory cc-butler-ops-log-dir t))
+    (with-file-modes #o600
+      (write-region (concat line "\n") nil (cc-butler--log-file)
+                    'append 'silent))
     line))
 
 (defun cc-butler--msg-log-file ()
@@ -542,17 +548,19 @@ same latent gap for a multi-line message body -- out of scope for this
 fix; flagged, not silently left for the next person to rediscover.)
 
 Non-fatal like `cc-butler--log-mirror': an audit layer, never a
-precondition for the operation being logged."
+precondition for the operation being logged.  Dir/file created
+0700/0600, same reason and mechanism as `cc-butler--log-mirror'."
   (ignore-errors
-    (make-directory cc-butler-ops-log-dir t)
-    (write-region
-     (concat (json-encode (list (cons 'time (format-time-string "%FT%T"))
-                                 (cons 'kind kind)
-                                 (cons 'from (or from ""))
-                                 (cons 'to (or to ""))
-                                 (cons 'body (or body ""))))
-             "\n")
-     nil (cc-butler--msg-log-file) 'append 'silent)))
+    (with-file-modes #o700 (make-directory cc-butler-ops-log-dir t))
+    (with-file-modes #o600
+      (write-region
+       (concat (json-encode (list (cons 'time (format-time-string "%FT%T"))
+                                   (cons 'kind kind)
+                                   (cons 'from (or from ""))
+                                   (cons 'to (or to ""))
+                                   (cons 'body (or body ""))))
+               "\n")
+       nil (cc-butler--msg-log-file) 'append 'silent))))
 
 (defun cc-butler--escalation-drain-log-file ()
   "Return today's on-disk escalation-drain log file under `cc-butler-ops-log-dir'."
@@ -606,19 +614,14 @@ not `prin1'/`.eld', because `cc-butler--log-message' already established
 embedded newlines, which a multi-line escalation body would hit.
 
 Escalation bodies routinely carry tokens, paths, and real names, so the
-log file is created 0600 -- via `with-file-modes', which sets the
-creation mode before the file exists rather than chmod'ing after
-(chmod-after leaves a real, if short, window at the process umask).
-This narrows only THIS new file: the rest of `cc-butler-ops-log-dir'
-and all of `cc-butler-mail-dir' are not narrowed by this change and are
-tracked as a separate follow-up (tree-wide dir/file permissions, plus
-fixing the writers so a later append does not recreate a wider mode via
-umask) -- a partial lock on one file while its siblings stay
-world-readable would read as reassurance it does not earn.  This file
-is append-only and never rotated or trimmed here (out of scope for this
-fix): it grows without bound and the secrets in it accumulate for as
-long as it lives; whoever owns retention for `cc-butler-ops-log-dir'
-needs to account for that.
+log file is created 0600 and its directory 0700 -- both via
+`with-file-modes', which sets the creation mode before the file/dir
+exists rather than chmod'ing after (chmod-after leaves a real, if
+short, window at the process umask).  This file is append-only and
+never rotated or trimmed here (out of scope for this fix): it grows
+without bound and the secrets in it accumulate for as long as it
+lives; whoever owns retention for `cc-butler-ops-log-dir' needs to
+account for that.
 
 Non-fatal like `cc-butler--log-mirror'/`cc-butler--log-message': an
 audit layer, never a precondition.  Callers MUST call this BEFORE
@@ -631,7 +634,7 @@ reopen the primary-delivery risk: the whole body below is wrapped in
 block the queue clear or the text return that must follow it either
 way."
   (ignore-errors
-    (make-directory cc-butler-ops-log-dir t)
+    (with-file-modes #o700 (make-directory cc-butler-ops-log-dir t))
     (with-file-modes #o600
       (write-region
        (concat (mapconcat

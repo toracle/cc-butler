@@ -132,6 +132,21 @@ match, and an empty inbox yields (0 . nil)."
            ,@body)
        (delete-directory cc-butler-mail-dir t))))
 
+(ert-deftest cc-butler-mail/file-dirs-and-messages-are-created-restricted ()
+  "Maildirs carry full message bodies (tokens, paths, real names can appear
+in them).  A bare `make-directory'/`with-temp-file' would take the process
+umask (typically 755/644), so this asserts the mode is set explicitly at
+creation time, not left to be narrowed by a separate chmod pass elsewhere."
+  (cc-butler-mail-test--with-file
+    (cc-butler--ch-deliver "worker-a" (list :kind 'note :from "x" :body "secret"))
+    (let* ((in (cc-butler--mail-inbox "worker-a"))
+           (msg-file (car (directory-files (expand-file-name "new/" in) t "\\.eld\\'"))))
+      (should (= #o700 (file-modes in)))
+      (should (= #o700 (file-modes (expand-file-name "new/" in))))
+      (should (= #o700 (file-modes (expand-file-name "archive/" in))))
+      (should msg-file)
+      (should (= #o600 (file-modes msg-file))))))
+
 (ert-deftest cc-butler-mail/file-atomicity ()
   "Given a half-written message left in tmp/, When an agent drains, Then it is
 never read (only complete, renamed messages appear in new/)."
