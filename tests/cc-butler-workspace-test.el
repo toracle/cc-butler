@@ -355,6 +355,48 @@ it without re-discovering it themselves."
                               bad))))
       (delete-directory topic t))))
 
+(ert-deftest cc-butler-workspace/close-topic-audit-vets-a-worktree-child-as-a-repo ()
+  "A child checkout whose `.git' is a FILE (worktree / submodule gitlink)
+must be vetted as a repo, not reported as an unaccounted-for loose item.
+
+Before `cc-butler--git-checkout-p' single-sourced the probe, the audit
+tested `.git' with `file-directory-p', which answers no for every
+worktree.  The worktree then fell through to the loose-entry check, so
+deletion WAS still refused -- but the stated reason was \"top-level
+item(s) outside any child repo, unaccounted for\", which reads like
+stray junk.  An operator who dismisses that reason and forces the delete
+loses real uncommitted work, and the per-repo git checks never ran at
+all.  Assert the reason, not merely that something was refused."
+  (let* ((topic (cc-butler-workspace-test--container-dir '("app") nil))
+         (wt (expand-file-name "wt" topic)))
+    (unwind-protect
+        (progn
+          ;; worktree shape: .git is a file, not a directory
+          (make-directory wt t)
+          (write-region "gitdir: /elsewhere/.git/worktrees/wt\n" nil
+                        (expand-file-name ".git" wt) nil 'silent)
+          (should (member (file-name-as-directory wt)
+                          (mapcar #'file-name-as-directory
+                                  (cc-butler--close-topic-repos topic))))
+          ;; and therefore NOT mistaken for stray content
+          (should-not (member wt (cc-butler--close-topic-loose-entries topic)))
+          (cl-letf (((symbol-function 'cc-butler--close-topic-unsafe)
+                     (lambda (repo)
+                       (when (string-match-p "/wt/?\\'" (directory-file-name repo))
+                         (list "uncommitted changes")))))
+            (let ((bad (cc-butler--close-topic-audit topic)))
+              (should bad)
+              (should (cl-some (lambda (cell)
+                                 (and (string-match-p "/wt/?\\'" (directory-file-name (car cell)))
+                                      (member "uncommitted changes" (cdr cell))))
+                               bad))
+              ;; the misleading reason must be gone
+              (should-not (cl-some (lambda (cell)
+                                     (string-match-p "unaccounted for"
+                                                     (string-join (cdr cell) " ")))
+                                   bad)))))
+      (delete-directory topic t))))
+
 (ert-deftest cc-butler-workspace/close-topic-audit-passes-clean-scaffolded-topic ()
   "The ordinary case must still pass: one clean child repo plus only
 cc-butler's own scaffold files (marker + CLAUDE.md) at the root is NOT
