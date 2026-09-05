@@ -99,5 +99,33 @@ must not be reported as a genuine reply."
                  (event_id . "$abc")
                  (content . ((msgtype . "m.text") (body . "x")))))))
 
+;;;; --- JSON false is not Lisp nil (regression, 2026-09-05) ------------------
+;; Found by replaying 248 real room events through both bridges: the Python
+;; and Elisp outputs diverged on 4 events, all genuine replies inside a thread.
+
+(ert-deftest matrix-bridge/json-false-fallback-is-a-genuine-reply ()
+  "Element writes is_falling_back:false on a genuine reply inside a thread.
+JSON false parses to :json-false, which is non-nil -- the naive test dropped it."
+  (let ((env (matrix-bridge-envelope
+              "$self"
+              '((msgtype . "m.text") (body . "x")
+                (m.relates_to . ((event_id . "$root")
+                                 (is_falling_back . :json-false)
+                                 (m.in_reply_to . ((event_id . "$target")))
+                                 (rel_type . "m.thread")))))))
+    (should (string-match-p "thread:\\$root" env))
+    (should (string-match-p "reply:\\$target" env))))
+(ert-deftest matrix-bridge/json-true-fallback-is-still-suppressed ()
+  "The real fallback (is_falling_back:true) must still NOT show as a reply."
+  (let ((env (matrix-bridge-envelope
+              "$self"
+              '((msgtype . "m.text") (body . "x")
+                (m.relates_to . ((event_id . "$root")
+                                 (is_falling_back . t)
+                                 (m.in_reply_to . ((event_id . "$target")))
+                                 (rel_type . "m.thread")))))))
+    (should (string-match-p "thread:\\$root" env))
+    (should-not (string-match-p "reply:" env))))
+
 (provide 'matrix-bridge-test)
 ;;; matrix-bridge-test.el ends here

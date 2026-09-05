@@ -95,6 +95,17 @@ cannot leave two loops running.")
   "Value of KEY in the alist OBJ produced by `json-parse-string'."
   (cdr (assq key obj)))
 
+(defun matrix-bridge--flag (obj key)
+  "Read KEY from OBJ as a boolean.
+
+JSON `false' parses to `:json-false', which is *non-nil* in Lisp -- reading it
+with `matrix-bridge--get' and testing it directly inverts the answer.  Element
+writes `\"is_falling_back\": false' explicitly on a genuine reply inside a
+thread, so the naive test silently dropped every such reply (observed on 4 of
+248 real room events, 2026-09-05).  Normalize the JSON falsehoods here, once."
+  (let ((v (matrix-bridge--get obj key)))
+    (and v (not (eq v :json-false)) (not (eq v 'false)))))
+
 (defun matrix-bridge--read-trimmed (file)
   (with-temp-buffer
     (insert-file-contents file)
@@ -136,7 +147,7 @@ NEW thread on a plain message, not merely answer inside an existing one."
         ;; only a genuine reply (no fallback flag) is worth announcing.
         (when (and (consp reply)
                    (matrix-bridge--get reply 'event_id)
-                   (not (matrix-bridge--get rel 'is_falling_back)))
+                   (not (matrix-bridge--flag rel 'is_falling_back)))
           (push (format "reply:%s" (matrix-bridge--get reply 'event_id)) parts))))
     (concat " · " (string-join (nreverse parts) " · "))))
 
