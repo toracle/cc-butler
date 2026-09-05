@@ -148,6 +148,26 @@ is not an edge case here."
     (should (equal (cc-butler--git-head wt)
                    (format "%s (side)" (substring hash 0 7))))))
 
+(ert-deftest cc-butler-git-head-sha/reads-the-full-hash-not-the-short-form ()
+  "Unlike `cc-butler--git-head', this returns the exact full SHA — what
+`cc-butler-tool-runtime-source' needs for an equality check against the
+loaded commit, not a truncated string a caller would have to re-parse."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (hash (cdr fix)))
+    (should (equal (cc-butler--git-head-sha dir) hash))))
+
+(ert-deftest cc-butler-git-head-sha/resolves-a-packed-ref ()
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (hash (cdr fix)))
+    (cc-butler-test--git dir "pack-refs" "--all")
+    (should (equal (cc-butler--git-head-sha dir) hash))))
+
+(ert-deftest cc-butler-git-head-sha/not-a-repo-degrades-to-nil-not-an-error ()
+  (let ((dir (file-name-as-directory (make-temp-file "cc-no-repo" t))))
+    (should-not (cc-butler--git-head-sha dir))))
+
 (ert-deftest cc-butler-git-head/not-a-repo-degrades-to-nil-not-an-error ()
   "Nil means \"cannot determine\"; the reload report drops the line and goes
 on.  Blocking or erroring while trying harder is the failure this replaced."
@@ -457,6 +477,77 @@ not check\", never as a silent pass."
         cc-butler--runtime-commit-line)
     (let ((out (cc-butler-tool-runtime-source)))
       (should (string-match-p "Cannot determine" out)))))
+
+;;;; ---- checkout HEAD vs loaded commit (steward incident, 2026-09-05) --
+;;;; Reading a :vc checkout's disk files was mistaken for reading the LIVE
+;;;; behavior, because the checkout had advanced 3 commits past the loaded
+;;;; image since the last reload — the exact fix a diagnosis relied on was
+;;;; on disk but not yet running. The tool must report both values and warn
+;;;; in its own body, not a footnote, whenever they diverge.
+
+(ert-deftest cc-butler-runtime-source/tool-warns-when-checkout-outran-the-loaded-commit ()
+  "The exact incident this half of the tool exists for: the checkout has
+moved past what is actually loaded. The warning must be in the result
+body, not require a separate lookup to notice."
+  (let ((cc-butler--runtime-source-dir "/src/")
+        (cc-butler--runtime-commit-sha "424dbeb")
+        (cc-butler--runtime-commit-line "424dbeb old behavior"))
+    (cl-letf (((symbol-function 'cc-butler--commit-merged-p) (lambda (&rest _) 'merged))
+              ((symbol-function 'cc-butler--git-head-sha) (lambda (_dir) "fc7f775"))
+              ((symbol-function 'cc-butler--source-revision) (lambda (_dir) "fc7f775 newer fix"))
+              ((symbol-function 'cc-butler--git) (lambda (&rest _) nil)))
+      (let ((out (cc-butler-tool-runtime-source)))
+        (should (string-match-p "424dbeb" out))
+        (should (string-match-p "fc7f775" out))
+        (should (string-match-p "LOADED COMMIT ≠ CHECKOUT HEAD" out))
+        (should (string-match-p "reload_butler_code" out))))))
+
+(ert-deftest cc-butler-runtime-source/tool-is-quiet-when-checkout-matches-loaded ()
+  "The ordinary case — checkout HEAD equals what is actually loaded — must
+NOT show the divergence warning; a tool that always warns is as useless
+as one that never does."
+  (let ((cc-butler--runtime-source-dir "/src/")
+        (cc-butler--runtime-commit-sha "deadbeef")
+        (cc-butler--runtime-commit-line "deadbee fix the thing"))
+    (cl-letf (((symbol-function 'cc-butler--commit-merged-p) (lambda (&rest _) 'merged))
+              ((symbol-function 'cc-butler--git-head-sha) (lambda (_dir) "deadbeef"))
+              ((symbol-function 'cc-butler--source-revision) (lambda (_dir) "deadbee fix the thing"))
+              ((symbol-function 'cc-butler--git) (lambda (&rest _) nil)))
+      (let ((out (cc-butler-tool-runtime-source)))
+        (should-not (string-match-p "LOADED COMMIT ≠ CHECKOUT HEAD" out))
+        (should-not (string-match-p "⚠️" out))))))
+
+(ert-deftest cc-butler-runtime-source/tool-flags-uncommitted-checkout-changes ()
+  "Even the disk not matching its own last commit is worth surfacing —
+someone reading source to reason about behavior should know the file
+they are looking at might not be committed anywhere at all."
+  (let ((cc-butler--runtime-source-dir "/src/")
+        (cc-butler--runtime-commit-sha "deadbeef")
+        (cc-butler--runtime-commit-line "deadbee fix the thing"))
+    (cl-letf (((symbol-function 'cc-butler--commit-merged-p) (lambda (&rest _) 'merged))
+              ((symbol-function 'cc-butler--git-head-sha) (lambda (_dir) "deadbeef"))
+              ((symbol-function 'cc-butler--source-revision) (lambda (_dir) "deadbee fix the thing"))
+              ((symbol-function 'cc-butler--git)
+               (lambda (_dir &rest args)
+                 (when (equal args '("status" "--porcelain")) " M cc-butler.el"))))
+      (let ((out (cc-butler-tool-runtime-source)))
+        (should (string-match-p "uncommitted changes" out))
+        (should (string-match-p "cc-butler.el" out))))))
+
+(ert-deftest cc-butler-runtime-source/tool-degrades-when-checkout-head-undeterminable ()
+  "When the checkout's HEAD cannot be read at all, say so plainly rather
+than silently omitting the line or claiming a match that was never
+checked."
+  (let ((cc-butler--runtime-source-dir "/src/")
+        (cc-butler--runtime-commit-sha "deadbeef")
+        (cc-butler--runtime-commit-line "deadbee fix the thing"))
+    (cl-letf (((symbol-function 'cc-butler--commit-merged-p) (lambda (&rest _) 'merged))
+              ((symbol-function 'cc-butler--git-head-sha) (lambda (_dir) nil))
+              ((symbol-function 'cc-butler--source-revision) (lambda (_dir) nil))
+              ((symbol-function 'cc-butler--git) (lambda (&rest _) nil)))
+      (let ((out (cc-butler-tool-runtime-source)))
+        (should (string-match-p "could not determine" out))
+        (should-not (string-match-p "LOADED COMMIT ≠ CHECKOUT HEAD" out))))))
 
 (ert-deftest cc-butler-runtime-source/oneline-is-nil-when-not-determinable ()
   (let (cc-butler--runtime-source-dir
