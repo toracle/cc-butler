@@ -39,11 +39,20 @@
   ;; invisible to the dynamically-scoped code that logs to it — and the
   ;; later `defcustom' would then error trying to redeclare a
   ;; still-in-scope lexical variable as dynamic.
+  ;; Same reasoning, same trap, for `cc-butler-inbox-queue-file': its default
+  ;; is the real on-disk inbox-queue mirror, and `cc-butler--inbox-push' is
+  ;; advised to write it on every call -- ordinary inbox tests would else
+  ;; clobber the live queue file.
   (defvar cc-butler-ops-log-dir)
+  (defvar cc-butler-inbox-queue-file)
   (let ((cc-butler-ops-log-dir
-         (file-name-as-directory (make-temp-file "cc-butler-test-ops-log-" t))))
+         (file-name-as-directory (make-temp-file "cc-butler-test-ops-log-" t)))
+        (cc-butler-inbox-queue-file
+         (make-temp-file "cc-butler-test-inbox-queue-" nil ".eld")))
     (add-hook 'kill-emacs-hook
-              (lambda () (ignore-errors (delete-directory cc-butler-ops-log-dir t))))
+              (lambda ()
+                (ignore-errors (delete-directory cc-butler-ops-log-dir t))
+                (ignore-errors (delete-file cc-butler-inbox-queue-file))))
     ;; `require' (not `load') so a test file already pulled in by a cross-test
     ;; `require' (e.g. the shared mock/helpers) is not loaded — and
     ;; redefined — a second time.
