@@ -1731,5 +1731,40 @@ bug (per the reporting session's framing)."
       ;; distinguishable, not concatenated into one unlabeled run
       (should-not (string-match-p "Running testsblocked" line)))))
 
+(ert-deftest cc-butler-orchestrator/steward-template-carries-the-prod-data-boundary ()
+  "The steward role template must state the prod-data boundary itself.
+
+This section lived only as a hand-edit in the running steward's CLAUDE.md,
+which `cc-butler-home-regenerate' force-overwrites from this template --
+so a regeneration would have silently deleted it.  It exists because the
+same incident recurred three times (2026-08-01 worker, 2026-08-11 and
+2026-09-02 steward), twice with the steward itself reasoning that a
+read-only prod query was safe to self-approve.
+
+Assert the load-bearing sentences, not the heading: a heading survives a
+rewrite that guts the content under it."
+  (let ((md (cc-butler--steward-claude-md)))
+    ;; the steward cannot grant it -- the specific thing that went wrong twice
+    (should (string-match-p "cannot approve prod-data access" md))
+    ;; and the exact sentence both recurrences used as their excuse
+    (should (string-match-p "읽기 전용이니 승인한다" md))
+    ;; reversibility is not the test: a read is reversible in state, not exposure
+    (should (string-match-p "not in exposure" md))
+    ;; a worker that stops and asks is behaving correctly
+    (should (string-match-p "stops and asks is behaving correctly" md))
+    ;; and the pointer to the full rationale
+    (should (string-match-p "prod-data-access-requires-explicit-approval" md))))
+
+(ert-deftest cc-butler-orchestrator/role-templates-carry-the-memory-cache-warning ()
+  "Both role templates must say the shared memory is a generated cache and
+that hand-editing it is silently overwritten.
+
+Same failure shape as the test above: this sentence existed only as a
+hand-edit in both live homes, so regenerating would have dropped it from
+both at once."
+  (dolist (md (list (cc-butler--steward-claude-md) (cc-butler--butler-claude-md)))
+    (should (string-match-p "generated cache" md))
+    (should (string-match-p "never by hand-editing" md))))
+
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here
