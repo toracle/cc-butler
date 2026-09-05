@@ -133,8 +133,18 @@ def deliver_event(ev):
     if content.get("msgtype") != "m.text":
         return True
     body = content.get("body", "")
-    text = f"[matrix · {attribution(sender)}] {body}"
-    log(f"RECV from {sender}: {body[:200]!r}")
+    event_id = ev.get("event_id", "")
+    relates_to = content.get("m.relates_to") or {}
+    thread_root = (
+        relates_to.get("event_id")
+        if relates_to.get("rel_type") == "m.thread"
+        else None
+    )
+    text = (
+        f"[matrix · {attribution(sender)}] {body}\n"
+        f"(event_id={event_id} thread_root={thread_root or '없음'})"
+    )
+    log(f"RECV from {sender}: {body[:200]!r} thread_root={thread_root or 'none'}")
     return inject_into_session(text)
 
 
