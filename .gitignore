@@ -1,6 +1,8 @@
 *.elc
 *.eln
 /eln-cache/
+__pycache__/
+*.pyc
 
 # Per-checkout Claude Code state: machine-specific absolute paths
 # (statusLine command) and live process locks (PID/session-id/timestamp) —
