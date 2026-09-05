@@ -458,13 +458,57 @@ confirmation)."
             (should (= 1 return-count))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
+(ert-deftest cc-butler-session/accept-trust-dialog-new-shape-polls-until-highlight-actually-lands ()
+  "Regression for the x600-measured live failure (2026-09-05, the night
+after #153 reloaded): the highlight takes roughly 1s to move after Down
+is sent — 0-900ms of re-reads still show the OLD (\"No, exit\") highlight,
+the NEW one appears from ~1000ms on. A single re-read taken immediately
+after Down, with no polling at all, always read the highlight as
+not-yet-landed and errored — even though detection and the safety gate
+were both correct (no Return was ever sent onto \"No, exit\"). This test
+is exactly what the earlier tests in this file could NOT catch:
+`cc-butler-session-test--insert-trust-dialog-new-shape' mocks used to
+swap the buffer to the settled screen the INSTANT Down was sent, so even
+zero polling passed. Here `cc-butler--refresh-terminal-text' itself only
+reveals the settled screen starting on its Nth call — simulating a screen
+that takes repeated re-reads, not merely wall-clock time, to catch up —
+so this can only pass if `cc-butler--accept-trust-dialog-new-shape'
+genuinely keeps re-reading rather than checking once."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-trust-new-settle*"))
+        (refresh-count 0)
+        (settle-on-refresh 4)
+        (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (cc-butler-session-test--insert-trust-dialog-new-shape))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text)
+                     (lambda (_buf)
+                       (cl-incf refresh-count)
+                       (with-current-buffer term-buf
+                         (erase-buffer)
+                         (cc-butler-session-test--insert-trust-dialog-new-shape
+                          (>= refresh-count settle-on-refresh)))))
+                    ((symbol-function 'cc-butler--terminal-send-down) (lambda (&optional _buf) nil))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda () (cl-incf return-count))))
+            (should (cc-butler--accept-trust-dialog-new-shape "/worker/"))
+            (should (>= refresh-count settle-on-refresh))
+            (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
 (ert-deftest cc-butler-session/accept-trust-dialog-new-shape-errors-without-return-when-down-does-not-land ()
-  "If Down is sent but the highlight does NOT move (a dropped keypress,
-wrong terminal mode, etc.), `cc-butler--accept-trust-dialog-new-shape'
-must error loudly and must NOT send Return — a Return here would land on
-\"No, exit\" and kill the session (2026-09-05 steward correction: this is
-the exact bug an earlier, unconfirmed-landing draft of this function would
-have shipped)."
+  "If Down is sent but the highlight NEVER moves within
+`cc-butler-trust-dialog-settle-timeout' (a dropped keypress, wrong
+terminal mode, etc.), `cc-butler--accept-trust-dialog-new-shape' must
+error loudly — with the specific \"did not move\" message, not just any
+error a bare `should-error' would also accept — and must NOT send Return;
+a Return here would land on \"No, exit\" and kill the session (2026-09-05
+steward correction: this is the exact bug an earlier, unconfirmed-landing
+draft of this function would have shipped). Settle timeout shortened so
+this genuinely-never-lands case does not cost the suite the real default
+budget."
   (let ((term-buf (get-buffer-create " *cc-butler-test-trust-new-stuck*"))
         (return-count 0))
     (unwind-protect
@@ -475,8 +519,13 @@ have shipped)."
                     ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
                     ((symbol-function 'cc-butler--terminal-send-down) (lambda (&optional _buf) nil))
                     ((symbol-function 'claude-code-ide--terminal-send-return)
-                     (lambda () (cl-incf return-count))))
-            (should-error (cc-butler--accept-trust-dialog-new-shape "/worker/"))
+                     (lambda () (cl-incf return-count)))
+                    (cc-butler-trust-dialog-settle-timeout 0.2))
+            (let ((msg (condition-case err
+                           (progn (cc-butler--accept-trust-dialog-new-shape "/worker/") nil)
+                         (error (error-message-string err)))))
+              (should msg)
+              (should (string-match-p "did not move" msg)))
             (should (= 0 return-count))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
@@ -1898,6 +1947,34 @@ configured target size as argv."
 ;; trivial shell command keeps the test fast, dependency-free, and still
 ;; exercises the actual sentinel this code registers.
 
+(defun cc-butler-test--ensure-process-dead (proc)
+  "Force PROC dead and pump output until Emacs has actually noticed, so no
+live process — and no pending sentinel call — can outlive the caller's
+`cl-letf' mocking scope.
+
+Root cause of a real, CI-only flake (2026-09-05): a trivial subprocess
+occasionally takes longer than the 5s budget below to exit under
+GitHub Actions' `pull_request'-triggered runner contention (confirmed:
+identical commits passed on `push', failed on `pull_request'). When that
+happened, the timed-out test's own assertion correctly failed — but the
+still-alive process was left running PAST that test's `cl-letf' scope.
+Its real exit and sentinel fired moments later, under whatever mocks the
+NEXT test running in the same Emacs process happened to have active,
+incrementing THAT unrelated test's `log-calls' — this is confirmed
+exactly in one CI run where `pipe-mitigation-sentinel-logs-on-nonzero-exit'
+timed out (0 calls seen, wanted 1) immediately followed by
+`pipe-mitigation-sentinel-quiet-on-clean-exit' failing with one
+UNEXPLAINED extra call (1 seen, wanted 0) — the first test's orphaned
+process poisoning the second. Calling this before a test's `cl-letf'
+unwinds closes that leak: the process is confirmed dead (forcibly, if
+necessary) before control returns to a caller whose mocks are about to
+change."
+  (when (process-live-p proc)
+    (ignore-errors (delete-process proc))
+    (let ((deadline (+ (float-time) 2)))
+      (while (and (process-live-p proc) (< (float-time) deadline))
+        (accept-process-output proc 0.05)))))
+
 (defmacro cc-butler-test--with-real-sentinel (shell-command &rest body)
   "Run BODY after the REAL sentinel
 `cc-butler--mitigate-ghostel-event-pipe-deadlock' registers via
@@ -1921,7 +1998,8 @@ made while running BODY and while waiting for the process to exit."
        (should (process-live-p proc))
        (let ((deadline (+ (float-time) 5)))
          (while (and (process-live-p proc) (< (float-time) deadline))
-           (accept-process-output proc 0.05))))
+           (accept-process-output proc 0.05)))
+       (cc-butler-test--ensure-process-dead proc))
      ,@body))
 
 (ert-deftest cc-butler-session/pipe-mitigation-sentinel-logs-on-nonzero-exit ()
@@ -1969,6 +2047,7 @@ signal apart from a real second log line.)"
       (let ((deadline (+ (float-time) 5)))
         (while (and (process-live-p proc) (< (float-time) deadline))
           (accept-process-output proc 0.05)))
+      (cc-butler-test--ensure-process-dead proc)
       (should (= 1 log-calls))
       (should-not (buffer-live-p (process-buffer proc)))
       (funcall (process-sentinel proc) proc "exit abnormally\n")

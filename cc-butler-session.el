@@ -1810,12 +1810,33 @@ those backends elsewhere in this file's dependency, but are untested here."
 
 (declare-function ghostel-send-key "ghostel" (key-name &optional mods))
 
+(defcustom cc-butler-trust-dialog-settle-timeout 3.0
+  "Seconds to POLL, at 0.1s intervals, for the v2.1.260+ trust dialog's
+highlight to actually land on \"Yes, I trust this folder\" after Down is
+sent, before giving up and erroring. See `cc-butler--accept-trust-dialog-new-shape'.
+
+Measured live (x600, 2026-09-05, after this landed and reloaded): the
+highlight takes roughly a second to move — 0-900ms of polling still shows
+the OLD (\"No, exit\") highlight, the NEW one appears from ~1000ms on.
+Checking once, immediately after sending Down with no wait at all, is
+what actually shipped and regressed live: detection and the safety gate
+both worked (no Return was sent onto \"No, exit\"), but the single
+too-early re-read always read the highlight as not-yet-landed, so
+`new_topic' on an untrusted ancestor kept erroring instead of ever
+completing. A single FIXED `sleep-for' before that one re-read would
+still be wrong twice over — too short on a slow machine, wasted time on a
+fast one that already landed. Polling a real condition is the fix, not a
+bigger fixed number."
+  :type 'number :group 'cc-butler)
+
 (defun cc-butler--accept-trust-dialog-new-shape (dir)
   "If DIR's live cc-butler-managed session buffer shows the v2.1.260+
 folder-trust dialog (`cc-butler--trust-dialog-new-shape-p'), accept it:
-send Down, RE-READ the screen to confirm the highlight actually moved onto
-\"Yes, I trust this folder\" (`cc-butler--trust-dialog-new-shape-yes-selected-p'),
-and only then send Return. If the Down did not land, or if the trust
+send Down, then POLL (`cc-butler-trust-dialog-settle-timeout') to confirm
+the highlight actually lands on \"Yes, I trust this folder\"
+(`cc-butler--trust-dialog-new-shape-yes-selected-p') — proceeding the
+moment it does, not waiting out a fixed delay — and only then send
+Return. If the highlight never lands within the budget, or if the trust
 marker is present in some other unrecognized shape, signal a loud `error'
 with the literal screen text — Return is never sent in either case.
 
@@ -1841,13 +1862,18 @@ territory, not this function's."
     (cond
      ((cc-butler--trust-dialog-new-shape-p buf)
       (cc-butler--terminal-send-down buf)
-      (cc-butler--refresh-terminal-text buf)
-      (if (cc-butler--trust-dialog-new-shape-yes-selected-p buf)
-          (progn
-            (with-current-buffer buf (claude-code-ide--terminal-send-return))
-            t)
-        (error "cc-butler: sent Down but highlight did not move to \"Yes, I trust this folder\" in %s — Return NOT sent. Screen:\n%s"
-               dir (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max))))))
+      (let ((deadline (+ (float-time) cc-butler-trust-dialog-settle-timeout))
+            (landed nil))
+        (while (not landed)
+          (cc-butler--refresh-terminal-text buf)
+          (cond
+           ((cc-butler--trust-dialog-new-shape-yes-selected-p buf) (setq landed t))
+           ((< (float-time) deadline) (sleep-for 0.1))
+           (t (error "cc-butler: sent Down but highlight did not move to \"Yes, I trust this folder\" in %s within %ss — Return NOT sent. Screen:\n%s"
+                     dir cc-butler-trust-dialog-settle-timeout
+                     (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max)))))))
+        (with-current-buffer buf (claude-code-ide--terminal-send-return))
+        t))
      ((cc-butler--trust-dialog-showing-p buf) nil)
      ((cc-butler--trust-dialog-marker-present-p buf)
       (error "cc-butler: trust dialog marker present but shape unrecognized (neither old nor new v2.1.260+ shape) in %s. Screen:\n%s"
