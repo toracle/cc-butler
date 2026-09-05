@@ -92,9 +92,14 @@ Bind to a mock channel to contract-test the routing in isolation.")
                      (file-name-as-directory (expand-file-name cc-butler-mail-dir)))))
 
 (defun cc-butler--mail-ensure (agent)
+  "Ensure AGENT's maildir exists.  Dirs created 0700 -- see
+`cc-butler--log-escalation-drain' (cc-butler-session.el) for why 0700
+via `with-file-modes' rather than a later chmod: these hold full
+message bodies, same sensitivity class."
   (let ((in (cc-butler--mail-inbox agent)))
-    (dolist (sub '("tmp/" "new/" "archive/"))
-      (make-directory (expand-file-name sub in) t))
+    (with-file-modes #o700
+      (dolist (sub '("tmp/" "new/" "archive/"))
+        (make-directory (expand-file-name sub in) t)))
     in))
 
 (defun cc-butler--mail-file-deliver (to msg)
@@ -107,10 +112,12 @@ Bind to a mock channel to contract-test the routing in isolation.")
          (fname (format "%s.eld" id))
          (tmp (expand-file-name (concat "tmp/" fname) in))
          (new (expand-file-name (concat "new/" fname) in)))
-    (with-temp-file tmp
-      (let ((print-length nil) (print-level nil))
-        (prin1 msg (current-buffer)) (insert "\n")))
-    (rename-file tmp new t)            ; atomic within the filesystem
+    (with-file-modes #o600
+      (with-temp-file tmp
+        (let ((print-length nil) (print-level nil))
+          (prin1 msg (current-buffer)) (insert "\n"))))
+    (rename-file tmp new t)            ; atomic within the filesystem; mode
+                                        ; set above travels with the rename
     ;; Audit layer: the same id as the inbox file, so the journal line and
     ;; the delivered message are traceable to each other.  `--mail-journal'
     ;; is non-fatal by construction — a journal failure never rolls back or
@@ -147,7 +154,8 @@ Bind to a mock channel to contract-test the routing in isolation.")
   "Append ENTRY (a plist) to today's journal file.  Non-fatal: any failure
 is swallowed (`ignore-errors') — the journal is an audit layer, never a
 precondition.  Fills :time and :id when absent.  Returns the entry, or nil
-if the write failed."
+if the write failed.  Dir/file created 0700/0600, same reason as
+`cc-butler--mail-ensure' -- this journal carries full message bodies."
   (ignore-errors
     (let* ((entry (plist-put (plist-put entry
                                         :time (or (plist-get entry :time)
@@ -155,10 +163,11 @@ if the write failed."
                              :id (or (plist-get entry :id) (cc-butler--mail-id))))
            (dir (cc-butler--mail-log-dir))
            (file (expand-file-name (format-time-string "%Y-%m-%d.eld") dir)))
-      (make-directory dir t)
-      (let ((print-length nil) (print-level nil))
-        (write-region (concat (prin1-to-string entry) "\n") nil file
-                      'append 'silent))
+      (with-file-modes #o700 (make-directory dir t))
+      (with-file-modes #o600
+        (let ((print-length nil) (print-level nil))
+          (write-region (concat (prin1-to-string entry) "\n") nil file
+                        'append 'silent)))
       entry)))
 
 (defun cc-butler-mail-journal-send (from-dir to-name text)
