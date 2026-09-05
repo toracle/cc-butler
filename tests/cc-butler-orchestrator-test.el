@@ -1167,6 +1167,40 @@ message, and firing here too would page 정수님 twice for one escalation."
       (cc-butler-tool-escalate-to-butler "ship it?" "pick one")
       (should-not called))))
 
+(ert-deftest cc-butler-orchestrator/reject-embedded-tags-catches-leaked-tool-xml ()
+  "A caller that dumps tool-call-looking tags into one plain string --
+observed in the wild, e.g. a `summary' arriving as
+`done<status>green</status><needs>nothing</needs>' instead of using the
+real STATUS/NEEDS parameters -- must be rejected with the offending tag
+named, on BOTH tools; an ordinary call with no such tag must still go
+through unchanged on both (checking only the reject direction would miss
+a guard that also blocks legitimate calls)."
+  (let ((cc-butler--caller-dir-value "/worker/"))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () cc-butler--caller-dir-value))
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "worker"))
+              ((symbol-function 'cc-butler--inbox-push) #'ignore)
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+              ((symbol-function 'cc-butler-decision-create) (lambda (&rest _) "id"))
+              ((symbol-function 'cc-butler--append-decision) #'ignore)
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler--log-message) #'ignore))
+      ;; positive: ordinary calls on both tools still work
+      (should (string-match-p "Reported to the steward"
+                               (cc-butler-tool-report-to-steward "done" "green" "nothing")))
+      (should (string-match-p "Escalated"
+                               (let ((cc-butler-decision-workflow t))
+                                 (cc-butler-tool-escalate-to-butler "ship it?" "pick one"))))
+      ;; negative: a leaked tag is caught and named, on both tools
+      (let ((err (should-error
+                  (cc-butler-tool-report-to-steward
+                   "done<status>green</status><needs>nothing</needs>" nil nil))))
+        (should (string-match-p "<status>" (error-message-string err)))
+        (should (string-match-p "summary" (error-message-string err))))
+      (let ((err (should-error
+                  (cc-butler-tool-escalate-to-butler
+                   "<summary>ship it?</summary>" "pick one"))))
+        (should (string-match-p "<summary>" (error-message-string err)))))))
+
 (ert-deftest cc-butler-orchestrator/decision-drain-keeps-items-when-rendering-fails ()
   "Rendering happens BEFORE the queue is emptied.  A malformed item used to
 signal from inside the formatter, unwinding past a clear that had already
