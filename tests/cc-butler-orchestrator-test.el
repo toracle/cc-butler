@@ -1731,5 +1731,53 @@ bug (per the reporting session's framing)."
       ;; distinguishable, not concatenated into one unlabeled run
       (should-not (string-match-p "Running testsblocked" line)))))
 
+;;;; ---- hook scripts must stay executable (0755) -------------------------
+;;;;
+;;;; REGRESSION GUARD, not a report of an existing break: as of this test's
+;;;; addition, `cc-butler--ensure-butler-home'/`--ensure-steward-home' are
+;;;; verified to still produce their generated hook scripts at 0755.  The
+;;;; guard exists because a separate, unrelated effort (fleet PR #170) is
+;;;; introducing a shared "force private permissions" write helper across
+;;;; several cc-butler writers to fix a real PII-exposure defect (new files
+;;;; born world-readable). That helper forces 0600/0700 on everything it
+;;;; wraps. If it is ever extended to reach these two hook-writing call
+;;;; sites (`cc-butler-orchestrator.el:928,981,1001'), the generated hook
+;;;; `.sh' script would become 0600 -- silently non-executable -- with
+;;;; nothing here to catch it before this test existed (a full-suite grep
+;;;; for the string "755" turned up zero hits anywhere in this repo's test
+;;;; suite prior to this addition).
+
+(defmacro cc-butler-orch-test--with-temp-home (var &rest body)
+  "Bind VAR to a fresh temp directory for BODY, deleting it afterward.
+Never point `cc-butler-home'/`cc-butler-steward-home' at a real home
+directory in a test -- these functions scaffold real files on disk."
+  (declare (indent 1))
+  `(let ((,var (make-temp-file "cc-butler-orch-test-home" t)))
+     (unwind-protect
+         (progn ,@body)
+       (delete-directory ,var t))))
+
+(ert-deftest cc-butler-orchestrator/butler-home-hook-script-is-executable ()
+  "`cc-butler--ensure-butler-home' must create check-pending-decisions.sh
+at 0755 -- verified by actually running the function and reading the mode
+back off disk, not by inspecting the source for a `set-file-modes' call."
+  (cc-butler-orch-test--with-temp-home tmp
+    (let ((cc-butler-home (expand-file-name "butler" tmp)))
+      (cc-butler--ensure-butler-home)
+      (let ((hook (expand-file-name ".claude/hooks/check-pending-decisions.sh"
+                                     cc-butler-home)))
+        (should (file-exists-p hook))
+        (should (= #o755 (file-modes hook)))))))
+
+(ert-deftest cc-butler-orchestrator/steward-home-hook-script-is-executable ()
+  "Same guard for `cc-butler--ensure-steward-home' / check-pending-events.sh."
+  (cc-butler-orch-test--with-temp-home tmp
+    (let ((cc-butler-steward-home (expand-file-name "steward" tmp)))
+      (cc-butler--ensure-steward-home)
+      (let ((hook (expand-file-name ".claude/hooks/check-pending-events.sh"
+                                     cc-butler-steward-home)))
+        (should (file-exists-p hook))
+        (should (= #o755 (file-modes hook)))))))
+
 (provide 'cc-butler-orchestrator-test)
 ;;; cc-butler-orchestrator-test.el ends here
