@@ -1731,29 +1731,69 @@ bug (per the reporting session's framing)."
       ;; distinguishable, not concatenated into one unlabeled run
       (should-not (string-match-p "Running testsblocked" line)))))
 
-(ert-deftest cc-butler-orchestrator/steward-template-carries-the-prod-data-boundary ()
-  "The steward role template must state the prod-data boundary itself.
+(ert-deftest cc-butler-orchestrator/both-role-templates-carry-the-prod-data-boundary ()
+  "BOTH role templates must state the prod-data boundary.
 
-This section lived only as a hand-edit in the running steward's CLAUDE.md,
-which `cc-butler-home-regenerate' force-overwrites from this template --
-so a regeneration would have silently deleted it.  It exists because the
-same incident recurred three times (2026-08-01 worker, 2026-08-11 and
-2026-09-02 steward), twice with the steward itself reasoning that a
-read-only prod query was safe to self-approve.
+It lived only as a hand-edit in the running steward's CLAUDE.md, which
+`cc-butler-home-regenerate' force-overwrites from these templates -- so a
+regeneration would have silently deleted it.  The butler carries it too
+because the newest incident in the store (2026-09-04) is the BUTLER asking
+for approval to read data-plane prod rows, where the asking was itself
+already over the line.
 
 Assert the load-bearing sentences, not the heading: a heading survives a
 rewrite that guts the content under it."
-  (let ((md (cc-butler--steward-claude-md)))
-    ;; the steward cannot grant it -- the specific thing that went wrong twice
-    (should (string-match-p "cannot approve prod-data access" md))
-    ;; and the exact sentence both recurrences used as their excuse
+  (dolist (md (list (cc-butler--steward-claude-md) (cc-butler--butler-claude-md)))
+    ;; the exact sentence both steward recurrences used as their excuse
     (should (string-match-p "읽기 전용이니 승인한다" md))
     ;; reversibility is not the test: a read is reversible in state, not exposure
     (should (string-match-p "not in exposure" md))
+    ;; rows are not an escalation -- asking is already past the line
+    (should (string-match-p "Do not ask for approval" md))
     ;; a worker that stops and asks is behaving correctly
     (should (string-match-p "stops and asks is behaving correctly" md))
-    ;; and the pointer to the full rationale
-    (should (string-match-p "prod-data-access-requires-explicit-approval" md))))
+    ;; and the pointer to the authoritative record
+    (should (string-match-p "prod-data-access-requires-explicit-approval" md))
+    ;; every numbered item of the standing duty survives, not just the first
+    (dolist (n '("1." "2." "3." "4." "5."))
+      (should (string-match-p (regexp-quote (concat "\n" n " **")) md)))))
+
+(ert-deftest cc-butler-orchestrator/prod-data-carve-out-is-not-widened ()
+  "The control-plane carve-out must keep both of its limits.
+
+This is the one clause whose regression direction is LOOSENING -- every
+other sentence in the section fails safe if it degrades, but a carve-out
+that quietly grows authorizes real access.  So assert what it excludes,
+not merely that the word appears."
+  (dolist (md (list (cc-butler--steward-claude-md) (cc-butler--butler-claude-md)))
+    ;; reads only -- writes are still gated
+    (should (string-match-p "control-plane \\*writes\\* stay gated" md))
+    ;; and nothing else rides along on it
+    (should (string-match-p "Nothing else inherits this" md))))
+
+(ert-deftest cc-butler-orchestrator/prod-data-boundary-hardcodes-no-incident-dates ()
+  "The section must not enumerate past incidents by date or count.
+
+This text is a generated cache frozen into the template: whatever it says
+propagates into both live homes on the next regenerate and cannot notice
+that the store moved on.  An earlier draft hardcoded \"recurred three
+times (2026-08-01, 2026-08-11, 2026-09-02)\" and \"needs per-instance
+approval -- escalate it\", when the store had already twice made the rule
+stronger (2026-09-03, 2026-09-04).  Regenerating would have propagated the
+weaker, superseded wording with nothing to notice.  Keep the invariant
+here; let the store hold the record."
+  (dolist (md (list (cc-butler--steward-claude-md) (cc-butler--butler-claude-md)))
+    (let ((section (and (string-match "## Prod-data boundary\\(?:.\\|\n\\)*?\nThe store holds" md)
+                        (match-string 0 md))))
+      (should section)
+      (should-not (string-match-p "recurred" section))
+      ;; the one date allowed is the carve-out's own ruling date, which names
+      ;; a standing decision rather than an incident tally
+      (should (= 1 (length (let ((start 0) (hits nil))
+                             (while (string-match "2026-[01][0-9]-[0-3][0-9]" section start)
+                               (push (match-string 0 section) hits)
+                               (setq start (match-end 0)))
+                             hits)))))))
 
 (ert-deftest cc-butler-orchestrator/role-templates-carry-the-memory-cache-warning ()
   "Both role templates must say the shared memory is a generated cache and
