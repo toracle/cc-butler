@@ -1455,6 +1455,16 @@ escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes.
       'note
     'decision))
 
+(defun cc-butler--payload-leak-marker (s)
+  "Return the leaked raw tool-call-XML marker found in S, or nil.
+cc-butler#135: a caller occasionally sends SUMMARY/NEEDS/OPTIONS text that
+already contains a fragment of raw Anthropic tool-call markup (`<invoke
+...>', `<parameter name=\"...\">...'), apparently echoed rather than
+authored content. Used at the `escalate_to_butler' trust boundary to
+reject such a payload outright rather than silently store it."
+  (and s (stringp s) (string-match "</?invoke\\b\\|</?parameter\\b" s)
+       (match-string 0 s)))
+
 (defun cc-butler-tool-escalate-to-butler (summary &optional needs options kind)
   "MCP tool (steward -> butler): raise a DECISION or a NOTIFICATION for
 the butler to relay to the human.
@@ -1499,7 +1509,24 @@ the next one."
          (s (string-trim summary))
          (n (and needs (stringp needs)
                  (not (string-empty-p (string-trim needs))) (string-trim needs)))
-         (k (cc-butler--escalate-kind kind)))
+         (k (cc-butler--escalate-kind kind))
+         (leak (or (cc-butler--payload-leak-marker s)
+                   (cc-butler--payload-leak-marker n)
+                   (cc-butler--payload-leak-marker options))))
+    ;; Trust-boundary check, not a downstream reader guard (cc-butler#135):
+    ;; 88/885 decision docs were found with a raw tool-call-XML fragment
+    ;; (<invoke ...>, <parameter name="...">) embedded in summary/needs/
+    ;; options -- apparently echoed by the calling session rather than
+    ;; authored content. A prior fix silently stripped it before storage;
+    ;; that hides the caller-side defect instead of surfacing it, so a
+    ;; contaminated payload could keep arriving forever with no signal.
+    ;; Reject outright (nothing is created) and log it, so the rate is
+    ;; observable and a caller-side fix can be verified by that log
+    ;; converging to zero.
+    (when leak
+      (cc-butler--log "%s -> butler │ REJECTED escalate_to_butler: payload contains a leaked tool-call fragment (%s) — see #135"
+                      (if self (cc-butler--who-dir self) "steward") leak)
+      (error "escalate_to_butler: summary/needs/options contains a raw tool-call fragment (%s) rather than authored text -- not created. See cc-butler#135; resend without it." leak))
     (cond
      ;; human adapter create-path: decision/note → 정수님's inbox (the watcher renders it)
      ((bound-and-true-p cc-butler-decision-workflow)
