@@ -1654,10 +1654,23 @@ caller's asymmetry."
 ;;;; or hang on ordinary sends that have nothing wrong with them.
 ;;;; ------------------------------------------------------------------
 
-(defcustom cc-butler-launch-ready-timeout 5
+(defcustom cc-butler-launch-ready-timeout 8
   "Seconds to wait, right after a session's process is spawned, for its
 input box to actually render before giving up. See
-`cc-butler--wait-for-session-ready'."
+`cc-butler--wait-for-session-ready'.
+
+Must stay large enough to contain a full run through the trust-dialog
+accept flow, not just a plain render: `cc-butler--trust-dialog-detection-margin'
+(2.5s) plus `cc-butler-trust-dialog-settle-timeout' (3.0s) plus slack for
+the real input row to render afterward (2.5s) — 8s total, not a rounder
+guess. Regressed live at the old default of 5s (2026-09-05, cc-butler#8
+follow-up): two back-to-back trials on the same machine measured
+detection delay (time from launch to the trust dialog being noticed) at
+0ms and 1.129s — the second alone, plus the 3.0s settle-poll, already
+exceeds 5s, so the OUTER timeout fired while the inner poll was still
+legitimately running, aborting before Return was ever sent. See the test
+asserting `cc-butler-launch-ready-timeout' stays >= detection-margin +
+settle-timeout — that invariant is the point, not this specific number."
   :type 'number
   :group 'cc-butler)
 
@@ -1810,6 +1823,20 @@ those backends elsewhere in this file's dependency, but are untested here."
 
 (declare-function ghostel-send-key "ghostel" (key-name &optional mods))
 
+(defconst cc-butler--trust-dialog-detection-margin 2.5
+  "Upper bound assumed for how long `cc-butler--wait-for-session-ready'
+polls before it even notices the trust dialog is showing and sends the
+first Down — the time this whole flow eats out of
+`cc-butler-launch-ready-timeout' BEFORE `cc-butler-trust-dialog-settle-timeout'
+even starts counting.
+
+Measured live 2026-09-05, two back-to-back trials on the same machine,
+same code: 0ms (dialog already rendered when polling started) and
+1.129s (real render delay after process spawn). This constant is
+roughly double the higher sample, not an independent guess — see
+`cc-butler-launch-ready-timeout'."
+  )
+
 (defcustom cc-butler-trust-dialog-settle-timeout 3.0
   "Seconds to POLL, at 0.1s intervals, for the v2.1.260+ trust dialog's
 highlight to actually land on \"Yes, I trust this folder\" after Down is
@@ -1840,6 +1867,21 @@ Return. If the highlight never lands within the budget, or if the trust
 marker is present in some other unrecognized shape, signal a loud `error'
 with the literal screen text — Return is never sent in either case.
 
+While polling, if a fresh re-read still shows the dialog in its ORIGINAL
+default shape (`cc-butler--trust-dialog-new-shape-p' — still \"No, exit\"
+highlighted), the first Down may simply not have registered, so send it
+again. This resend is gated on that exact re-check, every time, NOT on
+\"not yet landed\" — a 2-item menu means a Down sent while the highlight
+is already on \"Yes\" can wrap it back to \"No, exit\", and a Return sent
+onto that would exit the session outright (2026-09-05 steward review).
+Checking immediately before every resend cannot fully close the race
+against the real terminal's own timing, but it is what keeps the window
+as small as it can be; the `yes-selected-p' gate right before Return
+stays the last line of defense regardless. Two back-to-back live trials
+on 2026-09-05 could not tell whether the original failure was a dropped
+keypress or merely slow landing — this resend covers both without
+distinguishing them; see the PR body.
+
 This is NOT an exception to \"never send raw keys via emacsclient\" — it
 is the guard that rule was asking for: the screen state is pinned first
 (three conditions together, `cc-butler--trust-dialog-new-shape-p'), the
@@ -1868,10 +1910,14 @@ territory, not this function's."
           (cc-butler--refresh-terminal-text buf)
           (cond
            ((cc-butler--trust-dialog-new-shape-yes-selected-p buf) (setq landed t))
-           ((< (float-time) deadline) (sleep-for 0.1))
-           (t (error "cc-butler: sent Down but highlight did not move to \"Yes, I trust this folder\" in %s within %ss — Return NOT sent. Screen:\n%s"
-                     dir cc-butler-trust-dialog-settle-timeout
-                     (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max)))))))
+           ((>= (float-time) deadline)
+            (error "cc-butler: sent Down but highlight did not move to \"Yes, I trust this folder\" in %s within %ss — Return NOT sent. Screen:\n%s"
+                   dir cc-butler-trust-dialog-settle-timeout
+                   (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max)))))
+           ((cc-butler--trust-dialog-new-shape-p buf)
+            (cc-butler--terminal-send-down buf)
+            (sleep-for 0.1))
+           (t (sleep-for 0.1))))
         (with-current-buffer buf (claude-code-ide--terminal-send-return))
         t))
      ((cc-butler--trust-dialog-showing-p buf) nil)
