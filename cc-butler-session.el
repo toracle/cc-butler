@@ -571,23 +571,54 @@ colon for each key."
     (nreverse alist)))
 
 (defun cc-butler--log-escalation-drain (queue entries)
-  "Append one JSON line recording a drain of QUEUE (a short tag string,
-e.g. \"worker-inbox\" or \"butler-inbox\") to today's escalation-drain
-log under `cc-butler-ops-log-dir'.  ENTRIES is the list of plists just
-removed from the queue, logged in full -- this is the durability fix for
-the case where `cc-butler-decision-workflow' is nil and
-`cc-butler-message-transport' is `in-memory': that combination has no
-other on-disk trace of an escalation between enqueue and delivery, so if
-Emacs dies in that window the content is gone with nothing to recover.
+  "Append one JSON line per ENTRY to today's escalation-drain log under
+`cc-butler-ops-log-dir', recording a drain of QUEUE (a short tag string,
+e.g. \"worker-inbox\" or \"butler-inbox\").  ENTRIES is the list of
+plists just removed from the queue, logged in full -- this is the
+durability fix for the case where `cc-butler-decision-workflow' is nil
+and `cc-butler-message-transport' is `in-memory': that combination has
+no other on-disk trace of an ESCALATION-QUEUE drain between enqueue and
+delivery, so if Emacs dies in that window the content is gone with
+nothing to recover.  (Scoped deliberately: the ask/reply channel itself
+already persists to `cc-butler-mail-dir' maildirs regardless of this
+setting -- see `cc-butler--mail-file-deliver' in cc-butler-mail.el --
+so \"no durable trace at all\" is only ever true of this one in-memory
+decision/event queue, not of cc-butler's escalations in general.)
+
+Format choice, considered against the two existing on-disk conventions
+in this codebase rather than picked cold: `cc-butler-mail-dir' maildirs
+(cc-butler-mail.el) are per-MESSAGE files (`cc-butler--mail-file-deliver'
+writes one `<id>.eld' per delivery, later renamed `new/' -> `archive/'
+by `cc-butler--mail-file-drain'; there is no batch API, and one physical
+file per drained entry would multiply small-file I/O here for no
+retrieval benefit, since nothing ever needs to address a single drained
+entry by its own filename the way an unread mail message does) --
+mismatched shape, not followed.  But that same file also has a SECOND,
+already-append-only convention for exactly this shape:
+`cc-butler--mail-journal' mirrors each delivery as one `prin1'-printed
+line into a daily log, purely for audit, never for retrieval by
+filename -- this drain is that same role (nothing here is ever read back
+individually; it exists only so a human can grep it after a crash), so
+it follows THAT convention's granularity (one record per line) and this
+module's own sibling `cc-butler--log-message' for serialization: JSON,
+not `prin1'/`.eld', because `cc-butler--log-message' already established
+(see its docstring) that Emacs's default printer does not escape
+embedded newlines, which a multi-line escalation body would hit.
 
 Escalation bodies routinely carry tokens, paths, and real names, so the
 log file is created 0600 -- via `with-file-modes', which sets the
 creation mode before the file exists rather than chmod'ing after
 (chmod-after leaves a real, if short, window at the process umask).
-This file is append-only and never rotated or trimmed here (out of
-scope for this fix): it grows without bound and the secrets in it
-accumulate for as long as it lives; whoever owns retention for
-`cc-butler-ops-log-dir' needs to account for that.
+This narrows only THIS new file: the rest of `cc-butler-ops-log-dir'
+and all of `cc-butler-mail-dir' are not narrowed by this change and are
+tracked as a separate follow-up (tree-wide dir/file permissions, plus
+fixing the writers so a later append does not recreate a wider mode via
+umask) -- a partial lock on one file while its siblings stay
+world-readable would read as reassurance it does not earn.  This file
+is append-only and never rotated or trimmed here (out of scope for this
+fix): it grows without bound and the secrets in it accumulate for as
+long as it lives; whoever owns retention for `cc-butler-ops-log-dir'
+needs to account for that.
 
 Non-fatal like `cc-butler--log-mirror'/`cc-butler--log-message': an
 audit layer, never a precondition.  Callers MUST call this BEFORE
@@ -603,11 +634,13 @@ way."
     (make-directory cc-butler-ops-log-dir t)
     (with-file-modes #o600
       (write-region
-       (concat (json-encode
-                (list (cons 'time (format-time-string "%FT%T"))
-                      (cons 'queue queue)
-                      (cons 'count (length entries))
-                      (cons 'entries (mapcar #'cc-butler--plist-to-json-alist entries))))
+       (concat (mapconcat
+                (lambda (e)
+                  (json-encode
+                   (append (list (cons 'logged-at (format-time-string "%FT%T"))
+                                 (cons 'queue queue))
+                           (cc-butler--plist-to-json-alist e))))
+                entries "\n")
                "\n")
        nil (cc-butler--escalation-drain-log-file) 'append 'silent))))
 
