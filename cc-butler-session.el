@@ -510,6 +510,7 @@ precondition, so a full disk or an unwritable directory must not break
 the operation being logged.  Returns LINE, or nil if the write failed."
   (ignore-errors
     (make-directory cc-butler-ops-log-dir t)
+    (cc-butler--ops-log-rotate)
     (write-region (concat line "\n") nil (cc-butler--log-file)
                   'append 'silent)
     line))
@@ -518,6 +519,93 @@ the operation being logged.  Returns LINE, or nil if the write failed."
   "Return today's on-disk message-body log file under `cc-butler-ops-log-dir'."
   (expand-file-name (format-time-string "msg-%Y-%m-%d.log")
                     cc-butler-ops-log-dir))
+
+(defcustom cc-butler-ops-log-retention-days 14
+  "Days a dated ops/msg log file is kept before rotation deletes it.
+Only ever applies to files dated after `cc-butler-ops-log-rotation-epoch'
+-- see that defcustom's docstring. 14 days: long enough to cover a
+delayed review the following week, short enough that this log stops
+repeating the unbounded-growth pattern the 2026-09-04 retention audit
+found."
+  :type 'integer
+  :group 'cc-butler)
+
+(defcustom cc-butler-ops-log-rotation-epoch "2026-09-04"
+  "Rotation never deletes a dated log file dated at or before this date.
+Disposal of files that already existed when rotation shipped is a
+human decision, not one this code makes silently -- only a file dated
+AFTER this date is ever eligible for automatic deletion."
+  :type 'string
+  :group 'cc-butler)
+
+(defcustom cc-butler-ops-log-size-cap-mb 50
+  "Total on-disk size cap (MB), on top of `cc-butler-ops-log-retention-days',
+for files dated after `cc-butler-ops-log-rotation-epoch' -- a second,
+independent guard against a single unusually heavy day outrunning the
+day-based cap before its 14 days are up. Applies only to that eligible
+set: a file at or before the epoch is never counted toward the cap or
+deleted to satisfy it, same guarantee as the age-based rotation.  When
+exceeded, the oldest eligible files are deleted first until back under
+the cap.
+
+50MB: the current 14-day accumulation is ~17MB, and the heaviest single
+day observed so far was ~2.8MB -- this leaves roughly 10x headroom over
+the worst single-day spike seen to date, while still bounding the
+worst case instead of leaving it open-ended."
+  :type 'integer
+  :group 'cc-butler)
+
+(defvar cc-butler--ops-log-last-rotated nil
+  "Date string rotation last ran for.  Guards `cc-butler--ops-log-rotate'
+to at most once per day.")
+
+(defun cc-butler--ops-log-dated-files ()
+  "Return (FILE . DATE) for every dated ops/msg log file in
+`cc-butler-ops-log-dir', DATE as a YYYY-MM-DD string parsed from the name."
+  (when (file-directory-p cc-butler-ops-log-dir)
+    (delq nil
+          (mapcar (lambda (f)
+                    (when (string-match
+                           "/\\(?:ops\\|msg\\)-\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)\\.log\\'"
+                           f)
+                      (cons f (match-string 1 f))))
+                  (directory-files cc-butler-ops-log-dir t)))))
+
+(defun cc-butler--ops-log-file-age-days (date)
+  "Days between DATE (a YYYY-MM-DD string) and today."
+  (- (time-to-days (current-time))
+     (time-to-days (date-to-time (concat date "T00:00:00")))))
+
+(defun cc-butler--ops-log-total-size (pairs)
+  "Sum on-disk byte size of the files in PAIRS, a list of (FILE . DATE)."
+  (apply #'+ (mapcar (lambda (p) (or (file-attribute-size
+                                       (file-attributes (car p)))
+                                      0))
+                      pairs)))
+
+(defun cc-butler--ops-log-rotate ()
+  "Delete dated ops/msg log files past `cc-butler-ops-log-retention-days'
+or past `cc-butler-ops-log-size-cap-mb', never a file dated at or
+before `cc-butler-ops-log-rotation-epoch'. The age pass runs first;
+whatever survives it is the eligible set the size cap then prunes,
+oldest first. Runs at most once per day; safe to call from every log
+write."
+  (let ((today (format-time-string "%F")))
+    (unless (equal cc-butler--ops-log-last-rotated today)
+      (setq cc-butler--ops-log-last-rotated today)
+      (ignore-errors
+        (let (eligible)
+          (dolist (pair (cc-butler--ops-log-dated-files))
+            (when (string> (cdr pair) cc-butler-ops-log-rotation-epoch)
+              (if (> (cc-butler--ops-log-file-age-days (cdr pair))
+                     cc-butler-ops-log-retention-days)
+                  (delete-file (car pair))
+                (push pair eligible))))
+          (setq eligible (sort eligible (lambda (a b) (string< (cdr a) (cdr b)))))
+          (let ((cap-bytes (* cc-butler-ops-log-size-cap-mb 1024 1024)))
+            (while (and eligible
+                        (> (cc-butler--ops-log-total-size eligible) cap-bytes))
+              (delete-file (car (pop eligible))))))))))
 
 (defun cc-butler--log-message (kind from to body)
   "Append a full-body message record to today's message log, one JSON
@@ -545,6 +633,7 @@ Non-fatal like `cc-butler--log-mirror': an audit layer, never a
 precondition for the operation being logged."
   (ignore-errors
     (make-directory cc-butler-ops-log-dir t)
+    (cc-butler--ops-log-rotate)
     (write-region
      (concat (json-encode (list (cons 'time (format-time-string "%FT%T"))
                                  (cons 'kind kind)
