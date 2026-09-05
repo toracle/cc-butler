@@ -475,6 +475,44 @@ still just falls back to the last-known name, nothing more."
       (should (equal "claude-sonnet-5" (cc-butler-cleanup-model-for "/w/")))
       (should-not (cc-butler-cleanup-model-fresh-p "/w/")))))
 
+;;;; ---- context freshness marking (mirrors model freshness) ----------
+;;;; cc-butler#8 follow-up (steward review, 2026-09-05): a real fleet
+;;;; incident showed a session's CTX/PCT stuck at a stale, dialog-blocked
+;;;; reading (314k/157%/OVER THRESHOLD) for 6.5 hours, indistinguishable in
+;;;; the table from a genuinely fresh reading, until the dialog cleared and
+;;;; the same session read 326k/33%/ok. `cc-butler-compact--display-pct'
+;;;; already refuses to fabricate a percentage when the live pct is unknown
+;;;; (cc-butler#125); this closes the matching gap for CTX/severity, which
+;;;; had no freshness signal at all.
+
+(ert-deftest cc-butler-cleanup/context-fresh-p-true-after-real-read ()
+  "A genuinely fresh read marks the cached context fresh, mirroring
+`cc-butler-cleanup-model-fresh-p'."
+  (let ((cc-butler-cleanup--context-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--context-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-context-ttl 0)
+        (cc-butler-cleanup-context-function (lambda (_s) 326000)))
+    (should (= 326000 (cc-butler-cleanup-context-for "/w/")))
+    (should (cc-butler-cleanup-context-fresh-p "/w/"))))
+
+(ert-deftest cc-butler-cleanup/context-fresh-p-false-after-carried-forward-read ()
+  "When the real incident's shape happens — a dialog hides the statusline,
+so the read comes back nil — the last-known size (314000, this incident's
+real number) is still returned, per the existing no-flicker rule, but is
+now marked NOT fresh so a caller (the status table) can tell a carried-
+forward number apart from a confirmed one instead of trusting both alike."
+  (let ((cc-butler-cleanup--context-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup--context-fresh-cache (make-hash-table :test 'equal))
+        (cc-butler-cleanup-context-ttl 0)
+        (reading 314000))
+    (let ((cc-butler-cleanup-context-function (lambda (_s) reading)))
+      (should (= 314000 (cc-butler-cleanup-context-for "/w/")))
+      (should (cc-butler-cleanup-context-fresh-p "/w/"))
+      ;; the dialog opens: the statusline can no longer be read
+      (setq reading nil)
+      (should (= 314000 (cc-butler-cleanup-context-for "/w/")))
+      (should-not (cc-butler-cleanup-context-fresh-p "/w/")))))
+
 ;;;; ---- trigger gating ----------------------------------------------
 
 (ert-deftest cc-butler-cleanup/trigger-fires-over-200k ()
@@ -905,6 +943,10 @@ the in-dir copy exists, and passes once the record has been promoted outside."
         (let ((out (cc-butler-tool-close-topic "w")))
           (should (string-match-p "unsafe git state" out))
           (should (string-match-p "uncommitted changes" out))
+          ;; cc-butler#8 follow-up (steward review): a refusal must not be a
+          ;; dead end — it names the manual path to retire the topic without
+          ;; deleting it (kill the session, then drop it from the roster).
+          (should (string-match-p "cc-butler--roster-forget" out))
           (should-not torn))))))
 
 (ert-deftest cc-butler-cleanup/close-topic-tool-deletes-clean-worker ()

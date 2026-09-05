@@ -305,6 +305,67 @@ allowlist requires cc-butler's own marker."
         (should-not (cc-butler--close-topic-deletable-p plain))
       (delete-directory plain t))))
 
+;;;; ---- close-topic git-safety audit: non-git and loose top-level items --
+;;;; cc-butler#8 follow-up (steward review, 2026-09-05): a real fleet audit
+;;;; found 26 of 27 roster entries have a non-git top level, one of them a
+;;;; 14-nested-repo container with handoff docs (`recovered-notes-20260809/',
+;;;; `RESUME-817.md', `handover-image-editing-20260810.md') sitting loose at
+;;;; the root, outside every child repo -- invisible to an audit that only
+;;;; ever walked into repos it already knew about.
+
+(defun cc-butler-workspace-test--container-dir (child-repo-names loose-names)
+  "Make a temp multi-repo container and return its path.
+Each of CHILD-REPO-NAMES gets a repo-shaped `.git' subdir (a bare directory
+is enough: these tests mock `cc-butler--close-topic-unsafe' rather than
+shelling out to real git, matching this file's existing convention).
+LOOSE-NAMES are plain empty files sitting directly at the container root,
+outside every child repo."
+  (let* ((base (make-temp-file "cc-container" t))
+         (topic (file-name-as-directory (expand-file-name "container-x" base))))
+    (make-directory topic t)
+    (dolist (name child-repo-names)
+      (make-directory (expand-file-name ".git" (expand-file-name name topic)) t))
+    (dolist (name loose-names)
+      (write-region "" nil (expand-file-name name topic) nil 'silent))
+    topic))
+
+(ert-deftest cc-butler-workspace/close-topic-audit-refuses-non-git-empty-topic ()
+  "A topic dir that is not itself a git repo and has neither a child repo
+nor any loose item must still be refused, not silently pass as \"nothing
+to check, so safe\" — the original gap this audit had."
+  (let ((topic (file-name-as-directory (make-temp-file "cc-empty-topic" t))))
+    (unwind-protect
+        (should (cc-butler--close-topic-audit topic))
+      (delete-directory topic t))))
+
+(ert-deftest cc-butler-workspace/close-topic-audit-refuses-loose-top-level-file ()
+  "A container whose child repos are ALL clean must still be refused when it
+also holds a top-level file outside every child repo — \"every child repo
+is clean\" is not \"safe to delete\"; this is the exact real-incident shape.
+The refusal message must name the loose file so the next person can act on
+it without re-discovering it themselves."
+  (let ((topic (cc-butler-workspace-test--container-dir
+                '("app" "infra") '("RESUME-817.md"))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'cc-butler--close-topic-unsafe) (lambda (_repo) nil)))
+          (let ((bad (cc-butler--close-topic-audit topic)))
+            (should bad)
+            (should (cl-some (lambda (cell)
+                                (string-match-p "RESUME-817.md" (string-join (cdr cell) " ")))
+                              bad))))
+      (delete-directory topic t))))
+
+(ert-deftest cc-butler-workspace/close-topic-audit-passes-clean-scaffolded-topic ()
+  "The ordinary case must still pass: one clean child repo plus only
+cc-butler's own scaffold files (marker + CLAUDE.md) at the root is NOT
+refused — the loose-entry allowlist exists precisely so this common shape
+keeps working, not so the audit refuses everything indiscriminately."
+  (let ((topic (cc-butler-workspace-test--scaffold-dir)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'cc-butler--close-topic-unsafe) (lambda (_repo) nil)))
+          (should (null (cc-butler--close-topic-audit topic))))
+      (delete-directory topic t))))
+
 (ert-deftest cc-butler-workspace/deletable-keeps-shallow-and-home-guards ()
   "The pre-existing backstops still hold: home, root, .emacs.d, and shallow
 paths are refused regardless of markers."
