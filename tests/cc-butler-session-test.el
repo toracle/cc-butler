@@ -541,6 +541,96 @@ budget."
             (should (= 0 return-count))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
+(ert-deftest cc-butler-session/accept-trust-dialog-new-shape-resends-down-only-while-still-showing-old-shape ()
+  "2026-09-05 steward review: a naive fix for the settle-poll regression
+would resend Down whenever the highlight has \"not yet landed\", but this
+is a 2-item menu — a Down sent while the real highlight is ALREADY on
+\"Yes\" (just not yet visible to us, or mid-repaint) can wrap it back to
+\"No, exit\", and a Return sent onto that would exit the session outright.
+The resend must be gated on a fresh re-check that the screen still shows
+the exact pre-move shape (`cc-butler--trust-dialog-new-shape-p'), not on
+the weaker \"not yet confirmed landed\". This fixture forces one refresh
+that is neither the old shape nor the landed shape — an ambiguous,
+mid-repaint frame — and asserts no resend happens on that read; Down
+must fire only on the initial send and once landing is later confirmed
+to still be pending via the old shape re-appearing."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-trust-new-ambiguous*"))
+        (down-count 0) (return-count 0) (refresh-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (cc-butler-session-test--insert-trust-dialog-new-shape))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text)
+                     (lambda (_buf)
+                       (cl-incf refresh-count)
+                       (with-current-buffer term-buf
+                         (erase-buffer)
+                         (cond
+                          ;; 1st call is the OUTER function's own initial read, before it
+                          ;; has even decided which shape is showing — must stay the old
+                          ;; shape so it picks the new-shape accept branch at all.
+                          ((= refresh-count 1)
+                           (cc-butler-session-test--insert-trust-dialog-new-shape))
+                          ;; 1st loop read (2nd overall): ambiguous — mid-repaint, matches
+                          ;; neither shape.
+                          ((= refresh-count 2)
+                           (insert (make-string 24 cc-butler--border-rule-char) "\n")
+                           (insert " Accessing workspace:\n\n")
+                           (insert " Quick safety check: mid-repaint\n"))
+                          ;; 2nd loop read: landed.
+                          (t (cc-butler-session-test--insert-trust-dialog-new-shape t))))))
+                    ((symbol-function 'cc-butler--terminal-send-down) (lambda (&optional _buf) (cl-incf down-count)))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda () (cl-incf return-count))))
+            (should (cc-butler--accept-trust-dialog-new-shape "/worker/"))
+            (should (= 1 down-count))
+            (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-new-shape-resends-down-when-still-showing-old-shape ()
+  "The other half of the gating: when a re-read genuinely still shows the
+ORIGINAL default shape (still \"No, exit\" highlighted — the first Down
+plausibly never registered), a resend IS expected, not just silence
+until the settle timeout. Without a resend this fixture never lands
+within the shortened budget."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-trust-new-redown*"))
+        (down-count 0) (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (cc-butler-session-test--insert-trust-dialog-new-shape))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text)
+                     (lambda (_buf)
+                       (with-current-buffer term-buf
+                         (erase-buffer)
+                         ;; Only the SECOND Down (the resend) actually lands.
+                         (cc-butler-session-test--insert-trust-dialog-new-shape (>= down-count 2)))))
+                    ((symbol-function 'cc-butler--terminal-send-down) (lambda (&optional _buf) (cl-incf down-count)))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda () (cl-incf return-count)))
+                    (cc-butler-trust-dialog-settle-timeout 1.0))
+            (should (cc-butler--accept-trust-dialog-new-shape "/worker/"))
+            (should (= 2 down-count))
+            (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/launch-ready-timeout-covers-detection-margin-plus-settle-worst-case ()
+  "`cc-butler-launch-ready-timeout' (the OUTER budget) must stay large
+enough to contain a full detection delay
+(`cc-butler--trust-dialog-detection-margin') plus the inner settle-poll's
+own worst case (`cc-butler-trust-dialog-settle-timeout') — otherwise the
+outer `with-timeout' in `cc-butler--wait-for-session-ready' can fire
+WHILE the inner poll is still legitimately running, aborting before
+Return is ever sent. This is exactly the live 2026-09-05 regression:
+outer 5s < measured detection (up to 1.129s) + inner 3.0s. A future
+change to either budget that breaks this invariant must fail here, not
+silently regress live again."
+  (should (>= cc-butler-launch-ready-timeout
+              (+ cc-butler--trust-dialog-detection-margin
+                 cc-butler-trust-dialog-settle-timeout))))
+
 (ert-deftest cc-butler-session/accept-trust-dialog-new-shape-rejects-non-target-directory ()
   "`cc-butler--accept-trust-dialog-new-shape' errors on a directory with no
 live cc-butler-managed session buffer, rather than silently acting on (or
