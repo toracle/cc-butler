@@ -1947,6 +1947,34 @@ configured target size as argv."
 ;; trivial shell command keeps the test fast, dependency-free, and still
 ;; exercises the actual sentinel this code registers.
 
+(defun cc-butler-test--ensure-process-dead (proc)
+  "Force PROC dead and pump output until Emacs has actually noticed, so no
+live process — and no pending sentinel call — can outlive the caller's
+`cl-letf' mocking scope.
+
+Root cause of a real, CI-only flake (2026-09-05): a trivial subprocess
+occasionally takes longer than the 5s budget below to exit under
+GitHub Actions' `pull_request'-triggered runner contention (confirmed:
+identical commits passed on `push', failed on `pull_request'). When that
+happened, the timed-out test's own assertion correctly failed — but the
+still-alive process was left running PAST that test's `cl-letf' scope.
+Its real exit and sentinel fired moments later, under whatever mocks the
+NEXT test running in the same Emacs process happened to have active,
+incrementing THAT unrelated test's `log-calls' — this is confirmed
+exactly in one CI run where `pipe-mitigation-sentinel-logs-on-nonzero-exit'
+timed out (0 calls seen, wanted 1) immediately followed by
+`pipe-mitigation-sentinel-quiet-on-clean-exit' failing with one
+UNEXPLAINED extra call (1 seen, wanted 0) — the first test's orphaned
+process poisoning the second. Calling this before a test's `cl-letf'
+unwinds closes that leak: the process is confirmed dead (forcibly, if
+necessary) before control returns to a caller whose mocks are about to
+change."
+  (when (process-live-p proc)
+    (ignore-errors (delete-process proc))
+    (let ((deadline (+ (float-time) 2)))
+      (while (and (process-live-p proc) (< (float-time) deadline))
+        (accept-process-output proc 0.05)))))
+
 (defmacro cc-butler-test--with-real-sentinel (shell-command &rest body)
   "Run BODY after the REAL sentinel
 `cc-butler--mitigate-ghostel-event-pipe-deadlock' registers via
@@ -1970,7 +1998,8 @@ made while running BODY and while waiting for the process to exit."
        (should (process-live-p proc))
        (let ((deadline (+ (float-time) 5)))
          (while (and (process-live-p proc) (< (float-time) deadline))
-           (accept-process-output proc 0.05))))
+           (accept-process-output proc 0.05)))
+       (cc-butler-test--ensure-process-dead proc))
      ,@body))
 
 (ert-deftest cc-butler-session/pipe-mitigation-sentinel-logs-on-nonzero-exit ()
@@ -2018,6 +2047,7 @@ signal apart from a real second log line.)"
       (let ((deadline (+ (float-time) 5)))
         (while (and (process-live-p proc) (< (float-time) deadline))
           (accept-process-output proc 0.05)))
+      (cc-butler-test--ensure-process-dead proc)
       (should (= 1 log-calls))
       (should-not (buffer-live-p (process-buffer proc)))
       (funcall (process-sentinel proc) proc "exit abnormally\n")
