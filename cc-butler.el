@@ -400,6 +400,32 @@ loading or evaluating it. See `cc-butler--defcustom-drift'."
           (end-of-file nil))))
     (nreverse out)))
 
+(defun cc-butler--defcustom-drift-internal-p (sym)
+  "Non-nil if SYM's name marks it elisp-private — `--' anywhere in the name,
+the convention this codebase actually uses (not just a `cc-butler--' prefix:
+`cc-butler-cleanup--context-cache' is private too). These are runtime
+accumulators (queues, caches, inboxes), not customization points: they are
+SUPPOSED to differ from an empty/nil `defvar' default the moment anything
+runs, so reporting them as \"drift\" is always true and carries no signal.
+
+2026-09-05 (steward, live): the first version of `cc-butler--defcustom-drift'
+had no such filter and both (a) buried the 4 real drifts in 54 total, and
+(b) printed the LIVE VALUES of these accumulators in full — which are
+exactly the fields liable to hold worker-report bodies, session status
+text, and other content that should not appear whole in an escalation
+surface. Filtering by name here fixes both at once."
+  (string-match-p "--" (symbol-name sym)))
+
+(defun cc-butler--defcustom-drift-noise-p (sym)
+  "Non-nil if SYM is a hook list or a keymap. Both are designed to differ
+from their `defvar' default as soon as anything `add-hook's or
+`define-key's onto them — that is normal operation, not a stuck reload, so
+reporting it as drift is always true and never informative."
+  (or (string-match-p "-\\(hook\\|functions\\)\\'" (symbol-name sym))
+      (and (string-match-p "-map\\'" (symbol-name sym))
+           (boundp sym)
+           (keymapp (symbol-value sym)))))
+
 (defun cc-butler--defcustom-drift (file)
   "For every defcustom/defvar-with-default in FILE, compare its CURRENT
 live value to what evaluating its default form fresh would give. A
@@ -413,8 +439,11 @@ regression that motivated this).
 
 Returns a list of (SYMBOL LIVE-VALUE CODE-DEFAULT). This cannot tell the
 two causes apart — it is a loud, honest list to check by hand, not a
-verdict. Symbols not currently `boundp' are skipped: the next load sets
-them fresh, so they cannot have drifted.
+verdict. Skips symbols not currently `boundp' (the next load sets them
+fresh, so they cannot have drifted), private accumulators (see
+`cc-butler--defcustom-drift-internal-p' — always drift, and their live
+value is exactly the sensitive content this report must not leak), and
+hook/keymap noise (see `cc-butler--defcustom-drift-noise-p').
 
 This is not \"nice to have\" — it is the ONLY thing that can catch this
 class of bug at all. An ERT suite always loads its files fresh into an
@@ -430,7 +459,9 @@ every test would keep passing."
   (let (drift)
     (dolist (pair (cc-butler--defcustom-forms-in-file file))
       (let ((sym (car pair)))
-        (when (boundp sym)
+        (when (and (boundp sym)
+                   (not (cc-butler--defcustom-drift-internal-p sym))
+                   (not (cc-butler--defcustom-drift-noise-p sym)))
           (let ((code-default (ignore-errors (eval (cdr pair) t))))
             (unless (equal (symbol-value sym) code-default)
               (push (list sym (symbol-value sym) code-default) drift))))))
@@ -455,7 +486,20 @@ Loads from `cc-butler-source-dir' — where this file came from, unless
 `cc-butler-use-checkout' / `cc-butler-use-installed' deliberately pointed it
 elsewhere.
 
-Returns a plist describing what happened, for `cc-butler-tool-reload-code'."
+Returns a plist describing what happened, for `cc-butler-tool-reload-code'.
+
+NOTE on this function's own drift detector (`cc-butler--defcustom-drift',
+called below): a fix that changes what THIS function does — including the
+drift detector itself — is, on the very first reload after it lands, run
+by the OLD in-memory `cc-butler-reload' one last time, because the fix
+only takes effect once ITS OWN load has completed. This is the same
+self-hosted-reload property as the module-list bug this docstring already
+describes above, not a new bug: the first reload after landing a change to
+this function reports using the PRE-change behavior; only the second
+reload runs the new code. (2026-09-05: PR #162's drift report showed
+nothing on the reload that installed it, then showed the real drift on the
+very next reload — `cc-butler-reload' loaded at that point was still the
+pre-#162 version with no drift check at all.)"
   (interactive)
   (let ((self (expand-file-name "cc-butler.el" (cc-butler-source-dir))))
     (when (file-exists-p self) (load self nil t)))
@@ -641,6 +685,17 @@ fake drift."
 ;;;; MCP tool: hot-reload the control plane from disk
 ;;;; ------------------------------------------------------------------
 
+(defun cc-butler--truncate-for-report (value &optional limit)
+  "Render VALUE with `%S', cut to LIMIT characters (default 200) with a
+trailing ellipsis if longer. A drifted variable can legitimately be bound
+to a whole document; this report exists for a human to skim for the
+variable NAME and a rough shape, not to reproduce the value in full."
+  (let* ((limit (or limit 200))
+         (s (format "%S" value)))
+    (if (> (length s) limit)
+        (concat (substring s 0 limit) "…")
+      s)))
+
 (defun cc-butler-tool-reload-code ()
   "MCP tool: reload cc-butler from disk, and report what was actually loaded.
 
@@ -677,7 +732,10 @@ a context, and nothing in this path is a substitute for it."
      (if drift
          (format "\n\n⚠ %d variable(s) differ from their current code default after this reload — either a deliberate customization (harmless), or a changed default that could not apply because the symbol was already bound (this is exactly the failure class `cc-butler-launch-ready-timeout' hit 2026-09-05 — verify by hand, this is not something any test suite can catch):\n%s"
                  (length drift)
-                 (mapconcat (lambda (d) (format "  %s: live=%S code-default=%S" (nth 0 d) (nth 1 d) (nth 2 d)))
+                 (mapconcat (lambda (d) (format "  %s: live=%s code-default=%s"
+                                                 (nth 0 d)
+                                                 (cc-butler--truncate-for-report (nth 1 d))
+                                                 (cc-butler--truncate-for-report (nth 2 d))))
                             drift "\n"))
        "")
      ;; Same reason the stale .elc is spelled out: this caller cannot look at

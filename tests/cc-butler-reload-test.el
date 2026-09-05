@@ -87,27 +87,27 @@ out in the response rather than left as a silent trap."
 comments, defconst) must not be mistaken for one."
   (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
          (file (cc-butler-test--write-fixture-module
-                dir "(defcustom cc-butler-test--drift-a 1 \"doc\")
-(defvar cc-butler-test--drift-b 2 \"doc\")
-(defvar cc-butler-test--drift-c)
-(defconst cc-butler-test--drift-d 4)
-(defun cc-butler-test--drift-fn () nil)
+                dir "(defcustom cc-butler-test-drift-a 1 \"doc\")
+(defvar cc-butler-test-drift-b 2 \"doc\")
+(defvar cc-butler-test-drift-c)
+(defconst cc-butler-test-drift-d 4)
+(defun cc-butler-test-drift-fn () nil)
 ")))
     (should (equal (cc-butler--defcustom-forms-in-file file)
-                   '((cc-butler-test--drift-a . 1)
-                     (cc-butler-test--drift-b . 2))))))
+                   '((cc-butler-test-drift-a . 1)
+                     (cc-butler-test-drift-b . 2))))))
 
 (ert-deftest cc-butler-reload/defcustom-drift-empty-when-live-matches-code-default ()
   "No drift when the live value equals what the file's default form
 evaluates to — the common, healthy case."
   (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
          (file (cc-butler-test--write-fixture-module
-                dir "(defcustom cc-butler-test--drift-match 8 \"doc\")\n")))
-    (defvar cc-butler-test--drift-match)
-    (setq cc-butler-test--drift-match 8)
+                dir "(defcustom cc-butler-test-drift-match 8 \"doc\")\n")))
+    (defvar cc-butler-test-drift-match)
+    (setq cc-butler-test-drift-match 8)
     (unwind-protect
         (should-not (cc-butler--defcustom-drift file))
-      (makunbound 'cc-butler-test--drift-match))))
+      (makunbound 'cc-butler-test-drift-match))))
 
 (ert-deftest cc-butler-reload/defcustom-drift-catches-the-launch-ready-timeout-shape ()
   "The exact live regression this detector exists for: source now says one
@@ -117,22 +117,84 @@ Modeled directly on `cc-butler-launch-ready-timeout' raised 5->8 while a
 prior reload's binding stayed at 5."
   (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
          (file (cc-butler-test--write-fixture-module
-                dir "(defcustom cc-butler-test--drift-stuck 8 \"doc\")\n")))
-    (defvar cc-butler-test--drift-stuck)
-    (setq cc-butler-test--drift-stuck 5)
+                dir "(defcustom cc-butler-test-drift-stuck 8 \"doc\")\n")))
+    (defvar cc-butler-test-drift-stuck)
+    (setq cc-butler-test-drift-stuck 5)
     (unwind-protect
         (should (equal (cc-butler--defcustom-drift file)
-                        '((cc-butler-test--drift-stuck 5 8))))
-      (makunbound 'cc-butler-test--drift-stuck))))
+                        '((cc-butler-test-drift-stuck 5 8))))
+      (makunbound 'cc-butler-test-drift-stuck))))
 
 (ert-deftest cc-butler-reload/defcustom-drift-skips-unbound-symbols ()
   "A symbol not yet `boundp' cannot have drifted — the next load sets it
 fresh from the file's own default, so it needs no reporting."
   (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
          (file (cc-butler-test--write-fixture-module
-                dir "(defcustom cc-butler-test--drift-never-loaded 8 \"doc\")\n")))
-    (should-not (boundp 'cc-butler-test--drift-never-loaded))
+                dir "(defcustom cc-butler-test-drift-never-loaded 8 \"doc\")\n")))
+    (should-not (boundp 'cc-butler-test-drift-never-loaded))
     (should-not (cc-butler--defcustom-drift file))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-skips-private-double-dash-symbols ()
+  "REGRESSION (2026-09-05, steward live): a symbol with `--' anywhere in its
+name is an elisp-private runtime accumulator (queue, cache, inbox) — it is
+SUPPOSED to differ from its empty `defvar' default the instant anything
+runs, so reporting it is always-true noise. Worse, printing its live value
+leaked real content (worker-report bodies, session status text) into the
+reload report. Must be excluded even though it technically \"differs\"."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defvar cc-butler-test--drift-private-cache nil \"doc\")\n")))
+    (defvar cc-butler-test--drift-private-cache)
+    (setq cc-butler-test--drift-private-cache "sensitive worker report body")
+    (unwind-protect
+        (should-not (cc-butler--defcustom-drift file))
+      (makunbound 'cc-butler-test--drift-private-cache))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-skips-hook-and-keymap-noise ()
+  "A hook list or keymap differs from its `defvar' default as soon as
+anything `add-hook's or `define-key's onto it — normal operation, not a
+stuck reload. Reporting it as drift is always true and never actionable."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defvar cc-butler-test-drift-functions nil \"doc\")
+(defvar cc-butler-test-drift-map (make-sparse-keymap) \"doc\")\n")))
+    (defvar cc-butler-test-drift-functions)
+    (defvar cc-butler-test-drift-map)
+    (setq cc-butler-test-drift-functions '(some-added-hook-fn))
+    (let ((km (make-sparse-keymap)))
+      (define-key km (kbd "C-c C-c") 'ignore)
+      (setq cc-butler-test-drift-map km))
+    (unwind-protect
+        (should-not (cc-butler--defcustom-drift file))
+      (makunbound 'cc-butler-test-drift-functions)
+      (makunbound 'cc-butler-test-drift-map))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-still-reports-a-real-non-private-drift ()
+  "The filters above must not swallow the actual signal — a plain,
+non-private, non-hook, non-keymap defcustom that genuinely drifted still
+has to show up."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defcustom cc-butler-test-drift-real 8 \"doc\")\n")))
+    (defvar cc-butler-test-drift-real)
+    (setq cc-butler-test-drift-real 5)
+    (unwind-protect
+        (should (equal (cc-butler--defcustom-drift file)
+                        '((cc-butler-test-drift-real 5 8))))
+      (makunbound 'cc-butler-test-drift-real))))
+
+(ert-deftest cc-butler-reload/tool-output-truncates-long-drift-values ()
+  "A drifted variable can legitimately hold a whole document; the tool
+output must cap what it prints so one long value cannot dominate — or
+leak the bulk of — the report."
+  (let ((long (make-string 500 ?x)))
+    (cl-letf (((symbol-function 'cc-butler-reload)
+               (lambda () (list :count 3 :dir "/x/" :stale nil
+                                 :defcustom-drift (list (list 'cc-butler-test-drift-long long 8)))))
+              ((symbol-function 'cc-butler--git-head) (lambda (_) nil)))
+      (let ((out (cc-butler-tool-reload-code)))
+        (should (string-match-p "…" out))
+        (should-not (string-match-p (regexp-quote long) out))))))
 
 (ert-deftest cc-butler-reload/tool-output-surfaces-defcustom-drift-loudly ()
   "The MCP caller cannot inspect live variable bindings itself — a drift
