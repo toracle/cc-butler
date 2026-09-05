@@ -380,6 +380,62 @@ and quietly undoes whatever a reload just did."
           (push (file-name-nondirectory elc) out))))
     (nreverse out)))
 
+(defun cc-butler--defcustom-forms-in-file (file)
+  "Alist of (SYMBOL . DEFAULT-FORM) for every top-level `defcustom' or
+`defvar'-with-a-value form in FILE, read from its source text without
+loading or evaluating it. See `cc-butler--defcustom-drift'."
+  (let (out)
+    (when (file-readable-p file)
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-min))
+        (condition-case nil
+            (while t
+              (let ((form (read (current-buffer))))
+                (when (and (consp form)
+                           (memq (car form) '(defcustom defvar))
+                           (symbolp (nth 1 form))
+                           (>= (safe-length form) 3))
+                  (push (cons (nth 1 form) (nth 2 form)) out))))
+          (end-of-file nil))))
+    (nreverse out)))
+
+(defun cc-butler--defcustom-drift (file)
+  "For every defcustom/defvar-with-default in FILE, compare its CURRENT
+live value to what evaluating its default form fresh would give. A
+mismatch means the code's own stated default no longer matches what is
+actually running — either a human deliberately customized it away from
+the default (expected, harmless), or a reload changed the default in
+source but could not apply it, because `defcustom'/`defvar' never
+overwrite an already-bound symbol (2026-09-05: `cc-butler-launch-ready-timeout'
+raised 5->8 in source stayed live at 5 across a reload — the exact live
+regression that motivated this).
+
+Returns a list of (SYMBOL LIVE-VALUE CODE-DEFAULT). This cannot tell the
+two causes apart — it is a loud, honest list to check by hand, not a
+verdict. Symbols not currently `boundp' are skipped: the next load sets
+them fresh, so they cannot have drifted.
+
+This is not \"nice to have\" — it is the ONLY thing that can catch this
+class of bug at all. An ERT suite always loads its files fresh into an
+unbound symbol, so `defcustom'/`defvar' always apply the new default
+there; a test asserting behavior against a changed default (e.g.
+`cc-butler-session/launch-ready-timeout-covers-detection-margin-plus-settle-worst-case')
+stays green in the suite forever and can still be wrong on a live daemon whose
+symbol was already bound at the OLD default before the reload. Do not
+remove this call from `cc-butler-reload' on the reasoning \"we have a
+test for that now\" — the test and this check verify different things,
+and removing this leaves the live case with no detector, silently, since
+every test would keep passing."
+  (let (drift)
+    (dolist (pair (cc-butler--defcustom-forms-in-file file))
+      (let ((sym (car pair)))
+        (when (boundp sym)
+          (let ((code-default (ignore-errors (eval (cdr pair) t))))
+            (unless (equal (symbol-value sym) code-default)
+              (push (list sym (symbol-value sym) code-default) drift))))))
+    (nreverse drift)))
+
 ;;;###autoload
 (defun cc-butler-reload ()
   "Cleanly reload all cc-butler modules in dependency order — the hot-load
@@ -408,13 +464,16 @@ Returns a plist describing what happened, for `cc-butler-tool-reload-code'."
   ;; `cc-butler--switch-source' has to be the thing the modules follow.
   (dolist (m cc-butler--modules)
     (load (expand-file-name (concat (symbol-name m) ".el") (cc-butler-source-dir)) nil t))
-  (let ((stale (cc-butler--stale-elc))
-        (dir (cc-butler-source-dir)))
+  (let* ((stale (cc-butler--stale-elc))
+         (dir (cc-butler-source-dir))
+         (drift (cl-loop for m in (cons 'cc-butler cc-butler--modules)
+                          append (cc-butler--defcustom-drift
+                                  (expand-file-name (concat (symbol-name m) ".el") dir)))))
     (when (called-interactively-p 'interactive)
       (message "cc-butler: reloaded %d modules from %s%s"
                (length cc-butler--modules) dir
                (if stale (format " — WARNING: %d stale .elc" (length stale)) "")))
-    (list :count (length cc-butler--modules) :dir dir :stale stale)))
+    (list :count (length cc-butler--modules) :dir dir :stale stale :defcustom-drift drift)))
 
 ;;;; ------------------------------------------------------------------
 ;;;; What commit is the live daemon actually running, right now?
@@ -593,6 +652,7 @@ a context, and nothing in this path is a substitute for it."
   (let* ((res (cc-butler-reload))
          (dir (plist-get res :dir))
          (stale (plist-get res :stale))
+         (drift (plist-get res :defcustom-drift))
          ;; File reads only — `shell-command-to-string' here once put the
          ;; whole daemon one wedged .git/index.lock away from a total freeze
          ;; (single Lisp thread, no timeout, `with-timeout' can't interrupt
@@ -605,6 +665,20 @@ a context, and nothing in this path is a substitute for it."
      (if stale
          (format "\n\n⚠ STALE BYTE-CODE: %s are older than their .el source. Emacs prefers .elc on startup, so these will silently undo this reload the next time Emacs restarts. Delete them (or byte-recompile) in %s."
                  (string-join stale ", ") dir)
+       "")
+     ;; This is the ONLY detector for this class of bug, not a nice-to-have:
+     ;; `defcustom'/`defvar' never overwrite an already-bound symbol, so a
+     ;; reload that changes a default in source can silently leave the live
+     ;; value stuck at the old one (2026-09-05: `cc-butler-launch-ready-timeout'
+     ;; raised 5->8 in source, stayed live at 5 across a reload). No ERT test
+     ;; can catch this — the test suite always loads into an unbound symbol,
+     ;; so the new default always applies there and the suite stays green
+     ;; regardless of what a live daemon does. See `cc-butler--defcustom-drift'.
+     (if drift
+         (format "\n\n⚠ %d variable(s) differ from their current code default after this reload — either a deliberate customization (harmless), or a changed default that could not apply because the symbol was already bound (this is exactly the failure class `cc-butler-launch-ready-timeout' hit 2026-09-05 — verify by hand, this is not something any test suite can catch):\n%s"
+                 (length drift)
+                 (mapconcat (lambda (d) (format "  %s: live=%S code-default=%S" (nth 0 d) (nth 1 d) (nth 2 d)))
+                            drift "\n"))
        "")
      ;; Same reason the stale .elc is spelled out: this caller cannot look at
      ;; the filesystem, and "which copy did I just reload, and is it behind"
@@ -627,7 +701,7 @@ a context, and nothing in this path is a substitute for it."
   (claude-code-ide-make-tool
    :function #'cc-butler-tool-reload-code
    :name "reload_butler_code"
-   :description "Hot-reload the cc-butler control plane from disk after its SOURCE CODE changed — new tools, fixes, new modules — without restarting Emacs and without losing any session. Reloads every module in dependency order, including this file first so a newly added module is not skipped. It loads what is on disk and does NOT git pull, so pull first if you want newer code; it reports the source directory and its git HEAD so you can tell what you actually got. This changes CODE ONLY and has no effect whatsoever on any session's context size — it is not a way to shrink a large session and is unrelated to compaction; use compact_session for that."
+   :description "Hot-reload the cc-butler control plane from disk after its SOURCE CODE changed — new tools, fixes, new modules — without restarting Emacs and without losing any session. Reloads every module in dependency order, including this file first so a newly added module is not skipped. It loads what is on disk and does NOT git pull, so pull first if you want newer code; it reports the source directory and its git HEAD so you can tell what you actually got. Also reports any defcustom/defvar whose live value now differs from its code default — `defcustom'/`defvar' never overwrite an already-bound symbol, so a changed default in source can silently fail to take effect live even though the reload itself reports success; no test suite can catch this (a test always loads into an unbound symbol), so this report is the only detector. This changes CODE ONLY and has no effect whatsoever on any session's context size — it is not a way to shrink a large session and is unrelated to compaction; use compact_session for that."
    :args nil))
 
 (provide 'cc-butler)
