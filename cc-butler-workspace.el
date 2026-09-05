@@ -350,12 +350,75 @@ invocation is itself unsafe (we could not verify)."
           (push label reasons)))))
     (nreverse reasons)))
 
+(defconst cc-butler--close-topic-loose-entry-allowlist
+  (list ".DS_Store" cc-butler-project-marker "CLAUDE.md")
+  "Top-level entries `cc-butler--close-topic-loose-entries' never flags,
+because none of them can hold work worth losing: OS noise (`.DS_Store')
+and cc-butler's own generated scaffold files — the topic marker
+\(`cc-butler-project-marker', referenced by variable rather than its
+current literal value in case it is ever customized to a non-dot name)
+and its boilerplate `CLAUDE.md'. Both are wholly regenerable and would be
+deleted along with the topic either way. Kept short and explicit on
+purpose (cc-butler#8 follow-up, steward review): a long or pattern-based
+allowlist is exactly how a real loose file — a handoff doc, recovered
+notes — would quietly stop being checked again.")
+
+(defun cc-butler--close-topic-loose-entries (topic-dir)
+  "Return TOPIC-DIR's top-level entries that belong to no child git repo
+vetted by `cc-butler--close-topic-repos' and are not on
+`cc-butler--close-topic-loose-entry-allowlist' — real, possibly
+unversioned content sitting directly in a multi-repo container, which
+`cc-butler--close-topic-unsafe' can never see since it only vets the
+child repos it is told about.
+
+This is the exact shape of the 2026-09-05 incident that motivated this
+whole audit: a container with 14 clean nested repos ALSO held
+`recovered-notes-20260809/', `RESUME-817.md', and
+`handover-image-editing-20260810.md' sitting loose at its root — none of
+them inside any child repo, all invisible to a check that only walks
+into repos. \"Every child repo is clean\" was never \"safe to delete\";
+this closes that gap without touching the per-repo check itself.
+
+Empty when TOPIC-DIR is itself a repo — there is no \"top level besides
+the repo\" in that shape; the repo IS the whole audited unit."
+  (unless (file-directory-p (expand-file-name ".git" topic-dir))
+    (let ((repos (cc-butler--close-topic-repos topic-dir)))
+      (seq-remove
+       (lambda (p)
+         (or (member p repos)
+             (member (file-name-nondirectory (directory-file-name p))
+                     cc-butler--close-topic-loose-entry-allowlist)))
+       (ignore-errors (directory-files topic-dir t "\\`[^.]"))))))
+
 (defun cc-butler--close-topic-audit (topic-dir)
-  "Return an alist (REPO . REASONS) for every unsafe repo under TOPIC-DIR."
-  (let (bad)
-    (dolist (repo (cc-butler--close-topic-repos topic-dir))
+  "Return an alist (PATH . REASONS) covering everything that must block
+deleting TOPIC-DIR: every child repo with local-only commits, uncommitted
+changes, or stashes (`cc-butler--close-topic-unsafe'); every top-level
+item outside all child repos and not on the tiny allowlist
+(`cc-butler--close-topic-loose-entries'); and, only when NEITHER of those
+found anything at all — TOPIC-DIR is not itself a repo and has no child
+repo and no loose item either — TOPIC-DIR itself, since \"nothing found
+to check\" must never read as \"safe to delete\" (a real fleet audit,
+2026-09-05, found 26 of 27 roster entries have a non-git top level;
+before this, `cc-butler--close-topic-repos' returning nil for one of
+those meant this audit checked literally nothing for it — cc-butler#8
+follow-up)."
+  (let* ((repos (cc-butler--close-topic-repos topic-dir))
+         (loose (cc-butler--close-topic-loose-entries topic-dir))
+         bad)
+    (dolist (repo repos)
       (when-let ((reasons (cc-butler--close-topic-unsafe repo)))
         (push (cons repo reasons) bad)))
+    (when loose
+      (push (cons (file-name-as-directory topic-dir)
+                  (list (format "top-level item(s) outside any child repo, unaccounted for: %s"
+                                (string-join (mapcar #'file-name-nondirectory loose) ", "))))
+            bad))
+    (when (and (null repos) (null loose) (null bad))
+      (push (cons (file-name-as-directory topic-dir)
+                  (list (format "not a git repository, and no child repo or loose item found either — cannot verify no local-only work would be lost (%s)"
+                                (directory-file-name (expand-file-name topic-dir)))))
+            bad))
     (nreverse bad)))
 
 (defun cc-butler--close-topic-kill-session (dir)

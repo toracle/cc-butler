@@ -87,14 +87,16 @@ See `cc-butler-compact--severity-for'."
   :type 'integer :group 'cc-butler)
 
 (defcustom cc-butler-compact-threshold-fraction 0.60
-  "Fraction of the model context window used for the INFORMATIONAL percentage
-shown alongside a session's context figure (`cc-butler-compact--display-pct',
-`cc-butler-compact--threshold-pct') — never for gating.
+  "Formerly the sole compaction gate, retired 2026-09-02 in favor of the
+absolute `cc-butler-compact-threshold' (see its docstring for why).
 
-Until 2026-09-02 this fraction was the sole compaction gate; the gate is
-now the absolute `cc-butler-compact-threshold' (see its docstring for
-why). This variable survives only to render a human-readable percentage
-next to the token figure; changing it affects no behavior."
+`cc-butler-compact--display-pct' does NOT use this fraction — it only
+ever echoes a session's own live statusline percentage, or nil (\"?\")
+when that is unknown (cc-butler#125: a percentage is never reconstructed
+from CTX against a guessed window). `cc-butler-compact--threshold-pct'
+still formats this into a whole-percent number, but nothing currently
+calls it. This variable is otherwise unused; changing it affects no
+behavior."
   :type 'number :group 'cc-butler)
 
 (defcustom cc-butler-compact-model "sonnet"
@@ -1764,9 +1766,26 @@ The COMPACTION field is prefixed WARNING/CRITICAL (see
 `cc-butler-compact--severity-for') when a session is still over threshold
 and uncompacted at 400k/700k — a display escalation for a sweep that
 failed to catch it, layered on top of the base OVER THRESHOLD/blocked/ok
-text, never a second gate."
+text, never a second gate.
+
+CONTEXT gets a trailing `~' when `cc-butler-cleanup-context-fresh-p' says
+the cached figure was carried forward, not read this cycle (mirrors the
+same mark on MODEL) — e.g. an open dialog hides the statusline, as in the
+cc-butler#8 incident where a session read 314k/157%/OVER THRESHOLD for
+6.5 hours while a trust dialog blocked it, then 326k/33%/ok the moment it
+cleared. `cc-butler-compact--display-pct' already refuses to turn a stale
+CTX into a fabricated percentage (cc-butler#125: it is nil/\"?\" whenever
+the live statusline pct itself is unknown, never CTX divided by a guessed
+window). OVER THRESHOLD/severity, deliberately, are NOT suppressed just
+because CTX is stale — see `cc-butler-cleanup-context-for''s own
+no-flicker rationale: a session that was over threshold before a dialog
+covered its screen does not become an acceptable risk merely because we
+have not re-confirmed it yet. The `~' is what keeps that choice honest:
+the row still warns, but no longer lets a carried-forward number pass for
+a fresh one."
   (let* ((name (cc-butler--display-name dir))
          (ctx (cc-butler-cleanup-context-for dir))
+         (ctx-fresh (cc-butler-cleanup-context-fresh-p dir))
          (pct (cc-butler-compact--display-pct dir))
          (model (cc-butler-compact--model-for-status-line dir))
          (why (cc-butler-compact--blocked-reason dir))
@@ -1778,7 +1797,9 @@ text, never a second gate."
                      (t "ok"))))
     (format "%-36s %9s %6s  %-10s  %-13s  %s"
             name
-            (if (integerp ctx) (format "%.0fk" (/ ctx 1000.0)) "?")
+            (if (integerp ctx)
+                (format "%.0fk%s" (/ ctx 1000.0) (if ctx-fresh "" "~"))
+              "?")
             (if (integerp pct) (format "%d%%" pct) "?")
             (or model "?")
             (if (cc-butler--waiting-p dir) "WAITING" "running")
@@ -1796,7 +1817,7 @@ text, never a second gate."
         (concat "No live sessions.\n\n" monitor)
       (concat (format "%-36s %9s %6s  %-10s  %-13s  %s\n" "SESSION" "CONTEXT" "PCT" "MODEL" "STATE" "COMPACTION")
               (string-join rows "\n")
-              (format "\n\nThreshold: %dk tokens (`cc-butler-compact-threshold') — the compaction gate, an absolute figure since every fleet session currently runs the same context window. PCT is informational only (used-percentage of the assumed window, `cc-butler-compact-threshold-fraction'), never the gate. COMPACTION is prefixed WARNING/CRITICAL at %dk/%dk tokens when a session is still over threshold and uncompacted — a display escalation for a sweep that missed it, not a second gate. A context/PCT figure is what the session's statusline last reported, not a live measurement; \"?\" means it is not known there — never a computed-looking guess.\n%s"
+              (format "\n\nThreshold: %dk tokens (`cc-butler-compact-threshold') — the compaction gate, an absolute figure since every fleet session currently runs the same context window. PCT is informational only, the session's own live-reported percentage, never the gate and never reconstructed from a guessed window; \"?\" means it is not currently known, not a computed-looking guess. A CONTEXT figure with a trailing `~' is carried forward from a prior read, not confirmed this cycle (e.g. an open dialog is hiding the statusline) — OVER THRESHOLD/COMPACTION still fire on it, since a session that was over threshold does not become safe merely because it went unconfirmed; the `~' says only that the number, not the risk, is unconfirmed. COMPACTION is prefixed WARNING/CRITICAL at %dk/%dk tokens when a session is still over threshold and uncompacted — a display escalation for a sweep that missed it, not a second gate.\n%s"
                       (/ cc-butler-compact-threshold 1000)
                       (/ cc-butler-compact-warning-threshold 1000)
                       (/ cc-butler-compact-critical-threshold 1000)

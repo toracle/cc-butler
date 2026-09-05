@@ -905,6 +905,10 @@ the in-dir copy exists, and passes once the record has been promoted outside."
         (let ((out (cc-butler-tool-close-topic "w")))
           (should (string-match-p "unsafe git state" out))
           (should (string-match-p "uncommitted changes" out))
+          ;; cc-butler#8 follow-up (steward review): a refusal must not be a
+          ;; dead end — it names the manual path to retire the topic without
+          ;; deleting it (kill the session, then drop it from the roster).
+          (should (string-match-p "cc-butler--roster-forget" out))
           (should-not torn))))))
 
 (ert-deftest cc-butler-cleanup/close-topic-tool-deletes-clean-worker ()
