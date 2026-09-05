@@ -256,6 +256,24 @@ Callers must degrade (drop the line, show nothing), never probe harder."
            ((string-match "\\`[0-9a-f]\\{40,\\}\\'" head)
             (format "%s (detached)" (substring head 0 7)))))))))
 
+(defun cc-butler--git-head-sha (dir)
+  "DIR's git HEAD as a full SHA, or nil — same no-subprocess file reads as
+`cc-butler--git-head' (see its docstring for why this never shells out),
+without the short/formatted presentation `cc-butler--git-head' builds for
+display. Exists so a caller that needs an exact hash for equality
+comparison — `cc-butler-tool-runtime-source', comparing the checkout's
+CURRENT head against what is actually loaded — is not forced to re-parse
+a truncated, human-formatted string back into a hash."
+  (ignore-errors
+    (let ((gitdir (cc-butler--git-dir dir)))
+      (when gitdir
+        (let ((head (cc-butler--file-head-line (expand-file-name "HEAD" gitdir))))
+          (cond
+           ((null head) nil)
+           ((string-match "\\`ref:[ \t]*\\(refs/[^ \t]+\\)\\'" head)
+            (cc-butler--git-ref-hash gitdir (match-string 1 head)))
+           ((string-match "\\`[0-9a-f]\\{40,\\}\\'" head) head)))))))
+
 (defun cc-butler--source-revision (dir)
   "One-line description of the commit DIR is on, or nil if not determinable.
 The only trustworthy version signal for a source directory: the `Version:'
@@ -498,25 +516,52 @@ HEAD in its own return string, at the moment someone explicitly calls it.
 A daemon restart (crash, OOM kill, systemd) re-runs init.el's `require' and
 silently reloads cc-butler from whatever this machine's mutable dev
 checkout happens to be sitting on at that instant — with no error, even
-when that is not the code anyone intended running.  This tool can be asked
-at any time afterward, cheaply, from the snapshot
+when that is not the code anyone intended running.  The LOADED commit
+(what this tool has always reported) is the cheap snapshot
 `cc-butler--capture-runtime-source' took at load/reload time — it does not
 shell out on every call.
 
-The merged/unmerged check compares against the LOCALLY known `origin/main'
-only (no network fetch — see `cc-butler--commit-merged-p'), so a stale
-remote-tracking ref can only hide real drift, never invent fake drift."
-  (let ((dir cc-butler--runtime-source-dir)
-        (sha cc-butler--runtime-commit-sha)
-        (line cc-butler--runtime-commit-line))
-    (if (not sha)
+Also reads the CHECKOUT's current HEAD fresh, every call (via
+`cc-butler--git-head-sha', file reads only, never a subprocess) and warns,
+in the body of the result — not a footnote — when it differs from the
+loaded commit. This closes a real incident (steward, 2026-09-05): with
+cc-butler installed via `use-package :vc', the checkout on disk advances
+independently of the loaded image, which only changes on an explicit
+reload. Someone who reads the checkout's disk files to reason about
+\"current\" behavior — this tool's own earlier author included — silently
+answers a different question than \"what is actually running\" whenever
+the two have diverged; that is precisely how a `main'-only fix (already
+on disk) was mistaken for already being live, when the loaded image was
+still 3 commits behind and running the exact code the fix removed.
+Uncommitted changes in the checkout are also flagged, since that means
+even the disk does not match its own last commit.
+
+The merged/unmerged check is against the LOADED commit and the LOCALLY
+known `origin/main' only (no network fetch — see `cc-butler--commit-merged-p'),
+so a stale remote-tracking ref can only hide real drift, never invent
+fake drift."
+  (let* ((dir cc-butler--runtime-source-dir)
+         (loaded-sha cc-butler--runtime-commit-sha)
+         (loaded-line cc-butler--runtime-commit-line)
+         (checkout-sha (and dir (cc-butler--git-head-sha dir)))
+         (checkout-line (and dir (cc-butler--source-revision dir)))
+         (dirty (and dir (cc-butler--git dir "status" "--porcelain"))))
+    (if (not loaded-sha)
         (format "Cannot determine the running commit: %s is not a readable git checkout, or `git' failed there."
                 (or dir "<unknown directory>"))
       (concat
-       (format "Running cc-butler from: %s\nCommit: %s\n" dir (or line sha))
-       (pcase (cc-butler--commit-merged-p dir sha)
-         ('merged "Status: merged — this commit is reachable from origin/main.")
-         ('unmerged "⚠ UNMERGED — this commit is not reachable from origin/main. This is code that only ever lived on a branch (or was hot-loaded from one) and was never merged.")
+       (format "Running cc-butler from: %s\n" dir)
+       (format "Loaded commit (what is actually executing): %s\n" (or loaded-line loaded-sha))
+       (if checkout-sha
+           (format "Checkout HEAD (what is on disk right now): %s\n" (or checkout-line checkout-sha))
+         "Checkout HEAD: could not determine (not a readable git checkout, or unreadable ref files).\n")
+       (when (and checkout-sha (not (equal loaded-sha checkout-sha)))
+         "\n⚠️ LOADED COMMIT ≠ CHECKOUT HEAD — the checkout has moved since the last load/reload. Reading this checkout's files to reason about what cc-butler currently does answers a DIFFERENT question than what is actually running. Call reload_butler_code to bring the loaded image up to the checkout, or disregard if this divergence is expected (e.g. a deliberate pending update).\n")
+       (when dirty
+         (format "\n⚠️ Checkout has uncommitted changes — even the disk does not match its own last commit:\n%s\n" dirty))
+       (pcase (cc-butler--commit-merged-p dir loaded-sha)
+         ('merged "Status: merged — the loaded commit is reachable from origin/main.")
+         ('unmerged "⚠ UNMERGED — the loaded commit is not reachable from origin/main. This is code that only ever lived on a branch (or was hot-loaded from one) and was never merged.")
          (_ "Status: unknown — could not check ancestry against origin/main (no locally known origin/main ref, or a git error). This does NOT mean the commit is merged; it means the check could not run. Compared against whatever origin/main was last fetched locally — deliberately does not fetch, so this can be stale; that is a known, accepted limitation, not a bug."))))))
 
 ;; Idempotent registration.
@@ -530,7 +575,7 @@ remote-tracking ref can only hide real drift, never invent fake drift."
   (claude-code-ide-make-tool
    :function #'cc-butler-tool-runtime-source
    :name "runtime_source"
-   :description "Report the exact git commit the LIVE daemon is running cc-butler from right now, and whether that commit is merged into origin/main (checked against locally-known state — no network fetch, so it is fast and never blocks). Answers a question nothing else answers except transiently: `reload_butler_code' only reports this in its own return value at the moment it is explicitly called, and a daemon restart (crash, OOM, systemd) silently reloads cc-butler from whatever a mutable dev checkout happens to be sitting on, with no error surfaced anywhere. Call this any time you need to verify what code is actually live — especially after suspecting a restart happened, or before trusting behavior that depends on recently-merged or recently-hot-loaded code."
+   :description "Report the exact git commit the LIVE daemon is running cc-butler from right now (the LOADED commit), separately from the checkout's current HEAD on disk, and warn loudly if they differ — reading a checkout's files never tells you what is actually running unless the two match, since :vc-installed cc-butler's checkout advances independently of the loaded image until an explicit reload. Also flags uncommitted changes in the checkout, and whether the loaded commit is merged into origin/main (checked against locally-known state — no network fetch, so it is fast and never blocks). Answers a question nothing else answers except transiently: `reload_butler_code' only reports this in its own return value at the moment it is explicitly called, and a daemon restart (crash, OOM, systemd) silently reloads cc-butler from whatever a mutable dev checkout happens to be sitting on, with no error surfaced anywhere. Call this any time you need to verify what code is actually live — especially after suspecting a restart happened, before trusting behavior inferred from reading the checkout's source files, or before trusting behavior that depends on recently-merged or recently-hot-loaded code."
    :args nil))
 
 ;;;; ------------------------------------------------------------------
