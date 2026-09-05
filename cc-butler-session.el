@@ -554,6 +554,63 @@ precondition for the operation being logged."
              "\n")
      nil (cc-butler--msg-log-file) 'append 'silent)))
 
+(defun cc-butler--escalation-drain-log-file ()
+  "Return today's on-disk escalation-drain log file under `cc-butler-ops-log-dir'."
+  (expand-file-name (format-time-string "escalation-drain-%Y-%m-%d.log")
+                    cc-butler-ops-log-dir))
+
+(defun cc-butler--plist-to-json-alist (plist)
+  "Convert PLIST (keyword keys) to an alist with bare symbol keys, so
+`json-encode' emits a clean field name instead of a literal leading
+colon for each key."
+  (let (alist)
+    (while plist
+      (push (cons (intern (substring (symbol-name (car plist)) 1)) (cadr plist))
+            alist)
+      (setq plist (cddr plist)))
+    (nreverse alist)))
+
+(defun cc-butler--log-escalation-drain (queue entries)
+  "Append one JSON line recording a drain of QUEUE (a short tag string,
+e.g. \"worker-inbox\" or \"butler-inbox\") to today's escalation-drain
+log under `cc-butler-ops-log-dir'.  ENTRIES is the list of plists just
+removed from the queue, logged in full -- this is the durability fix for
+the case where `cc-butler-decision-workflow' is nil and
+`cc-butler-message-transport' is `in-memory': that combination has no
+other on-disk trace of an escalation between enqueue and delivery, so if
+Emacs dies in that window the content is gone with nothing to recover.
+
+Escalation bodies routinely carry tokens, paths, and real names, so the
+log file is created 0600 -- via `with-file-modes', which sets the
+creation mode before the file exists rather than chmod'ing after
+(chmod-after leaves a real, if short, window at the process umask).
+This file is append-only and never rotated or trimmed here (out of
+scope for this fix): it grows without bound and the secrets in it
+accumulate for as long as it lives; whoever owns retention for
+`cc-butler-ops-log-dir' needs to account for that.
+
+Non-fatal like `cc-butler--log-mirror'/`cc-butler--log-message': an
+audit layer, never a precondition.  Callers MUST call this BEFORE
+clearing their queue and BEFORE returning the drained text -- logging
+first is what makes this a durability fix rather than cosmetic, since
+logging after the clear would recreate the exact \"queue empty, nothing
+on disk\" crash window this exists to close.  That ordering does not
+reopen the primary-delivery risk: the whole body below is wrapped in
+`ignore-errors', so a write failure here can never propagate up and
+block the queue clear or the text return that must follow it either
+way."
+  (ignore-errors
+    (make-directory cc-butler-ops-log-dir t)
+    (with-file-modes #o600
+      (write-region
+       (concat (json-encode
+                (list (cons 'time (format-time-string "%FT%T"))
+                      (cons 'queue queue)
+                      (cons 'count (length entries))
+                      (cons 'entries (mapcar #'cc-butler--plist-to-json-alist entries))))
+               "\n")
+       nil (cc-butler--escalation-drain-log-file) 'append 'silent))))
+
 (defun cc-butler--log (fmt &rest args)
   "Append a timestamped FMT/ARGS line to `cc-butler-log-buffer-name',
 mirrored on disk via `cc-butler--log-mirror' (one line, two sinks —
