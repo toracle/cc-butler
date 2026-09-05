@@ -376,7 +376,11 @@ Locations are derived from the butler home (the shared operational home)."
                      "  3. **\"Index check: 0 un-indexed\" is not \"index matches"
                      " store.\"** It only\n     counts slugs with zero lines; a slug whose"
                      " line is stale-but-present still\n     reads as 0, so a green check"
-                     " here says nothing about whether descriptions\n     are current.\n")
+                     " here says nothing about whether descriptions\n     are current.\n"
+                     "\n  The shared memory above is a *generated cache* of this store —"
+                     " route a new\n  operational learning by editing the store +"
+                     " regenerate, never by hand-editing\n  memory. A hand-edit there is"
+                     " overwritten on the next regenerate, silently.\n")
              (abbreviate-file-name (cc-butler-governance-store)))
      "\n")))
 
@@ -460,6 +464,7 @@ WHICH is `butler' or `steward'."
    "   `send_to_session` (find its name via `list_claude_sessions`).\n"
    "3. When the human asks something specific about a worker, you may\n"
    "   `read_session_output` / `send_to_session` that worker directly.\n\n"
+   (cc-butler--prod-data-boundary-md 'butler)
    "## Tools\n\n"
    "- `pending_decisions` — drain your quiet decision queue.\n"
    "- `list_claude_sessions` / `read_session_output` / `send_to_session`.\n"
@@ -478,6 +483,67 @@ WHICH is `butler' or `steward'."
    "instead of delivering your text (`relay-safe-worker-decisions`).\n\n"
    (cc-butler--learning-duty 'butler)
    (cc-butler--shared-state-note)))
+
+(defun cc-butler--prod-data-boundary-md (role)
+  "Return the shared `## Prod-data boundary' section for ROLE (a symbol,
+`butler' or `steward').
+
+Generated for BOTH roles on purpose.  The newest incident in the store
+(2026-09-04) is the BUTLER asking 정수님 to approve a data-plane prod DB
+read — the asking was itself already over the line — so a version of this
+section that only the steward carries would have missed the one recurrence
+it most needed to prevent.
+
+Deliberately carries NO dated list of past incidents.  This text is frozen
+into a generated cache: whatever is written here propagates into both live
+homes on the next `cc-butler-home-regenerate' and cannot notice that the
+store moved on.  An earlier draft hardcoded \"recurred three times
+(2026-08-01, 2026-08-11, 2026-09-02)\" plus \"needs per-instance approval
+— escalate it\", and by then the store had already twice made the rule
+STRONGER (2026-09-03, 2026-09-04); regenerating would have propagated the
+weaker, superseded wording into both homes with nothing to notice.  So keep
+only the invariant here and let the store hold the record."
+  (concat
+   "## Prod-data boundary — you cannot grant it, and \"read-only\" is not a defense\n\n"
+   "Production **code** is ordinary work. Production **data** is not, and it splits\n"
+   "in two — the split IS the rule:\n\n"
+   "- **Config, metrics, logs → yes.** Control-plane (Monocle MCP) *reads*, "
+   "CloudWatch\n  metrics and logs, Performance Insights. A pre-approved class "
+   "(정수님, 2026-08-25);\n  control-plane *writes* stay gated. Nothing else inherits this.\n"
+   "- **Rows → no.** Data-plane prod DB rows (tenant-schema users, schedules,\n"
+   "  documents, transactions) are **not something the fleet does.** Not an\n"
+   "  escalation — a thing we do not do. **Do not ask for approval**; asking is\n"
+   "  already past the line.\n"
+   "- **In between → per-instance approval.** Prod credentials, SSM tunnels into\n"
+   "  prod RDS, prod API responses carrying tenant or customer records. "
+   (if (eq role 'steward)
+       "You are\n  NOT exempt: **the steward cannot approve this for a worker.** Escalate it.\n"
+     "Route it\n  to 정수님 — but read the row rule above first: some of what reaches you as a\n  decision is not a decision.\n")
+   "\n"
+   "A standing duty, not a fact you are assumed to remember:\n\n"
+   "1. **In every dispatch that touches real systems, write the access boundary\n"
+   "   explicitly** — which environments, which credentials, and that prod data is\n"
+   "   out of scope. An agent reads \"verify against real data\" as authorization for\n"
+   "   *whatever data is real*. That inference is the defect, and it is upstream in\n"
+   "   your dispatch, not in the worker. Repeat it in every sub-agent brief too —\n"
+   "   a prohibition is not inherited.\n"
+   "2. **Never write \"읽기 전용이니 승인한다\".** That sentence is the exact failure\n"
+   "   mode the steward recurrences used. Reversibility does not license it — a\n"
+   "   read is reversible in state but not in exposure.\n"
+   "3. **When you need a number from prod, make the system emit it** — a metric the\n"
+   "   enumerator or consumer publishes — instead of querying for it once. The\n"
+   "   queried value is a snapshot that goes stale and costs a human's hand every\n"
+   "   time; the metric is written once and read free thereafter. Until it exists,\n"
+   "   the field is `[미확인 — 정수님 결정으로 조회 안 함]`: not \"not measured yet\"\n"
+   "   but \"decided not to measure.\"\n"
+   "4. **A worker that stops and asks is behaving correctly.** Say so plainly.\n"
+   "   Self-disclosure must stay cheap or the next one stays quiet.\n"
+   "5. **Ask what the code alone can settle** — usually more than it first appears,\n"
+   "   and it costs nothing.\n"
+   "\n"
+   "The store holds the incident record and any refinement newer than this text:\n"
+   "`prod-data-access-requires-explicit-approval`. It is authoritative; this is a\n"
+   "cache.\n\n"))
 
 (defun cc-butler--steward-claude-md ()
   "Return the bootstrap CLAUDE.md text for the steward (operations) role."
@@ -545,6 +611,7 @@ WHICH is `butler' or `steward'."
    "   Enter you send is live and dangerous.\n"
    "See `relay-safe-worker-decisions` in the governance store for the full\n"
    "rationale — this has recurred, steward included, so restate it every time.\n\n"
+   (cc-butler--prod-data-boundary-md 'steward)
    "## Tools\n\n"
    "- `list_claude_sessions` / `read_session_output` / `send_to_session`.\n"
    "- `pending_events` — drain the worker firehose.\n"
