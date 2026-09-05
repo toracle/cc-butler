@@ -1673,20 +1673,186 @@ deleted from cc-butler-orchestrator.el on 2026-07-24 — see
 `cc-butler--input-state')."
   )
 
+(defun cc-butler--live-screen-tail-lines ()
+  "How many lines up from the bottom of a terminal buffer count as \"live\"
+for detectors that must not fire on scrollback.
+
+Delegates to `cc-butler-compact-menu-lines' (cc-butler-compact.el:
+\"Scrollback is full of numbered lists that Claude wrote; only the bottom
+of the screen is a live dialog\") when that variable is loaded, so the two
+modules share one number instead of two constants that can silently drift
+apart (cc-butler#8 PR follow-up review — an earlier version of this file
+kept a separate `defconst' here on the mistaken belief that
+cc-butler-session.el cannot reference cc-butler-compact.el; it already did,
+elsewhere in this file, via the same `fboundp'-guarded soft dependency
+used below, e.g. `cc-butler-compact--severity-for'). The literal 25
+fallback exists only so this file has no load-order requirement on
+cc-butler-compact.el, not because the two numbers are meant to differ.
+See `cc-butler--live-screen-tail-start'."
+  (if (boundp 'cc-butler-compact-menu-lines)
+      cc-butler-compact-menu-lines
+    25))
+
+(defun cc-butler--live-screen-tail-start (buf)
+  "Return the position in BUF that starts the last
+`cc-butler--live-screen-tail-lines' lines — the live bottom of the screen,
+as opposed to scrollback.
+
+A first cut at this (2026-09-05) anchored on a real box border found
+within a lookback window above the marker instead of on position, and
+x600 reproduced a real false positive against it: a worker's own terminal
+buffer showed the trust-dialog marker purely from quoting cc-butler#8's
+own bug discussion in a relayed chat message, and that quote still passed
+the border check. Position is the fix, not another content heuristic —
+cc-butler-compact--menu-p already solved exactly this class of problem
+(a structurally-real-looking match sitting in scrollback) the same way,
+and this reuses its narrowing rather than inventing a second kind
+(cc-butler#8 PR #151 review)."
+  (with-current-buffer buf
+    (save-excursion
+      (goto-char (point-max))
+      (forward-line (- (cc-butler--live-screen-tail-lines)))
+      (point))))
+
+(defun cc-butler--trust-dialog-marker-present-p (buf)
+  "Non-nil only if BUF's trust marker (`cc-butler--trust-dialog-marker')
+appears within the live screen tail (`cc-butler--live-screen-tail-start')
+— not merely present as a substring anywhere in the buffer, which would
+also match the marker sitting in earlier scrollback (e.g. quoted while
+discussing this very bug)."
+  (with-current-buffer buf
+    (save-excursion
+      (goto-char (cc-butler--live-screen-tail-start buf))
+      (search-forward cc-butler--trust-dialog-marker nil t))))
+
 (defun cc-butler--trust-dialog-showing-p (buf)
   "Return non-nil if BUF's terminal currently shows the folder-trust
-screen (`cc-butler--trust-dialog-marker') with \"Yes, I trust this
-folder\" as the highlighted/default option. Both the marker phrase AND
-the exact option wording are required — a dialog that merely mentions
-trust, or shares the numbered-option shape for an unrelated first-run
-warning (e.g. an MCP permission prompt), must not be mistaken for this
-one and auto-accepted (cc-butler#8)."
+screen (`cc-butler--trust-dialog-marker-present-p') with \"Yes, I trust
+this folder\" as the highlighted/default option. Both the live-tail-scoped
+marker AND the exact option wording are required — a dialog that merely
+mentions trust, or shares the numbered-option shape for an unrelated
+first-run warning (e.g. an MCP permission prompt), must not be mistaken
+for this one and auto-accepted (cc-butler#8)."
+  (and (cc-butler--trust-dialog-marker-present-p buf)
+       (with-current-buffer buf
+         (save-excursion
+           (goto-char (cc-butler--live-screen-tail-start buf))
+           (search-forward "❯ 1. Yes, I trust this folder" nil t)))))
+
+;;;; ---- v2.1.260+ trust-dialog shape (2026-09-05) --------------------
+;;;; Claude Code v2.1.260 changed the trust screen: the numbering is gone,
+;;;; the default flipped from "Yes" to "No, exit", and the exact string
+;;;; `cc-butler--trust-dialog-showing-p' looks for
+;;;; (`❯ 1. Yes, I trust this folder') no longer appears at all — a bare
+;;;; Return now EXITS instead of accepting. The failure this caused was
+;;;; misleading rather than obviously wrong: `cc-butler--wait-for-session-ready'
+;;;; timed out with "did not show a live input row" (cc-butler#8's own
+;;;; error), which reads as a launch/timing bug, not "there's an unanswered
+;;;; dialog sitting right here" — new-directory sessions looked broken
+;;;; rather than merely waiting.
+
+(defun cc-butler--trust-dialog-new-shape-p (buf)
+  "Non-nil if BUF shows the v2.1.260+ trust dialog with its DEFAULT
+selection (\"No, exit\" highlighted) — the shape it renders in before any
+key has been pressed. Requires all three conditions together, all scoped
+to the live screen tail (`cc-butler--live-screen-tail-start'): the trust
+marker (`cc-butler--trust-dialog-marker-present-p'), the literal `❯ No,
+exit' line, and \"Yes, I trust this folder\" as the very next line —
+captured verbatim from a live 2026-09-05 screen (see PR body / x600's
+EVIDENCE doc). A prompt that merely resembles this shape (❯ plus Yes/No
+wording, e.g. an MCP permission confirmation) must not match — that
+prompt has no `Quick safety check:' marker at all. Nor may a conversation
+QUOTING this exact dialog text match — scrollback sits above the live
+tail, not inside it (cc-butler#8 PR #151 review)."
+  (and (cc-butler--trust-dialog-marker-present-p buf)
+       (with-current-buffer buf
+         (save-excursion
+           (goto-char (cc-butler--live-screen-tail-start buf))
+           (and (search-forward "❯ No, exit" nil t)
+                (progn (forward-line 1)
+                       (looking-at-p "[ \t]*Yes, I trust this folder")))))))
+
+(defun cc-butler--trust-dialog-new-shape-yes-selected-p (buf)
+  "Non-nil only once the highlight (❯) has actually LANDED on \"Yes, I
+trust this folder\" in BUF's current (already-refreshed) text — i.e. a
+Down keypress is CONFIRMED to have taken effect, not merely sent. This is
+the gate `cc-butler--accept-trust-dialog-new-shape' checks before sending
+Return: a Return sent on an unconfirmed Down can land on \"No, exit\"
+instead and exit the session outright (2026-09-05 steward correction —
+send confirmation is not landing confirmation)."
   (with-current-buffer buf
     (save-excursion
       (goto-char (point-min))
-      (and (search-forward cc-butler--trust-dialog-marker nil t)
-           (progn (goto-char (point-min))
-                  (search-forward "❯ 1. Yes, I trust this folder" nil t))))))
+      (search-forward "❯ Yes, I trust this folder" nil t))))
+
+(defun cc-butler--terminal-send-down (&optional buffer)
+  "Send a Down-arrow keypress to BUFFER's terminal (default: current
+buffer), through the configured backend's own key encoder — not a
+hardcoded escape sequence — so it lands correctly whether the terminal is
+in normal or application-cursor-key mode. Mirrors the per-backend dispatch
+`claude-code-ide--terminal-send-return' already uses for Return.
+
+Only the `ghostel' branch is exercised live in this fleet (the fleet's
+configured `claude-code-ide-terminal-backend'); the `vterm'/`eat' branches
+follow the same pattern `claude-code-ide--terminal-send-string' uses for
+those backends elsewhere in this file's dependency, but are untested here."
+  (with-current-buffer (or buffer (current-buffer))
+    (cond
+     ((eq claude-code-ide-terminal-backend 'vterm)
+      (vterm-send-key "<down>"))
+     ((eq claude-code-ide-terminal-backend 'eat)
+      (when (bound-and-true-p eat-terminal)
+        (eat-term-send-string eat-terminal "\e[B")))
+     ((eq claude-code-ide-terminal-backend 'ghostel)
+      (ghostel-send-key "down"))
+     (t
+      (error "cc-butler: unknown terminal backend %s" claude-code-ide-terminal-backend)))))
+
+(declare-function ghostel-send-key "ghostel" (key-name &optional mods))
+
+(defun cc-butler--accept-trust-dialog-new-shape (dir)
+  "If DIR's live cc-butler-managed session buffer shows the v2.1.260+
+folder-trust dialog (`cc-butler--trust-dialog-new-shape-p'), accept it:
+send Down, RE-READ the screen to confirm the highlight actually moved onto
+\"Yes, I trust this folder\" (`cc-butler--trust-dialog-new-shape-yes-selected-p'),
+and only then send Return. If the Down did not land, or if the trust
+marker is present in some other unrecognized shape, signal a loud `error'
+with the literal screen text — Return is never sent in either case.
+
+This is NOT an exception to \"never send raw keys via emacsclient\" — it
+is the guard that rule was asking for: the screen state is pinned first
+(three conditions together, `cc-butler--trust-dialog-new-shape-p'), the
+key is sent and its landing re-confirmed in this same function before the
+next key follows, and the whole thing acts only on an ALREADY-LIVE managed
+session buffer for DIR — never on a directory with no session yet (a
+brand-new directory should simply not be opened until this ships; see the
+PR body's priority note). A raw key sent without pinning the screen first,
+or without confirming where it landed, is exactly the failure mode this
+function exists to rule out.
+
+Returns t if the (new-shape) dialog was showing and accepted, nil if it
+wasn't showing at all — including when the OLD shape is showing instead,
+which is `cc-butler--trust-dialog-showing-p' / `cc-butler--wait-for-session-ready'
+territory, not this function's."
+  (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
+    (unless (buffer-live-p buf)
+      (error "cc-butler: no terminal buffer for %s" dir))
+    (cc-butler--refresh-terminal-text buf)
+    (cond
+     ((cc-butler--trust-dialog-new-shape-p buf)
+      (cc-butler--terminal-send-down buf)
+      (cc-butler--refresh-terminal-text buf)
+      (if (cc-butler--trust-dialog-new-shape-yes-selected-p buf)
+          (progn
+            (with-current-buffer buf (claude-code-ide--terminal-send-return))
+            t)
+        (error "cc-butler: sent Down but highlight did not move to \"Yes, I trust this folder\" in %s — Return NOT sent. Screen:\n%s"
+               dir (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max))))))
+     ((cc-butler--trust-dialog-showing-p buf) nil)
+     ((cc-butler--trust-dialog-marker-present-p buf)
+      (error "cc-butler: trust dialog marker present but shape unrecognized (neither old nor new v2.1.260+ shape) in %s. Screen:\n%s"
+             dir (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max)))))
+     (t nil))))
 
 (defun cc-butler--wait-for-session-ready (dir)
   "Block until DIR's session buffer shows a live input row (see
@@ -1700,12 +1866,17 @@ vanishes (cc-butler#8).
 Along the way, if the one-time folder-trust screen is showing (always
 true on a directory Claude Code has never opened before — the exact
 scenario 정수님's original report was about, a fresh environment full of
-new directories), accept it once (a bare Return; \"Yes, trust\" is the
-pre-highlighted default) and keep polling for the real input row
+new directories), accept it once and keep polling for the real input row
 afterward, rather than timing out on a session that is actually alive
-and just waiting for a yes/no answer. Accepted at most once per call —
-never re-sent if the screen is still transitioning — so a slow render
-can't cause a second Return to land on whatever comes next.
+and just waiting for a yes/no answer. Tries the v2.1.260+ shape first
+via `cc-butler--accept-trust-dialog-new-shape' (Down, re-confirm landing,
+then Return — see that function; it also errors loudly if the trust
+marker is present but neither shape matches, instead of silently
+retrying until timeout), then falls back to the pre-v2.1.260 shape (a
+bare Return; \"Yes, trust\" was the pre-highlighted default there).
+Accepted at most once per call — never re-sent if the screen is still
+transitioning — so a slow render can't cause a second Return to land on
+whatever comes next.
 
 Claude Code itself eventually auto-accepts this screen if left alone
 (confirmed: it does NOT hang forever, but takes 15-65s, unbounded and
@@ -1728,11 +1899,14 @@ is worse off than one told plainly that it didn't."
                                                   (forward-line -40)
                                                   (point))))
                       (cc-butler--find-input-line start (point-max)))))
-        (if (and (not trust-accepted) (cc-butler--trust-dialog-showing-p buf))
-            (progn
-              (with-current-buffer buf (claude-code-ide--terminal-send-return))
-              (setq trust-accepted t))
-          (sleep-for 0.1))))))
+        (cond
+         (trust-accepted (sleep-for 0.1))
+         ((cc-butler--accept-trust-dialog-new-shape dir)
+          (setq trust-accepted t))
+         ((cc-butler--trust-dialog-showing-p buf)
+          (with-current-buffer buf (claude-code-ide--terminal-send-return))
+          (setq trust-accepted t))
+         (t (sleep-for 0.1)))))))
 
 (defun cc-butler--launch-session (dir)
   "The ONE path every role launches through — butler, steward, and workers —
