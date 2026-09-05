@@ -503,15 +503,28 @@ require mail back."
   (expand-file-name (format-time-string "ops-%Y-%m-%d.log")
                     cc-butler-ops-log-dir))
 
+(defun cc-butler--log-write-file (file content)
+  "Ensure `cc-butler-ops-log-dir' exists and append CONTENT to FILE in it.
+Both the directory (if newly created) and the file (if newly created) are
+forced private — 700 and 600 respectively — via `with-file-modes' rather
+than relying on the ambient umask, since this directory holds real PII
+(message bodies, tenant email addresses). Does not touch the permissions
+of a directory or file that already exists; a one-time sweep already
+fixed pre-existing state, and this is only about what gets created from
+here on. Shared by `cc-butler--log-mirror' and `cc-butler--log-message'
+so the ensure-directory-then-write scaffolding lives in one place."
+  (with-file-modes #o700
+    (make-directory cc-butler-ops-log-dir t))
+  (with-file-modes #o600
+    (write-region content nil file 'append 'silent)))
+
 (defun cc-butler--log-mirror (line)
   "Append LINE to today's ops log file.  Non-fatal: any failure is
 swallowed (`ignore-errors') — the mirror is an audit layer, never a
 precondition, so a full disk or an unwritable directory must not break
 the operation being logged.  Returns LINE, or nil if the write failed."
   (ignore-errors
-    (make-directory cc-butler-ops-log-dir t)
-    (write-region (concat line "\n") nil (cc-butler--log-file)
-                  'append 'silent)
+    (cc-butler--log-write-file (cc-butler--log-file) (concat line "\n"))
     line))
 
 (defun cc-butler--msg-log-file ()
@@ -544,15 +557,14 @@ fix; flagged, not silently left for the next person to rediscover.)
 Non-fatal like `cc-butler--log-mirror': an audit layer, never a
 precondition for the operation being logged."
   (ignore-errors
-    (make-directory cc-butler-ops-log-dir t)
-    (write-region
+    (cc-butler--log-write-file
+     (cc-butler--msg-log-file)
      (concat (json-encode (list (cons 'time (format-time-string "%FT%T"))
                                  (cons 'kind kind)
                                  (cons 'from (or from ""))
                                  (cons 'to (or to ""))
                                  (cons 'body (or body ""))))
-             "\n")
-     nil (cc-butler--msg-log-file) 'append 'silent)))
+             "\n"))))
 
 (defun cc-butler--log (fmt &rest args)
   "Append a timestamped FMT/ARGS line to `cc-butler-log-buffer-name',

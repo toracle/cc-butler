@@ -1770,6 +1770,18 @@ silently defeated by a default-value change."
   (let ((real-default (eval (car (get 'cc-butler-ops-log-dir 'standard-value)) t)))
     (should-not (equal real-default cc-butler-ops-log-dir))))
 
+(ert-deftest cc-butler-session/newly-created-ops-log-file-and-dir-are-private ()
+  "Given `cc-butler-ops-log-dir' does not exist yet, When `cc-butler--log'
+creates it and appends the first line, Then the freshly-created directory
+is mode 700 and the freshly-created file is mode 600 — this directory
+holds real PII (message bodies, tenant email addresses), and files must
+not be born world-readable via the ambient umask."
+  (cc-butler-session-test--with-ops-log
+    (should-not (file-exists-p cc-butler-ops-log-dir))
+    (cc-butler--log "compact: worker-p │ start")
+    (should (= #o700 (file-modes cc-butler-ops-log-dir)))
+    (should (= #o600 (file-modes (cc-butler--log-file))))))
+
 ;;;; ---- ops log vs message log: a quoted event must not re-count -----
 ;;;;
 ;;;; REGRESSION for the live 2026-08-26 incident: investigating a compact
