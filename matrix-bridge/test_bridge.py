@@ -102,6 +102,29 @@ class DeliverEventTest(unittest.TestCase):
             self.assertTrue(bridge.deliver_event(ev))
             m.assert_not_called()
 
+    def test_thread_reply_extracts_thread_root(self):
+        ev = make_event("e2", "reply body")
+        ev["content"]["m.relates_to"] = {"rel_type": "m.thread", "event_id": "e1"}
+        with mock.patch.object(bridge, "inject_into_session", return_value=True) as m:
+            self.assertTrue(bridge.deliver_event(ev))
+            text = m.call_args[0][0]
+        self.assertIn("thread_root=e1", text)
+
+    def test_no_relates_to_reports_no_thread_root(self):
+        ev = make_event("e1", "top-level body")
+        with mock.patch.object(bridge, "inject_into_session", return_value=True) as m:
+            self.assertTrue(bridge.deliver_event(ev))
+            text = m.call_args[0][0]
+        self.assertIn("thread_root=없음", text)
+
+    def test_edit_relates_to_is_not_mistaken_for_thread_root(self):
+        ev = make_event("e2", "edited body")
+        ev["content"]["m.relates_to"] = {"rel_type": "m.replace", "event_id": "e1"}
+        with mock.patch.object(bridge, "inject_into_session", return_value=True) as m:
+            self.assertTrue(bridge.deliver_event(ev))
+            text = m.call_args[0][0]
+        self.assertIn("thread_root=없음", text)
+
 
 if __name__ == "__main__":
     unittest.main()
