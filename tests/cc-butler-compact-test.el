@@ -80,6 +80,51 @@ not mistaken for one."
   ;; Prose containing digits is not a menu.
   (should-not (cc-butler-compact--menu-p "step 1. do it\nthen finish")))
 
+(defconst cc-butler-compact-test--new-shape-trust-dialog-screen
+  (string-join
+   '("────────────────────────"
+     " Accessing workspace:"
+     ""
+     " /Users/jeongsoopark/projects/monocle-wiki-engine-sdd"
+     ""
+     " Quick safety check: Is this a project you created or one you trust?"
+     ""
+     " Claude Code'll be able to read, edit, and execute files here."
+     ""
+     " Security guide"
+     ""
+     "❯ No, exit"
+     "  Yes, I trust this folder"
+     ""
+     " Enter to confirm · Esc to cancel")
+   "\n")
+  "The v2.1.260+ folder-trust dialog (cc-butler#8): no numbered options at
+all, so `cc-butler-compact--menu-p''s numbered-option regex structurally
+cannot match it — this is the screen the restore gate must still block on.
+Wording trimmed from the real capture in cc-butler-session-test.el; only
+the trust marker and the unnumbered `❯' option rows matter here.")
+
+(ert-deftest cc-butler-compact/menu-p-detects-new-shape-trust-dialog ()
+  "The unnumbered v2.1.260+ trust dialog has no `[0-9]+\\.' option rows, so
+it must be caught by the marker-text fallback, not the numbered-menu
+regex (cc-butler#8 follow-up: this gate missing the new shape is what let
+a restore type into an unanswered trust dialog)."
+  (should (cc-butler-compact--menu-p
+           cc-butler-compact-test--new-shape-trust-dialog-screen)))
+
+(ert-deftest cc-butler-compact/menu-p-marker-outside-tail-is-not-a-menu ()
+  "The trust marker sitting in scrollback — pushed above the live
+`cc-butler-compact-menu-lines' tail by enough filler — must not trip the
+gate; only a marker actually on the live screen counts (same narrowing
+`cc-butler--live-screen-tail-start' already applies on the session.el
+side, reused here rather than duplicated)."
+  (let ((filler (make-list cc-butler-compact-menu-lines "…")))
+    (should-not
+     (cc-butler-compact--menu-p
+      (concat "Quick safety check: quoted from an old bug report, not a live dialog.\n\n"
+              (string-join filler "\n") "\n"
+              "❯ \n")))))
+
 (ert-deftest cc-butler-compact/busy-detected-by-the-interrupt-hint ()
   "A running turn is recognized by the spinner's interrupt hint; the idle
 screen (past-tense spinner line, hint gone) and the modal are not busy.

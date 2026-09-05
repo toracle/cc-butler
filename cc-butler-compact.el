@@ -191,7 +191,10 @@ lists that Claude wrote; only the bottom of the screen is a live dialog."
   :type 'integer :group 'cc-butler)
 
 (defun cc-butler-compact--menu-p (screen)
-  "Non-nil when SCREEN shows an open numbered choice menu awaiting a key.
+  "Non-nil when SCREEN shows an open numbered choice menu awaiting a key,
+OR the folder-trust dialog in either shape (see the trailing OR-clause
+below) — both must hold the restore gate
+(`cc-butler-compact--restore-block-reason').
 
 Anchored on the selection marker sitting on a numbered option (`❯ 1.') plus
 at least one sibling option row — the same structural signature
@@ -203,8 +206,23 @@ has been burned three separate times by color-anchored terminal detection
 Requiring the marker is what keeps prose out.  Claude writes numbered lists
 constantly; none of them carry a selection caret.
 
-Used two ways: as a pre-flight refusal, and — after `/model' — as the
-signal that the prompt-cache confirmation is up and waiting for a choice."
+Claude Code v2.1.260 dropped the numbering from the trust dialog
+specifically (`cc-butler--trust-dialog-new-shape-p', cc-butler-session.el),
+so that shape cannot match the numbered-option signature above at all —
+this gate missing it is what let a restore type into an unanswered trust
+dialog (cc-butler#8 follow-up).  Rather than loosening the numbered regex
+(which would let plain indented prose start tripping this gate), the
+trailing `or' clause below reuses the trust dialog's own unique,
+already-load-bearing anchor instead: `cc-butler--trust-dialog-marker'
+(\"Quick safety check:\"), true of both dialog shapes.  Read via a soft
+(`boundp'-guarded) reference to cc-butler-session.el — the same
+cross-module pattern this file's sibling `cc-butler--live-screen-tail-lines'
+now uses in the other direction — since neither module `require's the
+other and neither is reliably loaded first.
+
+Used three ways: as a pre-flight refusal, as the signal — after `/model'
+— that the prompt-cache confirmation is up and waiting for a choice, and
+as one leg of the restore gate above."
   (let* ((all (split-string (or screen "") "\n"))
          (lines (last all (min (length all) cc-butler-compact-menu-lines)))
          (marked (concat "\\`" cc-butler--input-pad "*❯"
@@ -212,9 +230,12 @@ signal that the prompt-cache confirmation is up and waiting for a choice."
                          cc-butler--input-pad "*[^ \t ]"))
          (option (concat "\\`" cc-butler--input-pad "*[0-9]+\\."
                          cc-butler--input-pad "*[^ \t ]")))
-    (and (cl-some (lambda (l) (string-match-p marked l)) lines)
-         (cl-some (lambda (l) (string-match-p option l)) lines)
-         t)))
+    (or (and (cl-some (lambda (l) (string-match-p marked l)) lines)
+             (cl-some (lambda (l) (string-match-p option l)) lines)
+             t)
+        (and (boundp 'cc-butler--trust-dialog-marker)
+             (cl-some (lambda (l) (string-search cc-butler--trust-dialog-marker l)) lines)
+             t))))
 
 (defun cc-butler-compact--input-box-row (screen)
   "Return the raw input-box row drawn on SCREEN, or nil when no box is drawn.

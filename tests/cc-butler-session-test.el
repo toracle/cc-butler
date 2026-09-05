@@ -311,7 +311,7 @@ merely a border-less version of the same near-top screen."
   (insert "이대로 두면 세션을 죽인다.\n\n")
   ;; Live bottom of the screen, well past the quote — a normal idle input
   ;; row, the way scrollback actually looks once a session keeps working.
-  (dotimes (_ cc-butler--live-screen-tail-lines)
+  (dotimes (_ (cc-butler--live-screen-tail-lines))
     (insert "…\n"))
   (insert (make-string 24 cc-butler--border-rule-char) "\n")
   (insert "❯ \n")
@@ -373,6 +373,15 @@ than the trust-dialog false-negative that started this, cc-butler#8)."
           (should-not (cc-butler--trust-dialog-marker-present-p buf)))
       (kill-buffer buf))))
 
+(ert-deftest cc-butler-session/live-screen-tail-lines-delegates-to-compact-menu-lines ()
+  "`cc-butler--live-screen-tail-lines' shares one number with
+`cc-butler-compact-menu-lines' rather than tracking a second constant
+that can silently drift from it (cc-butler#8 follow-up review) — proven
+here by customizing the compact value away from its default and checking
+this side follows, not just by asserting they happen to start equal."
+  (let ((cc-butler-compact-menu-lines 37))
+    (should (= 37 (cc-butler--live-screen-tail-lines)))))
+
 (ert-deftest cc-butler-session/trust-dialog-marker-present-p-nil-on-quoted-conversation ()
   "A screen where the trust dialog is being QUOTED in chat (the marker AND
 the `❯ No, exit' / \"Yes, I trust this folder\" lines all present, verbatim,
@@ -416,7 +425,7 @@ just to `cc-butler--trust-dialog-marker-present-p' in isolation."
         (progn
           (with-current-buffer buf
             (insert " Quick safety check: quoted from an old bug report, not a live dialog.\n\n")
-            (dotimes (_ cc-butler--live-screen-tail-lines) (insert "…\n"))
+            (dotimes (_ (cc-butler--live-screen-tail-lines)) (insert "…\n"))
             (insert "❯ 1. Yes, I trust this folder\n"))
           (should-not (cc-butler--trust-dialog-marker-present-p buf))
           (should-not (cc-butler--trust-dialog-showing-p buf)))
@@ -528,6 +537,71 @@ this is the exact case a genuinely new directory hits."
                     (cc-butler-launch-ready-timeout 2))
             (should (progn (cc-butler--wait-for-session-ready "/worker/") t))
             (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/wait-for-ready-accepts-new-shape-trust-dialog-then-proceeds ()
+  "`cc-butler--wait-for-session-ready' also recognizes and accepts the
+v2.1.260+ trust dialog shape via `cc-butler--accept-trust-dialog-new-shape'
+\(Down, re-confirm landing, then Return\), then keeps polling for the real
+input row — closing the wiring gap found in the cc-butler#8 follow-up
+review: `cc-butler--accept-trust-dialog-new-shape' had zero callers
+outside its own tests before this."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-trust-wait-new-shape*"))
+        (down-count 0)
+        (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (cc-butler-session-test--insert-trust-dialog-new-shape))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down)
+                     (lambda (&optional _buf)
+                       (cl-incf down-count)
+                       (with-current-buffer term-buf
+                         (erase-buffer)
+                         (cc-butler-session-test--insert-trust-dialog-new-shape t))))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda ()
+                       (cl-incf return-count)
+                       (with-current-buffer term-buf
+                         (erase-buffer)
+                         (insert (make-string 24 cc-butler--border-rule-char))
+                         (insert "\n❯ \n")
+                         (insert (make-string 24 cc-butler--border-rule-char)))))
+                    (cc-butler-launch-ready-timeout 2))
+            (should (progn (cc-butler--wait-for-session-ready "/worker/") t))
+            (should (= 1 down-count))
+            (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/wait-for-ready-errors-loudly-on-unrecognized-trust-shape ()
+  "If the trust marker is present but matches neither the old nor the
+v2.1.260+ shape, `cc-butler--wait-for-session-ready' must error via
+`cc-butler--accept-trust-dialog-new-shape''s third `cond' branch — its
+specific \"shape unrecognized\" message, on the FIRST poll — not silently
+retry until the generic cc-butler#8 timeout error, which is also just an
+`error' and would otherwise satisfy a bare `should-error' for the wrong
+reason (the exact gap the mutation-testing pass on this PR caught: this
+assertion is on message text, not merely error type, because without the
+wiring this scenario still errors — just 2 (`cc-butler-launch-ready-timeout')
+seconds later, with the generic message)."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-trust-wait-unrecognized*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (insert " Quick safety check: something new Claude Code shipped.\n\n")
+            (insert "❯ Some option nobody has seen before\n"))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    (cc-butler-launch-ready-timeout 2))
+            (let ((msg (condition-case err
+                           (progn (cc-butler--wait-for-session-ready "/worker/") nil)
+                         (error (error-message-string err)))))
+              (should msg)
+              (should (string-match-p "shape unrecognized" msg)))))
       (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
 
 (ert-deftest cc-butler-session/launch-session-waits-for-readiness ()
