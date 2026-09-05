@@ -66,11 +66,11 @@ Each function is called with one plist argument (:to :id :answer).")
 
 (defun cc-butler--decision-open-dir ()
   (let ((d (expand-file-name "open/" cc-butler-decision-dir)))
-    (make-directory d t) d))
+    (cc-butler--state-ensure-dir d) d))
 
 (defun cc-butler--decision-done-dir ()
   (let ((d (expand-file-name "done/" cc-butler-decision-dir)))
-    (make-directory d t) d))
+    (cc-butler--state-ensure-dir d) d))
 
 (defconst cc-butler--decision-org-re "\\`[^.].*\\.org\\'"
   "Match decision .org files, excluding dotfiles like lock files (.#foo.org).")
@@ -183,7 +183,7 @@ the filename alone, with no file content read."
                 (if (eq kind 'decision) (format "%s.org" id)
                   (format "%s.%s.org" id kind))
                 (or dir (cc-butler--decision-open-dir)))))
-    (with-temp-file file (insert (cc-butler--decision-doc-string msg)))
+    (cc-butler--state-write-file file (cc-butler--decision-doc-string msg))
     file))
 
 (defun cc-butler-decision-refresh ()
@@ -851,7 +851,7 @@ Returns the count of docs newly surfaced (new or superseded)."
   "Watch 정수님's inbox and render on arrival (Emacs-native, no agent turn)."
   (cc-butler-decision-watch-stop)
   (let ((newdir (expand-file-name "new/" (cc-butler--mail-inbox cc-butler-human-agent))))
-    (make-directory newdir t)
+    (cc-butler--state-ensure-dir newdir)
     (setq cc-butler--decision-watch
           (file-notify-add-watch
            newdir '(change)

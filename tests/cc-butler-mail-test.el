@@ -209,6 +209,47 @@ never read (only complete, renamed messages appear in new/)."
       (should (= 1 (length archived)))
       (should (null remaining)))))
 
+;;;; ---- private permissions on newly-created inbox files -------------
+;;
+;; This maildir tree holds real PII (message bodies, tenant email
+;; addresses) — see `cc-butler--state-ensure-dir'/`cc-butler--state-write-file'
+;; in cc-butler-session.el.  These exercise the REAL call sites end-to-end
+;; (not the shared helper directly), so a future rewiring away from the
+;; helper would be caught here.
+
+(ert-deftest cc-butler-mail/file-adapter-creates-restricted-dirs-and-files ()
+  "Given a fresh `cc-butler-mail-dir', When a message is delivered through the
+real file adapter, Then every freshly-created inbox subdirectory (tmp/, new/,
+archive/) is mode 700 and the delivered .eld file is mode 600."
+  (cc-butler-mail-test--with-file
+    (let* ((id (cc-butler--ch-deliver "worker-a" (list :kind 'note :from "x" :body "hi")))
+           (in (cc-butler--mail-inbox "worker-a")))
+      (dolist (sub '("tmp/" "new/" "archive/"))
+        (should (= #o700 (file-modes (expand-file-name sub in)))))
+      (should (= #o600 (file-modes (expand-file-name (format "new/%s.eld" id) in)))))))
+
+(ert-deftest cc-butler-mail/journal-dir-and-file-are-created-restricted ()
+  "Given a fresh mail-dir, When the channel journal writes its first entry,
+Then <mail-dir>/log/ is mode 700 and today's journal file is mode 600."
+  (cc-butler-mail-test--with-file
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cc-butler-mail-journal-send "steward" "worker-a" "hi"))
+    (should (= #o700 (file-modes (cc-butler--mail-log-dir))))
+    (should (= #o600 (file-modes (expand-file-name (format-time-string "%Y-%m-%d.eld")
+                                                   (cc-butler--mail-log-dir)))))))
+
+(ert-deftest cc-butler-mail/rename-file-preserves-mode-new-to-archive ()
+  "The file this fix creates at 600 is later moved new/ -> archive/ by
+`cc-butler--mail-file-drain' via `rename-file', which preserves whatever
+mode the file had at creation — true only because creation now forces 600
+in the first place.  Guards that invariant against a future change to the
+creation site silently widening it with no test noticing."
+  (cc-butler-mail-test--with-file
+    (let* ((id (cc-butler--ch-deliver "worker-a" (list :kind 'note :from "x" :body "hi")))
+           (in (cc-butler--mail-inbox "worker-a")))
+      (cc-butler--ch-drain "worker-a")     ; the real move: new/ -> archive/
+      (should (= #o600 (file-modes (expand-file-name (format "archive/%s.eld" id) in)))))))
+
 ;;;; ---- unified channel journal (audit log over BOTH channels) -------
 ;;
 ;; Two channels, two consumption patterns: "messenger" (send_to_session —

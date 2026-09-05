@@ -211,6 +211,61 @@ every real decision since) is `decision'."
                     (file-name-nondirectory
                      (cc-butler--decision-render '(:id "abc456" :kind note :summary "hi")))))))
 
+;;;; ---- private permissions on newly-created decision files ----------
+;;
+;; `open/'/`done/' hold real human decision text — the most sensitive
+;; content in this audit (see `cc-butler--state-ensure-dir'/
+;; `cc-butler--state-write-file' in cc-butler-session.el).  These exercise
+;; the REAL writer functions end-to-end, not the shared helper directly.
+
+(ert-deftest cc-butler-decision/open-done-dirs-and-rendered-doc-are-created-restricted ()
+  "Given a fresh `cc-butler-decision-dir', When a decision is rendered, Then
+open/ is mode 700, done/ (created alongside it) is mode 700, and the
+rendered .org file is mode 600."
+  (cc-butler-decision-test--with-arrival
+    (let ((file (cc-butler--decision-render cc-butler-decision-test--msg)))
+      (should (= #o700 (file-modes (cc-butler--decision-open-dir))))
+      (should (= #o700 (file-modes (cc-butler--decision-done-dir))))
+      (should (= #o600 (file-modes file))))))
+
+(ert-deftest cc-butler-decision/watch-dir-is-created-restricted ()
+  "Given a fresh mail-dir, When `cc-butler-decision-watch-start' ensures
+정수님's inbox new/ dir (for `file-notify-add-watch'), Then that directory
+is mode 700 -- regardless of whether a file-notify backend is actually
+available in this environment."
+  (cc-butler-decision-test--with-arrival
+    (unwind-protect
+        (ignore-errors (cc-butler-decision-watch-start))
+      (ignore-errors (cc-butler-decision-watch-stop)))
+    (should (= #o700 (file-modes (expand-file-name
+                                  "new/" (cc-butler--mail-inbox cc-butler-human-agent)))))))
+
+(ert-deftest cc-butler-decision/rename-file-preserves-mode-open-to-done ()
+  "The rendered file this fix creates at 600 in open/ is later moved to
+done/ by `cc-butler-decision-submit' via `rename-file', which preserves
+whatever mode the file had at creation — true only because creation now
+forces 600 in the first place.  Guards that invariant against a future
+change to the creation site silently widening it with no test noticing."
+  (let* ((cc-butler-decision-dir (make-temp-file "cc-butler-dec-mode-test" t))
+         (cc-butler-mail-test--inboxes nil)
+         (cc-butler-mail-test--pokes nil)
+         (cc-butler--channel (cc-butler-mail-test--mock-channel))
+         (cc-butler-human-agent "정수님")
+         (file (cc-butler--decision-render cc-butler-decision-test--msg)))
+    (unwind-protect
+        (progn
+          (let ((doc (with-temp-buffer (insert-file-contents file) (buffer-string))))
+            (with-temp-file file
+              (insert (cc-butler-decision-test--fill doc ?A "sandbox"))))
+          (let ((buf (find-file-noselect file)))
+            (unwind-protect
+                (with-current-buffer buf (cc-butler-decision-submit))
+              (kill-buffer buf)))
+          (let ((done (car (directory-files (cc-butler--decision-done-dir) t "\\.org\\'"))))
+            (should done)
+            (should (= #o600 (file-modes done)))))
+      (delete-directory cc-butler-decision-dir t))))
+
 (ert-deftest cc-butler-decision/create-path-note-lands-in-open-not-done ()
   "KIND `note', all the way from `cc-butler-decision-create' through
 arrival rendering, lands the actual FILE in open/ -- not done/ -- same

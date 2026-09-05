@@ -94,7 +94,7 @@ Bind to a mock channel to contract-test the routing in isolation.")
 (defun cc-butler--mail-ensure (agent)
   (let ((in (cc-butler--mail-inbox agent)))
     (dolist (sub '("tmp/" "new/" "archive/"))
-      (make-directory (expand-file-name sub in) t))
+      (cc-butler--state-ensure-dir (expand-file-name sub in)))
     in))
 
 (defun cc-butler--mail-file-deliver (to msg)
@@ -107,9 +107,8 @@ Bind to a mock channel to contract-test the routing in isolation.")
          (fname (format "%s.eld" id))
          (tmp (expand-file-name (concat "tmp/" fname) in))
          (new (expand-file-name (concat "new/" fname) in)))
-    (with-temp-file tmp
-      (let ((print-length nil) (print-level nil))
-        (prin1 msg (current-buffer)) (insert "\n")))
+    (let ((print-length nil) (print-level nil))
+      (cc-butler--state-write-file tmp (concat (prin1-to-string msg) "\n")))
     (rename-file tmp new t)            ; atomic within the filesystem
     ;; Audit layer: the same id as the inbox file, so the journal line and
     ;; the delivered message are traceable to each other.  `--mail-journal'
@@ -153,12 +152,10 @@ if the write failed."
                                         :time (or (plist-get entry :time)
                                                   (current-time)))
                              :id (or (plist-get entry :id) (cc-butler--mail-id))))
-           (dir (cc-butler--mail-log-dir))
-           (file (expand-file-name (format-time-string "%Y-%m-%d.eld") dir)))
-      (make-directory dir t)
+           (file (expand-file-name (format-time-string "%Y-%m-%d.eld")
+                                   (cc-butler--mail-log-dir))))
       (let ((print-length nil) (print-level nil))
-        (write-region (concat (prin1-to-string entry) "\n") nil file
-                      'append 'silent))
+        (cc-butler--state-write-file file (concat (prin1-to-string entry) "\n") t))
       entry)))
 
 (defun cc-butler-mail-journal-send (from-dir to-name text)

@@ -183,21 +183,19 @@
 (defun cc-butler-docs--ensure-index ()
   "Create the docs index file if it does not exist yet.  Return its path."
   (when-let ((file (cc-butler-docs--index-file)))
-    (make-directory (file-name-directory file) t)
     (unless (file-exists-p file)
-      (write-region
+      (cc-butler--state-write-file
+       file
        (concat "#+TITLE: Butler docs\n\n"
                "Operational document repository for the cc-butler butler.\n\n"
                "- [[file:dashboard.org][Dashboard]] — current snapshot"
                " (sessions, overview, open decisions)\n"
-               "- [[file:log/][Log]] — per-day, append-only timeline\n")
-       nil file nil 'silent))
+               "- [[file:log/][Log]] — per-day, append-only timeline\n")))
     file))
 
 (defun cc-butler-docs--append-log (kind entry)
   "Append a KIND ENTRY to today's log file.  Return the path, or nil."
-  (when-let ((dir (cc-butler-docs--log-dir)))
-    (make-directory dir t)
+  (when (cc-butler-docs--log-dir)
     (let* ((file (cc-butler-docs--log-file))
            (new (not (file-exists-p file)))
            (text (concat
@@ -205,14 +203,13 @@
                     (format "#+TITLE: Butler log — %s\n#+STARTUP: showeverything\n\n"
                             (format-time-string "%Y-%m-%d")))
                   (cc-butler-docs--render-log-entry kind entry))))
-      (write-region text nil file t 'silent)
+      (cc-butler--state-write-file file text t)
       file)))
 
 (defun cc-butler-docs--write-dashboard ()
   "(Re)write the dashboard file from current state.  Return the path, or nil."
   (when-let ((file (cc-butler-docs--dashboard-file)))
-    (make-directory (file-name-directory file) t)
-    (write-region (cc-butler-docs--render-dashboard) nil file nil 'silent)
+    (cc-butler--state-write-file file (cc-butler-docs--render-dashboard))
     file))
 
 ;;;; ------------------------------------------------------------------

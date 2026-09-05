@@ -503,20 +503,28 @@ require mail back."
   (expand-file-name (format-time-string "ops-%Y-%m-%d.log")
                     cc-butler-ops-log-dir))
 
-(defun cc-butler--log-write-file (file content)
-  "Ensure `cc-butler-ops-log-dir' exists and append CONTENT to FILE in it.
-Both the directory (if newly created) and the file (if newly created) are
-forced private — 700 and 600 respectively — via `with-file-modes' rather
-than relying on the ambient umask, since this directory holds real PII
-(message bodies, tenant email addresses). Does not touch the permissions
-of a directory or file that already exists; a one-time sweep already
-fixed pre-existing state, and this is only about what gets created from
-here on. Shared by `cc-butler--log-mirror' and `cc-butler--log-message'
-so the ensure-directory-then-write scaffolding lives in one place."
+(defun cc-butler--state-ensure-dir (dir)
+  "Ensure DIR exists, forcing a freshly-created DIR to mode 700 via
+`with-file-modes' rather than relying on the ambient umask.  Every
+directory under `~/.local/state/cc-butler/' this is used for can hold
+real PII (message bodies, tenant email addresses, decision text), so it
+must never be born group/world-readable.  Does not touch the permissions
+of a directory that already exists — a one-time sweep already fixed
+pre-existing state; this is only about what gets created from here on."
   (with-file-modes #o700
-    (make-directory cc-butler-ops-log-dir t))
+    (make-directory dir t)))
+
+(defun cc-butler--state-write-file (file content &optional append)
+  "Ensure FILE's directory exists (via `cc-butler--state-ensure-dir') and
+write CONTENT to FILE, forcing a freshly-created FILE to mode 600 via
+`with-file-modes' rather than relying on the ambient umask.  APPEND is
+passed through to `write-region' (nil overwrites, t appends).  Does not
+touch the permissions of a file that already exists.  Shared by every
+writer under the private state tree (ops/msg logs, mail, decisions,
+docs) so the ensure-directory-then-write scaffolding lives in one place."
+  (cc-butler--state-ensure-dir (file-name-directory file))
   (with-file-modes #o600
-    (write-region content nil file 'append 'silent)))
+    (write-region content nil file append 'silent)))
 
 (defun cc-butler--log-mirror (line)
   "Append LINE to today's ops log file.  Non-fatal: any failure is
@@ -524,7 +532,7 @@ swallowed (`ignore-errors') — the mirror is an audit layer, never a
 precondition, so a full disk or an unwritable directory must not break
 the operation being logged.  Returns LINE, or nil if the write failed."
   (ignore-errors
-    (cc-butler--log-write-file (cc-butler--log-file) (concat line "\n"))
+    (cc-butler--state-write-file (cc-butler--log-file) (concat line "\n") t)
     line))
 
 (defun cc-butler--msg-log-file ()
@@ -557,14 +565,15 @@ fix; flagged, not silently left for the next person to rediscover.)
 Non-fatal like `cc-butler--log-mirror': an audit layer, never a
 precondition for the operation being logged."
   (ignore-errors
-    (cc-butler--log-write-file
+    (cc-butler--state-write-file
      (cc-butler--msg-log-file)
      (concat (json-encode (list (cons 'time (format-time-string "%FT%T"))
                                  (cons 'kind kind)
                                  (cons 'from (or from ""))
                                  (cons 'to (or to ""))
                                  (cons 'body (or body ""))))
-             "\n"))))
+             "\n")
+     t)))
 
 (defun cc-butler--log (fmt &rest args)
   "Append a timestamped FMT/ARGS line to `cc-butler-log-buffer-name',
