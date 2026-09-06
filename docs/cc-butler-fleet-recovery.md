@@ -35,19 +35,27 @@ so the next person hit by either doesn't have to rediscover them mid-incident.
   `list_claude_sessions` reports such a session as `running` — it can't
   currently tell "processing" apart from "parked at its own prompt". On
   2026-07-21 this produced a false "16/16 recovered, zero failures" report
-  while 7 of the 16 sessions sat idle at exactly this gate. **Not yet
-  fixed** — tracked as
-  [issue #4](https://github.com/toracle/cc-butler/issues/4), filed but
-  deliberately not implemented (it touches the same status-detection
-  machinery the fleet depends on to know what it's doing; landing a change
-  there mid-incident is how you turn one bug into two).
+  while 7 of the 16 sessions sat idle at exactly this gate. **Detection
+  fixed in code** (2026-09-03; see `cc-butler--resume-gate-showing-p` and
+  `cc-butler--session-state` in `cc-butler-session.el`) — both
+  `list_claude_sessions` and the dashboard now report a gated session as
+  `STUCK-AT-RESUME-GATE`/`GATE` instead of `running`. Not yet merged/live
+  as of this writing; same caveat as the roster fix above applies. **Still
+  not automated**: cc-butler does not send an answer to this gate for you
+  — see step 3 below, and note the fix deliberately does NOT auto-answer
+  it either (a wrong auto-send here is worse than a session sitting idle;
+  [issue #4](https://github.com/toracle/cc-butler/issues/4) leaves that
+  decision open).
 - **The dashboard.org fallback below can itself be destroyed by using it.**
   During the 2026-07-21 recovery, calling `butler_dashboard` while only 2 of
   16 sessions were live overwrote the dashboard's session table down to
   those 2 rows — the tool's own response was `Dashboard updated (2 live
-  sessions)`. See the caveat in step 1 below and
-  [issue #5](https://github.com/toracle/cc-butler/issues/5) — filed, not
-  implemented.
+  sessions)`. **Fixed in code** (2026-09-03; see
+  `cc-butler-docs--stale-session-rows` in `cc-butler-docs.el`, which appends
+  an `OFFLINE` row per roster-recorded session that isn't currently live,
+  instead of the table only ever showing the live set) — not yet
+  merged/live as of this writing. See the caveat in step 1 below and
+  [issue #5](https://github.com/toracle/cc-butler/issues/5).
 
 ## The manual procedure
 
@@ -68,7 +76,8 @@ so the next person hit by either doesn't have to rediscover them mid-incident.
    used to. Treat it as "the last known-good snapshot, by luck of timing,"
    not as a guaranteed record — and do not call `butler_dashboard` yourself
    while consulting it for this purpose: refreshing it is what destroys it
-   ([issue #5](https://github.com/toracle/cc-butler/issues/5)).
+   ([issue #5](https://github.com/toracle/cc-butler/issues/5), fixed in
+   code 2026-09-03, not yet merged/live — see above).
 
 2. **Relaunch each session** in its directory, resuming its last
    conversation: `claude --continue` (or whatever `cc-butler-resume-args`
@@ -78,10 +87,16 @@ so the next person hit by either doesn't have to rediscover them mid-incident.
 
 3. **Check each relaunched session, don't trust the summary count.** After
    relaunching, actually look — or grep the screen capture — for the
-   startup-chooser text above. A session sitting at that prompt needs `1`
-   (or whatever option resumes from summary) sent to it before it's really
-   back. Do not conclude "N/N recovered" from `list_claude_sessions` alone
-   until this is fixed (issue #4).
+   startup-chooser text above. A session sitting at that prompt needs the
+   option whose text reads **"Resume full session as-is"** sent to it
+   before it's really back — send the option by matching its TEXT, never a
+   fixed keystroke like "send 1" or "send 2": confirmed live 2026-09-03
+   across a 5-session sample that the pre-highlighted default varies per
+   session (4 defaulted to "Resume from summary", only 1 to "Resume full
+   session as-is"), so a numbered/blind Return can land on the wrong
+   option. Do not conclude "N/N recovered" from `list_claude_sessions`
+   alone — even once the `STUCK-AT-RESUME-GATE` detection fix (issue #4)
+   is live, cc-butler does not send an answer for you.
 
 ## The throughline
 
@@ -99,9 +114,21 @@ clean: ask what it actually verified, not just whether it errored.
 Roster-clobber defect fixed in code (2026-07-21); not yet reloaded into any
 already-running fleet Emacs (a live reload was assessed as low-risk but
 deliberately held for a human decision, since it touches the fleet's own
-recovery data). Liveness/resume-gate defect filed as issue #4, and the
-dashboard.org self-destruction defect filed as issue #5 — both not scoped or
-implemented; all three cc-butler behavior changes are deliberately being
-held for a day when the fleet isn't live and mid-incident. This document
-should be revisited (or deleted) once all land and a restart has actually
-exercised the fixed path end-to-end.
+recovery data).
+
+A related but distinct defect in the SAME failure class — `cc-butler-
+restore-sessions`' relaunch loop aborting the whole batch the first time
+any one session errored (e.g. exactly the resume-gate timeout below),
+silently leaving every session after it in iteration order never even
+attempted — caused today's (2026-09-03) crash-recovery to lose 20 of 25
+sessions. Fixed and merged (PR #130, `a3e72ef`); regression test in PR
+#131 (open, not merged).
+
+Liveness/resume-gate detection (issue #4) and the dashboard self-
+destruction defect (issue #5) both now have code fixes as of 2026-09-03
+(see the bullets above) — PR-only, steward-authorized while the fleet
+recovers from today's crash: **not merged, not reloaded into any live
+Emacs.** Issue #4's harder question (should cc-butler auto-answer the
+gate?) remains open and unimplemented on purpose. This document should be
+revisited (or deleted) once all land, are actually merged AND reloaded,
+and a restart has exercised the fixed path end-to-end.
