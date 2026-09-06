@@ -43,6 +43,21 @@ shrink the persisted file down to that subset."
           (should (= 3 (length (cc-butler--load-roster)))))
       (delete-directory tmpdir t))))
 
+(ert-deftest cc-butler-persist/roster-write-is-created-0600 ()
+  "The roster is a list of workspace paths; a plain `write-region'/
+`with-temp-file' creation would take the process umask (typically
+644), silently widening it back open every save.  `cc-butler--roster-write'
+must set the mode explicitly at creation time, not rely on a one-off
+chmod done elsewhere."
+  (let* ((tmpdir (file-name-as-directory (make-temp-file "cc-butler-persist-test" t)))
+         (cc-butler-roster-file (expand-file-name "roster.eld" tmpdir)))
+    (unwind-protect
+        (progn
+          (cc-butler--roster-write nil)
+          (should (file-exists-p cc-butler-roster-file))
+          (should (= #o600 (file-modes cc-butler-roster-file))))
+      (delete-directory tmpdir t))))
+
 (ert-deftest cc-butler-persist/roster-drops-record-once-directory-gone ()
   "A record is pruned once its directory is actually removed — how
 `cc-butler-close-topic' retires a topic — so closed topics don't linger

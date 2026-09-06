@@ -43,12 +43,16 @@ session's working directory (restore last state, non-interactive)."
   (file-name-as-directory (expand-file-name dir)))
 
 (defun cc-butler--roster-write (records)
-  "Write RECORDS to `cc-butler-roster-file' as the whole persisted roster."
+  "Write RECORDS to `cc-butler-roster-file' as the whole persisted roster.
+Created 0600 -- the roster is a list of workspace paths, same reasoning
+as `cc-butler--log-escalation-drain' (cc-butler-session.el) for why
+`with-file-modes' rather than a later chmod."
   (ignore-errors
-    (with-temp-file cc-butler-roster-file
-      (let ((print-length nil) (print-level nil))
-        (prin1 (list :saved (current-time) :sessions records) (current-buffer))
-        (insert "\n")))))
+    (with-file-modes #o600
+      (with-temp-file cc-butler-roster-file
+        (let ((print-length nil) (print-level nil))
+          (prin1 (list :saved (current-time) :sessions records) (current-buffer))
+          (insert "\n"))))))
 
 (defun cc-butler--roster-records ()
   "Return a serializable snapshot of the roster: every live session, plus any

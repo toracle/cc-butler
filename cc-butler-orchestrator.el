@@ -1426,20 +1426,21 @@ NEEDS is not split the same way: in practice it stays a short one-line ask,
 and this file's own `from:'/`needs:' sub-lines already assume single-line
 values -- flagged here, not fixed, since nothing observed exercises it."
   (when-let ((file (cc-butler--decisions-file)))
-    (make-directory (file-name-directory file) t)
+    (with-file-modes #o700 (make-directory (file-name-directory file) t))
     (let* ((new (not (file-exists-p file)))
            (summary-lines (split-string (string-trim (or summary "")) "\n"))
            (summary-head (or (car summary-lines) ""))
            (summary-rest (cdr summary-lines)))
-      (write-region
-       (concat (when new "#+TITLE: Open decisions\n#+STARTUP: showeverything\n\n")
-               (format "* %s %s\n" (format-time-string "[%Y-%m-%d %a %H:%M]") summary-head)
-               (when summary-rest
-                 (concat (mapconcat (lambda (l) (concat "  " l)) summary-rest "\n") "\n"))
-               (when from (format "  from: %s\n" (cc-butler--who-dir from)))
-               (when (and needs (stringp needs) (not (string-empty-p (string-trim needs))))
-                 (format "  needs: %s\n" (string-trim needs))))
-       nil file t 'silent))))
+      (with-file-modes #o600
+        (write-region
+         (concat (when new "#+TITLE: Open decisions\n#+STARTUP: showeverything\n\n")
+                 (format "* %s %s\n" (format-time-string "[%Y-%m-%d %a %H:%M]") summary-head)
+                 (when summary-rest
+                   (concat (mapconcat (lambda (l) (concat "  " l)) summary-rest "\n") "\n"))
+                 (when from (format "  from: %s\n" (cc-butler--who-dir from)))
+                 (when (and needs (stringp needs) (not (string-empty-p (string-trim needs))))
+                   (format "  needs: %s\n" (string-trim needs))))
+         nil file t 'silent)))))
 
 (defun cc-butler--escalate-kind (kind)
   "Normalize an `escalate_to_butler' KIND string to `decision' or `note'.
