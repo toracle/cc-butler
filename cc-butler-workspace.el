@@ -315,14 +315,27 @@ The nearest ancestor holding `cc-butler-project-marker', else SESSION-DIR."
     (or (locate-dominating-file session-dir cc-butler-project-marker)
         session-dir))))
 
+(defun cc-butler--git-checkout-p (dir)
+  "Non-nil when DIR is a git working tree.
+
+`.git' is a DIRECTORY in an ordinary clone but a FILE in a worktree or a
+submodule gitlink, so the probe must be `file-exists-p' — `file-directory-p'
+silently answers no for every worktree.  Single-sourced here because this
+file already disagreed with itself: `cc-butler--close-topic-deletable-p'
+probed with `file-exists-p' (correct — it refuses to scaffold over any
+working tree) while the close-topic audit probed with `file-directory-p',
+so the same directory could count as a repo to one and not to the other.
+One predicate, one answer."
+  (file-exists-p (expand-file-name ".git" dir)))
+
 (defun cc-butler--close-topic-repos (topic-dir)
   "Return the git clones to vet before removing TOPIC-DIR.
 TOPIC-DIR itself when it is a repo, else its immediate child repos."
-  (if (file-directory-p (expand-file-name ".git" topic-dir))
+  (if (cc-butler--git-checkout-p topic-dir)
       (list (file-name-as-directory topic-dir))
     (seq-filter
      (lambda (p) (and (file-directory-p p)
-                      (file-directory-p (expand-file-name ".git" p))))
+                      (cc-butler--git-checkout-p p)))
      (ignore-errors (directory-files topic-dir t "\\`[^.]")))))
 
 (defun cc-butler--git-run (dir args)
@@ -381,7 +394,7 @@ this closes that gap without touching the per-repo check itself.
 
 Empty when TOPIC-DIR is itself a repo — there is no \"top level besides
 the repo\" in that shape; the repo IS the whole audited unit."
-  (unless (file-directory-p (expand-file-name ".git" topic-dir))
+  (unless (cc-butler--git-checkout-p topic-dir)
     (let ((repos (cc-butler--close-topic-repos topic-dir)))
       (seq-remove
        (lambda (p)
@@ -485,7 +498,7 @@ The git-clean commit-safety gate remains a separate, independent guarantee."
          ;; Blocklist: an existing project's root is a git working tree.
          ;; `.git' may be a directory (normal repo) or a file (worktree /
          ;; submodule gitlink); refuse either.  A scaffold root never has one.
-         (not (file-exists-p (expand-file-name ".git" dslash)))
+         (not (cc-butler--git-checkout-p dslash))
          ;; Allowlist: only a cc-butler-scaffolded topic carries this marker.
          (file-exists-p (expand-file-name cc-butler-project-marker dslash)))))
 
