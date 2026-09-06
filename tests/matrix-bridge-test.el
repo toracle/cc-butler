@@ -131,5 +131,102 @@ JSON false parses to :json-false, which is non-nil -- the naive test dropped it.
     (should (string-match-p "thread:\\$root" env))
     (should-not (string-match-p "reply:" env))))
 
+;;;; --- media: filename sanitization (path-traversal guard) ------------------
+
+(ert-deftest matrix-bridge/sanitize-filename-strips-traversal-characters ()
+  (should (equal (matrix-bridge--sanitize-filename "../../etc/passwd")
+                 ".._.._etc_passwd")))
+
+(ert-deftest matrix-bridge/sanitize-filename-keeps-safe-characters ()
+  (should (equal (matrix-bridge--sanitize-filename "shot-01.png")
+                 "shot-01.png")))
+
+(ert-deftest matrix-bridge/sanitize-filename-caps-length ()
+  (let ((long (make-string 500 ?a)))
+    (should (= (length (matrix-bridge--sanitize-filename long)) 100))))
+
+(ert-deftest matrix-bridge/sanitize-filename-nil-body-does-not-crash ()
+  (should (equal (matrix-bridge--sanitize-filename nil) "")))
+
+;;;; --- media: mxc URL parsing -------------------------------------------------
+
+(ert-deftest matrix-bridge/parse-mxc-splits-server-and-media-id ()
+  (should (equal (matrix-bridge--parse-mxc "mxc://warmblood-lounge/abc123")
+                 '("warmblood-lounge" . "abc123"))))
+
+(ert-deftest matrix-bridge/parse-mxc-rejects-non-mxc-url ()
+  (should-not (matrix-bridge--parse-mxc "https://example.com/x")))
+
+(ert-deftest matrix-bridge/parse-mxc-rejects-nil ()
+  (should-not (matrix-bridge--parse-mxc nil)))
+
+;;;; --- send: MIME type from extension ----------------------------------------
+
+(ert-deftest matrix-bridge/mime-from-extension-known-types ()
+  (should (equal (matrix-bridge--mime-from-extension "shot.png") "image/png"))
+  (should (equal (matrix-bridge--mime-from-extension "shot.JPG") "image/jpeg"))
+  (should (equal (matrix-bridge--mime-from-extension "shot.jpeg") "image/jpeg"))
+  (should (equal (matrix-bridge--mime-from-extension "shot.gif") "image/gif"))
+  (should (equal (matrix-bridge--mime-from-extension "shot.webp") "image/webp")))
+
+(ert-deftest matrix-bridge/mime-from-extension-unknown-type-is-nil ()
+  (should-not (matrix-bridge--mime-from-extension "notes.txt")))
+
+;;;; --- send: image message payload shape --------------------------------------
+
+(ert-deftest matrix-bridge/image-payload-plain-has-no-relation ()
+  (should (equal (matrix-bridge--image-send-payload
+                  "shot.png" "mxc://x/1" "image/png" 123 nil nil)
+                 '((msgtype . "m.image") (body . "shot.png") (url . "mxc://x/1")
+                   (info . ((mimetype . "image/png") (size . 123)))))))
+
+(ert-deftest matrix-bridge/image-payload-reply-only ()
+  (should (equal (matrix-bridge--image-send-payload
+                  "shot.png" "mxc://x/1" "image/png" 123 nil "$tgt")
+                 '((m.relates_to . ((m.in_reply_to . ((event_id . "$tgt")))))
+                   (msgtype . "m.image") (body . "shot.png") (url . "mxc://x/1")
+                   (info . ((mimetype . "image/png") (size . 123)))))))
+
+(ert-deftest matrix-bridge/image-payload-thread-root-only-replies-to-itself ()
+  "Matches post-to-lounge.sh's thread-fallback convention: a thread-root
+with no explicit reply-to still carries an m.in_reply_to to the root."
+  (should (equal (matrix-bridge--image-send-payload
+                  "shot.png" "mxc://x/1" "image/png" 123 "$root" nil)
+                 '((m.relates_to . ((rel_type . "m.thread") (event_id . "$root")
+                                    (m.in_reply_to . ((event_id . "$root")))))
+                   (msgtype . "m.image") (body . "shot.png") (url . "mxc://x/1")
+                   (info . ((mimetype . "image/png") (size . 123)))))))
+
+(ert-deftest matrix-bridge/image-payload-thread-root-and-reply ()
+  (should (equal (matrix-bridge--image-send-payload
+                  "shot.png" "mxc://x/1" "image/png" 123 "$root" "$tgt")
+                 '((m.relates_to . ((rel_type . "m.thread") (event_id . "$root")
+                                    (m.in_reply_to . ((event_id . "$tgt")))))
+                   (msgtype . "m.image") (body . "shot.png") (url . "mxc://x/1")
+                   (info . ((mimetype . "image/png") (size . 123)))))))
+
+;;;; --- media: which events trigger an async fetch -----------------------------
+
+(ert-deftest matrix-bridge/media-event-p-true-for-image ()
+  (should (matrix-bridge--media-event-p
+           '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+             (content . ((msgtype . "m.image")))))))
+
+(ert-deftest matrix-bridge/media-event-p-true-for-file ()
+  (should (matrix-bridge--media-event-p
+           '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+             (content . ((msgtype . "m.file")))))))
+
+(ert-deftest matrix-bridge/media-event-p-false-for-text ()
+  (should-not (matrix-bridge--media-event-p
+               '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+                 (content . ((msgtype . "m.text")))))))
+
+(ert-deftest matrix-bridge/media-event-p-false-for-own-outgoing ()
+  (let ((matrix-bridge-self-user-id "@butler-x600:warmblood-lounge"))
+    (should-not (matrix-bridge--media-event-p
+                 `((type . "m.room.message") (sender . ,matrix-bridge-self-user-id)
+                   (content . ((msgtype . "m.image"))))))))
+
 (provide 'matrix-bridge-test)
 ;;; matrix-bridge-test.el ends here

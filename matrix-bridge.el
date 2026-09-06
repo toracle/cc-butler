@@ -95,6 +95,21 @@ Set it to the empty string to switch the reminder off.")
 (defvar matrix-bridge-sync-timeout-ms 30000)
 (defvar matrix-bridge-retry-seconds 5)
 
+(defcustom matrix-bridge-media-dir
+  (expand-file-name "~/services/matrix-bridge/media/")
+  "Directory downloaded m.image/m.file attachments are written into.
+Created on first use if missing.  Deliberately its own directory rather
+than under `matrix-bridge-dir'/`matrix-bridge-conduit-dir' -- those are
+per-machine service paths this file only reads tokens from; media is new
+writable state and should not share a directory it doesn't otherwise touch."
+  :type 'string)
+
+(defcustom matrix-bridge-media-max-bytes (* 50 1024 1024)
+  "Attachments larger than this are left as a claim ticket, never fetched.
+50MB: large enough for an ordinary photo or PDF, small enough that one
+stray upload can't fill the disk or tie up the bridge on a single fetch."
+  :type 'integer)
+
 (defvar matrix-bridge--generation 0
   "Bumped by start and stop.  A callback or timer from an older generation
 does nothing, so a stopped loop cannot resurrect itself and a second start
@@ -196,6 +211,21 @@ point is that they stop vanishing silently."
                 (string-join (seq-remove #'string-empty-p (delq nil bits)) " · ")
                 "]")))))
 
+(defun matrix-bridge--format-line (sender event-id content description)
+  "Assemble the final relay line from already-resolved pieces.
+
+Split out of `matrix-bridge-event-line' so the async media path (see
+`matrix-bridge--deliver-media-event') can reuse the exact same attribution
++ envelope + reminder assembly once its DESCRIPTION -- unlike a text
+message's -- only becomes available after a download resolves."
+  (format "[matrix · %s%s] %s%s"
+          (matrix-bridge-attribution sender)
+          (matrix-bridge-envelope event-id content)
+          description
+          (if (equal sender matrix-bridge-human-user-id)
+              matrix-bridge-human-reminder
+            "")))
+
 (defun matrix-bridge-event-line (ev)
   "One relay line for room event EV, or nil if EV is not ours to deliver."
   (let ((sender (matrix-bridge--get ev 'sender))
@@ -204,13 +234,8 @@ point is that they stop vanishing silently."
                (not (equal sender matrix-bridge-self-user-id))
                ;; a redaction or state-ish payload has nothing to deliver
                (matrix-bridge--get content 'msgtype))
-      (format "[matrix · %s%s] %s%s"
-              (matrix-bridge-attribution sender)
-              (matrix-bridge-envelope (or (matrix-bridge--get ev 'event_id) "") content)
-              (matrix-bridge-describe content)
-              (if (equal sender matrix-bridge-human-user-id)
-                  matrix-bridge-human-reminder
-                "")))))
+      (matrix-bridge--format-line sender (or (matrix-bridge--get ev 'event_id) "")
+                                  content (matrix-bridge-describe content)))))
 
 ;;; --- delivery -------------------------------------------------------------
 
@@ -229,6 +254,134 @@ point is that they stop vanishing silently."
       (error
        (matrix-bridge--log "FAIL inject: %S -- shadowing instead" err)
        (matrix-bridge--shadow-deliver text))))))
+
+;;; --- media (images/files) --------------------------------------------------
+;;
+;; Audio is out of scope here -- it's handled separately in the Python bridge.
+;;
+;; ORDERING: a media fetch is a `url-retrieve' round-trip, so an m.image/
+;; m.file event can no longer be formatted-and-delivered in the same
+;; synchronous step as a text event.  Text events are UNCHANGED -- they still
+;; format and deliver synchronously, in order, in `matrix-bridge--handle''s
+;; dolist below.  A media event instead kicks off its fetch here and delivers
+;; only once that resolves.  The honest consequence: a text message that
+;; arrives (in this same /sync batch or a later one) while an image/file is
+;; still downloading is delivered to the session BEFORE that image/file line,
+;; out of chronological order.  Ordering is preserved within each event type,
+;; not across the two.  The envelope's id:/thread:/reply: markings are what
+;; let a human or the session re-sequence things by hand if that ever matters.
+
+(defun matrix-bridge--sanitize-filename (name)
+  "Reduce NAME to a safe filename component: alnum/dot/dash/underscore only,
+capped to 100 characters.
+
+NAME is `body' -- attacker/sender-controlled text from a JSON message -- and
+must never be used to build a path.  Stripping every other character (in
+particular \"/\") means even a body of \"../../etc/passwd\" collapses to a
+plain filename with no directory component, so it cannot escape
+`matrix-bridge-media-dir' once `matrix-bridge--media-path' prefixes it with
+the (safe, server-assigned) event id."
+  (let ((safe (replace-regexp-in-string "[^A-Za-z0-9._-]" "_" (or name ""))))
+    (substring safe 0 (min (length safe) 100))))
+
+(defun matrix-bridge--parse-mxc (url)
+  "Split mxc URL into (SERVER . MEDIA-ID), or nil if URL isn't one."
+  (when (and (stringp url) (string-match "\\`mxc://\\([^/]+\\)/\\(.+\\)\\'" url))
+    (cons (match-string 1 url) (match-string 2 url))))
+
+(defun matrix-bridge--media-path (event-id body)
+  "Where a downloaded attachment for EVENT-ID/BODY is written.
+The event id already guarantees global uniqueness, so no other collision
+handling is needed on top of it."
+  (expand-file-name (format "%s-%s" event-id (matrix-bridge--sanitize-filename body))
+                    matrix-bridge-media-dir))
+
+(defun matrix-bridge--media-event-p (ev)
+  "Non-nil when EV is an m.image/m.file message worth trying to fetch.
+Applies the same self/type/msgtype filter as `matrix-bridge-event-line' so
+the async and sync paths agree on what is ours to deliver at all."
+  (let ((sender (matrix-bridge--get ev 'sender))
+        (content (matrix-bridge--get ev 'content)))
+    (and (equal (matrix-bridge--get ev 'type) "m.room.message")
+        (not (equal sender matrix-bridge-self-user-id))
+        (member (matrix-bridge--get content 'msgtype) '("m.image" "m.file")))))
+
+(defun matrix-bridge--finish-attachment-fetch (status event-id body ticket finish)
+  "Write a just-downloaded attachment to disk and FUNCALL FINISH with the
+final description text.  Runs with `current-buffer' still the raw
+`url-retrieve' response buffer -- the byte range is written straight from
+it with `write-region' under `coding-system-for-write' `no-conversion'
+rather than routed through a Lisp string, because
+`matrix-bridge--response-body''s UTF-8 decoder is built for JSON and would
+corrupt binary image/file bytes.
+
+A failure here (network error, non-2xx, anything) must never look like
+\"nothing happened\" -- same principle `matrix-bridge--deliver' already
+follows on its own inject-failure path -- so every branch keeps TICKET (the
+claim-ticket text) and appends a short, honest note instead of dropping it."
+  (condition-case err
+      (if (plist-get status :error)
+          (funcall finish (format "%s · 다운로드 실패: %S" ticket (plist-get status :error)))
+        (let ((code (and (boundp 'url-http-response-status) url-http-response-status))
+              (start (progn (goto-char (point-min))
+                            (or (and (boundp 'url-http-end-of-headers) url-http-end-of-headers)
+                                (and (re-search-forward "\r?\n\r?\n" nil t) (point))
+                                (point-min)))))
+          (if (and code (>= code 200) (< code 300))
+              (let ((path (matrix-bridge--media-path event-id body))
+                    (coding-system-for-write 'no-conversion))
+                (make-directory matrix-bridge-media-dir t)
+                (write-region start (point-max) path nil 'silent)
+                (funcall finish (format "%s · 저장됨: %s" ticket path)))
+            (funcall finish (format "%s · 다운로드 실패: HTTP %s" ticket code)))))
+    (error
+     (funcall finish (format "%s · 다운로드 실패: %S" ticket err)))))
+
+(defun matrix-bridge--fetch-attachment (event-id content ticket finish)
+  "Resolve one m.image/m.file attachment then FUNCALL FINISH exactly once
+with the final description text.  Never signals past this function, so the
+caller's per-event delivery always eventually happens even when the fetch
+fails outright (bad mxc URL, `url-retrieve' throwing synchronously, etc)."
+  (let* ((info (matrix-bridge--get content 'info))
+         (size (matrix-bridge--get info 'size))
+         (mxc (matrix-bridge--get content 'url))
+         (body (or (matrix-bridge--get content 'body) "attachment"))
+         (parsed (matrix-bridge--parse-mxc mxc)))
+    (cond
+     ((and (numberp size) (> size matrix-bridge-media-max-bytes))
+      (funcall finish (format "%s · 너무 큼 (%s bytes), 수동 회수: %s" ticket size mxc)))
+     ((not parsed)
+      (funcall finish (format "%s · 다운로드 실패: mxc URL 파싱 불가" ticket)))
+     (t
+      (condition-case err
+          (let* ((url (format "%s/_matrix/client/v1/media/download/%s/%s"
+                              matrix-bridge-homeserver (car parsed) (cdr parsed)))
+                 (url-request-method "GET")
+                 (url-request-extra-headers
+                  (list (cons "Authorization" (concat "Bearer " matrix-bridge--token)))))
+            (url-retrieve
+             url
+             (lambda (status)
+               (unwind-protect
+                   (matrix-bridge--finish-attachment-fetch status event-id body ticket finish)
+                 (kill-buffer (current-buffer))))
+             nil t t))
+        (error
+         (funcall finish (format "%s · 다운로드 실패: %S" ticket err))))))))
+
+(defun matrix-bridge--deliver-media-event (ev)
+  "Fetch EV's attachment (async) then format+deliver the line once resolved.
+See the ORDERING comment at the top of this section."
+  (let* ((sender (matrix-bridge--get ev 'sender))
+         (event-id (or (matrix-bridge--get ev 'event_id) ""))
+         (content (matrix-bridge--get ev 'content))
+         (ticket (matrix-bridge-describe content)))
+    (matrix-bridge--fetch-attachment
+     event-id content ticket
+     (lambda (description)
+       (let ((line (matrix-bridge--format-line sender event-id content description)))
+         (matrix-bridge--log "RECV %s" line)
+         (matrix-bridge--deliver line))))))
 
 ;;; --- the poll loop --------------------------------------------------------
 ;;
@@ -318,10 +471,12 @@ point is that they stop vanishing silently."
                        (events (matrix-bridge--get
                                 (matrix-bridge--get room 'timeline) 'events)))
                   (dolist (ev (append events nil))
-                    (let ((line (matrix-bridge-event-line ev)))
-                      (when line
-                        (matrix-bridge--log "RECV %s" line)
-                        (matrix-bridge--deliver line))))))
+                    (if (matrix-bridge--media-event-p ev)
+                        (matrix-bridge--deliver-media-event ev)
+                      (let ((line (matrix-bridge-event-line ev)))
+                        (when line
+                          (matrix-bridge--log "RECV %s" line)
+                          (matrix-bridge--deliver line)))))))
               (setq matrix-bridge--since next)
               (matrix-bridge--save-since next)))
         (error
@@ -362,6 +517,123 @@ messages from a peer's and will mis-filter them"))
   (setq matrix-bridge--timer nil matrix-bridge--watchdog nil)
   (matrix-bridge--log "bridge stopped")
   (message "matrix-bridge stopped"))
+
+;;; --- sending (new capability; nothing calls this yet) ----------------------
+;;
+;; Text-only sending already exists outside this file, in
+;; post-to-lounge.sh -- this is the elisp equivalent for images, following
+;; the same PUT .../send/m.room.message/{txn_id} shape and the same
+;; m.relates_to threading/reply convention.  Standalone; not wired into any
+;; automatic trigger.
+
+(defconst matrix-bridge--image-mime-alist
+  '(("png" . "image/png") ("jpg" . "image/jpeg") ("jpeg" . "image/jpeg")
+    ("gif" . "image/gif") ("webp" . "image/webp"))
+  "Extension -> MIME lookup for `matrix-bridge-send-image'.
+A four-entry alist rather than `mailcap-extension-to-mime': this file only
+ever sends these four image types, and pulling in mailcap's much larger,
+system-dependent table for that is more surface than it's worth.")
+
+(defun matrix-bridge--mime-from-extension (file-path)
+  "MIME type for FILE-PATH by extension, or nil if not one of the four
+types `matrix-bridge-send-image' knows how to send."
+  (cdr (assoc (downcase (or (file-name-extension file-path) ""))
+             matrix-bridge--image-mime-alist)))
+
+(defun matrix-bridge--image-send-payload (basename content-uri mimetype size
+                                          thread-root reply-to)
+  "Pure builder for the m.room.message JSON payload of an image send.
+
+Split out from `matrix-bridge-send-image' so the payload shape is testable
+without any network I/O.  THREAD-ROOT/REPLY-TO fold into `m.relates_to' the
+same way post-to-lounge.sh's md_to_html/main does: THREAD-ROOT alone groups
+into that thread (replying to itself as the thread-fallback convention
+wants); REPLY-TO within a thread quotes that specific message; REPLY-TO
+alone with no THREAD-ROOT is a plain (non-threaded) reply."
+  (let ((payload `((msgtype . "m.image")
+                   (body . ,basename)
+                   (url . ,content-uri)
+                   (info . ((mimetype . ,mimetype) (size . ,size))))))
+    (cond
+     (thread-root
+      (push (cons 'm.relates_to
+                  `((rel_type . "m.thread")
+                    (event_id . ,thread-root)
+                    (m.in_reply_to . ((event_id . ,(or reply-to thread-root))))))
+            payload))
+     (reply-to
+      (push (cons 'm.relates_to `((m.in_reply_to . ((event_id . ,reply-to))))) payload)))
+    payload))
+
+(defun matrix-bridge--send-message-event (payload)
+  "PUT PAYLOAD as an m.room.message send, async like every request in this
+file.  Mirrors post-to-lounge.sh's PUT .../send/m.room.message/{txn_id}."
+  (let* ((txn-id (format "%d-%d" (round (* 1000 (float-time))) (random 1000000)))
+         (url (format "%s/_matrix/client/v3/rooms/%s/send/m.room.message/%s"
+                      matrix-bridge-homeserver
+                      (url-hexify-string matrix-bridge--room-id)
+                      txn-id))
+         (url-request-method "PUT")
+         (url-request-extra-headers
+          (list (cons "Authorization" (concat "Bearer " matrix-bridge--token))
+                (cons "Content-Type" "application/json")))
+         (url-request-data (json-serialize payload)))
+    (url-retrieve
+     url
+     (lambda (status)
+       (unwind-protect
+           (when (plist-get status :error)
+             (matrix-bridge--log "send-image: message send failed: %S"
+                                 (plist-get status :error)))
+         (kill-buffer (current-buffer))))
+     nil t t)))
+
+(defun matrix-bridge--handle-upload-response (status basename mimetype size
+                                              thread-root reply-to)
+  "Parse the media-upload response and, on success, send the m.image event."
+  (if (plist-get status :error)
+      (matrix-bridge--log "send-image: upload failed: %S" (plist-get status :error))
+    (let* ((body (matrix-bridge--response-body))
+           (resp (json-parse-string body :object-type 'alist
+                                    :null-object nil :false-object nil))
+           (content-uri (matrix-bridge--get resp 'content_uri)))
+      (if (not content-uri)
+          (matrix-bridge--log "send-image: no content_uri in response: %s" body)
+        (matrix-bridge--send-message-event
+         (matrix-bridge--image-send-payload basename content-uri mimetype size
+                                            thread-root reply-to))))))
+
+;;;###autoload
+(defun matrix-bridge-send-image (file-path &optional thread-root reply-to)
+  "Upload FILE-PATH to the homeserver's media repo, then send an m.image
+event pointing at it.  Both requests are async via `url-retrieve', per
+this file's never-block invariant.
+
+Not wired into any automatic trigger -- callable standalone for future use."
+  (let* ((basename (file-name-nondirectory file-path))
+         (mimetype (or (matrix-bridge--mime-from-extension file-path)
+                      (error "matrix-bridge-send-image: unrecognized extension: %s"
+                             file-path)))
+         (bytes (with-temp-buffer
+                  (set-buffer-multibyte nil)
+                  (insert-file-contents-literally file-path)
+                  (buffer-string)))
+         (size (length bytes))
+         (url (format "%s/_matrix/media/v3/upload?filename=%s"
+                      matrix-bridge-homeserver (url-hexify-string basename)))
+         (url-request-method "POST")
+         (url-request-extra-headers
+          (list (cons "Authorization" (concat "Bearer " matrix-bridge--token))
+                (cons "Content-Type" mimetype)))
+         (url-request-data bytes))
+    (url-retrieve
+     url
+     (lambda (status)
+       (unwind-protect
+           (matrix-bridge--handle-upload-response
+            status basename mimetype size thread-root reply-to)
+         (kill-buffer (current-buffer))))
+     nil t t)))
 
 ;;; --- self-test (pure functions only, no network) --------------------------
 
