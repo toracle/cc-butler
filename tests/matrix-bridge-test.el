@@ -72,7 +72,11 @@ must not be reported as a genuine reply."
   (should (equal (matrix-bridge-event-line
                   `((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
                     (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                 "[matrix · 정수님 · id:$abc] hi")))
+                 ;; The human's own messages carry `matrix-bridge-human-reminder'.
+                 ;; Built from the variable, not a copy of its wording: a reworded
+                 ;; reminder must not turn this attribution test red.
+                 (concat "[matrix · 정수님 · id:$abc] hi"
+                         matrix-bridge-human-reminder))))
 
 (ert-deftest matrix-bridge/event-line-fleet-sender-shows-short-name ()
   (should (equal (matrix-bridge-event-line
