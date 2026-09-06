@@ -155,7 +155,8 @@ delivering anything."
                 (lambda (text) (setq ,var (append ,var (list text))))))
        ,@body)))
 
-;;;;; sanitize-filename / media-path: the path-traversal guard -------------
+;;;;; sanitize-filename / media-path: shared by the audio and image/file ---
+;;;;; axes -- the path-traversal guard --------------------------------------
 
 (ert-deftest matrix-bridge/sanitize-filename-strips-path-traversal ()
   "Only the slashes get replaced -- dots/dashes/underscores are in the
@@ -169,6 +170,13 @@ but the result has no `/' in it, so it can never escape the media dir."
   (should (equal (matrix-bridge--sanitize-filename "voice-msg_01.ogg")
                  "voice-msg_01.ogg")))
 
+(ert-deftest matrix-bridge/sanitize-filename-caps-length ()
+  (let ((long (make-string 500 ?a)))
+    (should (= (length (matrix-bridge--sanitize-filename long)) 100))))
+
+(ert-deftest matrix-bridge/sanitize-filename-nil-body-does-not-crash ()
+  (should (equal (matrix-bridge--sanitize-filename nil) "")))
+
 (ert-deftest matrix-bridge/media-path-has-no-directory-component-from-body ()
   (matrix-bridge-test--with-media-dir
     (let ((path (matrix-bridge--media-path "$abc" "../../etc/passwd")))
@@ -176,6 +184,19 @@ but the result has no `/' in it, so it can never escape the media dir."
                       (file-name-as-directory matrix-bridge-media-dir)))
       (should (equal (file-name-nondirectory path) "$abc-.._.._etc_passwd"))
       (should-not (string-match-p "/" (file-name-nondirectory path))))))
+
+(ert-deftest matrix-bridge/media-path-creates-media-dir-if-missing ()
+  "The kept half of the audio/media dedupe: `--media-path' lazily creates
+`matrix-bridge-media-dir' (audio's prior behavior) rather than leaving that
+to each caller (media's prior behavior) -- see the commit message for why."
+  (let* ((parent (make-temp-file "matrix-bridge-test-media-parent-" t))
+         (matrix-bridge-media-dir (expand-file-name "nested/media" parent)))
+    (unwind-protect
+        (progn
+          (should-not (file-directory-p matrix-bridge-media-dir))
+          (matrix-bridge--media-path "$abc" "voice.ogg")
+          (should (file-directory-p matrix-bridge-media-dir)))
+      (delete-directory parent t))))
 
 ;;;;; download-media: url parsing and the two non-monocle failure shapes ---
 
@@ -305,7 +326,7 @@ was built for, and gone the instant that call returns -- never a global
                  (setq env-seen-inside-call process-environment)
                  nil)))
       (matrix-bridge--transcribe-audio "/tmp/some-audio.ogg" "@jeongsoo:warmblood-lounge"
-                                       " · id:$abc" ""))
+                                       "$abc" nil))
     ;; Inside the call, the override was present ...
     (should (member "HOME=/fake/monocle/home" env-seen-inside-call))
     ;; ... and outside it, both the ambient HOME and the whole
@@ -320,7 +341,7 @@ that (by invariant #2) is already on disk by this point."
     (cl-letf (((symbol-function 'make-process)
                (lambda (&rest _) (error "no such file"))))
       (matrix-bridge--transcribe-audio "/tmp/audio-path.ogg" "@jeongsoo:warmblood-lounge"
-                                       " · id:$abc" ""))
+                                       "$abc" nil))
     (should (= 1 (length delivered)))
     (should (string-match-p "텍스트 변환 시작 실패" (car delivered)))
     (should (string-match-p "첨부: /tmp/audio-path.ogg" (car delivered)))))
@@ -330,7 +351,7 @@ that (by invariant #2) is already on disk by this point."
 (ert-deftest matrix-bridge/finish-transcription-nonzero-rc-has-attachment ()
   (matrix-bridge-test--capture-delivery delivered
     (matrix-bridge--finish-transcription
-     "/tmp/a.ogg" "@jeongsoo:warmblood-lounge" " · id:$abc" ""
+     "/tmp/a.ogg" "@jeongsoo:warmblood-lounge" "$abc" nil
      1 "" "credentials not found")
     (should (= 1 (length delivered)))
     (should (string-match-p "텍스트 변환 실패: rc=1" (car delivered)))
@@ -340,7 +361,7 @@ that (by invariant #2) is already on disk by this point."
 (ert-deftest matrix-bridge/finish-transcription-empty-text-has-attachment ()
   (matrix-bridge-test--capture-delivery delivered
     (matrix-bridge--finish-transcription
-     "/tmp/a.ogg" "@jeongsoo:warmblood-lounge" " · id:$abc" ""
+     "/tmp/a.ogg" "@jeongsoo:warmblood-lounge" "$abc" nil
      0 "{\"text\": \"\"}" "")
     (should (= 1 (length delivered)))
     (should (string-match-p "변환 결과 비어있음" (car delivered)))
@@ -349,18 +370,115 @@ that (by invariant #2) is already on disk by this point."
 (ert-deftest matrix-bridge/finish-transcription-success-delivers-text-and-attachment ()
   (matrix-bridge-test--capture-delivery delivered
     (matrix-bridge--finish-transcription
-     "/tmp/a.ogg" "@jeongsoo:warmblood-lounge" " · id:$abc" ""
+     "/tmp/a.ogg" "@jeongsoo:warmblood-lounge" "$abc" nil
      0 "{\"text\": \"안녕하세요\"}" "")
     (should (= 1 (length delivered)))
     (should (string-match-p "안녕하세요" (car delivered)))
     (should (string-match-p "첨부: /tmp/a.ogg" (car delivered)))))
 
 (ert-deftest matrix-bridge/finish-transcription-appends-human-reminder-only-for-human ()
+  "The human-reminder suffix now comes from `matrix-bridge--format-line',
+derived from SENDER -- no longer a param `--finish-transcription' is handed
+directly.  Covered as a positive/negative pair, same pattern as
+`matrix-bridge/event-line-human-sender-shows-attribution' /
+`-fleet-sender-shows-short-name'."
   (matrix-bridge-test--capture-delivery delivered
     (matrix-bridge--finish-transcription
-     "/tmp/a.ogg" "@jeongsoo:warmblood-lounge" " · id:$abc" matrix-bridge-human-reminder
+     "/tmp/a.ogg" "@jeongsoo:warmblood-lounge" "$abc" nil
      0 "{\"text\": \"hi\"}" "")
     (should (string-suffix-p matrix-bridge-human-reminder (car delivered)))))
+
+(ert-deftest matrix-bridge/finish-transcription-no-reminder-for-non-human-sender ()
+  (matrix-bridge-test--capture-delivery delivered
+    (matrix-bridge--finish-transcription
+     "/tmp/a.ogg" "@butler-macbook-m1-max:warmblood-lounge" "$abc" nil
+     0 "{\"text\": \"hi\"}" "")
+    (should-not (string-suffix-p matrix-bridge-human-reminder (car delivered)))))
+
+;;;; --- media (m.image/m.file axis) -- ported from m1's independent branch --
+
+;;;;; parse-mxc: url splitting --------------------------------------------
+
+(ert-deftest matrix-bridge/parse-mxc-splits-server-and-media-id ()
+  (should (equal (matrix-bridge--parse-mxc "mxc://warmblood-lounge/abc123")
+                 '("warmblood-lounge" . "abc123"))))
+
+(ert-deftest matrix-bridge/parse-mxc-rejects-non-mxc-url ()
+  (should-not (matrix-bridge--parse-mxc "https://example.com/x")))
+
+(ert-deftest matrix-bridge/parse-mxc-rejects-nil ()
+  (should-not (matrix-bridge--parse-mxc nil)))
+
+;;;;; media-event-p: which events trigger an async fetch -------------------
+
+(ert-deftest matrix-bridge/media-event-p-true-for-image ()
+  (should (matrix-bridge--media-event-p
+           '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+             (content . ((msgtype . "m.image")))))))
+
+(ert-deftest matrix-bridge/media-event-p-true-for-file ()
+  (should (matrix-bridge--media-event-p
+           '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+             (content . ((msgtype . "m.file")))))))
+
+(ert-deftest matrix-bridge/media-event-p-false-for-text ()
+  (should-not (matrix-bridge--media-event-p
+               '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+                 (content . ((msgtype . "m.text")))))))
+
+(ert-deftest matrix-bridge/media-event-p-false-for-own-outgoing ()
+  (let ((matrix-bridge-self-user-id "@butler-x600:warmblood-lounge"))
+    (should-not (matrix-bridge--media-event-p
+                 `((type . "m.room.message") (sender . ,matrix-bridge-self-user-id)
+                   (content . ((msgtype . "m.image"))))))))
+
+;;;; --- sending (m.image; inert, nothing calls this yet) ---------------------
+;;;; Ported from m1's independent branch, alongside the media axis it sends.
+
+;;;;; mime-from-extension ----------------------------------------------------
+
+(ert-deftest matrix-bridge/mime-from-extension-known-types ()
+  (should (equal (matrix-bridge--mime-from-extension "shot.png") "image/png"))
+  (should (equal (matrix-bridge--mime-from-extension "shot.JPG") "image/jpeg"))
+  (should (equal (matrix-bridge--mime-from-extension "shot.jpeg") "image/jpeg"))
+  (should (equal (matrix-bridge--mime-from-extension "shot.gif") "image/gif"))
+  (should (equal (matrix-bridge--mime-from-extension "shot.webp") "image/webp")))
+
+(ert-deftest matrix-bridge/mime-from-extension-unknown-type-is-nil ()
+  (should-not (matrix-bridge--mime-from-extension "notes.txt")))
+
+;;;;; image-send-payload: pure JSON payload shape ---------------------------
+
+(ert-deftest matrix-bridge/image-payload-plain-has-no-relation ()
+  (should (equal (matrix-bridge--image-send-payload
+                  "shot.png" "mxc://x/1" "image/png" 123 nil nil)
+                 '((msgtype . "m.image") (body . "shot.png") (url . "mxc://x/1")
+                   (info . ((mimetype . "image/png") (size . 123)))))))
+
+(ert-deftest matrix-bridge/image-payload-reply-only ()
+  (should (equal (matrix-bridge--image-send-payload
+                  "shot.png" "mxc://x/1" "image/png" 123 nil "$tgt")
+                 '((m.relates_to . ((m.in_reply_to . ((event_id . "$tgt")))))
+                   (msgtype . "m.image") (body . "shot.png") (url . "mxc://x/1")
+                   (info . ((mimetype . "image/png") (size . 123)))))))
+
+(ert-deftest matrix-bridge/image-payload-thread-root-only-replies-to-itself ()
+  "Matches post-to-lounge.sh's thread-fallback convention: a thread-root
+with no explicit reply-to still carries an m.in_reply_to to the root."
+  (should (equal (matrix-bridge--image-send-payload
+                  "shot.png" "mxc://x/1" "image/png" 123 "$root" nil)
+                 '((m.relates_to . ((rel_type . "m.thread") (event_id . "$root")
+                                    (m.in_reply_to . ((event_id . "$root")))))
+                   (msgtype . "m.image") (body . "shot.png") (url . "mxc://x/1")
+                   (info . ((mimetype . "image/png") (size . 123)))))))
+
+(ert-deftest matrix-bridge/image-payload-thread-root-and-reply ()
+  (should (equal (matrix-bridge--image-send-payload
+                  "shot.png" "mxc://x/1" "image/png" 123 "$root" "$tgt")
+                 '((m.relates_to . ((rel_type . "m.thread") (event_id . "$root")
+                                    (m.in_reply_to . ((event_id . "$tgt")))))
+                   (msgtype . "m.image") (body . "shot.png") (url . "mxc://x/1")
+                   (info . ((mimetype . "image/png") (size . 123)))))))
 
 (provide 'matrix-bridge-test)
 ;;; matrix-bridge-test.el ends here
