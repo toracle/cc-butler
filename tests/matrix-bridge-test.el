@@ -7,44 +7,63 @@
 (require 'ert)
 (require 'matrix-bridge)
 
-;;;; --- envelope: what the courier stamps on the outside ---------------------
+;;;; --- envelope: the labeled footer (room/message-id/thread-root/reply-to) --
+;; Ported from bridge.py's identical footer, 2026-09-06 (정수님 feedback:
+;; unlabeled short ids side by side read as indistinguishable noise).
 
-(ert-deftest matrix-bridge/envelope-plain-message-has-only-id ()
-  (should (equal (matrix-bridge-envelope "$abc" '((msgtype . "m.text") (body . "hi")))
-                 " · id:$abc")))
+(ert-deftest matrix-bridge/envelope-plain-message-has-no-thread-or-reply ()
+  (should (equal (matrix-bridge-envelope "$abc" "!r:x" '((msgtype . "m.text") (body . "hi")))
+                 "(room: !r:x, message-id: $abc, thread-root: 없음, reply-to: 없음)")))
 
 (ert-deftest matrix-bridge/envelope-threaded-message-adds-thread-id ()
   (should (equal (matrix-bridge-envelope
-                  "$def" '((msgtype . "m.text")
+                  "$def" "!r:x" '((msgtype . "m.text")
                            (m.relates_to . ((rel_type . "m.thread")
                                             (event_id . "$root")))))
-                 " · id:$def · thread:$root")))
+                 "(room: !r:x, message-id: $def, thread-root: $root, reply-to: 없음)")))
 
 (ert-deftest matrix-bridge/envelope-falling-back-reply-not-shown-as-reply ()
   "A thread reply carries a synthetic in_reply_to for old clients; that
 must not be reported as a genuine reply."
   (should (equal (matrix-bridge-envelope
-                  "$ghi" '((msgtype . "m.text")
+                  "$ghi" "!r:x" '((msgtype . "m.text")
                            (m.relates_to . ((rel_type . "m.thread")
                                             (event_id . "$root")
                                             (is_falling_back . t)
                                             (m.in_reply_to . ((event_id . "$prev")))))))
-                 " · id:$ghi · thread:$root")))
+                 "(room: !r:x, message-id: $ghi, thread-root: $root, reply-to: 없음)")))
 
 (ert-deftest matrix-bridge/envelope-genuine-reply-survives-the-filter ()
   (should (equal (matrix-bridge-envelope
-                  "$jkl" '((msgtype . "m.text")
+                  "$jkl" "!r:x" '((msgtype . "m.text")
                            (m.relates_to . ((m.in_reply_to . ((event_id . "$tgt")))))))
-                 " · id:$jkl · reply:$tgt")))
+                 "(room: !r:x, message-id: $jkl, thread-root: 없음, reply-to: $tgt)")))
 
 (ert-deftest matrix-bridge/envelope-threaded-and-genuine-reply-keeps-both ()
   (should (equal (matrix-bridge-envelope
-                  "$mno" '((msgtype . "m.text")
+                  "$mno" "!r:x" '((msgtype . "m.text")
                            (m.relates_to . ((rel_type . "m.thread")
                                             (event_id . "$root")
                                             (is_falling_back . nil)
                                             (m.in_reply_to . ((event_id . "$tgt")))))))
-                 " · id:$mno · thread:$root · reply:$tgt")))
+                 "(room: !r:x, message-id: $mno, thread-root: $root, reply-to: $tgt)")))
+
+;;;; --- sanitize-filename: attacker-controlled body text must never leave a path
+
+(ert-deftest matrix-bridge/sanitize-filename-strips-traversal-characters ()
+  (should (equal (matrix-bridge--sanitize-filename "../../etc/passwd")
+                 ".._.._etc_passwd")))
+
+(ert-deftest matrix-bridge/sanitize-filename-keeps-safe-characters ()
+  (should (equal (matrix-bridge--sanitize-filename "shot-01.png")
+                 "shot-01.png")))
+
+(ert-deftest matrix-bridge/sanitize-filename-caps-length ()
+  (let ((long (make-string 500 ?a)))
+    (should (= (length (matrix-bridge--sanitize-filename long)) 100))))
+
+(ert-deftest matrix-bridge/sanitize-filename-nil-body-does-not-crash ()
+  (should (equal (matrix-bridge--sanitize-filename nil) "")))
 
 ;;;; --- describe: text passes through, attachments leave a claim ticket ------
 
@@ -68,22 +87,32 @@ must not be reported as a genuine reply."
 
 ;;;; --- event-line: the whole line, and what must be dropped -----------------
 
+;; `matrix-bridge-event-line' reads the room id off the global (set by
+;; `matrix-bridge-start'), so every test here binds it explicitly rather
+;; than relying on whatever the global happens to hold.
+
 (ert-deftest matrix-bridge/event-line-human-sender-shows-attribution ()
-  (should (equal (matrix-bridge-event-line
-                  `((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
-                    (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                 ;; The human's own messages carry `matrix-bridge-human-reminder'.
-                 ;; Built from the variable, not a copy of its wording: a reworded
-                 ;; reminder must not turn this attribution test red.
-                 (concat "[matrix · 정수님 · id:$abc] hi"
-                         matrix-bridge-human-reminder))))
+  (let ((matrix-bridge--room-id "!test:warmblood-lounge"))
+    (should (equal (matrix-bridge-event-line
+                    `((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+                      (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
+                   ;; The human's own messages carry `matrix-bridge-human-reminder'.
+                   ;; Built from the variable, not a copy of its wording: a reworded
+                   ;; reminder must not turn this attribution test red.
+                   (concat "[matrix · 정수님] hi\n"
+                           "(room: !test:warmblood-lounge, message-id: $abc, "
+                           "thread-root: 없음, reply-to: 없음)"
+                           matrix-bridge-human-reminder)))))
 
 (ert-deftest matrix-bridge/event-line-fleet-sender-shows-short-name ()
-  (should (equal (matrix-bridge-event-line
-                  '((type . "m.room.message")
-                    (sender . "@butler-macbook-m1-max:warmblood-lounge")
-                    (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                 "[matrix · butler-macbook-m1-max · id:$abc] hi")))
+  (let ((matrix-bridge--room-id "!test:warmblood-lounge"))
+    (should (equal (matrix-bridge-event-line
+                    '((type . "m.room.message")
+                      (sender . "@butler-macbook-m1-max:warmblood-lounge")
+                      (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
+                   (concat "[matrix · butler-macbook-m1-max] hi\n"
+                           "(room: !test:warmblood-lounge, message-id: $abc, "
+                           "thread-root: 없음, reply-to: 없음)")))))
 
 (ert-deftest matrix-bridge/event-line-own-outgoing-message-is-dropped ()
   (let ((matrix-bridge-self-user-id "@butler-x600:warmblood-lounge"))
@@ -111,25 +140,25 @@ must not be reported as a genuine reply."
   "Element writes is_falling_back:false on a genuine reply inside a thread.
 JSON false parses to :json-false, which is non-nil -- the naive test dropped it."
   (let ((env (matrix-bridge-envelope
-              "$self"
+              "$self" "!r:x"
               '((msgtype . "m.text") (body . "x")
                 (m.relates_to . ((event_id . "$root")
                                  (is_falling_back . :json-false)
                                  (m.in_reply_to . ((event_id . "$target")))
                                  (rel_type . "m.thread")))))))
-    (should (string-match-p "thread:\\$root" env))
-    (should (string-match-p "reply:\\$target" env))))
+    (should (string-match-p "thread-root: \\$root" env))
+    (should (string-match-p "reply-to: \\$target" env))))
 (ert-deftest matrix-bridge/json-true-fallback-is-still-suppressed ()
   "The real fallback (is_falling_back:true) must still NOT show as a reply."
   (let ((env (matrix-bridge-envelope
-              "$self"
+              "$self" "!r:x"
               '((msgtype . "m.text") (body . "x")
                 (m.relates_to . ((event_id . "$root")
                                  (is_falling_back . t)
                                  (m.in_reply_to . ((event_id . "$target")))
                                  (rel_type . "m.thread")))))))
-    (should (string-match-p "thread:\\$root" env))
-    (should-not (string-match-p "reply:" env))))
+    (should (string-match-p "thread-root: \\$root" env))
+    (should (string-match-p "reply-to: 없음" env))))
 
 (provide 'matrix-bridge-test)
 ;;; matrix-bridge-test.el ends here

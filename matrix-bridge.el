@@ -139,6 +139,20 @@ thread, so the naive test silently dropped every such reply (observed on 4 of
     (insert-file-contents file)
     (string-trim (buffer-string))))
 
+(defun matrix-bridge--sanitize-filename (name)
+  "Reduce NAME to a safe filename component: alnum/dot/dash/underscore only,
+capped to 100 characters.
+
+NAME is `body' -- attacker/sender-controlled text from a JSON message -- and
+must never be used to build a path.  Stripping every other character (in
+particular \"/\") means even a body of \"../../etc/passwd\" collapses to a
+plain filename with no directory component, so it cannot escape a media
+directory once an event id is prefixed onto it (bridge.py's identical
+`sanitize_filename`, ported 2026-09-06 -- this needs no download/media-path
+work to exist on its own, it's a pure string function)."
+  (let ((safe (replace-regexp-in-string "[^A-Za-z0-9._-]" "_" (or name ""))))
+    (substring safe 0 (min (length safe) 100))))
+
 (defun matrix-bridge--load-since ()
   (when (file-exists-p matrix-bridge-state-file)
     (matrix-bridge--get
@@ -159,25 +173,37 @@ thread, so the naive test silently dropped every such reply (observed on 4 of
     ;; "@butler-macbook-m1-max:..." -> "butler-macbook-m1-max"
     (string-remove-prefix "@" (car (split-string sender ":")))))
 
-(defun matrix-bridge-envelope (event-id content)
-  "The courier's markings: which message this is, and what it answers.
+(defun matrix-bridge-envelope (event-id room-id content)
+  "Explicit English-labeled footer: which room, which message, what it
+answers. Ported from bridge.py's identical footer (정수님 feedback,
+2026-09-06): short unlabeled ids side by side read as indistinguishable
+noise -- which one is the room, which is this message, which is what it
+replies to. Spelling each field out costs a few more characters and
+removes the ambiguity entirely -- this also means the RECV log line (which
+dumps this whole rendered footer, see `matrix-bridge--handle') always
+carries an unambiguous `message-id:' field, unlike bridge.py's separate
+log-line construction which needed its own explicit `own=' fix for the
+same reason.
 
-Always carries the event's own id -- that is what lets the session open a
-NEW thread on a plain message, not merely answer inside an existing one."
-  (let ((parts (list (format "id:%s" event-id)))
+ROOM-ID is the raw room id, not a fetched label -- elisp has no
+room-label lookup yet (single-room today); bridge.py falls back to the
+same raw id when its label fetch fails, so this matches that fallback
+path rather than inventing new behavior."
+  (let (thread-id reply-id
         (rel (matrix-bridge--get content 'm.relates_to)))
     (when (consp rel)
-      (let ((thread-id (matrix-bridge--get rel 'event_id))
+      (let ((tid (matrix-bridge--get rel 'event_id))
             (reply (matrix-bridge--get rel 'm.in_reply_to)))
-        (when (and (equal (matrix-bridge--get rel 'rel_type) "m.thread") thread-id)
-          (push (format "thread:%s" thread-id) parts))
+        (when (and (equal (matrix-bridge--get rel 'rel_type) "m.thread") tid)
+          (setq thread-id tid))
         ;; A thread reply carries a synthetic in_reply_to for old clients;
         ;; only a genuine reply (no fallback flag) is worth announcing.
         (when (and (consp reply)
                    (matrix-bridge--get reply 'event_id)
                    (not (matrix-bridge--flag rel 'is_falling_back)))
-          (push (format "reply:%s" (matrix-bridge--get reply 'event_id)) parts))))
-    (concat " · " (string-join (nreverse parts) " · "))))
+          (setq reply-id (matrix-bridge--get reply 'event_id)))))
+    (format "(room: %s, message-id: %s, thread-root: %s, reply-to: %s)"
+            room-id event-id (or thread-id "없음") (or reply-id "없음"))))
 
 (defun matrix-bridge-describe (content)
   "The letter itself -- or a claim ticket when it is not text.
@@ -204,10 +230,11 @@ point is that they stop vanishing silently."
                (not (equal sender matrix-bridge-self-user-id))
                ;; a redaction or state-ish payload has nothing to deliver
                (matrix-bridge--get content 'msgtype))
-      (format "[matrix · %s%s] %s%s"
+      (format "[matrix · %s] %s\n%s%s"
               (matrix-bridge-attribution sender)
-              (matrix-bridge-envelope (or (matrix-bridge--get ev 'event_id) "") content)
               (matrix-bridge-describe content)
+              (matrix-bridge-envelope (or (matrix-bridge--get ev 'event_id) "")
+                                      matrix-bridge--room-id content)
               (if (equal sender matrix-bridge-human-user-id)
                   matrix-bridge-human-reminder
                 "")))))
@@ -369,35 +396,43 @@ messages from a peer's and will mis-filter them"))
 (defun matrix-bridge-self-test ()
   "Check the envelope/describe formatting against test_bridge.py's cases."
   (interactive)
-  ;; envelope: what the courier stamps on the outside
-  (cl-assert (equal (matrix-bridge-envelope "$abc" '((msgtype . "m.text") (body . "hi")))
-                    " · id:$abc") t)
+  ;; envelope: the labeled footer, room/message-id/thread-root/reply-to
+  (cl-assert (equal (matrix-bridge-envelope "$abc" "!r:x" '((msgtype . "m.text") (body . "hi")))
+                    "(room: !r:x, message-id: $abc, thread-root: 없음, reply-to: 없음)") t)
   (cl-assert (equal (matrix-bridge-envelope
-                     "$def" '((msgtype . "m.text")
+                     "$def" "!r:x" '((msgtype . "m.text")
                               (m.relates_to . ((rel_type . "m.thread")
                                                (event_id . "$root")))))
-                    " · id:$def · thread:$root") t)
+                    "(room: !r:x, message-id: $def, thread-root: $root, reply-to: 없음)") t)
   ;; A thread reply's synthetic in_reply_to must NOT show up as a real reply.
   (cl-assert (equal (matrix-bridge-envelope
-                     "$ghi" '((msgtype . "m.text")
+                     "$ghi" "!r:x" '((msgtype . "m.text")
                               (m.relates_to . ((rel_type . "m.thread")
                                                (event_id . "$root")
                                                (is_falling_back . t)
                                                (m.in_reply_to . ((event_id . "$prev")))))))
-                    " · id:$ghi · thread:$root") t)
+                    "(room: !r:x, message-id: $ghi, thread-root: $root, reply-to: 없음)") t)
   ;; ...and a genuine reply must survive the same filter.
   (cl-assert (equal (matrix-bridge-envelope
-                     "$jkl" '((msgtype . "m.text")
+                     "$jkl" "!r:x" '((msgtype . "m.text")
                               (m.relates_to . ((m.in_reply_to . ((event_id . "$tgt")))))))
-                    " · id:$jkl · reply:$tgt") t)
+                    "(room: !r:x, message-id: $jkl, thread-root: 없음, reply-to: $tgt)") t)
   ;; A threaded message that is ALSO a genuine reply keeps both markings.
   (cl-assert (equal (matrix-bridge-envelope
-                     "$mno" '((msgtype . "m.text")
+                     "$mno" "!r:x" '((msgtype . "m.text")
                               (m.relates_to . ((rel_type . "m.thread")
                                                (event_id . "$root")
                                                (is_falling_back . nil)
                                                (m.in_reply_to . ((event_id . "$tgt")))))))
-                    " · id:$mno · thread:$root · reply:$tgt") t)
+                    "(room: !r:x, message-id: $mno, thread-root: $root, reply-to: $tgt)") t)
+
+  ;; sanitize-filename: attacker-controlled body text must never leave a path
+  (cl-assert (equal (matrix-bridge--sanitize-filename "../../etc/passwd")
+                    ".._.._etc_passwd") t)
+  (cl-assert (equal (matrix-bridge--sanitize-filename "shot-01.png")
+                    "shot-01.png") t)
+  (cl-assert (= (length (matrix-bridge--sanitize-filename (make-string 500 ?a))) 100) t)
+  (cl-assert (equal (matrix-bridge--sanitize-filename nil) "") t)
 
   ;; describe: text passes through, attachments leave a claim ticket
   (cl-assert (equal (matrix-bridge-describe '((msgtype . "m.text") (body . "hello")))
@@ -413,38 +448,48 @@ messages from a peer's and will mis-filter them"))
                     "[첨부 m.audio · voice.ogg]") t)
 
   ;; the whole line, and the two events we must drop
-  ;; The human's own messages carry the reminder ...
-  (cl-assert (equal (matrix-bridge-event-line
-                     `((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
-                       (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                    (concat "[matrix · 정수님 · id:$abc] hi"
-                            matrix-bridge-human-reminder)) t)
-  ;; ... and nobody else's do.  Without this negative case the assertion above
-  ;; would still pass if the reminder were appended unconditionally.
-  (cl-assert (equal (matrix-bridge-event-line
-                     `((type . "m.room.message")
-                       (sender . "@butler-x600:warmblood-lounge")
-                       (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                    "[matrix · butler-x600 · id:$abc] hi") t)
-  (cl-assert (equal (matrix-bridge-event-line
-                     '((type . "m.room.message")
-                       (sender . "@butler-macbook-m1-max:warmblood-lounge")
-                       (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                    "[matrix · butler-macbook-m1-max · id:$abc] hi") t)
-  ;; Bound explicitly: with the defvar now nil, reading the global here would
-  ;; make this assertion pass for the wrong reason (nil sender equals nil id).
-  (let ((matrix-bridge-self-user-id "@butler-x600:warmblood-lounge"))
+  ;; Bound explicitly: `matrix-bridge-event-line' reads the room id off the
+  ;; global (set by `matrix-bridge-start'), so tests fix it rather than
+  ;; relying on whatever the global happens to hold.
+  (let ((matrix-bridge--room-id "!test:warmblood-lounge"))
+    ;; The human's own messages carry the reminder ...
+    (cl-assert (equal (matrix-bridge-event-line
+                       `((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+                         (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
+                      (concat "[matrix · 정수님] hi\n"
+                              "(room: !test:warmblood-lounge, message-id: $abc, "
+                              "thread-root: 없음, reply-to: 없음)"
+                              matrix-bridge-human-reminder)) t)
+    ;; ... and nobody else's do.  Without this negative case the assertion above
+    ;; would still pass if the reminder were appended unconditionally.
+    (cl-assert (equal (matrix-bridge-event-line
+                       `((type . "m.room.message")
+                         (sender . "@butler-x600:warmblood-lounge")
+                         (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
+                      (concat "[matrix · butler-x600] hi\n"
+                              "(room: !test:warmblood-lounge, message-id: $abc, "
+                              "thread-root: 없음, reply-to: 없음)")) t)
+    (cl-assert (equal (matrix-bridge-event-line
+                       '((type . "m.room.message")
+                         (sender . "@butler-macbook-m1-max:warmblood-lounge")
+                         (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
+                      (concat "[matrix · butler-macbook-m1-max] hi\n"
+                              "(room: !test:warmblood-lounge, message-id: $abc, "
+                              "thread-root: 없음, reply-to: 없음)")) t)
+    ;; Bound explicitly: with the defvar now nil, reading the global here would
+    ;; make this assertion pass for the wrong reason (nil sender equals nil id).
+    (let ((matrix-bridge-self-user-id "@butler-x600:warmblood-lounge"))
+      (cl-assert (null (matrix-bridge-event-line
+                        `((type . "m.room.message") (sender . ,matrix-bridge-self-user-id)
+                          (event_id . "$abc")
+                          (content . ((msgtype . "m.text") (body . "echo")))))) t))
     (cl-assert (null (matrix-bridge-event-line
-                      `((type . "m.room.message") (sender . ,matrix-bridge-self-user-id)
+                      '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+                        (event_id . "$abc") (content . ())))) t)
+    (cl-assert (null (matrix-bridge-event-line
+                      '((type . "m.room.member") (sender . "@jeongsoo:warmblood-lounge")
                         (event_id . "$abc")
-                        (content . ((msgtype . "m.text") (body . "echo")))))) t))
-  (cl-assert (null (matrix-bridge-event-line
-                    '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
-                      (event_id . "$abc") (content . ())))) t)
-  (cl-assert (null (matrix-bridge-event-line
-                    '((type . "m.room.member") (sender . "@jeongsoo:warmblood-lounge")
-                      (event_id . "$abc")
-                      (content . ((msgtype . "m.text") (body . "x")))))) t)
+                        (content . ((msgtype . "m.text") (body . "x")))))) t))
   (message "matrix-bridge-self-test: ok"))
 
 (provide 'matrix-bridge)
