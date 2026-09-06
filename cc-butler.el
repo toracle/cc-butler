@@ -380,25 +380,36 @@ and quietly undoes whatever a reload just did."
           (push (file-name-nondirectory elc) out))))
     (nreverse out)))
 
+(defun cc-butler--defcustom-forms-in-string (text)
+  "Alist of (SYMBOL . DEFAULT-FORM) for every top-level `defcustom' or
+`defvar'-with-a-value form in TEXT, read without loading or evaluating it.
+Shared by `cc-butler--defcustom-forms-in-file' (the current file on disk)
+and `cc-butler--defcustom-history-defaults' (past revisions read from git
+history) — both need the identical read-don't-eval parse, just fed
+different source text."
+  (let (out)
+    (with-temp-buffer
+      (insert text)
+      (goto-char (point-min))
+      (condition-case nil
+          (while t
+            (let ((form (read (current-buffer))))
+              (when (and (consp form)
+                         (memq (car form) '(defcustom defvar))
+                         (symbolp (nth 1 form))
+                         (>= (safe-length form) 3))
+                (push (cons (nth 1 form) (nth 2 form)) out))))
+        (end-of-file nil)))
+    (nreverse out)))
+
 (defun cc-butler--defcustom-forms-in-file (file)
   "Alist of (SYMBOL . DEFAULT-FORM) for every top-level `defcustom' or
 `defvar'-with-a-value form in FILE, read from its source text without
 loading or evaluating it. See `cc-butler--defcustom-drift'."
-  (let (out)
-    (when (file-readable-p file)
-      (with-temp-buffer
-        (insert-file-contents file)
-        (goto-char (point-min))
-        (condition-case nil
-            (while t
-              (let ((form (read (current-buffer))))
-                (when (and (consp form)
-                           (memq (car form) '(defcustom defvar))
-                           (symbolp (nth 1 form))
-                           (>= (safe-length form) 3))
-                  (push (cons (nth 1 form) (nth 2 form)) out))))
-          (end-of-file nil))))
-    (nreverse out)))
+  (when (file-readable-p file)
+    (with-temp-buffer
+      (insert-file-contents file)
+      (cc-butler--defcustom-forms-in-string (buffer-string)))))
 
 (defun cc-butler--defcustom-drift-internal-p (sym)
   "Non-nil if SYM's name marks it elisp-private — `--' anywhere in the name,
@@ -466,6 +477,99 @@ every test would keep passing."
             (unless (equal (symbol-value sym) code-default)
               (push (list sym (symbol-value sym) code-default) drift))))))
     (nreverse drift)))
+
+;;;; ------------------------------------------------------------------
+;;;; Drift labeling: is a stuck reload or a deliberate customization more
+;;;; plausible, given the file's OWN git history? Read-only, additive,
+;;;; never changes `cc-butler--defcustom-drift's return shape (existing
+;;;; tests assert that 3-tuple exactly) — this only feeds extra text into
+;;;; `cc-butler-tool-reload-code's rendering.
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler--defcustom-history-defaults (file symbol)
+  "Alist of (SHA . DEFAULT-FORM), newest commit first, of every default form
+FILE's git history ever gave SYMBOL's top-level `defcustom'/`defvar' —
+walked via `git log --follow' over every commit `git' can find touching
+FILE, then `git show SHA:PATH' to read each revision's full text (parsed
+with `cc-butler--defcustom-forms-in-string' — never `load'ed or `eval'ed as
+a whole, so an old revision's unrelated code never runs).
+
+Nil whenever this cannot be answered at all — FILE is not inside a git
+checkout, `git' is unavailable, or FILE is not tracked. Nil here means
+\"undeterminable\", never \"no history\"; `cc-butler--defcustom-drift-label'
+must treat it as \"give no label\", not as evidence of anything.
+
+Uses `cc-butler--git' throughout — the same process-file-based subprocess
+call `cc-butler--git-head''s docstring explains this codebase never
+replaces with `shell-command-to-string' (a wedged .git/index.lock would
+freeze the whole single-threaded daemon)."
+  (let ((dir (file-name-directory (expand-file-name file))))
+    (when (cc-butler--git-dir dir)
+      ;; Relative to DIR itself, NOT `git rev-parse --show-toplevel' — that
+      ;; resolves symlinks (macOS puts /tmp under a /var -> /private/var
+      ;; symlink) and can answer a different, resolved path than the
+      ;; unresolved DIR every other call here uses as `default-directory',
+      ;; which broke this relative path silently in exactly that case.
+      ;; DIR having its own `.git' (checked above) is what already makes it
+      ;; the repo root for every other caller in this codebase.
+      (let* ((relfile (file-relative-name (expand-file-name file) dir))
+             (log (cc-butler--git dir "log" "--follow" "--format=%H"
+                                   "--" relfile)))
+        (when log
+          (let (out)
+            (dolist (sha (split-string log "\n" t))
+              (let* ((content (cc-butler--git dir "show" (concat sha ":" relfile)))
+                     (form (and content
+                                (cdr (assq symbol
+                                           (cc-butler--defcustom-forms-in-string content))))))
+                (when form (push (cons sha form) out))))
+            (nreverse out)))))))
+
+(defun cc-butler--defcustom-drift-label (file symbol live-value code-default)
+  "Evidence-based classification string for one drifted SYMBOL in FILE, or
+nil if undeterminable (no git history could be walked at all — see
+`cc-butler--defcustom-history-defaults').
+
+Ground truth is FILE's own git history: every past default form that
+symbol's line ever had, other than the current CODE-DEFAULT, gets
+evaluated and compared to LIVE-VALUE.
+
+- LIVE-VALUE matches one of those past defaults: \"(likely stuck reload)\"
+  — a reload plausibly never applied a later source change — naming the
+  commit, WITH an inline caveat that a human could have coincidentally
+  picked the same value, since this can never be proof.
+- LIVE-VALUE matches no past default in this file's history: \"(likely
+  deliberate customization)\" — WITH an inline caveat that only this one
+  file's history was checked, so a value set some other way (a different
+  package, a value predating this repo) is not thereby proven deliberate.
+
+The caveat text is embedded in the label STRING ITSELF, not only here in
+the docstring: a reader who only ever sees the rendered MCP tool output —
+never this source — must not mistake either label for a certain verdict."
+  (let ((history (cc-butler--defcustom-history-defaults file symbol)))
+    (when history
+      (let ((match (cl-find-if
+                    (lambda (pair)
+                      (let ((v (ignore-errors (eval (cdr pair) t))))
+                        (and (not (equal v code-default))
+                             (equal v live-value))))
+                    history)))
+        (if match
+            (format "(likely stuck reload) this value matches a past shipped default (commit %s) — cannot rule out a human coincidentally choosing the same value"
+                    (substring (car match) 0 7))
+          "(likely deliberate customization) this value never appears in this line's git history — only this file's own history was checked")))))
+
+(defun cc-butler--defcustom-file-for-symbol (dir symbol)
+  "Path of the module under DIR whose top-level `defcustom'/`defvar' defines
+SYMBOL, or nil if none of `cc-butler--modules' (plus cc-butler.el itself)
+does. `cc-butler--defcustom-drift's own (SYMBOL LIVE CODE-DEFAULT) triples
+do not carry the file they came from — by design, that return shape is
+asserted exactly by existing tests — so a caller that needs the file (to
+walk ITS git history for a label) re-derives it here instead."
+  (cl-loop for m in (cons 'cc-butler cc-butler--modules)
+           for file = (expand-file-name (concat (symbol-name m) ".el") dir)
+           when (assq symbol (cc-butler--defcustom-forms-in-file file))
+           return file))
 
 ;;;###autoload
 (defun cc-butler-reload ()
@@ -732,11 +836,27 @@ a context, and nothing in this path is a substitute for it."
      (if drift
          (format "\n\n⚠ %d variable(s) differ from their current code default after this reload — either a deliberate customization (harmless), or a changed default that could not apply because the symbol was already bound (this is exactly the failure class `cc-butler-launch-ready-timeout' hit 2026-09-05 — verify by hand, this is not something any test suite can catch):\n%s"
                  (length drift)
-                 (mapconcat (lambda (d) (format "  %s: live=%s code-default=%s"
-                                                 (nth 0 d)
-                                                 (cc-butler--truncate-for-report (nth 1 d))
-                                                 (cc-butler--truncate-for-report (nth 2 d))))
-                            drift "\n"))
+                 (mapconcat
+                  (lambda (d)
+                    (let* ((sym (nth 0 d))
+                           (live (nth 1 d))
+                           (code-default (nth 2 d))
+                           ;; Best-effort only: labeling walks git history, which
+                           ;; can fail in any number of ways (untracked file, no
+                           ;; git). A label that can't be determined is simply
+                           ;; omitted — never a reason to hide the drift line
+                           ;; itself, which is the one thing this report exists
+                           ;; to surface unconditionally.
+                           (file (ignore-errors (cc-butler--defcustom-file-for-symbol dir sym)))
+                           (label (and file (ignore-errors
+                                              (cc-butler--defcustom-drift-label
+                                               file sym live code-default)))))
+                      (format "  %s: live=%s code-default=%s%s"
+                              sym
+                              (cc-butler--truncate-for-report live)
+                              (cc-butler--truncate-for-report code-default)
+                              (if label (format "\n    %s" label) ""))))
+                  drift "\n"))
        "")
      ;; Same reason the stale .elc is spelled out: this caller cannot look at
      ;; the filesystem, and "which copy did I just reload, and is it behind"

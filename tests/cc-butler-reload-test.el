@@ -219,6 +219,147 @@ build-artifact noise every call)."
     (let ((out (cc-butler-tool-reload-code)))
       (should-not (string-match-p "code-default" out)))))
 
+;;;; ------------------------------------------------------------------
+;;;; Drift labeling: git-history-based (ㄴ) stuck-reload vs (ㄱ) deliberate
+;;;; classification. Read-only, additive — `cc-butler--defcustom-drift's own
+;;;; return shape is untouched (asserted exactly by the tests above).
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-test--make-multi-commit-git-repo (symbol-name defaults)
+  "Fixture git repo (a fresh temp dir) with one file holding a single
+`defcustom' for SYMBOL-NAME, committed once per value in DEFAULTS (Lisp
+default forms, oldest first — the last entry is HEAD's current default).
+Returns (DIR FILE SHAS): FILE is the fixture file's absolute path, SHAS is
+the list of commit SHAs in the same oldest-first order as DEFAULTS, so a
+test can say \"value (nth N defaults) shipped in commit (nth N shas)\"."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-drift-history" t)))
+         (relfile "cc-butler-drift-history-fixture.el")
+         (file (expand-file-name relfile dir))
+         shas)
+    (cc-butler-test--git dir "init" "-q")
+    (cc-butler-test--git dir "config" "user.email" "test@test")
+    (cc-butler-test--git dir "config" "user.name" "test")
+    (dolist (default defaults)
+      (write-region (format "(defcustom %s %S \"doc\")\n" symbol-name default)
+                     nil file)
+      (cc-butler-test--git dir "add" relfile)
+      (cc-butler-test--git dir "commit" "-q" "-m" (format "set default to %S" default))
+      (push (let ((default-directory dir))
+              (with-temp-buffer
+                (call-process "git" nil t nil "rev-parse" "HEAD")
+                (string-trim (buffer-string))))
+            shas))
+    (list dir file (nreverse shas))))
+
+(ert-deftest cc-butler-reload/drift-label-marks-stuck-reload-when-live-matches-a-past-default ()
+  "A live value that matches a REAL past shipped default (not the current
+one) is the (ㄴ) shape: name the commit, and say so with the caveat that
+this can never be certainty — a human could have coincidentally chosen the
+same value as some past default."
+  (skip-unless (executable-find "git"))
+  (cl-destructuring-bind (_dir file shas)
+      (cc-butler-test--make-multi-commit-git-repo "cc-butler-test-drift-hist-a" '(3 5 8))
+    (let ((label (cc-butler--defcustom-drift-label
+                  file 'cc-butler-test-drift-hist-a 3 8)))
+      (should label)
+      (should (string-match-p "likely stuck reload" label))
+      (should (string-match-p (regexp-quote (substring (nth 0 shas) 0 7)) label))
+      (should (string-match-p
+               "cannot rule out a human coincidentally choosing the same value"
+               label)))))
+
+(ert-deftest cc-butler-reload/drift-label-marks-deliberate-customization-when-live-value-never-shipped ()
+  "A live value that never appears anywhere in the file's git history for
+that line is the (ㄱ) shape — WITH the caveat that only this one file's
+history was checked, so this cannot prove the value was chosen deliberately
+by a human rather than set some other way this check cannot see."
+  (skip-unless (executable-find "git"))
+  (cl-destructuring-bind (_dir file _shas)
+      (cc-butler-test--make-multi-commit-git-repo "cc-butler-test-drift-hist-b" '(3 5 8))
+    (let ((label (cc-butler--defcustom-drift-label
+                  file 'cc-butler-test-drift-hist-b 999 8)))
+      (should label)
+      (should (string-match-p "likely deliberate customization" label))
+      (should (string-match-p
+               "only this file's own history was checked" label)))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-unaffected-by-labeling-when-live-matches-current-default ()
+  "REGRESSION GUARD: a symbol whose live value equals the CURRENT code
+default must never even reach labeling — `cc-butler--defcustom-drift'
+already excludes it from its return value, and that contract must still
+hold with history-based labeling added alongside it."
+  (skip-unless (executable-find "git"))
+  (cl-destructuring-bind (_dir file _shas)
+      (cc-butler-test--make-multi-commit-git-repo "cc-butler-test-drift-hist-c" '(3 5 8))
+    (defvar cc-butler-test-drift-hist-c)
+    (setq cc-butler-test-drift-hist-c 8)
+    (unwind-protect
+        (should-not (cc-butler--defcustom-drift file))
+      (makunbound 'cc-butler-test-drift-hist-c))))
+
+(ert-deftest cc-butler-reload/drift-label-nil-when-file-has-no-git-history ()
+  "A plain fixture file with no `.git' anywhere above it must degrade to
+nil — never error, never guess a classification."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defcustom cc-butler-test-drift-hist-nogit 8 \"doc\")\n")))
+    (should-not (cc-butler--defcustom-drift-label
+                 file 'cc-butler-test-drift-hist-nogit 5 8))))
+
+(ert-deftest cc-butler-reload/defcustom-file-for-symbol-finds-the-defining-module ()
+  "The tool-rendering wiring needs to know which file a drifted symbol came
+from — `cc-butler--defcustom-drift's own triples deliberately do not carry
+it (existing tests assert that return shape exactly), so this re-derives it
+by re-scanning the modules, the same way the drift check itself did."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (cc-butler--modules '(cc-butler-fixture-mod-a cc-butler-fixture-mod-b)))
+    (write-region "" nil (expand-file-name "cc-butler.el" dir))
+    (write-region "" nil (expand-file-name "cc-butler-fixture-mod-a.el" dir))
+    (write-region "(defvar cc-butler-test-drift-locate-me 1 \"doc\")\n" nil
+                  (expand-file-name "cc-butler-fixture-mod-b.el" dir))
+    (should (equal (cc-butler--defcustom-file-for-symbol dir 'cc-butler-test-drift-locate-me)
+                   (expand-file-name "cc-butler-fixture-mod-b.el" dir)))
+    (should-not (cc-butler--defcustom-file-for-symbol dir 'cc-butler-test-drift-unknown-symbol))))
+
+(ert-deftest cc-butler-reload/tool-output-includes-history-label-when-determinable ()
+  "The label has to actually reach the MCP tool's rendered string end to
+end, appended after the existing live=/code-default= line — not just exist
+as an internal function nothing calls."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 3 :dir "/x/" :stale nil
+                               :defcustom-drift '((cc-butler-test-drift-hist-tool 5 8)))))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+            ((symbol-function 'cc-butler--defcustom-file-for-symbol)
+             (lambda (dir sym)
+               (should (equal dir "/x/"))
+               (should (eq sym 'cc-butler-test-drift-hist-tool))
+               "/fake/file.el"))
+            ((symbol-function 'cc-butler--defcustom-drift-label)
+             (lambda (file sym live code-default)
+               (should (equal file "/fake/file.el"))
+               (should (eq sym 'cc-butler-test-drift-hist-tool))
+               (should (equal live 5))
+               (should (equal code-default 8))
+               "(likely stuck reload) LABEL-MARKER")))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should (string-match-p "live=5" out))
+      (should (string-match-p "code-default=8" out))
+      (should (string-match-p "LABEL-MARKER" out)))))
+
+(ert-deftest cc-butler-reload/tool-output-renders-drift-normally-when-label-undeterminable ()
+  "No determinable label (e.g. the drifted file has no git history) must
+not crash the tool and must not print a false classification — the drift
+line itself still renders exactly as before."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 3 :dir "/x/" :stale nil
+                               :defcustom-drift '((cc-butler-test-drift-hist-nolabel 5 8)))))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+            ((symbol-function 'cc-butler--defcustom-file-for-symbol) (lambda (&rest _) nil)))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should (string-match-p "live=5" out))
+      (should (string-match-p "code-default=8" out))
+      (should-not (string-match-p "likely" out)))))
+
 (ert-deftest cc-butler-reload/tool-says-it-does-not-fetch ()
   "`reload_butler' loads what is on disk.  Saying so prevents the caller
 concluding a merge reached the fleet when nothing was pulled."
