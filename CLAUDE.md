@@ -45,6 +45,53 @@ those as breaking actions on this machine.
 
 ---
 
+# Merging several PRs? Re-run the suite AFTER the last one
+
+Per-PR CI green does not compose. Each PR is tested against the `main` it was
+written on, and GitHub's mergeability check is textual — neither of them ever
+sees the state where all of them are in at once.
+
+**So after a run of merges, before you call it done:**
+
+```
+git fetch && git checkout main && git pull
+emacs -Q --batch -l tests/run-tests.el
+```
+
+## This is not hypothetical — three times in one afternoon (2026-09-06)
+
+A sweep merged 12 PRs. All 12 were individually green with no conflict. Three
+pairs still broke on contact, and every one of them broke SILENTLY — the code
+kept working, the guarantee did not:
+
+- **#136 + #146** — two sessions independently fixed the same leaked-tool-call-XML
+  bug with disjoint patterns. Merged together, #146's guard ran above #136's, so
+  #136's `REJECTED …` log never fired for the commonest payload. Rejections kept
+  happening while the log that measures them read zero — indistinguishable from
+  the fix having worked. (Its ERT test caught it, which is the only reason it was
+  found.)
+- **#165 + #148** — #165 adds `escalation-drain-*.log`, whose own docstring says
+  it grows without bound. #148 adds rotation matching `ops-`/`msg-` only. Merged
+  together, rotation reported success forever and never touched the one file that
+  needed it.
+- **#170 + #165** — #170's base branch WAS #165's branch. Merging #165 with
+  `--delete-branch` auto-closed #170 and left it unreopenable until the deleted
+  ref was recreated. Check `baseRefName` on every open PR before deleting a
+  branch.
+
+## The shape
+
+All three are the same failure: **a mechanism that still reports success after it
+stopped covering the case it exists for.** Nothing goes red, nothing logs, and
+the difference between "working" and "holed" is invisible from outside. The whole
+suite, run once at the end, is what makes it visible — and it is cheap (~6s).
+
+While you are there, run it more than once: three tests spawn real subprocesses
+and flake under concurrent runs (issue #177), so a single green is weaker
+evidence than it looks.
+
+---
+
 # There are two test surfaces here, and only one of them is the gate
 
 `matrix-bridge.el` carries its own `matrix-bridge-self-test` (in-file
