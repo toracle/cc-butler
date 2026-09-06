@@ -566,13 +566,19 @@ worst case instead of leaving it open-ended."
 to at most once per day.")
 
 (defun cc-butler--ops-log-dated-files ()
-  "Return (FILE . DATE) for every dated ops/msg log file in
-`cc-butler-ops-log-dir', DATE as a YYYY-MM-DD string parsed from the name."
+  "Return (FILE . DATE) for every dated log file in `cc-butler-ops-log-dir',
+DATE as a YYYY-MM-DD string parsed from the name.
+
+The prefix alternation must list EVERY dated log written into this
+directory.  A writer that adds a new prefix and forgets this line gets
+rotation that reports success and never touches its files -- which is how
+`escalation-drain-' arrived: its own docstring says it accumulates without
+bound, and it was the one file rotation could not see."
   (when (file-directory-p cc-butler-ops-log-dir)
     (delq nil
           (mapcar (lambda (f)
                     (when (string-match
-                           "/\\(?:ops\\|msg\\)-\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)\\.log\\'"
+                           "/\\(?:ops\\|msg\\|escalation-drain\\)-\\([0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\)\\.log\\'"
                            f)
                       (cons f (match-string 1 f))))
                   (directory-files cc-butler-ops-log-dir t)))))

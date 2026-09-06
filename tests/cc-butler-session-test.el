@@ -2213,6 +2213,42 @@ what already existed when rotation shipped is a human decision."
     (cc-butler--ops-log-rotate)
     (should (file-exists-p recent-file))))
 
+(ert-deftest cc-butler-session/ops-log-rotate-covers-every-dated-log-writer ()
+  "Rotation must see EVERY dated log written into `cc-butler-ops-log-dir'.
+
+The failure this guards is silent by construction: a writer adds a new
+filename prefix, rotation's alternation does not list it, and rotation
+keeps reporting success while that one file grows without bound.  That is
+exactly what happened to `escalation-drain-' -- its own docstring warned it
+accumulates, and it was the single file rotation could not see.
+
+So this asserts the PROPERTY (every prefix written here is rotatable), not
+the current list: it derives the prefixes from the writers' own filename
+builders, so adding a writer without teaching rotation about it turns this
+red instead of leaking."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-butler-rotate-test-" t)))
+         (cc-butler-ops-log-dir dir)
+         (cc-butler-ops-log-rotation-epoch "2020-01-01")
+         (cc-butler-ops-log-retention-days 1)
+         (cc-butler--ops-log-last-rotated nil)
+         ;; the writers' own path builders -- not a hand-copied prefix list
+         (writers (list #'cc-butler--log-file
+                        #'cc-butler--msg-log-file
+                        #'cc-butler--escalation-drain-log-file))
+         (stale nil))
+    (dolist (build writers)
+      ;; same prefix the writer uses, but dated far past the retention window
+      (let* ((name (file-name-nondirectory (funcall build)))
+             (old (expand-file-name
+                   (replace-regexp-in-string
+                    "-[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}\\.log\\'"
+                    "-2020-01-05.log" name)
+                   dir)))
+        (write-region "" nil old)
+        (push old stale)))
+    (cc-butler--ops-log-rotate)
+    (dolist (f stale)
+      (should-not (file-exists-p f)))))
 (ert-deftest cc-butler-session/ops-log-rotate-size-cap-deletes-oldest-eligible-file-first ()
   "When the eligible (post-epoch, within-retention) set exceeds the size
 cap, the oldest file is deleted first, not the newest -- the size cap
