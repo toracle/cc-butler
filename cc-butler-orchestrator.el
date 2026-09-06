@@ -1526,12 +1526,20 @@ the caller can see and fix.")
   "Error if any (NAME . VALUE) pair in PARAMS contains a tag from
 `cc-butler--report-tag-strings'.  Names the exact tag and the exact
 parameter it was found in, so the caller can fix the call instead of
-guessing which field is corrupted."
+guessing which field is corrupted.
+
+Logs before erroring, for the same reason the `<invoke'/`<parameter'
+guard does (cc-butler#135): the error reaches only the calling session,
+which is the one that just got this wrong.  Without a line on disk the
+rejection rate is invisible, so nobody can tell a caller-side fix from a
+caller that simply stopped reporting."
   (dolist (pair params)
     (let ((name (car pair)) (value (cdr pair)))
       (when (stringp value)
         (dolist (tag cc-butler--report-tag-strings)
           (when (string-match-p (regexp-quote tag) value)
+            (cc-butler--log "REJECTED: %s contains the literal tag %s — see #135"
+                            name tag)
             (error "%s contains the literal tag %s -- pass summary/status/needs/options as separate arguments, not embedded tags inside one string"
                    name tag)))))))
 
@@ -1599,9 +1607,6 @@ turn; an escalation arriving between prompts would otherwise sit until
 the next one."
   (unless (and summary (stringp summary) (not (string-empty-p (string-trim summary))))
     (error "A decision summary is required"))
-  (cc-butler--reject-embedded-tags (list (cons "summary" summary)
-                                          (cons "needs" needs)
-                                          (cons "options" options)))
   (let* ((self (cc-butler--caller-dir))
          (s (string-trim summary))
          (n (and needs (stringp needs)
@@ -1624,6 +1629,18 @@ the next one."
       (cc-butler--log "%s -> butler │ REJECTED escalate_to_butler: payload contains a leaked tool-call fragment (%s) — see #135"
                       (if self (cc-butler--who-dir self) "steward") leak)
       (error "escalate_to_butler: summary/needs/options contains a raw tool-call fragment (%s) rather than authored text -- not created. See cc-butler#135; resend without it." leak))
+    ;; Second net, deliberately BELOW the first.  Both guards reject leaked
+    ;; tool-call XML, on disjoint patterns: the check above matches `<invoke'
+    ;; / `<parameter' and LOGS, this one matches the `<summary>'-family tags
+    ;; and only errors.  Run above the `let*' -- where it was written, before
+    ;; the two landed together -- it pre-empts the logging guard for the most
+    ;; common payload shape, so the rejection rate #135 exists to watch would
+    ;; silently read zero while rejections kept happening.  Order is the whole
+    ;; fix; `escalate-rejects-and-logs-leaked-tool-call-payload' fails if it
+    ;; is moved back up.
+    (cc-butler--reject-embedded-tags (list (cons "summary" summary)
+                                            (cons "needs" needs)
+                                            (cons "options" options)))
     (cond
      ;; human adapter create-path: decision/note → 정수님's inbox (the watcher renders it)
      ((bound-and-true-p cc-butler-decision-workflow)
