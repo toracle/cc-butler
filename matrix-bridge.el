@@ -62,7 +62,18 @@ Set to nil to go live.  See the commentary at the top of this file.")
   (expand-file-name "state-elisp.json" matrix-bridge-dir))
 
 (defvar matrix-bridge-target-session "butler")
-(defvar matrix-bridge-self-user-id "@butler-x600:warmblood-lounge")
+(defvar matrix-bridge-self-user-id nil
+  "This fleet's own Matrix user id, e.g. \"@butler-x600:warmblood-lounge\".
+
+Deliberately nil: it feeds the \"don't re-deliver my own messages\" filter in
+`matrix-bridge-event-line', and a default belonging to ONE fleet is worse than
+no default at all.  Carrying another fleet's id here means the filter drops
+exactly that fleet's messages -- the relay starts cleanly, logs nothing, and
+delivers nothing, which on screen is indistinguishable from a quiet room.
+
+`matrix-bridge-start' refuses to run while this is nil, so a fleet that forgets
+to set it fails loudly at startup instead of going silently deaf.  Set it in
+per-machine config, not here.")
 (defvar matrix-bridge-human-user-id "@jeongsoo:warmblood-lounge")
 (defvar matrix-bridge-sync-timeout-ms 30000)
 (defvar matrix-bridge-retry-seconds 5)
@@ -305,6 +316,10 @@ point is that they stop vanishing silently."
 (defun matrix-bridge-start ()
   "Start the Matrix -> cc-butler relay.  Safe to call twice."
   (interactive)
+  (unless matrix-bridge-self-user-id
+    (error "matrix-bridge: `matrix-bridge-self-user-id' is nil -- set it to \
+THIS fleet's own Matrix id before starting, or the relay cannot tell your own \
+messages from a peer's and will mis-filter them"))
   (matrix-bridge-stop)
   (setq matrix-bridge--token (matrix-bridge--read-trimmed matrix-bridge-token-file)
         matrix-bridge--room-id (matrix-bridge--read-trimmed matrix-bridge-room-id-file)
@@ -387,10 +402,13 @@ point is that they stop vanishing silently."
                        (sender . "@butler-macbook-m1-max:warmblood-lounge")
                        (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
                     "[matrix · butler-macbook-m1-max · id:$abc] hi") t)
-  (cl-assert (null (matrix-bridge-event-line
-                    `((type . "m.room.message") (sender . ,matrix-bridge-self-user-id)
-                      (event_id . "$abc")
-                      (content . ((msgtype . "m.text") (body . "echo")))))) t)
+  ;; Bound explicitly: with the defvar now nil, reading the global here would
+  ;; make this assertion pass for the wrong reason (nil sender equals nil id).
+  (let ((matrix-bridge-self-user-id "@butler-x600:warmblood-lounge"))
+    (cl-assert (null (matrix-bridge-event-line
+                      `((type . "m.room.message") (sender . ,matrix-bridge-self-user-id)
+                        (event_id . "$abc")
+                        (content . ((msgtype . "m.text") (body . "echo")))))) t))
   (cl-assert (null (matrix-bridge-event-line
                     '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
                       (event_id . "$abc") (content . ())))) t)
