@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
-# Send a text message into the Warmblood Lounge room as @butler-x600.
+# Send a text message into the Warmblood Lounge room as this fleet's butler.
 # Usage: post-to-lounge.sh "$(cat message.md)" ["$thread-root-event-id"]
+#
+# Machine identity (homeserver, token, room-id file, human mxid) comes from
+# matrix-bridge/config.sh next to this script (MATRIX_BRIDGE_CONFIG=<path>
+# to point elsewhere), or plain env vars, which always win.  See config.sh.
+#
+# Room selection has TWO accepted calling shapes, kept side by side rather
+# than picking one, because 2026-09-06 the x600 and m1 fleets each already
+# had live callers on their own shape and a silent reinterpretation of an
+# existing argument position is exactly how a message lands in the wrong
+# room with no error (the orphan-thread incident earlier that night):
+#   x600-style (2 args):  ROOM_ID=<id-or-name> post-to-lounge.sh body thread-root
+#   m1-style   (4 args):  post-to-lounge.sh body thread-root <reserved> room
+# The 3rd positional arg in m1-style is m1's own and not interpreted here --
+# only its presence (4 args total) selects the branch.  Exactly 3 args, or
+# both a 4th arg AND ROOM_ID set, is refused as ambiguous: a guess here would
+# be a silent misroute, so it errors instead.  `room` may be a literal room
+# id ('!...') or a symbolic name resolved against
+# "$MATRIX_BRIDGE_CONDUIT_DIR/<name>-room-id.txt" (e.g. "lounge", "butlers").
 #
 # Pass the body via "$(cat FILE)" -- NOT as an inline double-quoted string.
 # Inside double quotes the shell runs backticks and expands $..., so a body
@@ -20,25 +38,61 @@
 # him on those would train him to ignore the ping that matters.
 set -euo pipefail
 
-JEONGSOO_MXID="@jeongsoo:warmblood-lounge"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${MATRIX_BRIDGE_CONFIG:-$SCRIPT_DIR/config.sh}"
+if [ -f "$CONFIG_FILE" ]; then
+  # shellcheck source=config.sh
+  . "$CONFIG_FILE"
+fi
 
-CONDUIT_DIR="/home/toracle/services/conduit"
-HOMESERVER="http://localhost:8008"
-TOKEN="$(cat "$CONDUIT_DIR/butler-x600.token")"
-# Which room to send into.  Reading became multi-room on 2026-09-06 (the bridge
-# now polls every joined room, including each fleet's own), but sending stayed
-# pinned to the lounge -- so a message arriving in the x600 fleet room would be
-# READ there and ANSWERED in the lounge, which is the same "right channel, wrong
-# place" failure measured that day, one level up.  ROOM_ID=<room id> overrides.
-ROOM_ID="${ROOM_ID:-$(cat "$CONDUIT_DIR/lounge-room-id.txt")}"
+JEONGSOO_MXID="${MATRIX_BRIDGE_HUMAN_MXID:?MATRIX_BRIDGE_HUMAN_MXID not set (config.sh missing or incomplete)}"
+CONDUIT_DIR="${MATRIX_BRIDGE_CONDUIT_DIR:?MATRIX_BRIDGE_CONDUIT_DIR not set (config.sh missing or incomplete)}"
+HOMESERVER="${MATRIX_BRIDGE_HOMESERVER:?MATRIX_BRIDGE_HOMESERVER not set (config.sh missing or incomplete)}"
+TOKEN="$(cat "${MATRIX_BRIDGE_SELF_TOKEN_FILE:?MATRIX_BRIDGE_SELF_TOKEN_FILE not set (config.sh missing or incomplete)}")"
+
+TEXT="${1:?usage: post-to-lounge.sh \"text\" [thread-root-event-id]}"
+THREAD_ROOT="${2:-}"
+
+# Room selection: two calling shapes, see header comment for why both stay.
+case "$#" in
+  0|1|2) CALL_MODE=x600 ;;
+  4)     CALL_MODE=m1 ;;
+  *) echo "post-to-lounge: unrecognized call shape ($# args)." >&2
+     echo "  expected 2 args (x600: body, thread-root; room via ROOM_ID env)" >&2
+     echo "  or 4 args (m1: body, thread-root, <m1-reserved>, room)." >&2
+     exit 2 ;;
+esac
+if [ "$CALL_MODE" = "m1" ] && [ -n "${ROOM_ID:-}" ]; then
+  echo "post-to-lounge: ambiguous room selection -- got BOTH a 4th" >&2
+  echo "  positional arg ('$4') AND ROOM_ID=$ROOM_ID in the environment." >&2
+  echo "  Pick one: 4 positional args (m1-style) XOR ROOM_ID env var (x600-style)." >&2
+  exit 2
+fi
+ROOM_RAW="${ROOM_ID:-}"
+[ "$CALL_MODE" = "m1" ] && ROOM_RAW="$4"
+
+# Reading became multi-room on 2026-09-06 (the bridge now polls every joined
+# room, including each fleet's own), but sending stayed pinned to one room per
+# call -- so a message arriving in a fleet room would be READ there and
+# ANSWERED elsewhere, which is the same "right channel, wrong place" failure
+# measured that day, one level up.
+if [ -z "$ROOM_RAW" ]; then
+  ROOM_ID="$(cat "${MATRIX_BRIDGE_ROOM_ID_FILE:?MATRIX_BRIDGE_ROOM_ID_FILE not set (config.sh missing or incomplete)}")"
+elif [ "${ROOM_RAW#!}" != "$ROOM_RAW" ]; then
+  ROOM_ID="$ROOM_RAW"
+else
+  ROOM_NAME_FILE="$CONDUIT_DIR/${ROOM_RAW}-room-id.txt"
+  if [ ! -f "$ROOM_NAME_FILE" ]; then
+    echo "post-to-lounge: unknown room '$ROOM_RAW' (no $ROOM_NAME_FILE)" >&2
+    exit 2
+  fi
+  ROOM_ID="$(cat "$ROOM_NAME_FILE")"
+fi
 case "$ROOM_ID" in
   '!'*) : ;;
   *) echo "post-to-lounge: bad ROOM_ID: $ROOM_ID (a room id starts with !)" >&2
      exit 2 ;;
 esac
-
-TEXT="${1:?usage: post-to-lounge.sh \"text\" [thread-root-event-id]}"
-THREAD_ROOT="${2:-}"
 
 # An argument that is PRESENT but EMPTY is a caller bug, not a request to post
 # at top level -- and the two are indistinguishable downstream, so the message
