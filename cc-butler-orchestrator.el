@@ -1633,6 +1633,11 @@ only says how many and how stale the oldest is."
                                      (if (plist-get e :name) (format " (from %s)" (plist-get e :name)) "")
                                      (if (plist-get e :needs) (format " . needs: %s" (plist-get e :needs)) "")))
                            events "\n")))
+               ;; Durability log BEFORE the clear below -- see
+               ;; `cc-butler--log-escalation-drain''s own docstring for why
+               ;; that order matters and why its internal `ignore-errors'
+               ;; already makes a second guard here redundant.
+               (cc-butler--log-escalation-drain "butler-inbox" events)
                (setq cc-butler--butler-inbox-drained
                      (cc-butler--archive-drained cc-butler--butler-inbox-drained events))
                (setq cc-butler--butler-inbox nil)
@@ -1907,6 +1912,14 @@ durable log; only delivery to the steward is suppressed."
                                             (plist-get e :body)))
                                   deliverable "\n")
                      "No pending worker events.")))
+        ;; Durability log BEFORE the clear below -- see
+        ;; `cc-butler--log-escalation-drain''s own docstring for why that
+        ;; order matters and why its internal `ignore-errors' already
+        ;; makes a second guard here redundant.  Logs EVENTS (everything
+        ;; removed from the queue), not the narrower DELIVERABLE, so the
+        ;; steward's own filtered-out self-notifications are not the one
+        ;; thing this fix still lets vanish untraced.
+        (cc-butler--log-escalation-drain "worker-inbox" events)
         (setq cc-butler--inbox-drained
               (cc-butler--archive-drained cc-butler--inbox-drained events))
         (setq cc-butler--inbox nil)

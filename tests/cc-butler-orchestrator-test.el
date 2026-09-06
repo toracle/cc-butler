@@ -1217,6 +1217,26 @@ regression than the bug it fixes."
     (should (null cc-butler--inbox))
     (should (= 2 (length cc-butler--inbox-drained)))))
 
+(ert-deftest cc-butler-orchestrator/event-drain-survives-durability-log-failure ()
+  "`cc-butler--log-escalation-drain' runs BEFORE the queue clear (see its
+own docstring for why) precisely so it can be inserted without ever
+becoming a precondition for delivery.  Fake `write-region' itself
+failing -- not just the wrapper -- to prove that guarantee mechanically
+rather than by reading the `ignore-errors': even when the log write
+throws, the queue must still end up empty and the correct text must
+still come back, i.e. logging first and delivery-is-unconditional are
+not actually in tension."
+  (let ((cc-butler-message-transport 'in-memory)
+        (cc-butler--inbox-drained nil)
+        (cc-butler--inbox
+         (list (list :time (current-time) :name "worker" :body "needs input on auth"))))
+    (cl-letf (((symbol-function 'write-region)
+               (lambda (&rest _) (error "disk full (simulated)"))))
+      (let ((text (cc-butler-tool-inbox)))
+        (should (string-match-p "needs input on auth" text))))
+    (should (null cc-butler--inbox))
+    (should (= 1 (length cc-butler--inbox-drained)))))
+
 (ert-deftest cc-butler-orchestrator/forward-pending-count-ignores-ops-own-notification ()
   "REGRESSION (found 2026-09-02, steward-reported false alarms at ~02:2x/
 03:42/05:41): `cc-butler--forward-pending-count' used to be the RAW
