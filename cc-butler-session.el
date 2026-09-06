@@ -519,6 +519,50 @@ the operation being logged.  Returns LINE, or nil if the write failed."
   (expand-file-name (format-time-string "msg-%Y-%m-%d.log")
                     cc-butler-ops-log-dir))
 
+(defconst cc-butler--secret-shape-patterns
+  '("sk-[A-Za-z0-9]\\{20,\\}"
+    "ghp_[A-Za-z0-9]\\{20,\\}"
+    "AKIA[0-9A-Z]\\{16\\}"
+    "eyJ[A-Za-z0-9_-]\\{10,\\}\\(?:\\.[A-Za-z0-9_-]\\{10,\\}\\)\\{1,2\\}")
+  "Regexps for token/key shapes masked at the msg-log write site by
+`cc-butler--mask-secret-shapes': an OpenAI-style key, a GitHub PAT, an
+AWS access key id, and a JWT. Excludes the generic long-run shape,
+which needs an extra hex-only exclusion Emacs regexps can't express in
+one pattern (no lookahead) -- handled separately, see
+`cc-butler--secret-shape-generic-pattern'.")
+
+(defconst cc-butler--secret-shape-generic-pattern
+  "[A-Za-z0-9+/]\\{40,\\}=\\{0,2\\}"
+  "Generic long base64/alnum run -- the fifth masked shape. Also matches
+a purely lowercase-hex run (a git SHA is exactly this shape), which
+`cc-butler--mask-secret-shapes' filters back out via
+`cc-butler--looks-like-hex-only' so ordinary commit hashes in report
+bodies survive.")
+
+(defun cc-butler--looks-like-hex-only (s)
+  "Non-nil if S is entirely lowercase hex digits -- a git SHA's shape,
+not a secret's."
+  (string-match-p "\\`[0-9a-f]+\\'" s))
+
+(defun cc-butler--mask-secret-shapes (body)
+  "Replace token/key-shaped runs in BODY with <redacted:LEN>, LEN the
+length of what was there. Everything else in BODY is left untouched --
+investigative value matters (see 2026-09-04 retention audit: report
+bodies in this log are routinely the evidence a correction is based
+on), so this only ever removes the one thing that must not be at rest
+here, never anything around it."
+  (let ((out body))
+    (dolist (pat cc-butler--secret-shape-patterns)
+      (setq out (replace-regexp-in-string
+                 pat (lambda (m) (format "<redacted:%d>" (length m)))
+                 out t t)))
+    (replace-regexp-in-string
+     cc-butler--secret-shape-generic-pattern
+     (lambda (m)
+       (if (cc-butler--looks-like-hex-only m) m
+         (format "<redacted:%d>" (length m))))
+     out t t)))
+
 (defun cc-butler--log-message (kind from to body)
   "Append a full-body message record to today's message log, one JSON
 object per physical line, always.  KIND identifies the caller (e.g.
@@ -550,7 +594,7 @@ precondition for the operation being logged."
                                  (cons 'kind kind)
                                  (cons 'from (or from ""))
                                  (cons 'to (or to ""))
-                                 (cons 'body (or body ""))))
+                                 (cons 'body (cc-butler--mask-secret-shapes (or body "")))))
              "\n")
      nil (cc-butler--msg-log-file) 'append 'silent)))
 

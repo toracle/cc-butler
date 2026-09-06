@@ -2170,5 +2170,81 @@ one shared launch path, not an opt-in a caller could forget."
       (cc-butler--configure-session "/tmp/some-worker/"))
     (should mitigated)))
 
+;;;; ------------------------------------------------------------------
+;;;; write-site token/key masking (msg-log)
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-session-test--logged-body (body)
+  "Call `cc-butler--log-message' with BODY and return the `body' field
+actually written to today's message log."
+  (cc-butler--log-message "report" "worker" "steward" body)
+  (let* ((got (cc-butler-session-test--msg-file-string))
+         (record (json-parse-string got :object-type 'alist)))
+    (alist-get 'body record)))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-openai-style-key ()
+  "An sk-... key must never reach the on-disk message log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234")
+           (logged (cc-butler-session-test--logged-body
+                    (format "here is a key %s in the body" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged))
+      (should (string-match-p "here is a key" logged))
+      (should (string-match-p "in the body" logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-github-pat ()
+  "A ghp_... GitHub token must never reach the log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "ghp_1234567890abcdefGHIJKLMNOPQR")
+           (logged (cc-butler-session-test--logged-body
+                    (format "token %s here" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-aws-access-key-id ()
+  "An AKIA... AWS access key id must never reach the log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "AKIAABCDEFGHIJKL1234")
+           (logged (cc-butler-session-test--logged-body
+                    (format "key %s in there" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-jwt ()
+  "A JWT (eyJ...) must never reach the log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret (concat "eyJhbGciOiJIUzI1NiJ9."
+                            "eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+                            "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"))
+           (logged (cc-butler-session-test--logged-body
+                    (format "jwt %s here" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-generic-long-base64-run ()
+  "A generic long base64-looking blob (no specific prefix) must never
+reach the log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret (concat "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVoxMjM0"
+                            "NTY3ODkwYWJjZGVmZ2hpams="))
+           (logged (cc-butler-session-test--logged-body
+                    (format "blob %s end" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-a-git-sha-alone ()
+  "A 40+-char lowercase-hex git commit SHA -- the same length class as
+the generic rule, and something this fleet's own reports quote
+constantly -- must survive unredacted, or the whole reason the rest of
+the body is preserved (investigative value) is lost on the single most
+common long token this log actually contains."
+  (cc-butler-session-test--with-ops-log
+    (let* ((sha "e429387abcdef1234567890abcdef1234567890ab")
+           (logged (cc-butler-session-test--logged-body
+                    (format "squash commit %s into main" sha))))
+      (should (string-match-p (regexp-quote sha) logged))
+      (should-not (string-match-p "<redacted:" logged)))))
+
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here
