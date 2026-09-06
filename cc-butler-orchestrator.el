@@ -1910,6 +1910,7 @@ durable log; only delivery to the steward is suppressed."
         (setq cc-butler--inbox-drained
               (cc-butler--archive-drained cc-butler--inbox-drained events))
         (setq cc-butler--inbox nil)
+        (cc-butler--inbox-queue-save)
         text))))
 
 ;; Idempotent (re)registration: drop prior copies before adding.

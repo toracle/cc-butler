@@ -596,6 +596,64 @@ re-logged as if the event it described had happened a second time)."
                   (cc-butler--who-dir dir) (length (or body "")))
   (cc-butler--log-message "report" (cc-butler--who-dir dir) "butler" body))
 
+(defcustom cc-butler-inbox-queue-file
+  (expand-file-name
+   "cc-butler/cc-butler-inbox-queue.eld"
+   (let ((xdg (getenv "XDG_STATE_HOME")))
+     (if (and xdg (not (string-empty-p xdg))) xdg
+       (expand-file-name ".local/state" "~"))))
+  "On-disk mirror of `cc-butler--inbox', so an undrained worker event
+survives an Emacs restart instead of being silently lost. Always holds
+exactly the CURRENT live queue, never a history: rewritten on every
+push and rewritten empty the instant the queue drains, so a drained
+item's disk copy disappears in the same operation that drains it in
+memory. Same XDG derivation as `cc-butler-ops-log-dir', duplicated for
+the same require-order reason (see that defcustom's docstring)."
+  :type 'file
+  :group 'cc-butler)
+
+(defcustom cc-butler-inbox-queue-warn-threshold 20
+  "Live (undrained) inbox length that triggers a one-line ops-log warning.
+Never drops an event to enforce this -- discarding an undelivered event
+to satisfy a size cap would reproduce the exact bug the drain-order fix
+avoids (see `cc-butler--pending-events-hook-payload'); this is a
+backlog signal only. Defaults to `cc-butler-drained-keep''s existing
+20, this fleet's established size for a small bounded event window."
+  :type 'integer
+  :group 'cc-butler)
+
+(defun cc-butler--inbox-queue-save ()
+  "Rewrite `cc-butler-inbox-queue-file' to mirror the current `cc-butler--inbox'.
+Call after every mutation (push or drain) so the file never lags."
+  (ignore-errors
+    (make-directory (file-name-directory cc-butler-inbox-queue-file) t)
+    (with-temp-file cc-butler-inbox-queue-file
+      (let ((print-length nil) (print-level nil))
+        (prin1 cc-butler--inbox (current-buffer))
+        (insert "\n"))))
+  (when (> (length cc-butler--inbox) cc-butler-inbox-queue-warn-threshold)
+    (cc-butler--log "inbox queue backlog: %d undrained (warn threshold %d)"
+                    (length cc-butler--inbox) cc-butler-inbox-queue-warn-threshold)))
+
+(defun cc-butler--inbox-queue-save-on-push (&rest _)
+  "Advice: persist the inbox queue after every push.  See `cc-butler--inbox-queue-save'."
+  (cc-butler--inbox-queue-save))
+
+(advice-add 'cc-butler--inbox-push :after #'cc-butler--inbox-queue-save-on-push)
+
+(defun cc-butler--inbox-queue-load ()
+  "Restore `cc-butler--inbox' from `cc-butler-inbox-queue-file' if present.
+Only fills in when the in-memory queue is still empty, so re-evaluating
+this file (or requiring it twice) can never clobber events already
+pushed this session."
+  (when (and (null cc-butler--inbox) (file-exists-p cc-butler-inbox-queue-file))
+    (ignore-errors
+      (with-temp-buffer
+        (insert-file-contents cc-butler-inbox-queue-file)
+        (setq cc-butler--inbox (read (current-buffer)))))))
+
+(cc-butler--inbox-queue-load)
+
 ;; The steward is designated in `cc-butler-orchestrator' (loaded after this
 ;; file); forward-declare it so the list UI can pin/label it.
 (defvar cc-butler--steward)
