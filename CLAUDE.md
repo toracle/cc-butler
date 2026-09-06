@@ -90,6 +90,8 @@ While you are there, run it more than once: three tests spawn real subprocesses
 and flake under concurrent runs (issue #177), so a single green is weaker
 evidence than it looks.
 
+---
+
 # There are two test surfaces here, and only one of them is the gate
 
 `matrix-bridge.el` carries its own `matrix-bridge-self-test` (in-file
