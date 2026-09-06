@@ -75,6 +75,23 @@ delivers nothing, which on screen is indistinguishable from a quiet room.
 to set it fails loudly at startup instead of going silently deaf.  Set it in
 per-machine config, not here.")
 (defvar matrix-bridge-human-user-id "@jeongsoo:warmblood-lounge")
+(defvar matrix-bridge-human-reminder
+  "\n※ 이 메시지에 대한 답은 반드시 이 방(Matrix)에 남겨라 — 터미널 응답만으로 \
+끝내지 말 것. 답할 때는 이 줄 머리 대괄호 안의 `id:'/`thread:'/`reply:' 값을 \
+그대로 넘겨 같은 스레드·답장으로 이어 붙여라."
+  "Reminder appended to messages from `matrix-bridge-human-user-id'.
+
+The human asked (2026-09-06) for two things the relaying session kept
+forgetting: answer IN the room rather than only in its own terminal, and keep
+the thread by reusing the ids this line already carries.  Both are per-turn
+discipline, so the reminder rides along with every message he sends instead of
+living in a document someone has to remember to reread.
+
+A string, not a hardcoded sentence in the formatter, because the way a fleet
+posts back to the room is fleet-local -- naming one fleet's script here would
+be the same mistake as shipping one fleet's `matrix-bridge-self-user-id'.
+Set it to the empty string to switch the reminder off.")
+
 (defvar matrix-bridge-sync-timeout-ms 30000)
 (defvar matrix-bridge-retry-seconds 5)
 
@@ -187,10 +204,13 @@ point is that they stop vanishing silently."
                (not (equal sender matrix-bridge-self-user-id))
                ;; a redaction or state-ish payload has nothing to deliver
                (matrix-bridge--get content 'msgtype))
-      (format "[matrix · %s%s] %s"
+      (format "[matrix · %s%s] %s%s"
               (matrix-bridge-attribution sender)
               (matrix-bridge-envelope (or (matrix-bridge--get ev 'event_id) "") content)
-              (matrix-bridge-describe content)))))
+              (matrix-bridge-describe content)
+              (if (equal sender matrix-bridge-human-user-id)
+                  matrix-bridge-human-reminder
+                "")))))
 
 ;;; --- delivery -------------------------------------------------------------
 
@@ -393,10 +413,19 @@ messages from a peer's and will mis-filter them"))
                     "[첨부 m.audio · voice.ogg]") t)
 
   ;; the whole line, and the two events we must drop
+  ;; The human's own messages carry the reminder ...
   (cl-assert (equal (matrix-bridge-event-line
                      `((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
                        (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                    "[matrix · 정수님 · id:$abc] hi") t)
+                    (concat "[matrix · 정수님 · id:$abc] hi"
+                            matrix-bridge-human-reminder)) t)
+  ;; ... and nobody else's do.  Without this negative case the assertion above
+  ;; would still pass if the reminder were appended unconditionally.
+  (cl-assert (equal (matrix-bridge-event-line
+                     `((type . "m.room.message")
+                       (sender . "@butler-x600:warmblood-lounge")
+                       (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
+                    "[matrix · butler-x600 · id:$abc] hi") t)
   (cl-assert (equal (matrix-bridge-event-line
                      '((type . "m.room.message")
                        (sender . "@butler-macbook-m1-max:warmblood-lounge")
