@@ -132,6 +132,15 @@ match, and an empty inbox yields (0 . nil)."
            ,@body)
        (delete-directory cc-butler-mail-dir t))))
 
+(ert-deftest cc-butler-mail/slug-preserves-non-ascii-agent-ids ()
+  "The maildir slug must not collapse a real multi-byte agent id -- e.g.
+`cc-butler-human-agent' (\"정수님\") -- into the same run of underscores as
+an unrelated garbage string.  An ASCII-only allow-list turns every
+non-Latin agent id into `___', silently merging any two agents whose ids
+happen to collapse to the same three characters."
+  (should-not (equal (cc-butler--mail-slug "정수님") (cc-butler--mail-slug "   ")))
+  (should (equal "정수님" (cc-butler--mail-slug "정수님"))))
+
 (ert-deftest cc-butler-mail/file-dirs-and-messages-are-created-restricted ()
   "Maildirs carry full message bodies (tokens, paths, real names can appear
 in them).  A bare `make-directory'/`with-temp-file' would take the process
@@ -161,6 +170,19 @@ never read (only complete, renamed messages appear in new/)."
         (should (equal "complete" (plist-get (car got) :body)))
         ;; the partial file is untouched in tmp/ (not consumed by the drain)
         (should (file-exists-p tmp))))))
+
+(ert-deftest cc-butler-mail/non-ascii-agent-does-not-collide-with-another ()
+  "Given two DIFFERENT agents whose ids would collapse to the same slug
+under an ASCII-only allow-list (a Hangul human agent id, and an unrelated
+whitespace-only garbage id), When each delivers a message over the real
+file adapter, Then their inboxes do not merge -- draining one agent must
+never surface the other's message."
+  (cc-butler-mail-test--with-file
+    (cc-butler--ch-deliver "정수님" (list :kind 'note :from "steward" :body "for the human"))
+    (cc-butler--ch-deliver "   " (list :kind 'note :from "someone-else" :body "unrelated"))
+    (let ((mine (cc-butler--ch-drain "정수님")))
+      (should (= 1 (length mine)))
+      (should (equal "for the human" (plist-get (car mine) :body))))))
 
 (ert-deftest cc-butler-mail/file-return-path-e2e ()
   "The return-path scenario, unchanged, over the real file adapter."

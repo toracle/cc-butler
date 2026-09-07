@@ -1985,6 +1985,9 @@ alias for already-connected callers."
   (let ((self (cc-butler--caller-dir)))
     (unless self
       (error "No calling session context for this report"))
+    (when (equal self (cc-butler--ops-dir))
+      (error "Refusing to report to the calling session itself (%s) -- report_to_steward/report_to_butler always delivers to the ops session, and the caller IS that session, so this would loop back to its own inbox with no one else seeing it. See cc-butler#47, #116."
+             (cc-butler--who-dir self)))
     (cc-butler--reject-embedded-tags (list (cons "summary" summary)
                                             (cons "status" status)
                                             (cons "needs" needs)))
