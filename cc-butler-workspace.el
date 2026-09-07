@@ -135,8 +135,11 @@ Runs `cc-butler-scaffold-functions' with (TOPIC-DIR TEMPLATE) at the end."
 (defun cc-butler--start-session-in (dir)
   "Start a Claude session with DIR as the working directory.
 Routes through `cc-butler--launch-session' — the single launch+config path all
-roles share — so worker, butler, and steward ghostel config cannot diverge."
-  (cc-butler--launch-session dir))
+roles share — so worker, butler, and steward ghostel config cannot diverge.
+Every caller of this function launches a worker (butler/steward launch via
+their own fixed home directories, never through here), so the worker model
+is pinned unconditionally — see `cc-butler--with-worker-model'."
+  (cc-butler--with-worker-model (cc-butler--launch-session dir)))
 
 (defun cc-butler--clone-repos (topic-dir repos done-fn)
   "Clone REPOS into TOPIC-DIR sequentially and asynchronously.

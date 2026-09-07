@@ -434,5 +434,25 @@ so the kill step is a no-op)."
                                     (plist-get res :note)))))
       (when (file-directory-p proj) (delete-directory proj t)))))
 
+;;;; ------------------------------------------------------------------
+;;;; Worker launch pins the model explicitly (2026-09-07) — a corrupted
+;;;; machine-wide `/model' default (compaction's restore step rewrites it,
+;;;; see cc-butler-compact.el) must not silently mis-tier a newly spawned
+;;;; worker.  Only `cc-butler--start-session-in' is fixed here — every
+;;;; caller of it launches a worker (butler/steward launch via their own
+;;;; fixed home directories, never through here).
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-workspace/start-session-in-pins-worker-model ()
+  "`cc-butler--start-session-in' pins the model explicitly via `--model' so a
+corrupted machine-wide `/model' default cannot silently mis-tier a newly
+spawned worker."
+  (let (captured-flags
+        (cc-butler-worker-launch-model "sonnet"))
+    (cl-letf (((symbol-function 'cc-butler--launch-session)
+               (lambda (_dir) (setq captured-flags claude-code-ide-cli-extra-flags))))
+      (cc-butler--start-session-in "/tmp/some-worker/"))
+    (should (string-match-p "--model sonnet\\b" captured-flags))))
+
 (provide 'cc-butler-workspace-test)
 ;;; cc-butler-workspace-test.el ends here

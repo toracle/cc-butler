@@ -44,6 +44,25 @@ An empty string adds nothing."
                                " " cc-butler-channel-args))))
      ,@body))
 
+(defcustom cc-butler-worker-launch-model "sonnet"
+  "Model workers are launched with, regardless of the machine-wide `/model'
+default.  Workers are the fleet's most frequently spawned sessions and the
+least supervised at the moment they start, so a corrupted global default
+(compaction's restore step rewrites it — see cc-butler-compact.el) must not
+silently mis-tier one.  Butler/steward are deliberately NOT pinned this way:
+their model is a human-owned value 정수님 hand-changes, and pinning it would
+silently revert his decision on every relaunch."
+  :type 'string
+  :group 'cc-butler)
+
+(defmacro cc-butler--with-worker-model (&rest body)
+  "Run BODY with `cc-butler-worker-launch-model' pinned via `--model'."
+  (declare (indent 0))
+  `(let ((claude-code-ide-cli-extra-flags
+          (string-trim (concat (or claude-code-ide-cli-extra-flags "")
+                               " --model " cc-butler-worker-launch-model))))
+     ,@body))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Display naming: nearest ancestor holding `.projectile'
 ;;;; ------------------------------------------------------------------
