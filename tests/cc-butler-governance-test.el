@@ -222,6 +222,242 @@ argument would reintroduce it one call at a time."
                               args))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; The store cap (2026-09-08, 정수님 배차: "제약이 있어야 효율화된다")
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/record-refuses-a-new-note-at-the-cap ()
+  "RED: a NEW slug is refused once the store already holds `max-notes' notes,
+and refusing means the file is genuinely never written — not just a
+rejection message with the write still landing underneath it."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-notes 1))
+      (cc-butler-governance-record "first" "d" "body")
+      (should-error (cc-butler-governance-record "second" "d" "body")
+                    :type 'user-error)
+      (should-not (file-exists-p
+                   (expand-file-name "second.md" (cc-butler-governance-store))))
+      (should (equal (cc-butler-governance-names) '("first"))))))
+
+(ert-deftest cc-butler-governance/record-allows-past-the-cap-once-raised ()
+  "GREEN: the identical call just refused succeeds once the cap is raised —
+proves this is a live count check, not a one-time snapshot or a permanent
+lock."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-notes 1))
+      (cc-butler-governance-record "first" "d" "body")
+      (should-error (cc-butler-governance-record "second" "d" "body")))
+    (let* ((cc-butler-governance-max-notes 10)
+           (res (cc-butler-governance-record "second" "d" "body")))
+      (should (plist-get res :verified))
+      (should (file-exists-p (plist-get res :path))))))
+
+(ert-deftest cc-butler-governance/record-cap-never-blocks-revising-an-existing-note ()
+  "Updating a principle that already exists must never be blocked — it does
+not grow the store, so it is not the growth this cap exists to stop."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-notes 1))
+      (cc-butler-governance-record "first" "d" "original")
+      (let ((res (cc-butler-governance-record "first" "d" "revised")))
+        (should (plist-get res :existed))
+        (should (plist-get res :verified))
+        (should (equal (cc-butler-governance--store-note-count) 1))))))
+
+(ert-deftest cc-butler-governance/cap-message-names-count-cap-and-largest-notes ()
+  "The rejection text must be actionable on the spot: current count, the cap,
+and which notes are large — not just \"no\"."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-notes 1))
+      (cc-butler-governance-record "big-one" "d" (make-string 500 ?x))
+      (let ((msg (condition-case err
+                     (progn (cc-butler-governance-record "second" "d" "body") nil)
+                   (user-error (cadr err)))))
+        (should (string-match-p "1 notes" msg))
+        (should (string-match-p "cap of 1" msg))
+        (should (string-match-p "big-one" msg))))))
+
+(ert-deftest cc-butler-governance/cap-message-gives-an-explicit-pass-now-action ()
+  "REGRESSION (2026-09-08, real-store probe before merge): the original
+message stated \"revising an existing principle is never blocked\" as a
+FACT but never told the worker to actually do that to get their own
+content saved now. Must contain an imperative the worker can follow
+without a follow-up question — naming record_principle and an existing
+name, not just describing the rule."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-notes 1))
+      (cc-butler-governance-record "big-one" "d" "body")
+      (let ((msg (condition-case err
+                     (progn (cc-butler-governance-record "second" "d" "body") nil)
+                   (user-error (cadr err)))))
+        (should (string-match-p "TO RECORD THIS NOW" msg))
+        (should (string-match-p "call record_principle again" msg))
+        (should (string-match-p "NAME of an EXISTING principle" msg))))))
+
+(ert-deftest cc-butler-governance/cap-message-does-not-present-size-as-a-ranked-merge-list ()
+  "REGRESSION (2026-09-08, real-store probe before merge): the real
+store's single largest note, at the moment this was measured, was the
+exact note warmble-jumble's own folding effort had concluded needs
+SPLITTING into 21 notes -- not merging into. A worker following
+\"largest = best merge target\" would have made the count WORSE. The
+message must explicitly warn that size is not a ranking and a large note
+may need splitting, not silently imply big-is-mergeable."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-notes 1))
+      (cc-butler-governance-record "big-one" "d" "body")
+      (let ((msg (condition-case err
+                     (progn (cc-butler-governance-record "second" "d" "body") nil)
+                   (user-error (cadr err)))))
+        (should (string-match-p "NOT a ranked merge list" msg))
+        (should (string-match-p "SPLITTING" msg))
+        (should (string-match-p "match by topic, never by size" msg))))))
+
+(ert-deftest cc-butler-governance/store-note-count-ignores-the-memory-cache ()
+  "The cap counts the STORE, never the generated memory-dir cache: the cache
+can hold an orphan a store deletion left behind (see cc-butler#36 /
+regenerate-governance), and a cap that counted the cache would refuse
+writes the store itself has room for, and would never shrink just because
+the store was cleaned up."
+  (cc-butler-governance-test--with-store
+    (cc-butler-governance-record "only-one" "d" "body")
+    (with-temp-file (expand-file-name "butler-orphan.md" cc-butler-governance-memory-dir)
+      (insert "orphan"))
+    (should (equal (cc-butler-governance--store-note-count) 1))
+    (should (equal (cc-butler-governance--note-count) 2))))
+
+;;;; ------------------------------------------------------------------
+;;;; The body-length cap (2026-09-08, 정수님 증보: "용건만 간단히")
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/record-refuses-a-body-over-the-length-cap ()
+  "RED: a body longer than `max-note-bytes' is refused, and refusing means
+the file is genuinely never written."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-note-bytes 100))
+      (should-error (cc-butler-governance-record "too-long" "d" (make-string 200 ?x))
+                    :type 'user-error)
+      (should-not (file-exists-p
+                   (expand-file-name "too-long.md" (cc-butler-governance-store)))))))
+
+(ert-deftest cc-butler-governance/record-allows-a-long-body-once-the-cap-is-raised ()
+  "GREEN: the identical call just refused succeeds once the cap is raised —
+a live byte count, not a permanent lock."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-note-bytes 100))
+      (should-error (cc-butler-governance-record "too-long" "d" (make-string 200 ?x))))
+    (let* ((cc-butler-governance-max-note-bytes 1000)
+           (res (cc-butler-governance-record "too-long" "d" (make-string 200 ?x))))
+      (should (plist-get res :verified))
+      (should (file-exists-p (plist-get res :path))))))
+
+(ert-deftest cc-butler-governance/record-length-cap-also-blocks-padding-an-existing-note ()
+  "The count cap alone can be dodged by appending to an existing note
+instead of creating a new one — 정수님 spotted this leak directly. The
+length cap must catch that path too, not just brand-new notes."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-note-bytes 100))
+      (cc-butler-governance-record "grows" "d" (make-string 50 ?x))
+      (should-error (cc-butler-governance-record "grows" "d" (make-string 200 ?x))
+                    :type 'user-error)
+      ;; refused edit must not have clobbered the original body
+      (let ((text (with-temp-buffer
+                    (insert-file-contents
+                     (expand-file-name "grows.md" (cc-butler-governance-store)))
+                    (buffer-string))))
+        (should (string-match-p (make-string 50 ?x) text))
+        (should-not (string-match-p (make-string 200 ?x) text))))))
+
+(ert-deftest cc-butler-governance/length-cap-counts-bytes-not-characters ()
+  "Multi-byte text (Korean, this fleet's working language) must be measured
+in bytes, matching what actually lands on disk — counting characters would
+let a body several times the intended byte cap through."
+  (cc-butler-governance-test--with-store
+    (let* ((korean (make-string 40 ?정))          ; 40 chars, 120 bytes in UTF-8
+           (cc-butler-governance-max-note-bytes 100))
+      (should (> (string-bytes korean) cc-butler-governance-max-note-bytes))
+      (should (< (length korean) cc-butler-governance-max-note-bytes))
+      (should-error (cc-butler-governance-record "korean-note" "d" korean)
+                    :type 'user-error))))
+
+(ert-deftest cc-butler-governance/length-cap-message-names-bytes-cap-and-longest-sections ()
+  "The rejection text must be actionable: current bytes, the cap, and which
+sections of THIS body are worth cutting — not just \"too long\"."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-note-bytes 50))
+      (let ((msg (condition-case err
+                     (progn (cc-butler-governance-record
+                             "too-long" "d"
+                             (concat "short bit\n\n" (make-string 80 ?y)))
+                            nil)
+                   (user-error (cadr err)))))
+        (should (string-match-p "cap of 50" msg))
+        (should (string-match-p (make-string 20 ?y) msg))   ; the long section, previewed
+        (should (string-match-p "Trim to the point" msg))))))
+
+;;;; ------------------------------------------------------------------
+;;;; The index-line-length cap (2026-09-08, butler's own design — a
+;;;; short body does not guarantee a short MEMORY.md line, and the index
+;;;; line is what a session's context-read budget actually pays for)
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/record-refuses-a-description-over-the-index-line-cap ()
+  "RED: a description that renders an index line over
+`max-index-line-bytes' is refused, and refusing means the file is
+genuinely never written — even though the BODY itself is tiny."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-index-line-bytes 40))
+      (should-error (cc-butler-governance-record
+                     "x" (make-string 60 ?d) "short body")
+                    :type 'user-error)
+      (should-not (file-exists-p (expand-file-name "x.md" (cc-butler-governance-store)))))))
+
+(ert-deftest cc-butler-governance/record-allows-past-the-index-line-cap-once-raised ()
+  "GREEN: the identical call just refused succeeds once the cap is raised —
+a live check, not a one-time snapshot."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-index-line-bytes 40))
+      (should-error (cc-butler-governance-record "x" (make-string 60 ?d) "short body")))
+    (let* ((cc-butler-governance-max-index-line-bytes 200)
+           (res (cc-butler-governance-record "x" (make-string 60 ?d) "short body")))
+      (should (plist-get res :verified))
+      (should (file-exists-p (plist-get res :path))))))
+
+(ert-deftest cc-butler-governance/index-line-cap-is-independent-of-the-body-cap ()
+  "A tiny body with a long DESCRIPTION must still be refused — the two caps
+measure different text, so passing one must never be mistaken for passing
+both. This is the actual gap the index-line cap closes: capping the body
+alone (`cc-butler-governance-max-note-bytes') does nothing to
+`MEMORY.md''s size, since the index line is rendered from the
+description, not the body."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-note-bytes 100000)   ; body cap wide open
+          (cc-butler-governance-max-index-line-bytes 40))
+      (should-error (cc-butler-governance-record "x" (make-string 60 ?d) "tiny")
+                    :type 'user-error))))
+
+(ert-deftest cc-butler-governance/index-line-cap-also-blocks-padding-an-existing-description ()
+  "Revising a principle's description into a longer one must be checked too
+-- an update is exactly how an author would otherwise dodge this cap on a
+NEW note, the same append-instead-of-add shape the body-length cap closes."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-index-line-bytes 40))
+      (cc-butler-governance-record "grows" "short" "body")
+      (should-error (cc-butler-governance-record "grows" (make-string 60 ?d) "body")
+                    :type 'user-error))))
+
+(ert-deftest cc-butler-governance/index-line-cap-message-names-bytes-cap-and-the-line ()
+  "The rejection text must be actionable: current bytes, the cap, and the
+offending line itself, so the author can shorten it on the spot."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-index-line-bytes 40))
+      (let ((msg (condition-case err
+                     (progn (cc-butler-governance-record
+                             "x" "a rather long description that overflows" "body")
+                            nil)
+                   (user-error (cadr err)))))
+        (should (string-match-p "cap of 40" msg))
+        (should (string-match-p "a rather long description" msg))
+        (should (string-match-p "Shorten the description" msg))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Syncing the MEMORY.md index (cc-butler#36 gap b)
 ;;;; ------------------------------------------------------------------
 
