@@ -48,22 +48,39 @@ cannot disagree about where it is."
        (expand-file-name "governance/" cc-butler-governance--load-dir))))
 
 (defcustom cc-butler-governance-max-notes 250
-  "Hard cap on how many principle notes the STORE may hold.
+  "Hard cap (250, 정수님's number) on how many principle notes the STORE may
+hold — enforced as a RATCHET (butler's design, not 정수님's), not an
+on/off switch:
 
-`record_principle' refuses to write a genuinely NEW note (one whose slug
-is not already in the store) once the store would grow past this count —
-a limit the tool itself enforces, not a number written in a doc nobody
-actually checks. Revising an EXISTING principle in place never counts
-against this; only growth does.
+  count >= 250  ->  only a count-INCREASING write is refused (a genuinely
+                     new slug). Revising an EXISTING principle in place
+                     never counts against this, at any count.
+  count < 250   ->  same rule; it just has not started refusing yet.
+
+There is exactly one rule, `count >= max-notes' blocks new slugs — the
+\"ratchet\" framing is about why that single rule is correct even while
+the store starts out (2026-09-08: 567) far above 250. Turning this on
+BEFORE consolidating the existing 567 down to 250 does not deadlock
+recording: an update to an EXISTING principle always passes regardless of
+count, so the natural response to a rejection — fold the new content into
+one of the largest existing notes the rejection message names — both
+succeeds immediately and moves the store toward the cap, never away from
+it. The count can only ever hold or fall through this gate; it cannot
+rise back above where consolidation last left it (m1 함대, 2026-09-08:
+correctly flagged that turning the gate on unconditionally would look
+like it blocks ALL recording at 567 — it does not block RECORDING, only
+GROWTH, and growth is exactly what should stay blocked at any count above
+the cap).
 
 정수님, 2026-09-08: \"제약이 좀 있어야 효율화, 추상화가 된다 — 넣으려고
-했는데 넘쳐서 못 넣었다, 그러면 기존 것을 정리하고 넣는다.\" 250 is a
-starting point, not a measurement; raise it here if it turns out too
-tight, but the intended response to hitting it is to consolidate first."
+했는데 넘쳐서 못 넣었다, 그러면 기존 것을 정리하고 넣는다.\" 250 is her
+number, not a measurement; raise it here only on her instruction — the
+intended response to hitting it is to consolidate first, not to widen the
+gate."
   :type 'integer
   :group 'cc-butler)
 
-(defcustom cc-butler-governance-max-note-bytes 4096
+(defcustom cc-butler-governance-max-note-bytes 2048
   "Hard cap on one principle note's BODY length, in bytes.
 
 Checked in the same place `cc-butler-governance-max-notes' is — whatever
@@ -74,16 +91,44 @@ notes instead (measured 2026-09-08: the store's single largest note was
 already 112 KB). Only blocking both closes the leak down to the one thing
 left: actually folding content down.
 
-4096 (4 KB), FIXED (2026-09-08, 정수님) — do not raise this again without
-new instruction. 8 KB was tried and rejected: m1 함대's distribution
-measurement showed 68% of existing notes already fit inside 8 KB, so that
-cap would almost never actually fire. A cap that rarely fires gives no
-reason to fold anything down — the point here is not to avoid overflow,
-it is to FORCE the folding/abstraction 정수님 asked for (\"제약이 좀
-있어야 효율화, 추상화가 될 수 있거든요\"). A measured value is not
-automatically the right value for that purpose; measure what actually
-makes folding necessary, not what triggers least often. Not retroactive —
-this bites the next time an existing 4KB+ note is edited, not now."
+2048 (2 KB) — 정수님 지정값 (2026-09-08). 개수 250과 한 쌍. This went
+through two intermediate values before landing here, in order: 4 KB
+(butler's first guess) -> 8 KB (butler, after m1's distribution
+measurement) -> 2 KB (정수님's own final call, overriding both). The 8 KB
+reasoning is still the right reasoning even though the number changed —
+keep it: 8 KB was rejected because m1 함대's distribution showed 68% of
+existing notes already fit inside it, so that cap would almost never
+actually fire, and a cap that rarely fires gives no reason to fold
+anything down. The point here is not to avoid overflow, it is to FORCE
+the folding/abstraction 정수님 asked for (\"제약이 좀 있어야 효율화,
+추상화가 될 수 있거든요\"). Do not raise this again without new
+instruction from 정수님 specifically. Not retroactive —
+this bites the next time an existing 2KB+ note is edited, not now."
+  :type 'integer
+  :group 'cc-butler)
+
+(defcustom cc-butler-governance-max-index-line-bytes 80
+  "Hard cap on one principle's `MEMORY.md' index-line length, in bytes —
+roughly a name plus a five-or-six-word hook.
+
+This is what actually decides whether a session can even SEE a given
+principle: `MEMORY.md' itself is read in full only up to whatever byte
+budget the caller reading it applies (measured 2026-09-08, butler: of
+598 index lines / 281 KB total, only the first 74 lines / 25 KB actually
+load into context — 12%). Shrinking `cc-butler-governance-max-notes' to
+250 does not fix this on its own: 250 notes at this store's current
+average index-line size (468 bytes, measured the same day) is still
+250*468 ~= 117 KB, still roughly 5x that budget. Body length
+(`cc-butler-governance-max-note-bytes') is a DIFFERENT variable from
+index-line length — capping the body alone does not shrink the index at
+all, since `cc-butler-governance--index-line' renders only the
+description, not the body.
+
+80 — butler's calculated value (2026-09-08), NOT 정수님's — keep that
+distinction visible; 정수님 specified 250 (count) and 2048 (body) directly,
+this one is derived: 21504 bytes (a conservative budget) / 250 notes ~=
+86, rounded down with a little margin. Adjust independently of the other
+two if the actual read-in budget turns out to be measured differently."
   :type 'integer
   :group 'cc-butler)
 
@@ -217,6 +262,15 @@ can cut on the spot, the same principle as `cc-butler-governance--cap-message'."
               (cc-butler-governance--longest-sections body 3) "\n")
    "\n\nTrim to the point, split part of it into a separate principle, or cut one of the sections above, then call record_principle again."))
 
+(defun cc-butler-governance--index-line-message (slug line)
+  "Rejection text for `record_principle' hitting
+`cc-butler-governance-max-index-line-bytes'. Names the byte count, the
+cap, and the offending LINE itself — short enough that showing the whole
+thing beats picking excerpts, unlike the other two caps' messages."
+  (format "Refusing to record `%s' — its MEMORY.md index line would be %d bytes, over the cap of %d (`cc-butler-governance-max-index-line-bytes').\nLine: %s\nShorten the description to a name plus a five-or-six-word hook, then call record_principle again."
+          slug (string-bytes line) cc-butler-governance-max-index-line-bytes
+          (string-trim line)))
+
 (defun cc-butler-governance--memory-index-file ()
   "Absolute path of `MEMORY.md' — the hand-maintained index every session
 actually loads.  A note's body can be regenerated perfectly and still never be
@@ -246,13 +300,21 @@ after it, so a leading blank line no longer matters."
           (when (re-search-forward "^description: \"\\(.*\\)\"$" frontmatter-end t)
             (match-string 1)))))))
 
+(defun cc-butler-governance--render-index-line (slug description)
+  "The literal `MEMORY.md' line text for SLUG with DESCRIPTION already in
+hand — the one formatter `cc-butler-governance--index-line' (reads
+DESCRIPTION off disk, after the note exists) and the record-time length
+check (has DESCRIPTION in the call already, before anything is written)
+both go through, so the two can never render the line differently."
+  (format "- [%s](butler-%s.md) — %s\n" slug slug description))
+
 (defun cc-butler-governance--index-line (slug)
   "Render the `MEMORY.md' line for SLUG, using the note's own description."
   (let* ((note (expand-file-name (concat "butler-" slug ".md")
                                  (cc-butler-governance-memory-store)))
          (desc (or (cc-butler-governance--frontmatter-description note)
                    "(no description in store)")))
-    (format "- [%s](butler-%s.md) — %s\n" slug slug desc)))
+    (cc-butler-governance--render-index-line slug desc)))
 
 (defun cc-butler-governance--index-has-slug-p (index slug)
   "Non-nil when INDEX (a file that may not exist yet) already links SLUG's note."
@@ -504,6 +566,14 @@ stamp that says `?'."
         (when (and (stringp who) (not (string-empty-p who)) (not (equal who "?")))
           (format "(최초 기록: %s, %s)" who (format-time-string "%m-%d")))))))
 
+(defun cc-butler-governance--clean-description (description)
+  "DESCRIPTION exactly as it ends up on disk — trimmed, `\"' swapped to `''
+so it cannot break the frontmatter's quoted value. The single place this
+cleanup happens, so `cc-butler-governance--render' (what gets written) and
+the record-time index-line length check (what gets measured before
+anything is written) can never disagree about what the text actually is."
+  (replace-regexp-in-string "\"" "'" (string-trim (or description ""))))
+
 (defun cc-butler-governance--render (slug description body type &optional stamp)
   "The full file text for a principle, frontmatter included.
 Written here rather than by the caller so the schema cannot be got wrong —
@@ -513,7 +583,7 @@ eventually get subtly wrong."
   (concat "---\n"
           "name: " cc-butler-governance--name-prefix slug "\n"
           "description: \""
-          (replace-regexp-in-string "\"" "'" (string-trim (or description ""))) "\"\n"
+          (cc-butler-governance--clean-description description) "\"\n"
           "metadata:\n"
           "  node_type: memory\n"
           "  type: " (or type "feedback") "\n"
@@ -548,6 +618,14 @@ source of truth."
              cc-butler-governance-max-note-bytes)
       (user-error "%s" (cc-butler-governance--length-message
                         slug (cc-butler-governance--strip-stamps body))))
+    ;; Also checked on every call, same reason: a DESCRIPTION that only
+    ;; grows the index line, never the body, would otherwise dodge the
+    ;; body-length cap entirely while still blowing the index-read budget
+    ;; the index-line cap exists for (butler, 2026-09-08).
+    (let ((line (cc-butler-governance--render-index-line
+                 slug (cc-butler-governance--clean-description description))))
+      (when (> (string-bytes line) cc-butler-governance-max-index-line-bytes)
+        (user-error "%s" (cc-butler-governance--index-line-message slug line))))
     (when (and (not existed)
                (>= (cc-butler-governance--store-note-count) cc-butler-governance-max-notes))
       (user-error "%s" (cc-butler-governance--cap-message slug)))
@@ -635,14 +713,16 @@ record tool). That write never calls regenerate itself, so the note can sit
 in the store, fully valid, and never reach the cache or the MEMORY.md index
 until something calls this. Call it once after any such direct write.
 
-⚠ HONEST GAP (2026-09-08): that same direct-write path also skips
-`cc-butler-governance-max-notes' and `cc-butler-governance-max-note-bytes'
-entirely — those are checked inside `cc-butler-governance-record', which a
-direct Write/Edit never calls. This function does not check them either.
-As long as writing straight to the store stays possible, the two caps are
-a gate on the one path that goes through `record_principle', not an
-enforced limit on the store overall. Not closed by this change; not hidden
-either — recorded here so the next person doesn't discover it the hard way.
+⚠ HONEST GAP (2026-09-08): that same direct-write path also skips all
+THREE record-time caps entirely — `cc-butler-governance-max-notes',
+`cc-butler-governance-max-note-bytes', and
+`cc-butler-governance-max-index-line-bytes' are checked inside
+`cc-butler-governance-record', which a direct Write/Edit never calls.
+This function does not check any of them either. As long as writing
+straight to the store stays possible, all three caps are a gate on the
+one path that goes through `record_principle', not an enforced limit on
+the store overall. Not closed by this change; not hidden either —
+recorded here so the next person doesn't discover it the hard way.
 
 Also useful with nothing new to sync: it reports how many store notes are
 CURRENTLY un-indexed, so running it any time surfaces a forgotten sync

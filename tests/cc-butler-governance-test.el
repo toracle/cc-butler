@@ -359,6 +359,71 @@ sections of THIS body are worth cutting — not just \"too long\"."
         (should (string-match-p "Trim to the point" msg))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; The index-line-length cap (2026-09-08, butler's own design — a
+;;;; short body does not guarantee a short MEMORY.md line, and the index
+;;;; line is what a session's context-read budget actually pays for)
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/record-refuses-a-description-over-the-index-line-cap ()
+  "RED: a description that renders an index line over
+`max-index-line-bytes' is refused, and refusing means the file is
+genuinely never written — even though the BODY itself is tiny."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-index-line-bytes 40))
+      (should-error (cc-butler-governance-record
+                     "x" (make-string 60 ?d) "short body")
+                    :type 'user-error)
+      (should-not (file-exists-p (expand-file-name "x.md" (cc-butler-governance-store)))))))
+
+(ert-deftest cc-butler-governance/record-allows-past-the-index-line-cap-once-raised ()
+  "GREEN: the identical call just refused succeeds once the cap is raised —
+a live check, not a one-time snapshot."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-index-line-bytes 40))
+      (should-error (cc-butler-governance-record "x" (make-string 60 ?d) "short body")))
+    (let* ((cc-butler-governance-max-index-line-bytes 200)
+           (res (cc-butler-governance-record "x" (make-string 60 ?d) "short body")))
+      (should (plist-get res :verified))
+      (should (file-exists-p (plist-get res :path))))))
+
+(ert-deftest cc-butler-governance/index-line-cap-is-independent-of-the-body-cap ()
+  "A tiny body with a long DESCRIPTION must still be refused — the two caps
+measure different text, so passing one must never be mistaken for passing
+both. This is the actual gap the index-line cap closes: capping the body
+alone (`cc-butler-governance-max-note-bytes') does nothing to
+`MEMORY.md''s size, since the index line is rendered from the
+description, not the body."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-note-bytes 100000)   ; body cap wide open
+          (cc-butler-governance-max-index-line-bytes 40))
+      (should-error (cc-butler-governance-record "x" (make-string 60 ?d) "tiny")
+                    :type 'user-error))))
+
+(ert-deftest cc-butler-governance/index-line-cap-also-blocks-padding-an-existing-description ()
+  "Revising a principle's description into a longer one must be checked too
+-- an update is exactly how an author would otherwise dodge this cap on a
+NEW note, the same append-instead-of-add shape the body-length cap closes."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-index-line-bytes 40))
+      (cc-butler-governance-record "grows" "short" "body")
+      (should-error (cc-butler-governance-record "grows" (make-string 60 ?d) "body")
+                    :type 'user-error))))
+
+(ert-deftest cc-butler-governance/index-line-cap-message-names-bytes-cap-and-the-line ()
+  "The rejection text must be actionable: current bytes, the cap, and the
+offending line itself, so the author can shorten it on the spot."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-index-line-bytes 40))
+      (let ((msg (condition-case err
+                     (progn (cc-butler-governance-record
+                             "x" "a rather long description that overflows" "body")
+                            nil)
+                   (user-error (cadr err)))))
+        (should (string-match-p "cap of 40" msg))
+        (should (string-match-p "a rather long description" msg))
+        (should (string-match-p "Shorten the description" msg))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Syncing the MEMORY.md index (cc-butler#36 gap b)
 ;;;; ------------------------------------------------------------------
 
