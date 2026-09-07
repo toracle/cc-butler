@@ -47,6 +47,46 @@ cannot disagree about where it is."
    (or cc-butler-governance-dir
        (expand-file-name "governance/" cc-butler-governance--load-dir))))
 
+(defcustom cc-butler-governance-max-notes 250
+  "Hard cap on how many principle notes the STORE may hold.
+
+`record_principle' refuses to write a genuinely NEW note (one whose slug
+is not already in the store) once the store would grow past this count —
+a limit the tool itself enforces, not a number written in a doc nobody
+actually checks. Revising an EXISTING principle in place never counts
+against this; only growth does.
+
+정수님, 2026-09-08: \"제약이 좀 있어야 효율화, 추상화가 된다 — 넣으려고
+했는데 넘쳐서 못 넣었다, 그러면 기존 것을 정리하고 넣는다.\" 250 is a
+starting point, not a measurement; raise it here if it turns out too
+tight, but the intended response to hitting it is to consolidate first."
+  :type 'integer
+  :group 'cc-butler)
+
+(defcustom cc-butler-governance-max-note-bytes 4096
+  "Hard cap on one principle note's BODY length, in bytes.
+
+Checked in the same place `cc-butler-governance-max-notes' is — whatever
+function `record_principle' actually calls to write. The two caps push
+against EACH OTHER by design: block only length and growth leaks out as
+more notes; block only count and growth leaks out as padding existing
+notes instead (measured 2026-09-08: the store's single largest note was
+already 112 KB). Only blocking both closes the leak down to the one thing
+left: actually folding content down.
+
+4096 (4 KB), FIXED (2026-09-08, 정수님) — do not raise this again without
+new instruction. 8 KB was tried and rejected: m1 함대's distribution
+measurement showed 68% of existing notes already fit inside 8 KB, so that
+cap would almost never actually fire. A cap that rarely fires gives no
+reason to fold anything down — the point here is not to avoid overflow,
+it is to FORCE the folding/abstraction 정수님 asked for (\"제약이 좀
+있어야 효율화, 추상화가 될 수 있거든요\"). A measured value is not
+automatically the right value for that purpose; measure what actually
+makes folding necessary, not what triggers least often. Not retroactive —
+this bites the next time an existing 4KB+ note is edited, not now."
+  :type 'integer
+  :group 'cc-butler)
+
 (defcustom cc-butler-governance-user-dir nil
   "A PRIVATE directory of your OWN principle .md files — custom operational
 content (private examples, org-specific principles) NOT shipped in the package.
@@ -118,6 +158,64 @@ overrides the built-in of that name, so you can specialize a built-in privately.
     (sort (hash-table-values by-name)
           (lambda (a b) (string< (file-name-nondirectory a)
                                  (file-name-nondirectory b))))))
+
+(defun cc-butler-governance--store-note-count ()
+  "How many principle notes are in the STORE right now (README excluded).
+
+This is the population `cc-butler-governance-max-notes' caps: the store
+directory alone (`cc-butler-governance-store'), never the generated
+memory-dir cache `cc-butler-governance--note-count' counts. The two can
+diverge — a note deleted from the store leaves an orphaned cache file
+behind until the next `cc-butler-governance-regenerate', which then
+re-discovers it as \"unindexed\" and relinks it — so counting the cache
+here would make cleanup fail to lower the count at all."
+  (length (cc-butler--governance-dir-principles (cc-butler-governance-store))))
+
+(defun cc-butler-governance--largest-notes (n)
+  "The N largest principle notes in the store, as (SLUG . BYTES), biggest
+first — what a caller hitting the cap is told to go merge or delete."
+  (let ((sized (mapcar (lambda (f)
+                          (cons (file-name-sans-extension (file-name-nondirectory f))
+                                (or (file-attribute-size (file-attributes f)) 0)))
+                        (cc-butler--governance-dir-principles (cc-butler-governance-store)))))
+    (seq-take (sort sized (lambda (a b) (> (cdr a) (cdr b)))) n)))
+
+(defun cc-butler-governance--cap-message (slug)
+  "Rejection text for `record_principle' hitting `cc-butler-governance-max-notes'.
+Names the count, the cap, and the current largest notes so the note can
+actually be consolidated on the spot, not just refused."
+  (let ((count (cc-butler-governance--store-note-count))
+        (largest (cc-butler-governance--largest-notes 5)))
+    (concat
+     (format "Refusing to record NEW principle `%s' — the store already holds %d notes, at the cap of %d (`cc-butler-governance-max-notes').\n"
+             slug count cc-butler-governance-max-notes)
+     "Largest notes in the store right now:\n"
+     (mapconcat (lambda (p) (format "  %7d bytes  %s" (cdr p) (car p))) largest "\n")
+     "\n\nMerge or delete one of these (or another near-duplicate) in the store, then call record_principle again. Revising an EXISTING principle by name is never blocked by this cap — only a genuinely new slug is.")))
+
+(defun cc-butler-governance--longest-sections (body n)
+  "The N longest blank-line-delimited paragraphs in BODY, biggest first, as
+\(BYTES . PREVIEW) pairs — what an author hitting the length cap should
+look at first to cut or split off."
+  (let ((sized (mapcar
+                (lambda (p) (cons (string-bytes p)
+                                  (truncate-string-to-width
+                                   (string-trim (replace-regexp-in-string "\n" " " p))
+                                   60 nil nil "…")))
+                (split-string body "\n\n+" t))))
+    (seq-take (sort sized (lambda (a b) (> (car a) (car b)))) n)))
+
+(defun cc-butler-governance--length-message (slug body)
+  "Rejection text for `record_principle' hitting `cc-butler-governance-max-note-bytes'.
+Names the byte count, the cap, and BODY's longest sections so the author
+can cut on the spot, the same principle as `cc-butler-governance--cap-message'."
+  (concat
+   (format "Refusing to record `%s' — its body is %d bytes, over the cap of %d (`cc-butler-governance-max-note-bytes').\n"
+           slug (string-bytes body) cc-butler-governance-max-note-bytes)
+   "Longest sections in this body:\n"
+   (mapconcat (lambda (p) (format "  %7d bytes  %s" (car p) (cdr p)))
+              (cc-butler-governance--longest-sections body 3) "\n")
+   "\n\nTrim to the point, split part of it into a separate principle, or cut one of the sections above, then call record_principle again."))
 
 (defun cc-butler-governance--memory-index-file ()
   "Absolute path of `MEMORY.md' — the hand-maintained index every session
@@ -443,6 +541,16 @@ source of truth."
          (before (cc-butler-governance--note-count)))
     (when (string-empty-p (string-trim (or body "")))
       (user-error "Refusing to record an empty principle: %s" slug))
+    ;; Checked on every call, not only new ones — an update that pads an
+    ;; existing note past the cap is the append-instead-of-add workaround
+    ;; the count cap alone opens up (정수님, 2026-09-08).
+    (when (> (string-bytes (cc-butler-governance--strip-stamps body))
+             cc-butler-governance-max-note-bytes)
+      (user-error "%s" (cc-butler-governance--length-message
+                        slug (cc-butler-governance--strip-stamps body))))
+    (when (and (not existed)
+               (>= (cc-butler-governance--store-note-count) cc-butler-governance-max-notes))
+      (user-error "%s" (cc-butler-governance--cap-message slug)))
     (make-directory store t)
     (with-temp-file path
       (insert (cc-butler-governance--render
@@ -526,6 +634,15 @@ the store with Write/Edit (its frontmatter controlled by hand, not via the
 record tool). That write never calls regenerate itself, so the note can sit
 in the store, fully valid, and never reach the cache or the MEMORY.md index
 until something calls this. Call it once after any such direct write.
+
+⚠ HONEST GAP (2026-09-08): that same direct-write path also skips
+`cc-butler-governance-max-notes' and `cc-butler-governance-max-note-bytes'
+entirely — those are checked inside `cc-butler-governance-record', which a
+direct Write/Edit never calls. This function does not check them either.
+As long as writing straight to the store stays possible, the two caps are
+a gate on the one path that goes through `record_principle', not an
+enforced limit on the store overall. Not closed by this change; not hidden
+either — recorded here so the next person doesn't discover it the hard way.
 
 Also useful with nothing new to sync: it reports how many store notes are
 CURRENTLY un-indexed, so running it any time surfaces a forgotten sync
