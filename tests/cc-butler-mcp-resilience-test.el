@@ -281,5 +281,122 @@ send it is never reached)."
     (should (stringp caught))
     (should (string-match-p "Missing required argument: text" caught))))
 
+;;;; ------------------------------------------------------------------
+;;;; Layer 3 — recovering the id an error response discards
+;;;; ------------------------------------------------------------------
+;;
+;; Regression for "MCP server returned a malformed result that failed
+;; schema validation": `--handle-post' passes literal `nil' for `id' from
+;; its `quit'/`error' condition-case clauses (id is bound in a `let*'
+;; those clauses can't see), so a perfectly readable diagnostic message
+;; ("Missing required argument: text") never reaches the caller -- the
+;; client rejects the whole envelope because `id' is null. See
+;; malformed-mcp-result-means-a-discarded-elisp-error.md (six recorded
+;; recurrences).
+
+(defun cc-butler-mcp-resilience-test--send-json-error-capture (id code message body)
+  "Call `--send-json-error' with ID/CODE/MESSAGE against a request whose
+body is BODY, capturing what would actually be sent over the wire
+(stubbing `--send-json-response' so no real process/ws-send is needed).
+Returns the captured response alist."
+  (let (sent)
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-http-server--send-json-response)
+               (lambda (_request _status resp-body) (setq sent resp-body))))
+      (claude-code-ide-mcp-http-server--send-json-error
+       (ws-request :body body) id code message))
+    sent))
+
+(ert-deftest cc-butler-mcp-resilience/layer3-unfixed-error-response-has-null-id ()
+  "RED reproduction, advice removed: a request that parsed fine (id 42)
+but errored during dispatch still comes back with id nil -- the
+historical, unpatched claude-code-ide behavior this layer exists to fix."
+  (unwind-protect
+      (progn
+        (cc-butler-mcp-resilience-uninstall)
+        (let ((sent (cc-butler-mcp-resilience-test--send-json-error-capture
+                     nil -32603 "Internal error: Missing required argument: text"
+                     (json-encode '((jsonrpc . "2.0") (id . 42) (method . "tools/call"))))))
+          (should (null (alist-get 'id sent)))))
+    (cc-butler-mcp-resilience-install)))
+
+(ert-deftest cc-butler-mcp-resilience/layer3-recovers-id-for-error-code ()
+  "Given the advice installed, a generic -32603 error recovers the real
+id by re-parsing the request body, and the diagnostic message survives
+unchanged."
+  (let ((sent (cc-butler-mcp-resilience-test--send-json-error-capture
+               nil -32603 "Internal error: Missing required argument: text"
+               (json-encode '((jsonrpc . "2.0") (id . 42) (method . "tools/call"))))))
+    (should (equal 42 (alist-get 'id sent)))
+    (should (equal "Internal error: Missing required argument: text"
+                   (alist-get 'message (alist-get 'error sent))))))
+
+(ert-deftest cc-butler-mcp-resilience/layer3-recovers-id-for-quit-code ()
+  "Same recovery for -32001 (`quit', user cancel)."
+  (let ((sent (cc-butler-mcp-resilience-test--send-json-error-capture
+               nil -32001 "Operation cancelled by user"
+               (json-encode '((jsonrpc . "2.0") (id . "req-7") (method . "tools/call"))))))
+    (should (equal "req-7" (alist-get 'id sent)))))
+
+(ert-deftest cc-butler-mcp-resilience/layer3-leaves-parse-error-id-null ()
+  "-32700 (Parse error) is untouched even when the body happens to be
+valid JSON with a usable id -- JSON-RPC 2.0 mandates id:null for a
+parse error regardless, and filling it in for exactly one of the three
+codes while leaving the others as literals would be worse than the
+current, at-least-consistent bug."
+  (let ((sent (cc-butler-mcp-resilience-test--send-json-error-capture
+               nil -32700 "Parse error"
+               (json-encode '((jsonrpc . "2.0") (id . 42) (method . "tools/call"))))))
+    (should (null (alist-get 'id sent)))))
+
+(ert-deftest cc-butler-mcp-resilience/layer3-unparseable-body-leaves-id-null ()
+  "If the body can't be parsed either (the genuinely-unrecoverable case),
+recovery fails silently and id stays nil -- never worse than before
+this advice existed, and no error escapes the advice itself."
+  (let ((sent (cc-butler-mcp-resilience-test--send-json-error-capture
+               nil -32603 "Internal error: something" "not json at all")))
+    (should (null (alist-get 'id sent)))))
+
+(ert-deftest cc-butler-mcp-resilience/layer3-does-not-touch-an-already-present-id ()
+  "If a caller ever passes a real id directly (defensive: no known call
+site does today), the advice must not overwrite it by re-parsing."
+  (let ((sent (cc-butler-mcp-resilience-test--send-json-error-capture
+               99 -32603 "Internal error: x"
+               (json-encode '((jsonrpc . "2.0") (id . 42) (method . "tools/call"))))))
+    (should (equal 99 (alist-get 'id sent)))))
+
+(ert-deftest cc-butler-mcp-resilience/layer3-normal-successful-response-unaffected ()
+  "Mutation proof: the advice is on `--send-json-error' only, so a normal
+successful `--handle-post' response (which never calls it) is untouched.
+Drives the real `--handle-post' end to end for a `tools/list' call."
+  (let (sent)
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-http-server--send-json-response)
+               (lambda (_request _status resp-body) (setq sent resp-body))))
+      (claude-code-ide-mcp-http-server--handle-post
+       (ws-request :body (json-encode '((jsonrpc . "2.0") (id . 5)
+                                        (method . "tools/list") (params . ()))))))
+    (should (equal 5 (alist-get 'id sent)))
+    (should (alist-get 'result sent))
+    (should (null (alist-get 'error sent)))))
+
+(ert-deftest cc-butler-mcp-resilience/layer3-end-to-end-missing-argument-is-readable ()
+  "The actual regression, driven through the real `--handle-post', not a
+re-implementation of it: a `tools/call' for an unknown tool signals
+`json-rpc-error' from `--handle-tools-call' (outside its own inner
+condition-case), which `--handle-post's outer `(error ...)' clause
+catches -- the exact path six real recurrences took. Before this layer,
+`id' arrives nil and the message is unreachable; after, both id and the
+readable message survive."
+  (let (sent)
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-http-server--send-json-response)
+               (lambda (_request _status resp-body) (setq sent resp-body))))
+      (claude-code-ide-mcp-http-server--handle-post
+       (ws-request
+        :body (json-encode
+               '((jsonrpc . "2.0") (id . 7) (method . "tools/call")
+                 (params . ((name . "cc-butler-test-nonexistent-tool")
+                            (arguments . ()))))))))
+    (should (equal 7 (alist-get 'id sent)))
+    (should (string-match-p "Unknown tool" (alist-get 'message (alist-get 'error sent))))))
+
 (provide 'cc-butler-mcp-resilience-test)
 ;;; cc-butler-mcp-resilience-test.el ends here
