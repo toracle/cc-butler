@@ -334,6 +334,167 @@ file."
         (should (string-match-p "not a merge" msg))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; Duplicate search (2026-09-08, steward: two existing human/agent
+;;;; recall mechanisms both fired on a real duplicate the same day and it
+;;;; was still re-recorded under a new slug -- "사람이 하는 검색은 안
+;;;; 됩니다. 검색을 도구가 해야 합니다." record_principle now searches
+;;;; the store itself before creating a genuinely new slug.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/keywords-strips-stopwords-and-short-words ()
+  "The tokenizer: lowercased, length>=4, stopwords and short filler words
+gone, order-independent (dedup via delete-dups is a set, not a sequence)."
+  (let ((kw (cc-butler-governance--keywords
+             "The Verify Delivery Test is a Test of the delivery path")))
+    (should (member "verify" kw))
+    (should (member "delivery" kw))
+    (should (member "path" kw))
+    (should-not (member "the" kw))
+    (should-not (member "is" kw))
+    (should-not (member "a" kw))
+    (should-not (member "of" kw))
+    ;; "test" appears twice in the input; the tokenizer is a set
+    (should (= 1 (length (seq-filter (lambda (w) (equal w "test")) kw))))))
+
+(ert-deftest cc-butler-governance/duplicate-candidates-requires-a-minimum-shared-count ()
+  "A single incidentally-shared word is not evidence of duplication -- must
+stay below `cc-butler-governance-duplicate-search-min-shared-keywords' and
+therefore not be returned as a candidate at all."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-duplicate-search-min-shared-keywords 3)
+          (cc-butler-governance-max-index-line-bytes 1000))
+      (cc-butler-governance-record "verify-delivery" "Confirm delivery landed" "body")
+      (should-not (cc-butler-governance--duplicate-candidates
+                   "unrelated-topic" "Something about timeouts entirely" "body")))))
+
+(ert-deftest cc-butler-governance/duplicate-search-blocks-a-new-note-that-shares-enough-keywords ()
+  "RED-shaped: recording a NEW slug whose name/description/body shares
+enough keywords with an existing principle's description must be refused
+-- and no file created -- before it ever reaches the count/length caps."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-duplicate-search-min-shared-keywords 3)
+          (cc-butler-governance-max-index-line-bytes 1000))
+      (cc-butler-governance-record
+       "verify-delivery" "Confirm delivery landed before declaring success" "original body")
+      (should-error
+       (cc-butler-governance-record
+        "check-delivery-again" "Please confirm delivery landed before declaring anything done"
+        "new body")
+       :type 'user-error)
+      (should-not (file-exists-p (expand-file-name "check-delivery-again.md" store))))))
+
+(ert-deftest cc-butler-governance/duplicate-search-allows-a-genuinely-new-topic ()
+  "An unrelated new principle, sharing no meaningful vocabulary with what's
+already in the store, must record normally -- the search must not become
+a de facto block on all new principles."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-index-line-bytes 1000))
+      (cc-butler-governance-record
+       "verify-delivery" "Confirm delivery landed before declaring success" "body")
+      (let ((res (cc-butler-governance-record
+                  "rotate-logs" "Old log files must be compressed weekly" "body")))
+        (should (plist-get res :verified))))))
+
+(ert-deftest cc-butler-governance/duplicate-search-skip-flag-bypasses-the-check ()
+  "GREEN: the identical call that was just refused succeeds once
+skip_duplicate_check is passed -- the false-positive escape hatch."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-duplicate-search-min-shared-keywords 3)
+          (cc-butler-governance-max-index-line-bytes 1000))
+      (cc-butler-governance-record
+       "verify-delivery" "Confirm delivery landed before declaring success" "original body")
+      (should-error
+       (cc-butler-governance-record
+        "check-delivery-again" "Please confirm delivery landed before declaring anything done"
+        "new body"))
+      (let ((res (cc-butler-governance-record
+                  "check-delivery-again" "Please confirm delivery landed before declaring anything done"
+                  "new body" "feedback" nil t)))
+        (should (plist-get res :verified))))))
+
+(ert-deftest cc-butler-governance/duplicate-search-never-fires-on-an-update ()
+  "Revising an EXISTING principle is not \"creating something that might
+already exist\" -- the whole point is that it already does. The search
+must never fire when `existed' is true, no matter the wording."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-duplicate-search-min-shared-keywords 3)
+          (cc-butler-governance-max-index-line-bytes 1000))
+      (cc-butler-governance-record
+       "verify-delivery" "Confirm delivery landed before declaring success" "body")
+      (let ((res (cc-butler-governance-record
+                  "verify-delivery" "Confirm delivery landed before declaring success"
+                  "revised body, still about delivery confirmation and success")))
+        (should (plist-get res :verified))))))
+
+(ert-deftest cc-butler-governance/duplicate-search-message-names-candidate-shared-count-and-size ()
+  "The rejection text must be actionable: which existing note, how many
+keywords it shares, and its current size -- not just \"looks similar\"."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-duplicate-search-min-shared-keywords 3)
+          (cc-butler-governance-max-index-line-bytes 1000))
+      (cc-butler-governance-record
+       "verify-delivery" "Confirm delivery landed before declaring success" "original body")
+      (let ((msg (condition-case err
+                     (progn (cc-butler-governance-record
+                             "check-delivery-again"
+                             "Please confirm delivery landed before declaring anything done"
+                             "new body")
+                            nil)
+                   (user-error (cadr err)))))
+        (should (string-match-p "verify-delivery" msg))
+        (should (string-match-p "shared keyword" msg))
+        (should (string-match-p "bytes" msg))
+        (should (string-match-p "skip_duplicate_check" msg))))))
+
+(ert-deftest cc-butler-governance/duplicate-search-flags-a-candidate-already-over-the-body-cap ()
+  "The structural gap steward asked this be designed around, not hidden
+behind a dead end: a candidate already over the body-length cap cannot be
+folded into with a normal update. The message must say so plainly next to
+that candidate, not leave the worker to discover it by trying and failing."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-duplicate-search-min-shared-keywords 3)
+          (cc-butler-governance-max-note-bytes 100))
+      ;; written directly -- bypasses the body cap, matching how a real
+      ;; oversized legacy note predates any cap on it
+      (with-temp-file (expand-file-name "verify-delivery.md" store)
+        (insert (cc-butler-governance--render
+                 "verify-delivery" "Confirm delivery landed before declaring success"
+                 (make-string 500 ?x) "feedback")))
+      (let ((msg (condition-case err
+                     (progn (cc-butler-governance-record
+                             "check-delivery-again"
+                             "Please confirm delivery landed before declaring anything done"
+                             "new")
+                            nil)
+                   (user-error (cadr err)))))
+        (should (string-match-p "OVER the.*body cap" msg))
+        (should (string-match-p "condensed under the cap first" msg))))))
+
+(ert-deftest cc-butler-governance/duplicate-search-runs-before-the-count-cap ()
+  "Meta-requirement (steward, 2026-09-08): a gate placed after another
+never gets exercised by a call the earlier gate already refuses -- exactly
+how the description/index-line cap went untested against real data behind
+the count cap. Prove ordering directly: with BOTH the duplicate condition
+and the count cap simultaneously true, the DUPLICATE message -- not the
+count-cap message -- is what a caller actually sees."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-duplicate-search-min-shared-keywords 3)
+          (cc-butler-governance-max-notes 1)
+          (cc-butler-governance-max-index-line-bytes 1000))
+      (cc-butler-governance-record
+       "verify-delivery" "Confirm delivery landed before declaring success" "body")
+      ;; store is now AT the count cap (1) AND a genuine duplicate exists
+      (let ((msg (condition-case err
+                     (progn (cc-butler-governance-record
+                             "check-delivery-again"
+                             "Please confirm delivery landed before declaring anything done"
+                             "new body")
+                            nil)
+                   (user-error (cadr err)))))
+        (should (string-match-p "may already exist in the store" msg))
+        (should-not (string-match-p "at the cap of" msg))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; The store cap (2026-09-08, 정수님 배차: "제약이 있어야 효율화된다")
 ;;;; ------------------------------------------------------------------
 

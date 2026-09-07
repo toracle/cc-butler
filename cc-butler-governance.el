@@ -679,8 +679,106 @@ If this is deliberate — you actually condensed this note on purpose (e.g. fold
           slug old-bytes new-bytes
           (round (* 100 (- 1 (/ (float new-bytes) old-bytes))))))
 
+(defcustom cc-butler-governance-duplicate-search-min-shared-keywords 3
+  "Minimum shared significant keywords for an existing principle to count
+as a possible duplicate of a NEW one being recorded (see
+`cc-butler-governance--duplicate-candidates'). Below this, overlap is
+treated as ordinary shared vocabulary, not evidence of the same lesson.
+
+butler's judgment call (2026-09-08), not measured against real
+duplicate/non-duplicate pairs — there was no time to build that dataset
+under this dispatch's own urgency. Tune down if real near-duplicates keep
+slipping through with too few shared keywords; tune up if unrelated new
+principles keep getting flagged."
+  :type 'integer
+  :group 'cc-butler)
+
+(defconst cc-butler-governance--stopwords
+  '("the" "a" "an" "and" "or" "but" "of" "in" "on" "at" "to" "for" "is"
+    "are" "was" "were" "be" "been" "being" "this" "that" "these" "those"
+    "it" "its" "as" "by" "with" "from" "not" "no" "so" "if" "then" "than"
+    "do" "does" "did" "has" "have" "had" "will" "would" "should" "could"
+    "can" "must" "never" "always" "only" "just" "also" "when" "while"
+    "into" "onto" "out" "over" "under" "again" "own" "same" "note" "notes"
+    "principle" "principles" "store" "record")
+  "Common English function words (plus a few domain words so common in
+this store's own vocabulary they carry no discriminating signal) excluded
+from `cc-butler-governance--keywords'. This store's slugs and descriptions
+are written in English kebab-case/prose by convention (measured
+2026-09-08: 566 of 566 real slugs are ASCII) -- Korean body text is not
+tokenized meaningfully by this word-splitter, so the duplicate search
+below is English-vocabulary-only by construction, not by oversight.")
+
+(defun cc-butler-governance--keywords (text)
+  "Significant lowercase word tokens in TEXT: alphanumeric runs of length
+>= 4, lowercased, deduplicated, stopwords removed. The one tokenizer both
+the submitted query and every candidate's description go through in
+`cc-butler-governance--duplicate-candidates', so the two extractions can
+never silently disagree about what counts as a keyword."
+  (let (out)
+    (dolist (w (split-string (downcase (or text "")) "[^a-z0-9]+" t))
+      (when (and (>= (length w) 4) (not (member w cc-butler-governance--stopwords)))
+        (push w out)))
+    (delete-dups (nreverse out))))
+
+(defun cc-butler-governance--duplicate-candidates (name description body)
+  "Store principles that may already say what NAME/DESCRIPTION/BODY is
+about to record, as (SLUG SHARED-COUNT DESCRIPTION) triples, highest
+shared-keyword-count first, top 5. Only principles meeting
+`cc-butler-governance-duplicate-search-min-shared-keywords' are returned
+at all — weaker overlap is not treated as evidence.
+
+REGRESSION this closes (steward, 2026-09-08): this fleet already has TWO
+recall mechanisms telling agents to search the store before recording
+\(a role-file section, a vault hook that fired nearly every turn on the
+actual duplicate in question\), and a real duplicate was still
+re-recorded under a new slug, costing hours to rediscover. Human/agent
+search stacked in layers still failed; this makes the tool itself
+search, at the one moment — right before a NEW slug is created — where
+it can still be caught before it happens again."
+  (let* ((query (cc-butler-governance--keywords
+                 (mapconcat #'identity (list name description body) " ")))
+         (scored
+          (mapcar
+           (lambda (f)
+             (let* ((slug (file-name-sans-extension (file-name-nondirectory f)))
+                    (desc (or (cc-butler-governance--frontmatter-description f) ""))
+                    (shared (seq-intersection query (cc-butler-governance--keywords desc))))
+               (list slug (length shared) desc)))
+           (cc-butler--governance-dir-principles (cc-butler-governance-store)))))
+    (seq-take
+     (sort (seq-filter (lambda (r) (>= (nth 1 r)
+                                       cc-butler-governance-duplicate-search-min-shared-keywords))
+                       scored)
+           (lambda (a b) (> (nth 1 a) (nth 1 b))))
+     5)))
+
+(defun cc-butler-governance--duplicate-message (slug candidates)
+  "Rejection text for `record_principle' hitting `cc-butler-governance--duplicate-candidates'.
+Names each candidate's slug, shared-keyword count, current size, and — the
+structural gap steward asked this be designed around, not hidden behind a
+dead end — whether it is already over the body-length cap and therefore
+cannot be folded into via a normal-sized update at all."
+  (concat
+   (format "Refusing to record NEW principle `%s' — this looks like it may already exist in the store. Before creating a new slug, check these:\n\n"
+           slug)
+   (mapconcat
+    (lambda (c)
+      (let* ((cand-slug (nth 0 c)) (shared (nth 1 c)) (desc (nth 2 c))
+             (path (expand-file-name (concat cand-slug ".md") (cc-butler-governance-store)))
+             (bytes (or (and (file-exists-p path) (file-attribute-size (file-attributes path))) 0)))
+        (format "  %s — %d shared keyword(s), %d bytes%s\n    %s"
+                cand-slug shared bytes
+                (if (> bytes cc-butler-governance-max-note-bytes)
+                    (format " — OVER the %dB body cap: cannot be folded into with a normal update until IT is condensed under the cap first"
+                            cc-butler-governance-max-note-bytes)
+                  "")
+                desc)))
+    candidates "\n\n")
+   "\n\nIf one of these is genuinely the same lesson: call record_principle again with THAT name. Read its current content first, fold your new material into the complete text by hand, and submit that whole result — record_principle REPLACES the file, it never merges, and a drastic shrink needs confirm_shrink.\n\nIf none of these are actually the same thing — this is shared wording, not a real duplicate — call record_principle again with the same new name and pass skip_duplicate_check as true."))
+
 ;;;###autoload
-(defun cc-butler-governance-record (name description body &optional type confirm-shrink)
+(defun cc-butler-governance-record (name description body &optional type confirm-shrink skip-duplicate-check)
   "Write a principle into the store, regenerate, and PROVE it landed.
 
 Returns a plist: :slug :path :existed :before :after :verified :names.
@@ -696,7 +794,13 @@ fine — AS LONG AS BODY is the complete, already-folded text you want the
 note to hold, not just the new material.  A BODY far smaller than what
 the note currently holds is refused unless CONFIRM-SHRINK is non-nil (see
 `cc-butler-governance-shrink-guard-fraction') — the guard against exactly
-the mistake of passing only the new bit and losing the rest."
+the mistake of passing only the new bit and losing the rest.
+
+A genuinely NEW NAME is checked against the store for a possible existing
+duplicate first (see `cc-butler-governance--duplicate-candidates') unless
+SKIP-DUPLICATE-CHECK is non-nil — before anything else, since \"does this
+even need to be a new principle at all\" is upstream of every other
+question this function asks."
   (let* ((slug (cc-butler-governance--slug name))
          (store (cc-butler-governance-store))
          (path (expand-file-name (concat slug ".md") store))
@@ -704,10 +808,18 @@ the mistake of passing only the new bit and losing the rest."
          (before (cc-butler-governance--note-count)))
     (when (string-empty-p (string-trim (or body "")))
       (user-error "Refusing to record an empty principle: %s" slug))
-    ;; Data-loss guard, checked before anything else: this call is about
-    ;; to OVERWRITE (not merge) an existing file. Run first because it is
-    ;; the one check whose failure is irreversible; the others below are
-    ;; merely refused writes (steward, 2026-09-08: "노트가 사라집니다").
+    ;; "Does this already exist?" is asked before anything else -- a
+    ;; question nobody was asking mechanically until now (steward,
+    ;; 2026-09-08: two existing human/agent-facing recall mechanisms both
+    ;; fired on the real duplicate in question and it was still missed).
+    (when (and (not existed) (not (cc-butler-governance--truthy-p skip-duplicate-check)))
+      (let ((candidates (cc-butler-governance--duplicate-candidates name description body)))
+        (when candidates
+          (user-error "%s" (cc-butler-governance--duplicate-message slug candidates)))))
+    ;; Data-loss guard, checked next: this call is about to OVERWRITE
+    ;; (not merge) an existing file. Ordered ahead of the caps below
+    ;; because it is the one check whose failure is irreversible; those
+    ;; are merely refused writes (steward, 2026-09-08: "노트가 사라집니다").
     (when (and existed (not (cc-butler-governance--truthy-p confirm-shrink)))
       (let* ((old-body (cc-butler-governance--body-in-file path))
              (old-bytes (and old-body (string-bytes old-body)))
@@ -760,9 +872,9 @@ the mistake of passing only the new bit and losing the rest."
             :verified verified :note note :store store
             :names (cc-butler-governance-names)))))
 
-(defun cc-butler-tool-record-principle (name description body &optional type confirm-shrink)
+(defun cc-butler-tool-record-principle (name description body &optional type confirm-shrink skip-duplicate-check)
   "MCP tool: record an operating principle and report where it landed."
-  (let* ((res (cc-butler-governance-record name description body type confirm-shrink))
+  (let* ((res (cc-butler-governance-record name description body type confirm-shrink skip-duplicate-check))
          (verified (plist-get res :verified)))
     (concat
      (if verified
@@ -887,17 +999,19 @@ index, index -> store, and description drift."
   (claude-code-ide-make-tool
    :function #'cc-butler-tool-record-principle
    :name "record_principle"
-   :description "Record a butler/steward operating principle into the governance store and regenerate the Claude Code memory from it. Writes the frontmatter for you (name/description/metadata) so the schema cannot be got wrong, and takes NO path argument — it writes to exactly the store the regenerator reads, which is the whole point. Calling it with the name of an EXISTING principle REPLACES that principle's entire file with whatever you pass as body — this OVERWRITES, it never merges or appends. To revise one: read its current content first, fold your change into the complete text by hand, then pass that whole result as body; passing only your new material deletes the rest. A body far smaller than the note's current size is refused unless confirm_shrink is also passed as true, so an accidental partial-overwrite cannot silently destroy most of a note. Returns the absolute file written, the note count before and after, and whether the generated note was read back off disk and confirmed to name this principle — if that verification fails it reports failure, because a regeneration reporting success while landing nothing is a real thing that has happened here."
+   :description "Record a butler/steward operating principle into the governance store and regenerate the Claude Code memory from it. Writes the frontmatter for you (name/description/metadata) so the schema cannot be got wrong, and takes NO path argument — it writes to exactly the store the regenerator reads, which is the whole point. A genuinely NEW name is first checked against the store for a possible existing duplicate (shared-keyword search over every principle's description) — if one looks similar enough, this refuses and names the candidate(s) instead of creating a near-duplicate; pass skip_duplicate_check if you've checked and it's a false positive. Calling it with the name of an EXISTING principle REPLACES that principle's entire file with whatever you pass as body — this OVERWRITES, it never merges or appends. To revise one: read its current content first, fold your change into the complete text by hand, then pass that whole result as body; passing only your new material deletes the rest. A body far smaller than the note's current size is refused unless confirm_shrink is also passed as true, so an accidental partial-overwrite cannot silently destroy most of a note. Returns the absolute file written, the note count before and after, and whether the generated note was read back off disk and confirmed to name this principle — if that verification fails it reports failure, because a regeneration reporting success while landing nothing is a real thing that has happened here."
    :args '((:name "name" :type "string" :required t
             :description "Kebab-case slug for the principle, e.g. verify-delivery. Naming an EXISTING principle REPLACES its entire file (never merges) — read it first if you mean to revise it. The butler- prefix is added for you.")
            (:name "description" :type "string" :required t
-            :description "One-line summary, used to decide relevance during recall. Write it so a reader can tell whether this principle applies without opening it.")
+            :description "One-line summary, used to decide relevance during recall. Write it so a reader can tell whether this principle applies without opening it. Also used, together with name and body, to search the store for a possible existing duplicate before a NEW principle is created.")
            (:name "body" :type "string" :required t
             :description "The principle itself, in Markdown, as the COMPLETE text the note should hold — this replaces the whole file when the name already exists, it is never merged with what's there. Follow the store's shape: what the rule is, then **Why:** with the concrete incident that motivated it, then **How to apply:**.")
            (:name "type" :type "string" :required nil
             :description "Frontmatter metadata type. Defaults to feedback, which is what every principle in the store currently uses.")
            (:name "confirm_shrink" :type "boolean" :required nil
-            :description "Required (true) when revising an existing principle to less than half its current body size — otherwise refused, to catch an accidental partial-overwrite that would delete most of the note. Pass true only when the shrink is deliberate (e.g. you already folded the note down under the body-length cap).")))
+            :description "Required (true) when revising an existing principle to less than half its current body size — otherwise refused, to catch an accidental partial-overwrite that would delete most of the note. Pass true only when the shrink is deliberate (e.g. you already folded the note down under the body-length cap).")
+           (:name "skip_duplicate_check" :type "boolean" :required nil
+            :description "Required (true) to create a NEW principle that the store's duplicate search flagged as similar to an existing one. Pass true only after checking the named candidate(s) and confirming this is genuinely a different lesson, not the same one under a new name.")))
   (claude-code-ide-make-tool
    :function #'cc-butler-tool-regenerate-governance
    :name "regenerate_governance"
