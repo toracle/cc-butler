@@ -1235,6 +1235,25 @@ a guard that also blocks legitimate calls)."
                    "<summary>ship it?</summary>" "pick one"))))
         (should (string-match-p "<summary>" (error-message-string err)))))))
 
+(ert-deftest cc-butler-orchestrator/report-to-steward-refuses-steward-self-loop ()
+  "cc-butler#47, cc-butler#116: the steward calling report_to_steward (or its
+alias report_to_butler) used to succeed silently while delivering the
+report into its OWN inbox -- \"Reported to the steward as steward (...)\",
+with no one else ever seeing it.  Must refuse loudly instead, matching
+send_to_session's existing self-delivery guard."
+  (let* ((cc-butler--steward "/steward/")
+         (cc-butler--butler "/butler/")
+         (cc-butler-message-transport 'in-memory)
+         (cc-butler--inbox nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () "/steward/"))
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "steward (claude-steward-x)"))
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler--log-message) #'ignore)
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore))
+      (should-error (cc-butler-tool-report-to-steward "fact-check reply" "green" nil))
+      (should (null cc-butler--inbox))
+      (should-error (cc-butler-tool-report-to-butler "another reply" nil nil)))))
+
 (ert-deftest cc-butler-orchestrator/decision-drain-keeps-items-when-rendering-fails ()
   "Rendering happens BEFORE the queue is emptied.  A malformed item used to
 signal from inside the formatter, unwinding past a clear that had already

@@ -84,7 +84,7 @@ Bind to a mock channel to contract-test the routing in isolation.")
 ;;;; ------------------------------------------------------------------
 
 (defun cc-butler--mail-slug (s)
-  (replace-regexp-in-string "[^A-Za-z0-9_.-]" "_" (or s "unknown")))
+  (replace-regexp-in-string "[^[:alnum:]_.-]" "_" (or s "unknown")))
 
 (defun cc-butler--mail-inbox (agent)
   (file-name-as-directory
