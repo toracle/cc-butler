@@ -227,16 +227,32 @@ first — what a caller hitting the cap is told to go merge or delete."
 
 (defun cc-butler-governance--cap-message (slug)
   "Rejection text for `record_principle' hitting `cc-butler-governance-max-notes'.
-Names the count, the cap, and the current largest notes so the note can
-actually be consolidated on the spot, not just refused."
+
+REGRESSION-SHAPED GAP closed 2026-09-08 (steward-requested real-store
+probe, before merge): the first version of this message named the count,
+the cap, and the largest notes, and stopped there. Measured against the
+REAL 566-note store, that version failed on two counts a unit test with
+fake data cannot catch: (1) it stated a fact (\"revising an existing
+principle is never blocked\") without ever telling the worker to actually
+DO that to get their own content saved NOW; (2) it listed the largest
+notes as if size ~= good merge target, but the real #1 result
+\(a-true-observation-licenses-only-its-own-scope, 112KB) was, at the same
+moment, the exact note warmble-jumble's own folding effort had concluded
+needs SPLITTING into 21 notes, not merging into — which would have sent a
+worker following this message's implicit ranking to make the count WORSE,
+not better. Now: an explicit action line naming update-by-existing-name as
+the immediate way through, and the size list re-labeled as location
+context rather than a ranked pick list, with the split-vs-merge caveat
+spelled out."
   (let ((count (cc-butler-governance--store-note-count))
         (largest (cc-butler-governance--largest-notes 5)))
     (concat
-     (format "Refusing to record NEW principle `%s' — the store already holds %d notes, at the cap of %d (`cc-butler-governance-max-notes').\n"
+     (format "Refusing to record NEW principle `%s' — the store already holds %d notes, at the cap of %d (`cc-butler-governance-max-notes').\n\n"
              slug count cc-butler-governance-max-notes)
-     "Largest notes in the store right now:\n"
+     "TO RECORD THIS NOW: call record_principle again, but pass the NAME of an EXISTING principle whose topic overlaps with what you're recording, instead of a new slug — your text merges into that note in place, and revising an existing principle is never blocked by this cap, at any count.\n\n"
+     "For reference, where the store's bulk currently concentrates (NOT a ranked merge list — a note's size alone does not mean it is a good target; a very large note may need SPLITTING into several smaller ones rather than absorbing more, so match by topic, never by size):\n"
      (mapconcat (lambda (p) (format "  %7d bytes  %s" (cdr p) (car p))) largest "\n")
-     "\n\nMerge or delete one of these (or another near-duplicate) in the store, then call record_principle again. Revising an EXISTING principle by name is never blocked by this cap — only a genuinely new slug is.")))
+     "\n\nNothing existing actually fits the topic? Report to the steward rather than guessing which note to overload.")))
 
 (defun cc-butler-governance--longest-sections (body n)
   "The N longest blank-line-delimited paragraphs in BODY, biggest first, as

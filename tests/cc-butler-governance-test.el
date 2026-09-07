@@ -264,7 +264,7 @@ not grow the store, so it is not the growth this cap exists to stop."
 
 (ert-deftest cc-butler-governance/cap-message-names-count-cap-and-largest-notes ()
   "The rejection text must be actionable on the spot: current count, the cap,
-and which notes are worth merging or deleting — not just \"no\"."
+and which notes are large — not just \"no\"."
   (cc-butler-governance-test--with-store
     (let ((cc-butler-governance-max-notes 1))
       (cc-butler-governance-record "big-one" "d" (make-string 500 ?x))
@@ -273,8 +273,42 @@ and which notes are worth merging or deleting — not just \"no\"."
                    (user-error (cadr err)))))
         (should (string-match-p "1 notes" msg))
         (should (string-match-p "cap of 1" msg))
-        (should (string-match-p "big-one" msg))
-        (should (string-match-p "merge or delete" msg))))))
+        (should (string-match-p "big-one" msg))))))
+
+(ert-deftest cc-butler-governance/cap-message-gives-an-explicit-pass-now-action ()
+  "REGRESSION (2026-09-08, real-store probe before merge): the original
+message stated \"revising an existing principle is never blocked\" as a
+FACT but never told the worker to actually do that to get their own
+content saved now. Must contain an imperative the worker can follow
+without a follow-up question — naming record_principle and an existing
+name, not just describing the rule."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-notes 1))
+      (cc-butler-governance-record "big-one" "d" "body")
+      (let ((msg (condition-case err
+                     (progn (cc-butler-governance-record "second" "d" "body") nil)
+                   (user-error (cadr err)))))
+        (should (string-match-p "TO RECORD THIS NOW" msg))
+        (should (string-match-p "call record_principle again" msg))
+        (should (string-match-p "NAME of an EXISTING principle" msg))))))
+
+(ert-deftest cc-butler-governance/cap-message-does-not-present-size-as-a-ranked-merge-list ()
+  "REGRESSION (2026-09-08, real-store probe before merge): the real
+store's single largest note, at the moment this was measured, was the
+exact note warmble-jumble's own folding effort had concluded needs
+SPLITTING into 21 notes -- not merging into. A worker following
+\"largest = best merge target\" would have made the count WORSE. The
+message must explicitly warn that size is not a ranking and a large note
+may need splitting, not silently imply big-is-mergeable."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-notes 1))
+      (cc-butler-governance-record "big-one" "d" "body")
+      (let ((msg (condition-case err
+                     (progn (cc-butler-governance-record "second" "d" "body") nil)
+                   (user-error (cadr err)))))
+        (should (string-match-p "NOT a ranked merge list" msg))
+        (should (string-match-p "SPLITTING" msg))
+        (should (string-match-p "match by topic, never by size" msg))))))
 
 (ert-deftest cc-butler-governance/store-note-count-ignores-the-memory-cache ()
   "The cap counts the STORE, never the generated memory-dir cache: the cache
