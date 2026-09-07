@@ -249,7 +249,9 @@ spelled out."
     (concat
      (format "Refusing to record NEW principle `%s' — the store already holds %d notes, at the cap of %d (`cc-butler-governance-max-notes').\n\n"
              slug count cc-butler-governance-max-notes)
-     "TO RECORD THIS NOW: call record_principle again, but pass the NAME of an EXISTING principle whose topic overlaps with what you're recording, instead of a new slug — your text merges into that note in place, and revising an existing principle is never blocked by this cap, at any count.\n\n"
+     "TO RECORD THIS NOW: call record_principle again, but pass the NAME of an EXISTING principle whose topic overlaps with what you're recording, instead of a new slug — revising an existing principle is never blocked by this cap, at any count.\n\n"
+     "⚠ THIS REPLACES THAT NOTE'S ENTIRE BODY — it is not a merge, record_principle never merges. (1) Read the existing note's full current content first. (2) Fold your new material INTO that content by hand, staying under the body-length cap. (3) Pass that complete folded text as body — not just your new bit, or you delete everything else the note held. A body far smaller than what the note currently holds is refused unless you also pass confirm_shrink as true.\n\n"
+     "A note already at/over the body-length cap cannot be edited through record_principle until it is folded under that cap first — sizes are shown below for exactly this reason.\n\n"
      "For reference, where the store's bulk currently concentrates (NOT a ranked merge list — a note's size alone does not mean it is a good target; a very large note may need SPLITTING into several smaller ones rather than absorbing more, so match by topic, never by size):\n"
      (mapconcat (lambda (p) (format "  %7d bytes  %s" (cdr p) (car p))) largest "\n")
      "\n\nNothing existing actually fits the topic? Report to the steward rather than guessing which note to overload.")))
@@ -608,8 +610,77 @@ eventually get subtly wrong."
           "\n"
           (if stamp (concat "\n" stamp "\n") "")))
 
+(defcustom cc-butler-governance-shrink-guard-fraction 0.5
+  "Below this fraction of an EXISTING note's current body size, updating it
+via `record_principle' is refused unless the call also confirms the
+shrink (see `cc-butler-governance-record''s CONFIRM-SHRINK argument).
+
+REGRESSION-SHAPED DANGER closed 2026-09-08 (steward, reading the code
+directly): `record_principle' OVERWRITES a note's entire file via
+`with-temp-file' — never merges, never appends. The count-cap rejection
+message told a worker to \"call record_principle again ... your text
+merges into that note in place\", which is FALSE, and following it
+literally on any real (large) note would silently delete almost all of
+it. This guard is the structural stop that a truthful message alone
+cannot be, since a message not read is not a safeguard.
+
+0.5 is butler's judgment call, not a measurement: deliberate folding
+(cramming a 45KB note down to under the 2KB body cap) legitimately looks
+identical, byte-count-wise, to an accidental partial overwrite -- there
+is no size threshold that tells them apart. So this is not a hard block;
+it is a REQUIRED CONFIRMATION, the same shape the 4/4-real-store-probe
+discipline already established for this file: default to refusing,
+require an explicit opt-in for the case that looks the same as the
+danger it exists to catch."
+  :type 'number
+  :group 'cc-butler)
+
+(defun cc-butler-governance--truthy-p (v)
+  "Non-nil when V is a truthy CONFIRM-SHRINK argument.
+An MCP boolean argument's exact Lisp representation across JSON
+true/false is not something this file controls or wants to guess at
+narrowly -- nil, `:false', the empty string, and the literal string
+\"false\" are all treated as \"not confirmed\"; anything else (t, a
+non-empty string, `:true') is treated as confirmed. Erring toward
+treating an ambiguous value as NOT confirmed is the safe direction for a
+guard that exists to prevent data loss."
+  (not (or (null v) (eq v :false) (equal v "") (equal v "false"))))
+
+(defun cc-butler-governance--body-in-file (path)
+  "PATH's body text -- everything after the frontmatter's closing `---'
+line, with any trailing creation stamp stripped, matching exactly what
+`cc-butler-governance--render' put there. Nil if PATH is unreadable or
+has no frontmatter close. The one place \"what does this note currently
+say\" is read back off disk, so the shrink guard and any future reader of
+the same question cannot disagree."
+  (when (file-readable-p path)
+    (with-temp-buffer
+      (insert-file-contents path)
+      (goto-char (point-min))
+      (let* ((start (and (re-search-forward "^---$" nil t) (point)))
+             (end (and start (re-search-forward "^---$" nil t) (point))))
+        (when end
+          (goto-char end)
+          (forward-line 1)
+          (cc-butler-governance--strip-stamps
+           (buffer-substring-no-properties (point) (point-max))))))))
+
+(defun cc-butler-governance--shrink-guard-message (slug old-bytes new-bytes)
+  "Rejection text for `record_principle' hitting the shrink guard.
+Names both sizes plainly, then gives the two different next steps for the
+two different reasons this fires: accidental (go read + fold + resubmit
+the WHOLE text) or deliberate (resubmit with confirm-shrink)."
+  (format "Refusing to update `%s' without confirmation — its current body is %d bytes, and the body in this call is only %d bytes (%d%% smaller). record_principle OVERWRITES THE ENTIRE FILE, never merges, so this call would delete most of what the note currently holds.
+
+If this is accidental: you likely called record_principle with only your NEW material, not the note's existing content folded in. Read the note's current body first, merge your addition into the complete text by hand, then call record_principle again with that whole result as body.
+
+If this is deliberate — you actually condensed this note on purpose (e.g. folding it under the body-length cap) — call record_principle again with the same body, and pass confirm_shrink as true this time.
+"
+          slug old-bytes new-bytes
+          (round (* 100 (- 1 (/ (float new-bytes) old-bytes))))))
+
 ;;;###autoload
-(defun cc-butler-governance-record (name description body &optional type)
+(defun cc-butler-governance-record (name description body &optional type confirm-shrink)
   "Write a principle into the store, regenerate, and PROVE it landed.
 
 Returns a plist: :slug :path :existed :before :after :verified :names.
@@ -617,9 +688,15 @@ Returns a plist: :slug :path :existed :before :after :verified :names.
 actually names this principle — the check whose absence let three silent
 failures pass for successes.
 
-An existing NAME is overwritten in place.  Correcting a principle is the
-normal case; a near-duplicate under a new name is how a store stops being a
-source of truth."
+An existing NAME is OVERWRITTEN — the whole file is replaced with BODY,
+never merged or appended to.  Correcting a principle is the normal case
+for that (a near-duplicate under a new name is how a store stops being a
+source of truth), so calling this with an existing name is expected and
+fine — AS LONG AS BODY is the complete, already-folded text you want the
+note to hold, not just the new material.  A BODY far smaller than what
+the note currently holds is refused unless CONFIRM-SHRINK is non-nil (see
+`cc-butler-governance-shrink-guard-fraction') — the guard against exactly
+the mistake of passing only the new bit and losing the rest."
   (let* ((slug (cc-butler-governance--slug name))
          (store (cc-butler-governance-store))
          (path (expand-file-name (concat slug ".md") store))
@@ -627,6 +704,18 @@ source of truth."
          (before (cc-butler-governance--note-count)))
     (when (string-empty-p (string-trim (or body "")))
       (user-error "Refusing to record an empty principle: %s" slug))
+    ;; Data-loss guard, checked before anything else: this call is about
+    ;; to OVERWRITE (not merge) an existing file. Run first because it is
+    ;; the one check whose failure is irreversible; the others below are
+    ;; merely refused writes (steward, 2026-09-08: "노트가 사라집니다").
+    (when (and existed (not (cc-butler-governance--truthy-p confirm-shrink)))
+      (let* ((old-body (cc-butler-governance--body-in-file path))
+             (old-bytes (and old-body (string-bytes old-body)))
+             (new-bytes (string-bytes (cc-butler-governance--strip-stamps body))))
+        (when (and old-bytes (> old-bytes 0)
+                   (< new-bytes (* old-bytes cc-butler-governance-shrink-guard-fraction)))
+          (user-error "%s" (cc-butler-governance--shrink-guard-message
+                            slug old-bytes new-bytes)))))
     ;; Checked on every call, not only new ones — an update that pads an
     ;; existing note past the cap is the append-instead-of-add workaround
     ;; the count cap alone opens up (정수님, 2026-09-08).
@@ -671,15 +760,15 @@ source of truth."
             :verified verified :note note :store store
             :names (cc-butler-governance-names)))))
 
-(defun cc-butler-tool-record-principle (name description body &optional type)
+(defun cc-butler-tool-record-principle (name description body &optional type confirm-shrink)
   "MCP tool: record an operating principle and report where it landed."
-  (let* ((res (cc-butler-governance-record name description body type))
+  (let* ((res (cc-butler-governance-record name description body type confirm-shrink))
          (verified (plist-get res :verified)))
     (concat
      (if verified
          (format "Recorded principle `%s` (%s).\n"
                  (plist-get res :slug)
-                 (if (plist-get res :existed) "updated in place" "new"))
+                 (if (plist-get res :existed) "OVERWROTE the existing file" "new"))
        (format "FAILED to record `%s` — the principle was written but does NOT appear in the generated memory.\n"
                (plist-get res :slug)))
      (format "\nStore file : %s\nMemory note: %s\nNotes       : %d -> %d\nVerified    : %s\n"
@@ -695,7 +784,7 @@ source of truth."
      (format "\nPrinciples now in the store (%d): %s\n"
              (length (plist-get res :names))
              (string-join (plist-get res :names) ", "))
-     "\nTo revise one of these, call this again with that same name — it is overwritten in place.")))
+     "\nTo revise one of these, call this again with that same name — BODY REPLACES THE WHOLE FILE, it is never merged. Read the note first, fold your change into its complete text by hand, then pass that whole result as body.")))
 
 (defun cc-butler-governance--memory-dir-drift-detail ()
   "Nil if the write path (`cc-butler-governance-memory-store') agrees with
@@ -798,15 +887,17 @@ index, index -> store, and description drift."
   (claude-code-ide-make-tool
    :function #'cc-butler-tool-record-principle
    :name "record_principle"
-   :description "Record a butler/steward operating principle into the governance store and regenerate the Claude Code memory from it. Writes the frontmatter for you (name/description/metadata) so the schema cannot be got wrong, and takes NO path argument — it writes to exactly the store the regenerator reads, which is the whole point. Calling it with the name of an existing principle UPDATES that principle in place; revise rather than accumulating near-duplicates. Returns the absolute file written, the note count before and after, and whether the generated note was read back off disk and confirmed to name this principle — if that verification fails it reports failure, because a regeneration reporting success while landing nothing is a real thing that has happened here."
+   :description "Record a butler/steward operating principle into the governance store and regenerate the Claude Code memory from it. Writes the frontmatter for you (name/description/metadata) so the schema cannot be got wrong, and takes NO path argument — it writes to exactly the store the regenerator reads, which is the whole point. Calling it with the name of an EXISTING principle REPLACES that principle's entire file with whatever you pass as body — this OVERWRITES, it never merges or appends. To revise one: read its current content first, fold your change into the complete text by hand, then pass that whole result as body; passing only your new material deletes the rest. A body far smaller than the note's current size is refused unless confirm_shrink is also passed as true, so an accidental partial-overwrite cannot silently destroy most of a note. Returns the absolute file written, the note count before and after, and whether the generated note was read back off disk and confirmed to name this principle — if that verification fails it reports failure, because a regeneration reporting success while landing nothing is a real thing that has happened here."
    :args '((:name "name" :type "string" :required t
-            :description "Kebab-case slug for the principle, e.g. verify-delivery. Naming an existing principle updates it in place. The butler- prefix is added for you.")
+            :description "Kebab-case slug for the principle, e.g. verify-delivery. Naming an EXISTING principle REPLACES its entire file (never merges) — read it first if you mean to revise it. The butler- prefix is added for you.")
            (:name "description" :type "string" :required t
             :description "One-line summary, used to decide relevance during recall. Write it so a reader can tell whether this principle applies without opening it.")
            (:name "body" :type "string" :required t
-            :description "The principle itself, in Markdown. Follow the store's shape: what the rule is, then **Why:** with the concrete incident that motivated it, then **How to apply:**.")
+            :description "The principle itself, in Markdown, as the COMPLETE text the note should hold — this replaces the whole file when the name already exists, it is never merged with what's there. Follow the store's shape: what the rule is, then **Why:** with the concrete incident that motivated it, then **How to apply:**.")
            (:name "type" :type "string" :required nil
-            :description "Frontmatter metadata type. Defaults to feedback, which is what every principle in the store currently uses.")))
+            :description "Frontmatter metadata type. Defaults to feedback, which is what every principle in the store currently uses.")
+           (:name "confirm_shrink" :type "boolean" :required nil
+            :description "Required (true) when revising an existing principle to less than half its current body size — otherwise refused, to catch an accidental partial-overwrite that would delete most of the note. Pass true only when the shrink is deliberate (e.g. you already folded the note down under the body-length cap).")))
   (claude-code-ide-make-tool
    :function #'cc-butler-tool-regenerate-governance
    :name "regenerate_governance"
