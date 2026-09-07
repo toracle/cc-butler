@@ -222,6 +222,118 @@ argument would reintroduce it one call at a time."
                               args))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; The shrink guard (2026-09-08, steward: reading the code directly
+;;;; found record_principle OVERWRITES via with-temp-file -- it never
+;;;; merges -- while the count-cap rejection message told a worker
+;;;; "your text merges into that note in place". Following that message
+;;;; literally on any real note would have silently deleted almost all
+;;;; of it. This section proves BOTH halves: the danger is real (RED,
+;;;; against a realistic ~45KB copy, never the live store), and the
+;;;; guard actually stops it.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/shrink-guard-blocks-a-drastic-accidental-overwrite ()
+  "RED-shaped reproduction of the real incident: updating a large existing
+note (sized like the real ~45KB notes steward was about to fold) with only
+a small new body must be refused, and — the actual proof, not just that an
+error was raised — the OLD content must still be on disk afterward,
+completely intact."
+  (cc-butler-governance-test--with-store
+    (let* ((big-body (make-string 45000 ?x))
+           (path (expand-file-name "big-note.md" store)))
+      ;; Written DIRECTLY, bypassing record_principle's own 2KB body cap --
+      ;; the real 45KB/31KB notes this reproduces predate that cap and are
+      ;; exactly the ones a worker cannot create through record_principle
+      ;; today, only encounter already sitting in the store.
+      (with-temp-file path
+        (insert (cc-butler-governance--render "big-note" "d" big-body "feedback")))
+      (should-error (cc-butler-governance-record "big-note" "d" "tiny new fact")
+                    :type 'user-error)
+      (let ((text (with-temp-buffer (insert-file-contents path) (buffer-string))))
+        ;; string-match-p on a regexp-quoted 45000-char needle overflows
+        ;; Emacs's regexp engine ("Regular expression too big") -- a plain
+        ;; substring search has no such limit.
+        (should (string-search big-body text))
+        (should-not (string-match-p "tiny new fact" text))))))
+
+(ert-deftest cc-butler-governance/shrink-guard-message-names-both-sizes ()
+  "The rejection text must be actionable: both sizes and both possible next
+steps (accidental -> read+fold+resubmit whole; deliberate -> confirm_shrink)."
+  (cc-butler-governance-test--with-store
+    (cc-butler-governance-record "big-note" "d" (make-string 1000 ?x))
+    (let ((msg (condition-case err
+                   (progn (cc-butler-governance-record "big-note" "d" "small") nil)
+                 (user-error (cadr err)))))
+      (should (string-match-p "1000 bytes" msg))
+      (should (string-match-p "OVERWRITES THE ENTIRE FILE" msg))
+      (should (string-match-p "confirm_shrink\\|confirm-shrink" msg))
+      (should (string-match-p "read.*fold\\|fold.*read\\|Read the note" msg)))))
+
+(ert-deftest cc-butler-governance/shrink-guard-passes-with-confirm-shrink-true ()
+  "GREEN: the identical drastic shrink succeeds once CONFIRM-SHRINK is
+passed -- proves this is a confirmation gate, not a permanent block, since
+deliberate folding looks byte-for-byte identical to the accident."
+  (cc-butler-governance-test--with-store
+    (let ((path (expand-file-name "big-note.md" store)))
+      (with-temp-file path
+        (insert (cc-butler-governance--render "big-note" "d" (make-string 45000 ?x) "feedback")))
+      (let ((res (cc-butler-governance-record "big-note" "d" "folded down on purpose"
+                                              "feedback" t)))
+        (should (plist-get res :verified))
+        (let ((text (with-temp-buffer (insert-file-contents path) (buffer-string))))
+          (should (string-match-p "folded down on purpose" text))
+          (should-not (string-match-p "xxxxxxxxxx" text)))))))
+
+(ert-deftest cc-butler-governance/shrink-guard-does-not-block-a-new-note ()
+  "A brand-new slug has no old body to lose -- the guard must never fire on
+`existed' = nil, no matter how small the first body is."
+  (cc-butler-governance-test--with-store
+    (let ((res (cc-butler-governance-record "brand-new" "d" "tiny")))
+      (should (plist-get res :verified)))))
+
+(ert-deftest cc-butler-governance/shrink-guard-does-not-block-a-modest-revision ()
+  "A normal edit -- new body within `cc-butler-governance-shrink-guard-fraction'
+of the old size -- must pass without confirm-shrink. The guard exists for
+DRASTIC shrinks only, not ordinary tightening of wording."
+  (cc-butler-governance-test--with-store
+    (cc-butler-governance-record "a-rule" "d" (make-string 1000 ?x))
+    (let ((res (cc-butler-governance-record "a-rule" "d" (make-string 700 ?y))))
+      (should (plist-get res :verified)))))
+
+(ert-deftest cc-butler-governance/shrink-guard-fraction-boundary ()
+  "Exactly AT the fraction is still a pass (only STRICTLY below refuses) --
+matches this file's own at/above vs strictly-below convention elsewhere
+\(e.g. `cc-butler-governance/record-allows-past-the-cap-once-raised')."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-shrink-guard-fraction 0.5))
+      ;; Two independent slugs, each updated exactly ONCE from its own
+      ;; fresh 1000-byte original -- a second update to the SAME slug
+      ;; would be measured against the FIRST update's already-shrunk
+      ;; size, not the original, and silently test the wrong boundary.
+      (cc-butler-governance-record "at-half" "d" (make-string 1000 ?x))
+      (should (plist-get (cc-butler-governance-record "at-half" "d" (make-string 500 ?y))
+                         :verified))
+      (cc-butler-governance-record "under-half" "d" (make-string 1000 ?x))
+      (should-error (cc-butler-governance-record "under-half" "d" (make-string 499 ?z))
+                    :type 'user-error))))
+
+(ert-deftest cc-butler-governance/cap-message-no-longer-claims-a-merge ()
+  "REGRESSION (2026-09-08, steward reading the code directly): the count-cap
+message used to say \"your text merges into that note in place\", which is
+false -- record_principle overwrites. Must never say \"merge\" as if it
+were automatic, and must say the update replaces/overwrites the whole
+file."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-notes 1))
+      (cc-butler-governance-record "big-one" "d" "body")
+      (let ((msg (condition-case err
+                     (progn (cc-butler-governance-record "second" "d" "body") nil)
+                   (user-error (cadr err)))))
+        (should-not (string-match-p "your text merges into that note in place" msg))
+        (should (string-match-p "REPLACES THAT NOTE'S ENTIRE BODY" msg))
+        (should (string-match-p "not a merge" msg))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; The store cap (2026-09-08, 정수님 배차: "제약이 있어야 효율화된다")
 ;;;; ------------------------------------------------------------------
 
