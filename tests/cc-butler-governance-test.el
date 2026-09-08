@@ -409,7 +409,7 @@ stay below `cc-butler-governance-duplicate-search-min-shared-keywords' and
 therefore not be returned as a candidate at all."
   (cc-butler-governance-test--with-store
     (let ((cc-butler-governance-duplicate-search-min-shared-keywords 3)
-          (cc-butler-governance-max-index-line-bytes 1000))
+          (cc-butler-governance-max-description-bytes 1000))
       (cc-butler-governance-record "verify-delivery" "Confirm delivery landed" "body")
       (should-not (cc-butler-governance--duplicate-candidates
                    "unrelated-topic" "Something about timeouts entirely" "body")))))
@@ -420,7 +420,7 @@ enough keywords with an existing principle's description must be refused
 -- and no file created -- before it ever reaches the count/length caps."
   (cc-butler-governance-test--with-store
     (let ((cc-butler-governance-duplicate-search-min-shared-keywords 3)
-          (cc-butler-governance-max-index-line-bytes 1000))
+          (cc-butler-governance-max-description-bytes 1000))
       (cc-butler-governance-record
        "verify-delivery" "Confirm delivery landed before declaring success" "original body")
       (should-error
@@ -435,7 +435,7 @@ enough keywords with an existing principle's description must be refused
 already in the store, must record normally -- the search must not become
 a de facto block on all new principles."
   (cc-butler-governance-test--with-store
-    (let ((cc-butler-governance-max-index-line-bytes 1000))
+    (let ((cc-butler-governance-max-description-bytes 1000))
       (cc-butler-governance-record
        "verify-delivery" "Confirm delivery landed before declaring success" "body")
       (let ((res (cc-butler-governance-record
@@ -447,7 +447,7 @@ a de facto block on all new principles."
 skip_duplicate_check is passed -- the false-positive escape hatch."
   (cc-butler-governance-test--with-store
     (let ((cc-butler-governance-duplicate-search-min-shared-keywords 3)
-          (cc-butler-governance-max-index-line-bytes 1000))
+          (cc-butler-governance-max-description-bytes 1000))
       (cc-butler-governance-record
        "verify-delivery" "Confirm delivery landed before declaring success" "original body")
       (should-error
@@ -465,7 +465,7 @@ already exist\" -- the whole point is that it already does. The search
 must never fire when `existed' is true, no matter the wording."
   (cc-butler-governance-test--with-store
     (let ((cc-butler-governance-duplicate-search-min-shared-keywords 3)
-          (cc-butler-governance-max-index-line-bytes 1000))
+          (cc-butler-governance-max-description-bytes 1000))
       (cc-butler-governance-record
        "verify-delivery" "Confirm delivery landed before declaring success" "body")
       (let ((res (cc-butler-governance-record
@@ -478,7 +478,7 @@ must never fire when `existed' is true, no matter the wording."
 keywords it shares, and its current size -- not just \"looks similar\"."
   (cc-butler-governance-test--with-store
     (let ((cc-butler-governance-duplicate-search-min-shared-keywords 3)
-          (cc-butler-governance-max-index-line-bytes 1000))
+          (cc-butler-governance-max-description-bytes 1000))
       (cc-butler-governance-record
        "verify-delivery" "Confirm delivery landed before declaring success" "original body")
       (let ((msg (condition-case err
@@ -527,7 +527,7 @@ count-cap message -- is what a caller actually sees."
   (cc-butler-governance-test--with-store
     (let ((cc-butler-governance-duplicate-search-min-shared-keywords 3)
           (cc-butler-governance-max-notes 1)
-          (cc-butler-governance-max-index-line-bytes 1000))
+          (cc-butler-governance-max-description-bytes 1000))
       (cc-butler-governance-record
        "verify-delivery" "Confirm delivery landed before declaring success" "body")
       ;; store is now AT the count cap (1) AND a genuine duplicate exists
@@ -713,69 +713,229 @@ sections of THIS body are worth cutting — not just \"too long\"."
         (should (string-match-p "Trim to the point" msg))))))
 
 ;;;; ------------------------------------------------------------------
-;;;; The index-line-length cap (2026-09-08, butler's own design — a
-;;;; short body does not guarantee a short MEMORY.md line, and the index
-;;;; line is what a session's context-read budget actually pays for)
+;;;; The index LINE FORMAT (2026-09-08, steward: the old format,
+;;;; `- [slug](butler-slug.md) — ...', wrote the slug TWICE -- link text
+;;;; and mechanically-derivable filename -- and that duplication alone
+;;;; already ate almost the whole 80-byte cap. m1 measured: even an EMPTY
+;;;; description overflowed 504/568 times (89%). Fixed at the source: the
+;;;; filename is never written in the index at all now, only the slug.
 ;;;; ------------------------------------------------------------------
 
-(ert-deftest cc-butler-governance/record-refuses-a-description-over-the-index-line-cap ()
-  "RED: a description that renders an index line over
-`max-index-line-bytes' is refused, and refusing means the file is
-genuinely never written — even though the BODY itself is tiny."
+(ert-deftest cc-butler-governance/render-index-line-no-longer-duplicates-the-slug ()
+  "The new format is `- SLUG — DESCRIPTION' -- no brackets, no repeated
+filename. This is the precondition the description cap needed: under the
+old format, an EMPTY description already overflowed a reasonable byte cap
+on slug duplication alone."
+  (let ((line (cc-butler-governance--render-index-line "a-slug" "a description")))
+    (should (equal line "- a-slug — a description\n"))
+    (should-not (string-match-p "\\[" line))
+    (should-not (string-match-p "butler-a-slug\\.md" line))))
+
+(ert-deftest cc-butler-governance/index-has-slug-p-recognizes-both-shapes ()
+  "A slug already indexed in either the CURRENT shape or the pre-2026-09-08
+LEGACY shape must be recognized as present -- this is what stops the
+format change from duplicating every one of the 500+ real lines already
+on disk the first time they are regenerated against."
+  (let ((f (make-temp-file "gov-idx")))
+    (unwind-protect
+        (progn
+          (with-temp-file f (insert "- legacy-one — old desc\n"))
+          ;; wrong: this file actually holds CURRENT shape; overwrite with legacy
+          (with-temp-file f
+            (insert "- [legacy-one](butler-legacy-one.md) — old desc\n"))
+          (should (cc-butler-governance--index-has-slug-p f "legacy-one"))
+          (with-temp-file f (insert "- current-one — new desc\n"))
+          (should (cc-butler-governance--index-has-slug-p f "current-one")))
+      (delete-file f))))
+
+(ert-deftest cc-butler-governance/regenerate-does-not-duplicate-an-existing-legacy-line ()
+  "REGRESSION-PREVENTION (2026-09-08): the actual real-world risk this
+format change creates. A store note already indexed under the OLD shape
+must NOT get a second, new-shape line appended when regenerated -- that
+would double the index's size on first contact, the opposite of the
+point. Reproduces the real store's actual condition: 500+ pre-existing
+legacy lines, none of them ever rewritten."
   (cc-butler-governance-test--with-store
-    (let ((cc-butler-governance-max-index-line-bytes 40))
+    (with-temp-file (expand-file-name "MEMORY.md" mem)
+      (insert "- [a-rule](butler-a-rule.md) — legacy-shape description\n"))
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "legacy-shape description" "body" "feedback")))
+    (cc-butler-governance-regenerate)
+    (let* ((text (with-temp-buffer
+                   (insert-file-contents (expand-file-name "MEMORY.md" mem))
+                   (buffer-string)))
+           ;; count LINES for this slug, not substring occurrences -- the
+           ;; legacy line itself contains "a-rule" twice (display + filename)
+           (lines (seq-filter (lambda (l) (string-match-p "a-rule" l))
+                              (split-string text "\n" t))))
+      ;; exactly one LINE: the pre-existing legacy line, untouched -- not
+      ;; two lines (legacy line + a new duplicate in the current shape)
+      (should (= (length lines) 1))
+      (should (string-match-p "^- \\[a-rule\\]" (car lines))))))
+
+(ert-deftest cc-butler-governance/prune-dead-entries-removes-a-legacy-shaped-line-too ()
+  "Pruning a dangling link must work on a LEGACY-shaped line, not just the
+current shape -- the real store's dangling links, if any exist, are all
+legacy-shaped."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file (expand-file-name "a-rule.md" store)
+        (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
+      (cc-butler-governance-regenerate)
+      ;; simulate: this note was recorded back when the format was legacy
+      (with-temp-file index
+        (insert "- [a-rule](butler-a-rule.md) — d\n"))
+      (delete-file (expand-file-name "a-rule.md" store))
+      (delete-file (expand-file-name "butler-a-rule.md" mem))
+      (cc-butler-governance-regenerate)
+      (should-not (string-match-p "a-rule"
+                                  (with-temp-buffer (insert-file-contents index)
+                                                    (buffer-string)))))))
+
+(ert-deftest cc-butler-governance/stale-index-entries-detects-drift-in-legacy-shape ()
+  "Description-drift detection must also read a LEGACY-shaped line's
+description correctly, not just the current shape."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "revised description" "body" "feedback")))
+    (with-temp-file (expand-file-name "MEMORY.md" mem)
+      (insert "- [a-rule](butler-a-rule.md) — original description\n"))
+    (should (equal (cc-butler-governance--stale-index-entries) '("a-rule")))))
+
+;;;; ------------------------------------------------------------------
+;;;; The description-length cap (2026-09-08 correction of the earlier
+;;;; index-line cap: caps the SOURCE the author writes, not a derived
+;;;; rendering a generator would otherwise have to silently truncate)
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/record-refuses-a-description-over-the-cap ()
+  "RED: a description over `max-description-bytes' is refused, and
+refusing means the file is genuinely never written — even with a tiny body."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-description-bytes 20))
       (should-error (cc-butler-governance-record
                      "x" (make-string 60 ?d) "short body")
                     :type 'user-error)
       (should-not (file-exists-p (expand-file-name "x.md" (cc-butler-governance-store)))))))
 
-(ert-deftest cc-butler-governance/record-allows-past-the-index-line-cap-once-raised ()
+(ert-deftest cc-butler-governance/record-allows-past-the-description-cap-once-raised ()
   "GREEN: the identical call just refused succeeds once the cap is raised —
 a live check, not a one-time snapshot."
   (cc-butler-governance-test--with-store
-    (let ((cc-butler-governance-max-index-line-bytes 40))
+    (let ((cc-butler-governance-max-description-bytes 20))
       (should-error (cc-butler-governance-record "x" (make-string 60 ?d) "short body")))
-    (let* ((cc-butler-governance-max-index-line-bytes 200)
+    (let* ((cc-butler-governance-max-description-bytes 200)
            (res (cc-butler-governance-record "x" (make-string 60 ?d) "short body")))
       (should (plist-get res :verified))
       (should (file-exists-p (plist-get res :path))))))
 
-(ert-deftest cc-butler-governance/index-line-cap-is-independent-of-the-body-cap ()
-  "A tiny body with a long DESCRIPTION must still be refused — the two caps
-measure different text, so passing one must never be mistaken for passing
-both. This is the actual gap the index-line cap closes: capping the body
-alone (`cc-butler-governance-max-note-bytes') does nothing to
-`MEMORY.md''s size, since the index line is rendered from the
-description, not the body."
+(ert-deftest cc-butler-governance/description-cap-is-independent-of-the-body-cap ()
+  "A tiny body with a long DESCRIPTION must still be refused — capping the
+body alone does nothing to shrink the index, since the index line is
+rendered from the description, never the body."
   (cc-butler-governance-test--with-store
     (let ((cc-butler-governance-max-note-bytes 100000)   ; body cap wide open
-          (cc-butler-governance-max-index-line-bytes 40))
+          (cc-butler-governance-max-description-bytes 20))
       (should-error (cc-butler-governance-record "x" (make-string 60 ?d) "tiny")
                     :type 'user-error))))
 
-(ert-deftest cc-butler-governance/index-line-cap-also-blocks-padding-an-existing-description ()
+(ert-deftest cc-butler-governance/description-cap-also-blocks-padding-an-existing-description ()
   "Revising a principle's description into a longer one must be checked too
 -- an update is exactly how an author would otherwise dodge this cap on a
 NEW note, the same append-instead-of-add shape the body-length cap closes."
   (cc-butler-governance-test--with-store
-    (let ((cc-butler-governance-max-index-line-bytes 40))
+    (let ((cc-butler-governance-max-description-bytes 20))
       (cc-butler-governance-record "grows" "short" "body")
       (should-error (cc-butler-governance-record "grows" (make-string 60 ?d) "body")
                     :type 'user-error))))
 
-(ert-deftest cc-butler-governance/index-line-cap-message-names-bytes-cap-and-the-line ()
-  "The rejection text must be actionable: current bytes, the cap, and the
-offending line itself, so the author can shorten it on the spot."
+(ert-deftest cc-butler-governance/description-cap-message-shows-bytes-and-characters ()
+  "REGRESSION this closes (m1, 2026-09-08): this store's descriptions are
+mostly Korean, and a byte-only message reads as a bug to an author who
+counts far fewer characters. The message must show both units."
   (cc-butler-governance-test--with-store
-    (let ((cc-butler-governance-max-index-line-bytes 40))
+    (let ((cc-butler-governance-max-description-bytes 20))
       (let ((msg (condition-case err
                      (progn (cc-butler-governance-record
                              "x" "a rather long description that overflows" "body")
                             nil)
                    (user-error (cadr err)))))
-        (should (string-match-p "cap of 40" msg))
+        (should (string-match-p "cap of 20" msg))
+        (should (string-match-p "characters" msg))
         (should (string-match-p "a rather long description" msg))
-        (should (string-match-p "Shorten the description" msg))))))
+        (should (string-match-p "Shorten to a name" msg))))))
+
+;;;; ------------------------------------------------------------------
+;;;; The new-slug-length cap (2026-09-08, m1's finding: slugs carry the
+;;;; SAME amount of budget slack as descriptions -- median 46 real bytes,
+;;;; some grown into full sentences)
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/record-refuses-a-new-slug-over-the-cap ()
+  "RED: a brand-new slug over `max-new-slug-bytes' is refused before
+anything is written."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-new-slug-bytes 10))
+      (should-error (cc-butler-governance-record
+                     "this-slug-is-clearly-too-long-for-the-cap" "d" "body")
+                    :type 'user-error)
+      (should (zerop (cc-butler-governance--store-note-count))))))
+
+(ert-deftest cc-butler-governance/record-allows-a-long-new-slug-once-the-cap-is-raised ()
+  "GREEN: the identical call succeeds once the cap is raised."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-new-slug-bytes 10))
+      (should-error (cc-butler-governance-record
+                     "this-slug-is-clearly-too-long-for-the-cap" "d" "body")))
+    (let* ((cc-butler-governance-max-new-slug-bytes 100)
+           (res (cc-butler-governance-record
+                 "this-slug-is-clearly-too-long-for-the-cap" "d" "body")))
+      (should (plist-get res :verified)))))
+
+(ert-deftest cc-butler-governance/new-slug-cap-never-blocks-revising-an-existing-note ()
+  "A note whose slug already exceeds the cap must still be revisable --
+renaming it is a separate, out-of-scope concern (it would break every
+link to it); only the CREATION of a new over-cap slug is refused."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-new-slug-bytes 1000))
+      (cc-butler-governance-record "this-slug-is-clearly-too-long-for-the-cap" "d" "original"))
+    (let* ((cc-butler-governance-max-new-slug-bytes 10)
+           (res (cc-butler-governance-record
+                 "this-slug-is-clearly-too-long-for-the-cap" "d" "revised")))
+      (should (plist-get res :verified)))))
+
+(ert-deftest cc-butler-governance/new-slug-cap-message-shows-bytes-and-characters ()
+  "Actionable rejection text, same principle as the description cap."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-new-slug-bytes 10))
+      (let ((msg (condition-case err
+                     (progn (cc-butler-governance-record
+                             "this-slug-is-clearly-too-long-for-the-cap" "d" "body")
+                            nil)
+                   (user-error (cadr err)))))
+        (should (string-match-p "cap of 10" msg))
+        (should (string-match-p "characters" msg))))))
+
+(ert-deftest cc-butler-governance/description-and-slug-caps-run-before-the-count-cap ()
+  "Meta-requirement (steward, 2026-09-08): a gate placed after another
+never gets exercised by a call the earlier gate already refuses -- exactly
+how this very cap went untested against real data the first time, hidden
+behind the count cap. Prove ordering directly: with the count cap ALSO at
+threshold, the DESCRIPTION message -- not the count-cap message -- is what
+a caller sees."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-description-bytes 20)
+          (cc-butler-governance-max-notes 1))
+      (cc-butler-governance-record "first" "d" "body")
+      ;; store is now AT the count cap (1) AND the new attempt's
+      ;; description is also over the description cap
+      (let ((msg (condition-case err
+                     (progn (cc-butler-governance-record
+                             "second" (make-string 60 ?d) "body")
+                            nil)
+                   (user-error (cadr err)))))
+        (should (string-match-p "cap of 20" msg))
+        (should-not (string-match-p "at the cap of 1" msg))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Syncing the MEMORY.md index (cc-butler#36 gap b)
@@ -793,7 +953,7 @@ pulling the hook text from the note's own frontmatter description."
     (let ((index (expand-file-name "MEMORY.md" mem)))
       (should (file-exists-p index))
       (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
-        (should (string-match-p "\\[verify-delivery\\](butler-verify-delivery\\.md)" text))
+        (should (string-match-p "^- verify-delivery — " text))
         (should (string-match-p "Confirm it landed" text))))))
 
 (ert-deftest cc-butler-governance/regenerate-index-merge-preserves-hand-written-lines ()
@@ -809,7 +969,7 @@ overwrite or drop a line it didn't add."
       (cc-butler-governance-regenerate)
       (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
         (should (string-match-p (regexp-quote hand-written) text))
-        (should (string-match-p "\\[a-rule\\](butler-a-rule\\.md)" text))))))
+        (should (string-match-p "^- a-rule — " text))))))
 
 (ert-deftest cc-butler-governance/regenerate-index-merge-is-idempotent ()
   "Running regenerate twice must not duplicate an already-indexed note's line."
@@ -821,7 +981,7 @@ overwrite or drop a line it didn't add."
     (let* ((index (expand-file-name "MEMORY.md" mem))
            (text (with-temp-buffer (insert-file-contents index) (buffer-string)))
            (count 0) (start 0))
-      (while (string-match "\\[a-rule\\](butler-a-rule\\.md)" text start)
+      (while (string-match "^- a-rule — " text start)
         (setq count (1+ count) start (match-end 0)))
       (should (= count 1)))))
 
@@ -849,7 +1009,7 @@ a placeholder hook instead of crashing the whole regenerate call."
     (cc-butler-governance-regenerate)
     (let* ((index (expand-file-name "MEMORY.md" mem))
            (text (with-temp-buffer (insert-file-contents index) (buffer-string))))
-      (should (string-match-p "\\[raw-rule\\](butler-raw-rule\\.md)" text)))))
+      (should (string-match-p "^- raw-rule — " text)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Bare-trigger regeneration for direct writes (cc-butler#36 gap a)
@@ -870,8 +1030,7 @@ the cache and the MEMORY.md index, and say so in its report."
       (let ((index-text (with-temp-buffer
                           (insert-file-contents (expand-file-name "MEMORY.md" mem))
                           (buffer-string))))
-        (should (string-match-p "\\[direct-write-rule\\](butler-direct-write-rule\\.md)"
-                                index-text)))
+        (should (string-match-p "^- direct-write-rule — " index-text)))
       (should (string-match-p "direct-write-rule" out)))))
 
 (ert-deftest cc-butler-governance/regenerate-tool-reports-zero-gap-when-current ()
@@ -908,7 +1067,7 @@ a store principle must be pruned."
       (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
     (cc-butler-governance-regenerate)
     (let ((index (expand-file-name "MEMORY.md" mem)))
-      (should (string-match-p "\\[a-rule\\](butler-a-rule\\.md)"
+      (should (string-match-p "^- a-rule — "
                               (with-temp-buffer (insert-file-contents index) (buffer-string))))
       ;; Simulate the hand-cleanup: the principle is gone from the store
       ;; and its generated note is gone from memory, but nobody touched
@@ -916,14 +1075,15 @@ a store principle must be pruned."
       (delete-file (expand-file-name "a-rule.md" store))
       (delete-file (expand-file-name "butler-a-rule.md" mem))
       (cc-butler-governance-regenerate)
-      (should-not (string-match-p "\\[a-rule\\](butler-a-rule\\.md)"
+      (should-not (string-match-p "^- a-rule — "
                                   (with-temp-buffer (insert-file-contents index) (buffer-string)))))))
 
 (ert-deftest cc-butler-governance/prune-never-touches-a-non-generated-line ()
   "Pruning must only ever remove lines shaped exactly like this store's own
-generated entries (`- [slug](butler-slug.md) -- ...'). A hand-written entry
-in any other shape -- even one pointing at a file that does not exist -- is
-none of this store's business and must survive untouched."
+generated entries -- current (`- slug -- ...') or legacy
+(`- [slug](butler-slug.md) -- ...') shape. A hand-written entry in any
+OTHER shape -- even one pointing at a file that does not exist -- is none
+of this store's business and must survive untouched."
   (cc-butler-governance-test--with-store
     (let ((index (expand-file-name "MEMORY.md" mem))
           (hand-written "- [steward-only-note](steward-only-note.md) — points at nothing, on purpose\n"))

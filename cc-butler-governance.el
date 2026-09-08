@@ -107,28 +107,64 @@ this bites the next time an existing 2KB+ note is edited, not now."
   :type 'integer
   :group 'cc-butler)
 
-(defcustom cc-butler-governance-max-index-line-bytes 80
-  "Hard cap on one principle's `MEMORY.md' index-line length, in bytes —
-roughly a name plus a five-or-six-word hook.
+(defcustom cc-butler-governance-max-description-bytes 46
+  "Hard cap on one principle's frontmatter DESCRIPTION, in bytes — checked
+on every `record_principle' call, new or update, the same way
+`cc-butler-governance-max-note-bytes' checks the body.
 
-This is what actually decides whether a session can even SEE a given
-principle: `MEMORY.md' itself is read in full only up to whatever byte
-budget the caller reading it applies (measured 2026-09-08, butler: of
-598 index lines / 281 KB total, only the first 74 lines / 25 KB actually
-load into context — 12%). Shrinking `cc-butler-governance-max-notes' to
-250 does not fix this on its own: 250 notes at this store's current
-average index-line size (468 bytes, measured the same day) is still
-250*468 ~= 117 KB, still roughly 5x that budget. Body length
-(`cc-butler-governance-max-note-bytes') is a DIFFERENT variable from
-index-line length — capping the body alone does not shrink the index at
-all, since `cc-butler-governance--index-line' renders only the
-description, not the body.
+REPLACES a former index-LINE cap (removed 2026-09-08) that measured the
+wrong thing: the RENDERED `MEMORY.md' line, `- [slug](butler-slug.md) —
+description'. m1 함대 measured that shape against the real store (568
+notes): even an EMPTY description already exceeds it 504/568 times (89%)
+— the slug alone, written twice (display text + link target), already
+ate almost the whole budget. \"파생물이 아니라 원천에 걸어야 저자가
+접는다\" — capping the rendered line makes the GENERATOR silently
+truncate; capping DESCRIPTION, the thing the author actually writes,
+makes the author fold it. (The index format itself no longer duplicates
+the slug either — see `cc-butler-governance--render-index-line' — so the
+old defect is closed from both directions, not just this one.)
 
-80 — butler's calculated value (2026-09-08), NOT 정수님's — keep that
-distinction visible; 정수님 specified 250 (count) and 2048 (body) directly,
-this one is derived: 21504 bytes (a conservative budget) / 250 notes ~=
-86, rounded down with a little margin. Adjust independently of the other
-two if the actual read-in budget turns out to be measured differently."
+Budget derivation (this is the one number in this file with a
+DOUBLE-independent measurement, and it was still wrong twice before this
+— re-derive, do not just copy):
+  - butler measured (2026-09-08): MEMORY.md's own load-in cut is at
+    entry 74/598, cumulative 25,189 bytes.
+  - m1 measured independently, same day: ~24.4 KB — agrees within ~3%.
+  - THIS WORKER independently reproduced butler's own figure by directly
+    summing bytes in the live butler MEMORY.md
+    (~/.claude/projects/-home-toracle--emacs-d-cc-butler-butler/memory/MEMORY.md)
+    at PR time: entry 74 ends at cumulative byte 25,189 — exact match.
+  - The vault's own in-file header claiming \"~21KB\" is CONFIRMED STALE
+    documentation, not a third measurement — do not average it in.
+  ⇒ working budget: ~25,000 bytes / 250 notes (`cc-butler-governance-max-notes')
+    = 100 bytes/line. New line format overhead (see
+    `cc-butler-governance--render-index-line') is fixed at 8 bytes
+    (\"- \" + \" — \" + \"\\n\", the em dash is 3 UTF-8 bytes). Remaining 92
+    bytes is split evenly with the new-slug cap below (46 each) because
+    the real store's MEDIAN slug length, measured 2026-09-08 (566 real
+    slugs), is 46 bytes — almost exactly half of 92; this is not a
+    coincidence forced by rounding, it is what made the even split the
+    obvious one.
+
+Re-measure both this file and the real store before ever changing this
+number — a value copied without re-deriving is exactly how ~21KB and an
+un-slug-corrected 80 both survived here."
+  :type 'integer
+  :group 'cc-butler)
+
+(defcustom cc-butler-governance-max-new-slug-bytes 46
+  "Hard cap on a NEW principle's slug length, in bytes — never checked on
+an existing slug, since renaming one breaks every link to it (a separate
+concern, out of scope here).
+
+m1 함대 measured (2026-09-08): the real store's slug lengths carry \"같은
+크기의 여유\" (the same amount of slack) as descriptions — median 46
+bytes, some grown into full English sentences
+(`a-control-that-cannot-fail-is-not-a-control'). Splitting
+`cc-butler-governance-max-description-bytes'\\='s 92-byte remaining
+per-line budget evenly (46/46) is the same derivation as that cap; see
+its docstring for the full budget math. Only NEW slugs are checked, so
+this never blocks revising something that already exists."
   :type 'integer
   :group 'cc-butler)
 
@@ -280,14 +316,28 @@ can cut on the spot, the same principle as `cc-butler-governance--cap-message'."
               (cc-butler-governance--longest-sections body 3) "\n")
    "\n\nTrim to the point, split part of it into a separate principle, or cut one of the sections above, then call record_principle again."))
 
-(defun cc-butler-governance--index-line-message (slug line)
+(defun cc-butler-governance--description-message (slug description)
   "Rejection text for `record_principle' hitting
-`cc-butler-governance-max-index-line-bytes'. Names the byte count, the
-cap, and the offending LINE itself — short enough that showing the whole
-thing beats picking excerpts, unlike the other two caps' messages."
-  (format "Refusing to record `%s' — its MEMORY.md index line would be %d bytes, over the cap of %d (`cc-butler-governance-max-index-line-bytes').\nLine: %s\nShorten the description to a name plus a five-or-six-word hook, then call record_principle again."
-          slug (string-bytes line) cc-butler-governance-max-index-line-bytes
-          (string-trim line)))
+`cc-butler-governance-max-description-bytes'. Shows BOTH bytes and
+CHARACTERS — this store's descriptions are mostly Korean, and a byte
+count alone reads as a bug to a worker who counts 27 characters and sees
+\"80 bytes\" (m1, 2026-09-08): a Korean character is 3 UTF-8 bytes, so
+`cc-butler-governance-max-description-bytes' at 46 is only ~15 Korean
+characters — real, not a display glitch, and the message must say so in
+a unit the author can actually count against."
+  (format "Refusing to record `%s' — its description is %d bytes (%d characters), over the cap of %d bytes (`cc-butler-governance-max-description-bytes').\nDescription: %s\n(Korean text: ~3 bytes/character, so this cap is roughly %d Korean characters, not %d.)\nShorten to a name plus a five-or-six-word hook, then call record_principle again."
+          slug (string-bytes description) (length description)
+          cc-butler-governance-max-description-bytes
+          description
+          (/ cc-butler-governance-max-description-bytes 3)
+          cc-butler-governance-max-description-bytes))
+
+(defun cc-butler-governance--new-slug-message (name slug)
+  "Rejection text for `record_principle' hitting
+`cc-butler-governance-max-new-slug-bytes' on a genuinely NEW slug."
+  (format "Refusing to record NEW principle `%s' — its slug is %d bytes (%d characters), over the cap of %d bytes (`cc-butler-governance-max-new-slug-bytes').\nPick a shorter name — this only applies to a brand-new slug; renaming an existing one is a separate, out-of-scope concern (it would break every link to it)."
+          name (string-bytes slug) (length slug)
+          cc-butler-governance-max-new-slug-bytes))
 
 (defun cc-butler-governance--memory-index-file ()
   "Absolute path of `MEMORY.md' — the hand-maintained index every session
@@ -321,10 +371,25 @@ after it, so a leading blank line no longer matters."
 (defun cc-butler-governance--render-index-line (slug description)
   "The literal `MEMORY.md' line text for SLUG with DESCRIPTION already in
 hand — the one formatter `cc-butler-governance--index-line' (reads
-DESCRIPTION off disk, after the note exists) and the record-time length
-check (has DESCRIPTION in the call already, before anything is written)
-both go through, so the two can never render the line differently."
-  (format "- [%s](butler-%s.md) — %s\n" slug slug description))
+DESCRIPTION off disk, after the note exists) and any record-time check
+that needs the rendered line both go through, so the two can never
+disagree.
+
+FORMAT CHANGED 2026-09-08 (steward, reading m1's real-store measurement):
+was `- [SLUG](butler-SLUG.md) — DESCRIPTION' — the slug written TWICE,
+once as link text and once inside the mechanically-derivable filename.
+m1 measured: even an EMPTY description already overflows the old 80-byte
+cap 504/568 times (89%) on that duplication alone, before a single
+character of real content. The filename is not written here at all now
+— it is `butler-SLUG.md' in the same directory as this index, always,
+mechanically, so a reader (human or code) derives it from SLUG instead of
+being told it twice. See `cc-butler-governance--index-line-regexp' for
+how a line in this shape is recognized back out of the file, and
+`cc-butler-governance-max-description-bytes' for the cap this format
+change was a precondition for (`성립 조건', not a preference — steward:
+capping any value was arithmetically impossible under the old format's
+overhead)."
+  (format "- %s — %s\n" slug description))
 
 (defun cc-butler-governance--index-line (slug)
   "Render the `MEMORY.md' line for SLUG, using the note's own description."
@@ -334,13 +399,42 @@ both go through, so the two can never render the line differently."
                    "(no description in store)")))
     (cc-butler-governance--render-index-line slug desc)))
 
+(defconst cc-butler-governance--legacy-index-line-regexp
+  "^- \\[\\([a-z0-9][a-z0-9-]*\\)\\](butler-\\1\\.md) — "
+  "The OLD (pre-2026-09-08) generated-line shape, `- [SLUG](butler-SLUG.md)
+— ...'. Every one of the real store's 500+ existing lines is still in
+this shape and always will be — `cc-butler-governance--sync-index' never
+rewrites an existing line, by design, the same way a hand-curated
+description is left alone (see `cc-butler-governance--stale-index-entries').
+Recognizing this shape FOREVER, alongside the current one
+\(`cc-butler-governance--index-line-regexp'), is what keeps the
+2026-09-08 format change from duplicating or un-pruning every line
+already on disk: without it, every real slug would look \"unindexed\" to
+`cc-butler-governance--sync-index' and get a second, new-shape line
+appended underneath its old one.")
+
+(defun cc-butler-governance--index-line-regexp ()
+  "Regexp matching a MEMORY.md line THIS STORE generated, current shape
+only (`- SLUG — ...'), slug captured in group 1. See
+`cc-butler-governance--legacy-index-line-regexp' for the old shape, which
+this deliberately does NOT also match — callers that need both check
+both explicitly, so it stays visible in the code which shape is being
+asked about."
+  "^- \\([a-z0-9][a-z0-9-]*\\) — ")
+
 (defun cc-butler-governance--index-has-slug-p (index slug)
-  "Non-nil when INDEX (a file that may not exist yet) already links SLUG's note."
+  "Non-nil when INDEX (a file that may not exist yet) already has a line
+for SLUG — either the current shape or the legacy one (see
+`cc-butler-governance--legacy-index-line-regexp')."
   (and (file-readable-p index)
        (with-temp-buffer
          (insert-file-contents index)
          (goto-char (point-min))
-         (search-forward (format "(butler-%s.md)" slug) nil t))))
+         (let ((q (regexp-quote slug)))
+           (or (re-search-forward (concat "^- " q " — ") nil t)
+               (progn (goto-char (point-min))
+                      (re-search-forward
+                       (concat "^- \\[" q "\\](butler-" q "\\.md) — ") nil t)))))))
 
 (defun cc-butler-governance--sync-index (slugs)
   "Add-only merge of SLUGS into `MEMORY.md': append a line for any slug that
@@ -390,18 +484,27 @@ principles written."
         (message "cc-butler: regenerated %d principle(s) from the store" n))
       n)))
 
+(defun cc-butler-governance--index-entries (text)
+  "All (SLUG . DESCRIPTION) pairs for lines in TEXT shaped like this
+store's own generated entries — CURRENT shape (`- SLUG — ...') or LEGACY
+shape (`- [SLUG](butler-SLUG.md) — ...', see
+`cc-butler-governance--legacy-index-line-regexp'). Anything hand-authored
+in neither shape is never returned — this is deliberately narrow, so
+pruning and staleness-detection below can never touch a line this store
+did not itself write, in either generation."
+  (let (out)
+    (dolist (re (list (concat (cc-butler-governance--index-line-regexp) "\\(.*\\)$")
+                       (concat cc-butler-governance--legacy-index-line-regexp "\\(.*\\)$")))
+      (let ((start 0))
+        (while (string-match re text start)
+          (push (cons (match-string 1 text) (match-string 2 text)) out)
+          (setq start (match-end 0)))))
+    (nreverse out)))
+
 (defun cc-butler-governance--index-butler-slugs (text)
-  "Slugs of every line in TEXT shaped like this store's own generated entry:
-`- [S](butler-S.md) — ...'.  Anything hand-authored in a different shape
-(a different link target, or a slug that doesn't match on both sides) is
-never returned — this is deliberately narrow, so pruning below can never
-touch a line this store did not itself write."
-  (let (slugs (start 0))
-    (while (string-match "^- \\[\\([a-z0-9][a-z0-9-]*\\)\\](butler-\\1\\.md) — "
-                         text start)
-      (push (match-string 1 text) slugs)
-      (setq start (match-end 0)))
-    (nreverse slugs)))
+  "Slugs of every line in TEXT shaped like this store's own generated
+entry, current or legacy shape — see `cc-butler-governance--index-entries'."
+  (mapcar #'car (cc-butler-governance--index-entries text)))
 
 (defun cc-butler-governance--dead-index-slugs ()
   "Index slugs (this store's own generated lines only) whose store principle
@@ -433,11 +536,15 @@ Returns the removed slugs."
     (when (and dead (file-readable-p index))
       (with-temp-buffer
         (insert-file-contents index)
-        (goto-char (point-min))
-        (while (re-search-forward
-                "^- \\[\\([a-z0-9][a-z0-9-]*\\)\\](butler-\\1\\.md) — .*\n?" nil t)
-          (when (member (match-string 1) dead)
-            (delete-region (match-beginning 0) (match-end 0))))
+        ;; Two passes -- current shape, then legacy -- rather than one
+        ;; combined regexp, so it stays visible in the code which shape
+        ;; is being matched, same reasoning as `cc-butler-governance--index-line-regexp'.
+        (dolist (re (list (concat (cc-butler-governance--index-line-regexp) ".*\n?")
+                          (concat cc-butler-governance--legacy-index-line-regexp ".*\n?")))
+          (goto-char (point-min))
+          (while (re-search-forward re nil t)
+            (when (member (match-string 1) dead)
+              (delete-region (match-beginning 0) (match-end 0)))))
         (write-region (point-min) (point-max) index nil 'quiet)))
     dead))
 
@@ -455,13 +562,10 @@ if wanted, is to call `record_principle' again or hand-edit the line."
   (let ((index (cc-butler-governance--memory-index-file))
         stale)
     (when (file-readable-p index)
-      (with-temp-buffer
-        (insert-file-contents index)
-        (goto-char (point-min))
-        (while (re-search-forward
-                "^- \\[\\([a-z0-9][a-z0-9-]*\\)\\](butler-\\1\\.md) — \\(.*\\)$" nil t)
-          (let* ((slug (match-string 1))
-                 (indexed-desc (match-string 2))
+      (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        (dolist (entry (cc-butler-governance--index-entries text))
+          (let* ((slug (car entry))
+                 (indexed-desc (cdr entry))
                  (store-file (expand-file-name (concat slug ".md")
                                                (cc-butler-governance-store))))
             (when (file-exists-p store-file)
@@ -836,13 +940,20 @@ question this function asks."
       (user-error "%s" (cc-butler-governance--length-message
                         slug (cc-butler-governance--strip-stamps body))))
     ;; Also checked on every call, same reason: a DESCRIPTION that only
-    ;; grows the index line, never the body, would otherwise dodge the
+    ;; grows the index, never the body, would otherwise dodge the
     ;; body-length cap entirely while still blowing the index-read budget
-    ;; the index-line cap exists for (butler, 2026-09-08).
-    (let ((line (cc-butler-governance--render-index-line
-                 slug (cc-butler-governance--clean-description description))))
-      (when (> (string-bytes line) cc-butler-governance-max-index-line-bytes)
-        (user-error "%s" (cc-butler-governance--index-line-message slug line))))
+    ;; this exists for. Checked on the SOURCE (description) the author
+    ;; actually writes, not the rendered line a generator would otherwise
+    ;; have to silently truncate (m1/steward, 2026-09-08).
+    (let ((desc (cc-butler-governance--clean-description description)))
+      (when (> (string-bytes desc) cc-butler-governance-max-description-bytes)
+        (user-error "%s" (cc-butler-governance--description-message slug desc))))
+    ;; New-slug-only, same budget-splitting reasoning as the description
+    ;; cap above (see `cc-butler-governance-max-new-slug-bytes') — never
+    ;; checked on an existing slug, since renaming one breaks every link.
+    (when (and (not existed)
+               (> (string-bytes slug) cc-butler-governance-max-new-slug-bytes))
+      (user-error "%s" (cc-butler-governance--new-slug-message name slug)))
     (when (and (not existed)
                (>= (cc-butler-governance--store-note-count) cc-butler-governance-max-notes))
       (user-error "%s" (cc-butler-governance--cap-message slug)))
@@ -941,15 +1052,17 @@ record tool). That write never calls regenerate itself, so the note can sit
 in the store, fully valid, and never reach the cache or the MEMORY.md index
 until something calls this. Call it once after any such direct write.
 
-⚠ HONEST GAP (2026-09-08): that same direct-write path also skips all
-THREE record-time caps entirely — `cc-butler-governance-max-notes',
-`cc-butler-governance-max-note-bytes', and
-`cc-butler-governance-max-index-line-bytes' are checked inside
-`cc-butler-governance-record', which a direct Write/Edit never calls.
-This function does not check any of them either. As long as writing
-straight to the store stays possible, all three caps are a gate on the
-one path that goes through `record_principle', not an enforced limit on
-the store overall. Not closed by this change; not hidden either —
+⚠ HONEST GAP (2026-09-08): that same direct-write path also skips every
+record-time check entirely — `cc-butler-governance-max-notes',
+`cc-butler-governance-max-note-bytes',
+`cc-butler-governance-max-description-bytes',
+`cc-butler-governance-max-new-slug-bytes', the shrink guard, and the
+duplicate search are all checked inside `cc-butler-governance-record',
+which a direct Write/Edit never calls. This function does not check any
+of them either. As long as writing straight to the store stays possible,
+none of these are an enforced limit on the store overall, only a gate on
+the one path that goes through `record_principle'. Not closed by this
+change; not hidden either —
 recorded here so the next person doesn't discover it the hard way.
 
 Also useful with nothing new to sync: it reports how many store notes are
