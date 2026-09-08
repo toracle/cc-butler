@@ -188,6 +188,34 @@ store does not grow."
     (let ((res (cc-butler-governance-record "a-rule" "d" "body")))
       (should (equal (plist-get res :names) '("a-rule" "b-rule"))))))
 
+(ert-deftest cc-butler-governance/tool-response-does-not-dump-the-full-roster ()
+  "REGRESSION (정수님, 2026-09-08): the MCP tool response used to echo
+`:names' -- the FULL slug list `cc-butler-governance-record' returns --
+back to the caller on every single call, success or not. Measured against
+the real store (563 notes, 2026-09-09): ~28KB of dead weight per call,
+98% of the response. Reproduced here against a realistically-sized store
+(not a fake 1-2 note one) written directly to disk -- bypassing
+`cc-butler-governance-record' for the bulk so the test stays fast, since
+that function's duplicate-search and shrink-guard are irrelevant to what
+this test is proving -- then exercising the real tool wrapper for the one
+call under test. The response must stay small and must not name notes it
+never touched."
+  (cc-butler-governance-test--with-store
+    (dotimes (i 300)
+      (let ((slug (format "existing-principle-number-%d" i)))
+        (with-temp-file (expand-file-name (concat slug ".md") store)
+          (insert (cc-butler-governance--render
+                   slug "an existing note" "some body text" nil)))))
+    (cc-butler-governance-regenerate)
+    ;; Update an EXISTING slug (not a new one) -- with 300 notes already over
+    ;; `cc-butler-governance-max-notes' (250), that is the realistic call
+    ;; shape anyway: the count-cap ratchet only ever blocks new slugs.
+    (let ((out (cc-butler-tool-record-principle
+                "existing-principle-number-42" "d" "revised body" nil t)))
+      (should (< (string-bytes out) 2000))
+      (should-not (string-match-p "existing-principle-number-150" out))
+      (should-not (string-match-p "Principles now in the store" out)))))
+
 (ert-deftest cc-butler-governance/record-normalises-the-name ()
   "The frontmatter carries the butler- prefix and the filename does not — a
 distinction no caller should have to remember."
