@@ -173,6 +173,110 @@ variable directly."
   :type '(choice (const :tag "Derive from cc-butler-home" nil) directory)
   :group 'cc-butler)
 
+(defvar cc-butler-governance--last-sort-unavailable-reason nil
+  "Set by the most recent `cc-butler-governance-regenerate' call: nil when
+`MEMORY.md's index was rewritten sorted by git commit-recency; otherwise a
+short human-readable string naming why that sort was unavailable (not a
+repo, git missing, git log failed) and the fall back to plain insertion
+order happened instead. Read by `cc-butler-tool-regenerate-governance' so a
+silent fallback can never look like a normal successful run.")
+
+(defcustom cc-butler-governance-band-a-days 7
+  "Wall-clock day window for Band A of MEMORY.md's index (see
+`cc-butler-governance--band-order'): a note whose latest commit is within
+this many days of NOW qualifies for Band A; everything else falls to Band B,
+ordered by inbound-citation count instead. Measured against \"now\" at
+render time, never against some other commit's timestamp -- that distinction
+is what makes this a genuine freshness signal instead of a second disguised
+form of `cc-butler-governance-band-a-commit-cap''s bulk-commit problem."
+  :type 'integer
+  :group 'cc-butler)
+
+(defcustom cc-butler-governance-band-a-commit-cap 8
+  "K: the most notes any SINGLE commit (identified by its exact commit
+timestamp -- every file one commit touches shares it verbatim) may place
+into Band A of MEMORY.md's index. A commit touching more than K notes has
+only its top-K, by inbound-citation count, admitted; the rest fall through
+to Band B. This cap is the ONLY thing standing between Band A and a repeat
+of the failure that motivated it: a single bulk mechanical commit (2026-09-08,
+91 files, a wikilink-redirect cleanup) occupying the entire top of the index.
+
+8, not the originally-suggested 5 -- chosen 2026-09-08 against the real
+store: of six reference notes that needed to survive, one
+\(a-ratchet-is-only-as-wide-as-its-population-query.md\) shares its commit
+with `relay-safe-worker-decisions.md' inside that exact 91-file bulk commit,
+and ranks 8th in it by inbound-citation count. 5 silently dropped it; 8 is
+the smallest cap that keeps all six while still cutting that 91-file commit
+down by 91% (91 -> 8) -- still enough to stop the swallow."
+  :type 'integer
+  :group 'cc-butler)
+
+(defcustom cc-butler-governance-vault-root nil
+  "Root of the Obsidian vault scanned for inbound [[wikilink]] citation
+counts (see `cc-butler-governance--citation-count-map'), which order Band B
+of MEMORY.md's index (and break Band A's within-commit cap ties).
+
+Nil -- the default -- falls back to the hardcoded path below, the one real
+vault this fleet uses. Set only when genuinely different; an explicit value
+is always honoured. Read-only: nothing here ever writes into the vault."
+  :type '(choice (const :tag "Hardcoded fleet default" nil) directory)
+  :group 'cc-butler)
+
+(defun cc-butler-governance--vault-root ()
+  "Absolute path of the vault `cc-butler-governance--citation-count-map'
+scans, actually in effect."
+  (file-name-as-directory
+   (or cc-butler-governance-vault-root
+       (expand-file-name "~/obsidian/warmble-jumble/"))))
+
+(defun cc-butler-governance--citation-count-map ()
+  "Cons (MAP . REASON): MAP is a hash table of every bare slug (a note's
+filename minus its `.md') to how many `[[wikilink]]' references that exact
+slug across the WHOLE vault (`cc-butler-governance--vault-root', not just
+the governance store) -- built from ONE recursive `grep' over the vault,
+counted in Lisp, never one grep per note (the store alone holds 500+ notes),
+the same batching discipline as `cc-butler-governance--commit-recency-map'.
+A `[[target|display text]]' link counts toward TARGET only -- the `|' suffix
+is excluded by the same regexp that selects the match. A `[[target#heading]]'
+link is NOT normalized -- it counts toward the literal slug \"target#heading\",
+a distinct key from \"target\" -- matching the exact single-pass method this
+was decided against (`grep -rhoE \\='\\\\[\\\\[[^]|]+\\=' | sort | uniq -c'), not
+a resolver that understands Obsidian's link syntax.
+
+`docs/' and `site/' are excluded: this vault publishes an MkDocs build of
+itself into those two directories, a byte-for-byte-ish MIRROR of the real
+content directories (measured 2026-09-08: scanning them in ALONGSIDE the
+source roughly doubled every count and destabilized several individual
+files' occurrence counts, an artifact of the build, not a second real
+citation) -- so counting them would inflate every note's number by the same
+rendering artifact rather than reflect an actual second reader citing it.
+
+REASON is nil on success; otherwise a short string naming why counting was
+unavailable (vault missing, grep missing, grep failed) -- on failure MAP is
+an empty hash table (every count reads as 0), a graceful degradation: this
+map only orders Band B and breaks Band-A ties, it never gates whether a note
+appears in the index at all."
+  (let ((vault (cc-butler-governance--vault-root)))
+    (cond
+     ((not (file-directory-p vault))
+      (cons (make-hash-table :test 'equal) "vault directory does not exist"))
+     ((not (executable-find "grep"))
+      (cons (make-hash-table :test 'equal) "grep executable not found"))
+     (t
+      (with-temp-buffer
+        (let ((status (call-process "grep" nil t nil
+                                     "-rhoE" "\\[\\[[^]|]+" "--include=*.md"
+                                     "--exclude-dir=docs" "--exclude-dir=site" vault)))
+          ;; grep exits 1 (not an error here) when nothing matches at all;
+          ;; only >1 (a real grep failure -- bad pattern, I/O error) is fatal.
+          (if (> status 1)
+              (cons (make-hash-table :test 'equal) (format "citation grep failed (exit %s)" status))
+            (let ((map (make-hash-table :test 'equal)))
+              (dolist (line (split-string (buffer-string) "\n" t))
+                (let ((slug (if (string-prefix-p "[[" line) (substring line 2) line)))
+                  (puthash slug (1+ (gethash slug map 0)) map)))
+              (cons map nil)))))))))
+
 (defun cc-butler-governance-memory-store ()
   "Absolute path of the Claude Code memory dir actually in effect.
 Mirrors `cc-butler-governance-store': the single place this is decided,
@@ -365,15 +469,168 @@ actually appended."
         (write-region (point-min) (point-max) index nil 'quiet)))
     missing))
 
+(defun cc-butler-governance--commit-recency-map ()
+  "Cons (MAP . REASON): MAP is a hash table of every git-tracked filename
+under `cc-butler-governance-store' (relative to that directory, e.g.
+\"a-rule.md\") to its LATEST commit's unix-epoch timestamp, built from ONE
+batched `git log' call over the whole store — never one `git log -1' per
+file, which was measured too slow to repeat against the real ~564-note
+store. REASON is nil on success; otherwise a short human-readable string
+naming why the git-based sort is unavailable (not a repo, git missing,
+git log failed, or nothing usable came back), for a caller to surface
+LOUDLY rather than silently falling back to insertion order."
+  (let ((store (cc-butler-governance-store)))
+    (cond
+     ((not (and store (file-directory-p store)))
+      (cons nil "store directory does not exist"))
+     ((not (executable-find "git"))
+      (cons nil "git executable not found"))
+     (t
+      (let ((default-directory (file-name-as-directory store)))
+        (if (not (zerop (call-process "git" nil nil nil "rev-parse" "--is-inside-work-tree")))
+            (cons nil "not a git repository")
+          (with-temp-buffer
+            (let ((status (call-process "git" nil t nil
+                                         "log" "--name-only" "--format=%at"
+                                         "--relative" "--" ".")))
+              (if (not (zerop status))
+                  (cons nil (format "git log failed (exit %s)" status))
+                (let ((map (make-hash-table :test 'equal)) (ts nil))
+                  (dolist (line (split-string (buffer-string) "\n"))
+                    (cond
+                     ((string-match-p "\\`[0-9]+\\'" line)
+                      (setq ts (string-to-number line)))
+                     ((and ts (not (string-empty-p line)) (not (gethash line map)))
+                      (puthash line ts map))))
+                  (if (zerop (hash-table-count map))
+                      (cons nil "git log returned nothing usable")
+                    (cons map nil))))))))))))
+
+(defun cc-butler-governance--band-order (slugs recency-map citation-map &optional now)
+  "Two-band ordering of SLUGS for MEMORY.md's index.
+
+RECENCY-MAP is `cc-butler-governance--commit-recency-map''s MAP (store
+filename -> unix-epoch of its latest commit); CITATION-MAP is
+`cc-butler-governance--citation-count-map''s MAP (bare slug -> inbound
+`[[wikilink]]' count across the vault). NOW defaults to the real current
+time (a unix-epoch integer) — overridable only so a test can pin \"now\"
+without waiting on the clock.
+
+Band A: every slug whose latest commit is within
+`cc-butler-governance-band-a-days' of NOW, grouped by that commit's exact
+timestamp (every file one commit touches shares its timestamp verbatim, the
+proxy this uses for \"the same commit\") and capped at
+`cc-butler-governance-band-a-commit-cap' (K) members per group — an
+oversized group keeps only its top-K by CITATION-MAP, the rest fall through
+to Band B. This cap is the ONLY thing standing between Band A and a single
+bulk mechanical commit swallowing it whole. The groups (and ties within one)
+are then ordered by commit recency descending, most-recently-committed
+first — the same \"still being revised = still alive\" intuition #196 had,
+just no longer swampable by one bulk commit.
+
+Band B: everything else — not committed inside the window, or a bulk-commit
+member the cap dropped — ordered by CITATION-MAP descending, ties broken by
+slug (deterministic).
+
+A slug with no commit history never qualifies for Band A; a slug with no
+citations sorts as citation 0 in Band B. Neither ever errors."
+  (let* ((now (or now (floor (float-time))))
+         (window (* cc-butler-governance-band-a-days 86400))
+         (cite (lambda (slug) (or (gethash slug citation-map) 0)))
+         (groups (make-hash-table :test 'eql)))
+    (dolist (slug slugs)
+      (let ((ts (gethash (concat slug ".md") recency-map)))
+        (when (and ts (<= (- now ts) window))
+          (puthash ts (cons slug (gethash ts groups)) groups))))
+    (let (band-a (in-band-a (make-hash-table :test 'equal)))
+      (dolist (ts (sort (hash-table-keys groups) #'>))
+        (let* ((ranked (sort (copy-sequence (gethash ts groups))
+                              (lambda (a b) (> (funcall cite a) (funcall cite b)))))
+               (kept (seq-take ranked cc-butler-governance-band-a-commit-cap)))
+          (dolist (slug kept)
+            (push slug band-a)
+            (puthash slug t in-band-a))))
+      (setq band-a (nreverse band-a))
+      (let ((band-b (sort (seq-remove (lambda (s) (gethash s in-band-a)) slugs)
+                           (lambda (a b)
+                             (let ((ca (funcall cite a)) (cb (funcall cite b)))
+                               (if (= ca cb) (string< a b) (> ca cb)))))))
+        (append band-a band-b)))))
+
+(defun cc-butler-governance--rewrite-sorted-index (slugs recency-map citation-map)
+  "Rewrite `MEMORY.md's block of this store's own generated lines (see
+`cc-butler-governance--index-butler-slugs') so SLUGS appear as one
+contiguous run ordered by `cc-butler-governance--band-order' (RECENCY-MAP
+and CITATION-MAP passed straight through) — a note git-committed in the
+last `cc-butler-governance-band-a-days' days first (Band A), everything
+else after ordered by inbound-citation count (Band B). That two-band shape
+replaces a straight commit-recency sort specifically because a straight sort
+has the SAME failure shape as the `mtime' key it itself replaced: one bulk
+mechanical commit (2026-09-08, 91 files) occupies the entire top of the
+index, pushing out both the notes that actually needed surfacing and two
+very-high-citation notes — `cc-butler-governance-band-a-commit-cap' is what
+stops that from happening again. The historical (effectively insertion-
+order) placement this whole mechanism replaces is what let 6 real,
+fleet-re-tripped-over principles sit past the consumer's truncation cut —
+one at line 613, the very end of the file.
+
+Every line NOT in this store's own generated shape — hand-authored content
+the store does not own — is left byte-for-byte untouched at its original
+position, the same guarantee `cc-butler-governance--sync-index' gives (see
+`cc-butler-governance/regenerate-index-merge-preserves-hand-written-lines').
+An already-indexed slug's EXISTING line text is reused verbatim — curated
+wording is never overwritten (see
+`cc-butler-governance/regenerate-does-not-duplicate-an-already-curated-entry');
+only a slug with no line yet gets one freshly rendered. A slug not in SLUGS
+(already gone from the store) has its old line dropped here as a side
+effect — `cc-butler-governance--prune-dead-entries', called right after
+this in `cc-butler-governance-regenerate', is left in place as a
+belt-and-suspenders check, but finds nothing left to do."
+  (let ((index (cc-butler-governance--memory-index-file)))
+    (with-temp-buffer
+      (when (file-readable-p index) (insert-file-contents index))
+      (let ((existing (make-hash-table :test 'equal))
+            (insert-pos nil))
+        (goto-char (point-min))
+        (while (re-search-forward
+                "^- \\[\\([a-z0-9][a-z0-9-]*\\)\\](butler-\\1\\.md) — .*\n?" nil t)
+          (unless insert-pos (setq insert-pos (match-beginning 0)))
+          (puthash (match-string 1) (match-string 0) existing)
+          (delete-region (match-beginning 0) (match-end 0))
+          (goto-char (match-beginning 0)))
+        (unless insert-pos
+          (goto-char (point-max))
+          (unless (or (bobp) (bolp)) (insert "\n"))
+          (setq insert-pos (point)))
+        (let* ((ordered (cc-butler-governance--band-order slugs recency-map citation-map))
+               (block (mapconcat
+                       (lambda (slug)
+                         (or (gethash slug existing)
+                             (cc-butler-governance--index-line slug)))
+                       ordered "")))
+          (goto-char insert-pos)
+          (insert block))
+        (write-region (point-min) (point-max) index nil 'quiet)))))
+
 ;;;###autoload
 (defun cc-butler-governance-regenerate ()
   "Regenerate the Claude Code memory cache from the neutral store — the store is
 the source of truth; the memory is derived.  Also syncs `MEMORY.md's index
-against it in both directions: merges in any note missing from the index
-(add-only — see `cc-butler-governance--sync-index'), and prunes any index
-line whose principle no longer exists in the store (see
-`cc-butler-governance--prune-dead-entries').  Returns the count of
-principles written."
+against it in both directions: merges in any note missing from the index,
+and prunes any index line whose principle no longer exists in the store
+(see `cc-butler-governance--prune-dead-entries').  When the store is a git
+repo, the store-owned entries are also RE-SORTED into two bands — recently
+committed first (capped per commit so one bulk commit cannot swallow the
+band), inbound-citation count after — so a note that keeps getting revised
+OR is widely cited surfaces near the top instead of wherever it happened to
+land historically (see `cc-butler-governance--rewrite-sorted-index' and
+`cc-butler-governance--band-order'); when the store is not a git repo (or
+git itself is unavailable), this falls back to the previous add-only,
+insertion-order merge (`cc-butler-governance--sync-index') — and either
+way, `cc-butler-governance--last-sort-unavailable-reason' records which
+happened, non-nil only on the fallback, for a caller to report loudly
+rather than let a silent fallback pass as a normal run.  Returns the count
+of principles written."
   (interactive)
   (let ((memory-dir (cc-butler-governance-memory-store)))
     (make-directory memory-dir t)
@@ -384,10 +641,20 @@ principles written."
                    t)
         (push (file-name-sans-extension (file-name-nondirectory f)) slugs)
         (setq n (1+ n)))
-      (cc-butler-governance--sync-index (nreverse slugs))
+      (setq slugs (nreverse slugs))
+      (let ((recency (cc-butler-governance--commit-recency-map)))
+        (setq cc-butler-governance--last-sort-unavailable-reason (cdr recency))
+        (if (car recency)
+            (cc-butler-governance--rewrite-sorted-index
+             slugs (car recency) (car (cc-butler-governance--citation-count-map)))
+          (cc-butler-governance--sync-index slugs)))
       (cc-butler-governance--prune-dead-entries)
       (when (called-interactively-p 'interactive)
-        (message "cc-butler: regenerated %d principle(s) from the store" n))
+        (message "cc-butler: regenerated %d principle(s) from the store%s" n
+                  (if cc-butler-governance--last-sort-unavailable-reason
+                      (format " (git-based sort unavailable (%s): falling back to insertion order)"
+                              cc-butler-governance--last-sort-unavailable-reason)
+                    " (index in two bands: recent commits first, citation count after)")))
       n)))
 
 (defun cc-butler-governance--index-butler-slugs (text)
@@ -973,6 +1240,11 @@ index, index -> store, and description drift."
          (stale (cc-butler-governance--stale-index-entries)))
     (concat
      (format "Regenerated %d principle(s) from the store.\n" n)
+     (if cc-butler-governance--last-sort-unavailable-reason
+         (format "Index sort: git-based sort unavailable (%s): falling back to insertion order.\n"
+                 cc-butler-governance--last-sort-unavailable-reason)
+       (format "Index sort: two bands — committed within %d days first (max %d per commit), inbound-citation count after.\n"
+               cc-butler-governance-band-a-days cc-butler-governance-band-a-commit-cap))
      "Checked: store->index (notes missing an index line), index->store (index lines whose principle no longer exists), and description drift (index text vs each note's current frontmatter).\n"
      (if before
          (format "Merged %d previously un-indexed note(s) into MEMORY.md: %s\n"

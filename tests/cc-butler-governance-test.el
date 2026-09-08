@@ -111,16 +111,25 @@ this shape and dropped out of the recallable index."
 ;;;; ------------------------------------------------------------------
 
 (defmacro cc-butler-governance-test--with-store (&rest body)
-  "Run BODY with a throwaway store and memory dir wired together."
+  "Run BODY with a throwaway store, memory dir, and (empty) vault root wired
+together. The vault-root binding matters even for tests that never look at
+citations: without it, `cc-butler-governance-regenerate''s citation-count
+grep (see `cc-butler-governance--citation-count-map') falls back to whatever
+`cc-butler-governance-vault-root' resolves to for real on the machine
+running the suite -- real, slow, and machine-dependent, exactly what these
+tests must never quietly depend on."
   (declare (indent 0))
   `(let* ((store (file-name-as-directory (make-temp-file "gov-store" t)))
           (mem (file-name-as-directory (make-temp-file "gov-mem" t)))
+          (vault (file-name-as-directory (make-temp-file "gov-vault" t)))
           (cc-butler-governance-dir store)
           (cc-butler-governance-user-dir nil)
-          (cc-butler-governance-memory-dir mem))
+          (cc-butler-governance-memory-dir mem)
+          (cc-butler-governance-vault-root vault))
      (unwind-protect (progn ,@body)
        (delete-directory store t)
-       (delete-directory mem t))))
+       (delete-directory mem t)
+       (delete-directory vault t))))
 
 (ert-deftest cc-butler-governance/record-writes-the-store-frontmatter ()
   "The tool writes the frontmatter, so a caller cannot get the schema wrong.
@@ -1100,3 +1109,250 @@ a stamp read as one.  A stamp is a WHOLE line, never a substring."
                "prefix (최초 기록: w (s), 01-01)"))
   (should (cc-butler-governance--stamp-line
            "Body.\n\n(최초 기록: w (s), 01-01)")))
+
+;;;; ------------------------------------------------------------------
+;;;; Two-band index (2026-09-08) -- commit-recency alone has the SAME
+;;;; failure shape as the `mtime' key it replaced: one bulk mechanical
+;;;; commit occupies the entire top of the index. Band A (recent commits,
+;;;; capped per commit so one bulk commit cannot swallow it) followed by
+;;;; Band B (everything else, by inbound-citation count) is the fix.
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-governance-test--git (dir &rest args)
+  "Run git ARGS in DIR for fixture setup; error if git fails."
+  (let ((default-directory dir))
+    (unless (eq 0 (apply #'call-process "git" nil nil nil args))
+      (error "fixture git %s failed in %s" args dir))))
+
+(defun cc-butler-governance-test--init-repo (dir)
+  "Init a fixture git repo in DIR with a usable identity."
+  (cc-butler-governance-test--git dir "init" "-q")
+  (cc-butler-governance-test--git dir "config" "user.email" "test@test")
+  (cc-butler-governance-test--git dir "config" "user.name" "test"))
+
+(defun cc-butler-governance-test--commit-at (dir epoch message &rest files)
+  "Write FILES (relative to DIR, each file's own content is just its name)
+and commit them together, with author AND committer date pinned to unix
+EPOCH -- so a fixture's commit-recency is deterministic regardless of when
+the test actually runs, never relative to wall-clock `now' at test time."
+  (dolist (f files)
+    (with-temp-file (expand-file-name f dir) (insert f)))
+  (let ((default-directory dir)
+        (process-environment
+         (append (list (format "GIT_AUTHOR_DATE=%d +0000" epoch)
+                       (format "GIT_COMMITTER_DATE=%d +0000" epoch))
+                 process-environment)))
+    (apply #'call-process "git" nil nil nil "add" files)
+    (unless (eq 0 (call-process "git" nil nil nil "commit" "-q" "-m" message))
+      (error "fixture commit failed"))))
+
+;;;; --- cc-butler-governance--band-order: pure-function unit tests ---
+
+(ert-deftest cc-butler-governance/band-order-caps-a-single-commit-timestamp ()
+  "A commit touching more than K notes (K = `cc-butler-governance-band-a-commit-cap')
+contributes only its top-K, by citation count, to Band A -- the rest fall to
+Band B. This cap is the ONLY thing stopping one bulk commit from swallowing
+Band A whole."
+  (let* ((cc-butler-governance-band-a-commit-cap 2)
+         (cc-butler-governance-band-a-days 7)
+         (now 1000000)
+         (recency (make-hash-table :test 'equal))
+         (citation (make-hash-table :test 'equal)))
+    ;; four notes share ONE commit timestamp -- a stand-in bulk commit
+    (dolist (s '("bulk-1" "bulk-2" "bulk-3" "bulk-4"))
+      (puthash (concat s ".md") (- now 100) recency))
+    ;; a fifth note has its own, slightly older but still-recent commit
+    (puthash "solo.md" (- now 200) recency)
+    (puthash "bulk-2" 50 citation)   ; highest-cited bulk member
+    (puthash "bulk-4" 30 citation)   ; second highest
+    (puthash "bulk-1" 5 citation)
+    (puthash "bulk-3" 1 citation)
+    (let ((ordered (cc-butler-governance--band-order
+                    '("bulk-1" "bulk-2" "bulk-3" "bulk-4" "solo")
+                    recency citation now)))
+      ;; only the top-2 by citation from the bulk commit reach Band A, ahead
+      ;; of `solo' (an older, but still within-window, commit)
+      (should (equal (seq-take ordered 3) '("bulk-2" "bulk-4" "solo")))
+      ;; the rest of the bulk commit falls through to Band B, in the tail
+      (should (equal (last ordered 2) '("bulk-1" "bulk-3"))))))
+
+(ert-deftest cc-butler-governance/band-order-old-commit-falls-to-band-b ()
+  "A commit older than `cc-butler-governance-band-a-days' does not qualify for
+Band A no matter how heavily cited -- it is ordered into Band B like
+everything else outside the window, behind anything genuinely recent."
+  (let* ((cc-butler-governance-band-a-days 7)
+         (cc-butler-governance-band-a-commit-cap 5)
+         (now 1000000)
+         (recency (make-hash-table :test 'equal))
+         (citation (make-hash-table :test 'equal)))
+    (puthash "fresh.md" (- now 3600) recency)          ; 1 hour ago
+    (puthash "stale.md" (- now (* 8 86400)) recency)    ; 8 days ago -- outside
+    (puthash "stale" 100 citation)                      ; very cited, still too old
+    (puthash "fresh" 1 citation)
+    (should (equal (cc-butler-governance--band-order '("fresh" "stale") recency citation now)
+                   '("fresh" "stale")))))
+
+(ert-deftest cc-butler-governance/band-order-window-boundary-is-inclusive ()
+  "Exactly `cc-butler-governance-band-a-days' days ago still qualifies for
+Band A -- the window comparison is <=, not <."
+  (let* ((cc-butler-governance-band-a-days 7)
+         (cc-butler-governance-band-a-commit-cap 5)
+         (now 1000000)
+         (recency (make-hash-table :test 'equal))
+         (citation (make-hash-table :test 'equal)))
+    (puthash "edge.md" (- now (* 7 86400)) recency)
+    (should (equal (car (cc-butler-governance--band-order '("other" "edge") recency citation now))
+                   "edge"))))
+
+(ert-deftest cc-butler-governance/band-order-band-b-by-citation-then-slug ()
+  "Band B (no qualifying recent commit) is ordered by citation count
+descending; equal counts break by slug so the order is deterministic run to
+run, not an accident of hash-table iteration order."
+  (let* ((cc-butler-governance-band-a-days 7)
+         (now 1000000)
+         (recency (make-hash-table :test 'equal))
+         (citation (make-hash-table :test 'equal)))
+    (puthash "b" 5 citation)
+    (puthash "a" 5 citation)
+    (puthash "c" 9 citation)
+    (should (equal (cc-butler-governance--band-order '("a" "b" "c") recency citation now)
+                   '("c" "a" "b")))))
+
+(ert-deftest cc-butler-governance/band-order-slug-with-no-data-never-errors ()
+  "A slug absent from both maps (no git history, no citations) still sorts
+in -- as the least-favored Band B member -- rather than signalling an error."
+  (let ((recency (make-hash-table :test 'equal))
+        (citation (make-hash-table :test 'equal)))
+    (should (equal (cc-butler-governance--band-order '("nobody-knows-this-one") recency citation 1000000)
+                   '("nobody-knows-this-one")))))
+
+;;;; --- cc-butler-governance--citation-count-map ---
+
+(ert-deftest cc-butler-governance/citation-count-map-counts-across-the-vault ()
+  "One recursive grep over the vault, counted per exact `[[wikilink]]' target
+text -- `[[a]]' and `[[a|display text]]' both count toward `a'; a distinct
+target is a distinct key."
+  (let ((vault (file-name-as-directory (make-temp-file "gov-cite-vault" t))))
+    (unwind-protect
+        (let ((cc-butler-governance-vault-root vault))
+          (with-temp-file (expand-file-name "note1.md" vault)
+            (insert "See [[a]] and [[a|alias text]] and [[b]].\n"))
+          (with-temp-file (expand-file-name "note2.md" vault)
+            (insert "Also [[a]].\n"))
+          (let ((result (cc-butler-governance--citation-count-map)))
+            (should (null (cdr result)))
+            (should (equal (gethash "a" (car result)) 3))
+            (should (equal (gethash "b" (car result)) 1))
+            (should (null (gethash "nobody-links-here" (car result))))))
+      (delete-directory vault t))))
+
+(ert-deftest cc-butler-governance/citation-count-map-excludes-docs-and-site-mirrors ()
+  "REGRESSION guard (2026-09-08): the real vault publishes an MkDocs build of
+itself into `docs/' and `site/', a near-duplicate of the real content
+directories. Counting those in ALONGSIDE the source inflates every count by
+a rendering artifact, not a second real citation -- measured against the
+real vault, it silently doubled every count. `docs/' and `site/' must stay
+excluded."
+  (let ((vault (file-name-as-directory (make-temp-file "gov-cite-vault2" t))))
+    (unwind-protect
+        (let ((cc-butler-governance-vault-root vault))
+          (make-directory (expand-file-name "docs" vault))
+          (make-directory (expand-file-name "site" vault))
+          (with-temp-file (expand-file-name "note.md" vault) (insert "[[a]]\n"))
+          (with-temp-file (expand-file-name "docs/note.md" vault) (insert "[[a]]\n"))
+          (with-temp-file (expand-file-name "site/note.md" vault) (insert "[[a]]\n"))
+          (should (equal (gethash "a" (car (cc-butler-governance--citation-count-map))) 1)))
+      (delete-directory vault t))))
+
+(ert-deftest cc-butler-governance/citation-count-map-missing-vault-degrades-gracefully ()
+  "A vault that does not exist (or is not yet configured) must never break
+regeneration -- Band B's ordering is a nice-to-have, not a gate on whether
+notes appear in the index at all. Failure reads as an empty map plus a named
+reason, not an error."
+  (let* ((missing (expand-file-name "does-not-exist" (make-temp-file "gov-cite-missing" t)))
+         (cc-butler-governance-vault-root missing))
+    (let ((result (cc-butler-governance--citation-count-map)))
+      (should (zerop (hash-table-count (car result))))
+      (should (stringp (cdr result))))))
+
+;;;; --- integration: cc-butler-governance-regenerate wired end to end ---
+
+(ert-deftest cc-butler-governance/regenerate-two-band-index-real-git ()
+  "End to end, with a REAL git repo standing in for the store: a note
+committed recently (Band A) leads a note that is only heavily cited but has
+no recent commit (Band B), and the reported message names the two-band
+shape (not the old single-key wording)."
+  (skip-unless (executable-find "git"))
+  (cc-butler-governance-test--with-store
+    (cc-butler-governance-test--init-repo store)
+    (let ((now (floor (float-time))))
+      (cc-butler-governance-test--commit-at
+       store (- now 3600) "recent" "recent-note.md"))
+    ;; `old-note' pre-dates the window entirely -- write it WITHOUT a commit
+    ;; touching it inside the last `band-a-days', by committing it long ago
+    (cc-butler-governance-test--commit-at
+     store (- (floor (float-time)) (* 30 86400)) "old" "old-note.md")
+    (with-temp-file (expand-file-name "citing.md" vault)
+      (insert "[[old-note]] [[old-note]] [[old-note]]\n"))  ; heavily cited, but stale commit
+    (let ((out (cc-butler-tool-regenerate-governance)))
+      (should (string-match-p "two bands" out))
+      (let* ((index-text (with-temp-buffer
+                           (insert-file-contents (expand-file-name "MEMORY.md" mem))
+                           (buffer-string)))
+             (slugs (cc-butler-governance--index-butler-slugs index-text)))
+        ;; Band A (recent commit) leads Band B (citation-only), even though
+        ;; `old-note' is the more heavily cited of the two
+        (should (equal slugs '("recent-note" "old-note")))))))
+
+(ert-deftest cc-butler-governance/regenerate-still-falls-back-loudly-without-git ()
+  "REGRESSION GUARD (carried over from #196, re-confirmed after the two-band
+change): a store that is not a git repo must still fall back to plain
+insertion order, and say so loudly -- this must not have quietly broken
+while wiring the citation map in alongside it."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
+    (let ((out (cc-butler-tool-regenerate-governance)))
+      (should (string-match-p "git-based sort unavailable" out))
+      (should (string-match-p "not a git repository" out))
+      (should (stringp cc-butler-governance--last-sort-unavailable-reason)))))
+
+(ert-deftest cc-butler-governance/regenerate-bulk-commit-does-not-swallow-band-a ()
+  "Check 4 (bulk-commit immunity), through the REAL pipeline: a single commit
+touching many notes at once (a stand-in for the real 2026-09-08 91-file
+wikilink-redirect commit) must not occupy the whole front of the index --
+only `cc-butler-governance-band-a-commit-cap' of its members, the most-cited
+ones, make Band A; the rest are pushed behind a genuinely-solo recent commit
+and are still findable, just in Band B."
+  (skip-unless (executable-find "git"))
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-band-a-commit-cap 3))
+      (cc-butler-governance-test--init-repo store)
+      (let* ((now (floor (float-time)))
+             (bulk-files (mapcar (lambda (i) (format "bulk-%02d.md" i))
+                                  (number-sequence 1 20))))
+        (apply #'cc-butler-governance-test--commit-at
+               store (- now 1800) "bulk redirect" bulk-files)
+        (cc-butler-governance-test--commit-at
+         store (- now 3600) "solo" "loved.md"))
+      (with-temp-file (expand-file-name "citing.md" vault)
+        ;; `loved' and one bulk file (bulk-07) are the only cited notes --
+        ;; standing in for the mass of files a mechanical redirect touches
+        ;; without any of them individually being popular
+        (insert "[[loved]] [[loved]] [[bulk-07]]\n"))
+      (cc-butler-tool-regenerate-governance)
+      (let* ((index-text (with-temp-buffer
+                           (insert-file-contents (expand-file-name "MEMORY.md" mem))
+                           (buffer-string)))
+             (slugs (cc-butler-governance--index-butler-slugs index-text))
+             (bulk-slugs (seq-filter (lambda (s) (string-prefix-p "bulk-" s)) slugs)))
+        ;; all 20 bulk notes are still indexed SOMEWHERE -- the cap reorders,
+        ;; it never drops a note
+        (should (= (length bulk-slugs) 20))
+        ;; the cited bulk survivor and the solo recent commit lead
+        (should (member "loved" (seq-take slugs 4)))
+        (should (member "bulk-07" (seq-take slugs 4)))
+        ;; the cap actually bit: strictly fewer than all 20 bulk notes lead
+        ;; the index alongside them -- most of the 20 are pushed behind
+        (should (< (length (seq-intersection (seq-take slugs 4) bulk-slugs)) 20))
+        (should (> (length bulk-slugs) cc-butler-governance-band-a-commit-cap))))))
