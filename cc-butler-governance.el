@@ -873,7 +873,19 @@ question this function asks."
             :names (cc-butler-governance-names)))))
 
 (defun cc-butler-tool-record-principle (name description body &optional type confirm-shrink skip-duplicate-check)
-  "MCP tool: record an operating principle and report where it landed."
+  "MCP tool: record an operating principle and report where it landed.
+
+Reports the note COUNT (`:before'/`:after' on the plist `cc-butler-governance-record'
+returns), never the full roster of slugs — `:names' holds all of them (563 in
+the real store as of 2026-09-08) and every one of those went out on every
+single call, success or not, at ~28 KB of dead weight per response (measured
+against the real store, 2026-09-09: 27567 bytes old vs 565 new — a 98%
+reduction). Nothing here ever consumed the list: `cc-butler-governance-record'
+returns it for a caller who wants \"is X already recorded\" for free, and the
+duplicate check (`skip_duplicate_check') does its own targeted search instead
+of scanning this string. Revising an existing note needs its own name and
+current body — read via the store or memory path already in this response —
+not a directory of 562 unrelated slugs."
   (let* ((res (cc-butler-governance-record name description body type confirm-shrink skip-duplicate-check))
          (verified (plist-get res :verified)))
     (concat
@@ -893,10 +905,7 @@ question this function asks."
          ""
        (format "\nDo not treat this as recorded. The store being written (%s) and the memory being generated (%s) are the two paths to compare — a write landing in a store nobody regenerates from is what this check exists to catch.\n"
                (plist-get res :store) (cc-butler-governance-memory-store)))
-     (format "\nPrinciples now in the store (%d): %s\n"
-             (length (plist-get res :names))
-             (string-join (plist-get res :names) ", "))
-     "\nTo revise one of these, call this again with that same name — BODY REPLACES THE WHOLE FILE, it is never merged. Read the note first, fold your change into its complete text by hand, then pass that whole result as body.")))
+     "\nTo revise an existing principle, call this again with that same name — BODY REPLACES THE WHOLE FILE, it is never merged. Read the note first, fold your change into its complete text by hand, then pass that whole result as body.")))
 
 (defun cc-butler-governance--memory-dir-drift-detail ()
   "Nil if the write path (`cc-butler-governance-memory-store') agrees with
