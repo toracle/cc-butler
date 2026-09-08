@@ -263,17 +263,28 @@ current state read it from the screen or the transcript instead.")
   (gethash dir cc-butler--waiting))
 
 (defun cc-butler--session-state (s)
-  "Return `gate, `waiting, or `running for session plist S -- in that
-priority order.  A session parked at Claude Code's `--continue' startup
-resume gate (`cc-butler--resume-gate-showing-p') is not actually running
-even though its process is alive, and `cc-butler--waiting-p' can never
-catch it on its own: that flag is edge-triggered off a notification
-(`cc-butler--queue-on-notification') the gate never sends, so a gated
-session was reported plain \"running\" indefinitely (cc-butler#4 — a
-2026-07-21 mass restore reported \"16/16 recovered\" while 7 sessions sat
-at this exact gate)."
+  "Return `gate, `waiting, `blocked-on-dialog, or `running for session
+plist S -- in that priority order.  A session parked at Claude Code's
+`--continue' startup resume gate (`cc-butler--resume-gate-showing-p') is
+not actually running even though its process is alive, and
+`cc-butler--waiting-p' can never catch it on its own: that flag is
+edge-triggered off a notification (`cc-butler--queue-on-notification')
+the gate never sends, so a gated session was reported plain \"running\"
+indefinitely (cc-butler#4 — a 2026-07-21 mass restore reported \"16/16
+recovered\" while 7 sessions sat at this exact gate).
+
+`blocked-on-dialog is a REFINEMENT of `waiting, not a separate flag: only
+a session already flagged waiting AND whose screen matches a known open-
+dialog fingerprint (`cc-butler--blocked-on-dialog-p') gets it, so a
+session that has never notified cannot be mislabeled from screen content
+alone (2026-09-08 — see that function's docstring: false positives here
+are actively harmful, they block dispatch to a session that was never
+actually stuck)."
   (let ((dir (plist-get s :dir)) (buf (plist-get s :buffer)))
     (cond ((and buf (buffer-live-p buf) (cc-butler--resume-gate-showing-p buf)) 'gate)
+          ((and (cc-butler--waiting-p dir) buf (buffer-live-p buf)
+                (cc-butler--blocked-on-dialog-p buf))
+           'blocked-on-dialog)
           ((cc-butler--waiting-p dir) 'waiting)
           (t 'running))))
 
@@ -2147,6 +2158,77 @@ territory, not this function's."
       (error "cc-butler: trust dialog marker present but shape unrecognized (neither old nor new v2.1.260+ shape) in %s. Screen:\n%s"
              dir (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max)))))
      (t nil))))
+
+;;;; ---- BLOCKED-ON-DIALOG (2026-09-08) --------------------------------
+;;;; `list_claude_sessions' reported the single status WAITING-FOR-INPUT
+;;;; for both a genuinely idle prompt and a session stuck inside an open
+;;;; dialog -- indistinguishable to any caller, worker or human, without
+;;;; reading the terminal by eye. `monocle-jarvice-978' sat nine hours
+;;;; inside the feedback-draft dialog below before anyone noticed
+;;;; (an-open-menu-cannot-be-answered-remotely.md: there is no remote way
+;;;; to answer an open dialog, so this is visibility-only -- report a
+;;;; distinct status, never auto-answer or auto-dismiss).
+;;;;
+;;;; Detection follows the same shape as the trust-dialog detectors above:
+;;;; an exact fingerprint, scoped to the live screen tail
+;;;; (`cc-butler--live-screen-tail-start') so a dialog quoted in scrollback
+;;;; conversation cannot match. This deliberately does NOT route through
+;;;; `cc-butler--redact-ghost-input-line' (orchestrator.el) -- that
+;;;; redaction only ever replaces the framed input row's own content
+;;;; (`cc-butler--find-input-line', the box bordered by
+;;;; `cc-butler--border-rule-char'), and both fingerprints below are
+;;;; dialog chrome rendered ABOVE that row, never inside it -- exactly
+;;;; the same reasoning the trust-dialog detectors already rely on.
+
+(defconst cc-butler--feedback-draft-dialog-marker
+  "1 to review · 2 to send · 0 to dismiss"
+  "Literal option line of the feedback-draft dialog box (captured live
+2026-09-06/2026-09-08 on `monocle-jarvice-978'). Distinct from the
+statusline's mere \"1 feedback draft\" mention -- that string never
+appears here, so a session merely reporting one pending draft (not an
+open box) does not match.")
+
+(defun cc-butler--feedback-draft-dialog-showing-p (buf)
+  "Non-nil if BUF's live screen tail shows the feedback-draft dialog
+(`cc-butler--feedback-draft-dialog-marker')."
+  (with-current-buffer buf
+    (save-excursion
+      (goto-char (cc-butler--live-screen-tail-start buf))
+      (search-forward cc-butler--feedback-draft-dialog-marker nil t))))
+
+(defconst cc-butler--classifier-confirmation-dialog-marker
+  "requires confirmation for this command"
+  "Fragment of the Auto Mode classifier confirmation's header line
+(`cc-butler-session-test--insert-mcp-classifier-prompt', captured live
+2026-09-05). Already proven NOT to collide with the trust dialog's own
+marker (cc-butler#8) -- this is a different string entirely.")
+
+(defun cc-butler--classifier-confirmation-dialog-showing-p (buf)
+  "Non-nil if BUF's live screen tail shows the Auto Mode classifier
+confirmation with its default (\"❯ 1. Yes\") highlighted. Both the header
+fragment (`cc-butler--classifier-confirmation-dialog-marker') and the
+highlighted option are required together, scoped to the live tail -- the
+same belt-and-suspenders `cc-butler--trust-dialog-showing-p' uses, so a
+screen that merely mentions confirmation, or a stray \"1. Yes\" elsewhere,
+cannot match alone."
+  (with-current-buffer buf
+    (save-excursion
+      (goto-char (cc-butler--live-screen-tail-start buf))
+      (and (search-forward cc-butler--classifier-confirmation-dialog-marker nil t)
+           (progn
+             (goto-char (cc-butler--live-screen-tail-start buf))
+             (search-forward "❯ 1. Yes" nil t))))))
+
+(defun cc-butler--blocked-on-dialog-p (buf)
+  "Non-nil if BUF's live screen shows a known open-dialog fingerprint --
+either `cc-butler--feedback-draft-dialog-showing-p' or
+`cc-butler--classifier-confirmation-dialog-showing-p'. Add a new disjunct
+here, not a new caller, when a third shape is identified -- false
+positives are worse than false negatives, so only exact, confirmed
+fingerprints belong in this list; an ambiguous screen must fall through
+to plain `waiting."
+  (or (cc-butler--feedback-draft-dialog-showing-p buf)
+      (cc-butler--classifier-confirmation-dialog-showing-p buf)))
 
 (defun cc-butler--resume-gate-showing-p (buf)
   "Return non-nil if BUF's terminal currently shows Claude Code's

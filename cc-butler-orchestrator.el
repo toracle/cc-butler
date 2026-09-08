@@ -1853,7 +1853,8 @@ only says how many and how stale the oldest is."
                             ((equal dir cc-butler--butler) " (butler)")
                             (t ""))
                       (pcase (cc-butler--session-state s)
-                        ('gate "STUCK-AT-RESUME-GATE") ('waiting "WAITING-FOR-INPUT") ('running "running"))
+                        ('gate "STUCK-AT-RESUME-GATE") ('waiting "WAITING-FOR-INPUT")
+                        ('blocked-on-dialog "BLOCKED-ON-DIALOG") ('running "running"))
                       (let ((b (plist-get s :branch))) (if (string-empty-p b) "-" b))
                       (let ((f (plist-get s :forge))) (if (string-empty-p f) "" (concat " " f)))
                       (let ((o (plist-get s :osc))) (if (string-empty-p o) "" (concat " | activity:" o)))
@@ -2124,7 +2125,7 @@ durable log; only delivery to the steward is suppressed."
 (claude-code-ide-make-tool
  :function #'cc-butler-tool-list-sessions
  :name "list_claude_sessions"
- :description "List the other live Claude Code sessions running in this Emacs (the workers you orchestrate): their stable name, whether each is WAITING-FOR-INPUT, its git branch, its live activity title (what it's doing right now), any status note it deliberately left via set_session_info (e.g. parked with a reason), and (when known) the model it's running. Call this first to learn the names used by read_session_output and send_to_session."
+ :description "List the other live Claude Code sessions running in this Emacs (the workers you orchestrate): their stable name, whether each is WAITING-FOR-INPUT (idle at its prompt, dispatchable) or BLOCKED-ON-DIALOG (stuck inside an open dialog/confirmation menu it never resolved -- NOT dispatchable, and NOT answerable remotely either: sending it anything lands as prompt text and the trailing Enter falls on whatever the dialog's default happens to be, silently \"answering\" it wrong; this needs a human at the keyboard), its git branch, its live activity title (what it's doing right now), any status note it deliberately left via set_session_info (e.g. parked with a reason), and (when known) the model it's running. Call this first to learn the names used by read_session_output and send_to_session."
  :args nil)
 
 (claude-code-ide-make-tool
