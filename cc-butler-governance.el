@@ -895,9 +895,11 @@ not a directory of 562 unrelated slugs."
                  (if (plist-get res :existed) "OVERWROTE the existing file" "new"))
        (format "FAILED to record `%s` — the principle was written but does NOT appear in the generated memory.\n"
                (plist-get res :slug)))
-     (format "\nStore file : %s\nMemory note: %s\nNotes       : %d -> %d\nVerified    : %s\n"
+     (format "\nStore file : %s\nMemory note: %s\n             (internal cache copy, NOT a link target — link to this note as [[%s]], never as [[%s%s]])\nNotes       : %d -> %d\nVerified    : %s\n"
              (plist-get res :path)
              (plist-get res :note)
+             (plist-get res :slug)
+             cc-butler-governance--name-prefix (plist-get res :slug)
              (plist-get res :before) (plist-get res :after)
              (if verified "yes — read back off disk and it names this principle"
                "NO — the note is missing or does not name this principle"))

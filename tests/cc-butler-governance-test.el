@@ -216,6 +216,25 @@ never touched."
       (should-not (string-match-p "existing-principle-number-150" out))
       (should-not (string-match-p "Principles now in the store" out)))))
 
+(ert-deftest cc-butler-governance/tool-response-memory-note-path-is-not-a-bare-link-target ()
+  "REGRESSION (multiple sessions, 2026-08-21 through 2026-09-07): the
+response's `Memory note: .../butler-<slug>.md' line sits right next to the
+correct `Store file: .../<slug>.md' line, and was repeatedly misread as
+this note's link identifier -- linked elsewhere in the vault as
+`[[butler-<slug>]]', which nothing downstream ever resolves (the
+regenerator, the `MEMORY.md' index, and shared-state-note recall are all
+bare-slug-driven; the `butler-' prefix is filename/frontmatter-only, never
+read back for linking). Fix: the response now says, right at the line
+that caused the confusion, both what NOT to link and what to link
+instead -- so a session reading quickly hits the correction at the exact
+point it would otherwise misread, not somewhere else that needs
+cross-referencing."
+  (cc-butler-governance-test--with-store
+    (let ((out (cc-butler-tool-record-principle "verify-delivery" "d" "body")))
+      (should (string-match-p "NOT a link target" out))
+      (should (string-match-p (regexp-quote "[[verify-delivery]]") out))
+      (should (string-match-p (regexp-quote "[[butler-verify-delivery]]") out)))))
+
 (ert-deftest cc-butler-governance/record-normalises-the-name ()
   "The frontmatter carries the butler- prefix and the filename does not — a
 distinction no caller should have to remember."
