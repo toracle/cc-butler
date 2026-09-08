@@ -122,10 +122,12 @@
              (sstate (cc-butler--session-state s))
              (tag (cond ((equal dir cc-butler--butler) " (butler)")
                         ((eq sstate 'gate) " (gate)")
+                        ((eq sstate 'blocked-on-dialog) " (blocked)")
                         ((eq sstate 'waiting) " (waiting)")
                         (t "")))
              (state (pcase sstate
-                      ('gate "GATE") ('waiting "WAITING") ('running "running")))
+                      ('gate "GATE") ('blocked-on-dialog "BLOCKED-ON-DIALOG")
+                      ('waiting "WAITING") ('running "running")))
              (branch (let ((b (plist-get s :branch))) (if (string-empty-p b) "-" b)))
              (pr (let ((f (plist-get s :forge))) (if (string-empty-p f) "-" f)))
              ;; :osc (live harness-pushed activity) and :status (a note a

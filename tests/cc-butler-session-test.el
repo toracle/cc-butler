@@ -730,6 +730,79 @@ sessions sat at this exact gate)."
             (should (eq 'running (cc-butler--session-state (list :dir "/worker/" :buffer buf))))))
       (kill-buffer buf))))
 
+;;;; ---- BLOCKED-ON-DIALOG: WAITING-FOR-INPUT conflated an open dialog
+;;;; with a genuinely idle prompt (2026-09-08). `monocle-jarvice-978' sat
+;;;; nine hours inside a feedback-draft dialog while `list_claude_sessions'
+;;;; reported it identically to an idle session — the only way anyone
+;;;; noticed was reading the terminal by eye. Two dialog shapes seen live:
+;;;; the feedback-draft box ("1 to review · 2 to send · 0 to dismiss") and
+;;;; the Auto Mode classifier confirmation ("❯ 1. Yes"). Per the governance
+;;;; note (an-open-menu-cannot-be-answered-remotely.md), this is
+;;;; visibility-only: no auto-answer, just a status a human can act on.
+
+(defun cc-butler-session-test--insert-feedback-draft-dialog ()
+  "Insert the feedback-draft dialog box (captured live 2026-09-06/08,
+`monocle-jarvice-978') at the live bottom of the screen."
+  (insert " ╭─ Feedback draft ready ─────────────────────╮\n")
+  (insert " │ 1 to review · 2 to send · 0 to dismiss      │\n")
+  (insert " ╰──────────────────────────────────────────────╯\n"))
+
+;; RED reproduction (pre-fix): with `cc-butler--blocked-on-dialog-p'
+;; absent, `(cc-butler--session-state (list :dir "/worker/" :buffer buf))'
+;; on the feedback-draft buffer below returned plain `waiting --
+;; indistinguishable from a genuinely idle session, confirming the actual
+;; bug (`list_claude_sessions' reporting WAITING-FOR-INPUT for both).
+;; Superseded by the GREEN test immediately below once the fix landed;
+;; not kept as a separate case since it would now just assert the bug.
+
+(ert-deftest cc-butler-session/session-state-is-blocked-on-dialog-for-feedback-draft ()
+  "GREEN: once a session is `waiting' AND its screen shows the
+feedback-draft dialog fingerprint, `cc-butler--session-state' reports the
+distinct `blocked-on-dialog -- not `waiting."
+  (let ((buf (get-buffer-create " *cc-butler-test-dialog-feedback*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (cc-butler-session-test--insert-feedback-draft-dialog))
+          (let ((cc-butler--waiting (make-hash-table :test 'equal)))
+            (puthash "/worker/" (float-time) cc-butler--waiting)
+            (should (eq 'blocked-on-dialog
+                        (cc-butler--session-state (list :dir "/worker/" :buffer buf))))))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/session-state-is-blocked-on-dialog-for-classifier-confirmation ()
+  "The second, differently-shaped dialog (Auto Mode classifier
+confirmation, `❯ 1. Yes' highlighted -- same fixture used to prove this
+shape must NOT be mistaken for the trust dialog) also reports
+`blocked-on-dialog once the session is `waiting'."
+  (let ((buf (get-buffer-create " *cc-butler-test-dialog-classifier*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (cc-butler-session-test--insert-mcp-classifier-prompt))
+          (let ((cc-butler--waiting (make-hash-table :test 'equal)))
+            (puthash "/worker/" (float-time) cc-butler--waiting)
+            (should (eq 'blocked-on-dialog
+                        (cc-butler--session-state (list :dir "/worker/" :buffer buf))))))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/session-state-is-waiting-not-blocked-on-genuinely-idle-prompt ()
+  "Negative control, required: a `waiting session whose screen holds no
+dialog fingerprint -- just an ordinary empty input row -- must still
+report plain `waiting, not `blocked-on-dialog. False positives are worse
+than false negatives here: a genuinely idle session mislabeled blocked
+cannot receive dispatches."
+  (let ((buf (get-buffer-create " *cc-butler-test-dialog-idle*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert (make-string 24 cc-butler--border-rule-char))
+            (insert "\n❯ \n")
+            (insert (make-string 24 cc-butler--border-rule-char)))
+          (let ((cc-butler--waiting (make-hash-table :test 'equal)))
+            (puthash "/worker/" (float-time) cc-butler--waiting)
+            (should (eq 'waiting
+                        (cc-butler--session-state (list :dir "/worker/" :buffer buf))))))
+      (kill-buffer buf))))
+
 (ert-deftest cc-butler-session/wait-for-ready-accepts-trust-dialog-then-proceeds ()
   "`cc-butler--wait-for-session-ready' recognizes the folder-trust screen,
 sends a bare Return to accept it (\"Yes, trust\" is pre-highlighted), and
