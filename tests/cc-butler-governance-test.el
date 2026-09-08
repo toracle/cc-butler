@@ -1583,3 +1583,58 @@ a stamp read as one.  A stamp is a WHOLE line, never a substring."
                "prefix (최초 기록: w (s), 01-01)"))
   (should (cc-butler-governance--stamp-line
            "Body.\n\n(최초 기록: w (s), 01-01)")))
+
+;;;; ------------------------------------------------------------------
+;;;; Unconditional cap report line (2026-09-08 incident)
+;;;;
+;;;; regenerate_governance was called 4 times the night the store sat at
+;;;; 566/250 notes and one note's body sat at 16.4KB/2KB -- every call
+;;;; reported plain success. The direct-Write/Edit bypass path skips every
+;;;; cap record_principle enforces, so only a report INSIDE regenerate_governance
+;;;; itself can ever catch it. This is report-only: regenerate must never
+;;;; refuse to run just because the store is over-cap.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/regenerate-tool-reports-real-cap-violations ()
+  "REGRESSION this closes (2026-09-08): a store that already blew past both
+caps (count and per-note body length) must have the OVER-cap facts, in real
+numbers, in EVERY regenerate_governance report -- not just a generic success
+message. Seeds a store genuinely over both caps."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-notes 250)
+          (cc-butler-governance-max-note-bytes 2048))
+      ;; count cap: 252 tiny notes, well past 250.
+      (dotimes (i 252)
+        (with-temp-file (expand-file-name (format "note-%d.md" i) store)
+          (insert (cc-butler-governance--render
+                   (format "note-%d" i) "d" "tiny body" "feedback"))))
+      ;; body-length cap: one note with a body well past 2048 bytes.
+      (with-temp-file (expand-file-name "the-big-one.md" store)
+        (insert (cc-butler-governance--render
+                 "the-big-one" "d" (make-string 16793 ?x) "feedback")))
+      (let ((out (cc-butler-tool-regenerate-governance)))
+        ;; real count, real cap
+        (should (string-match-p "253" out))
+        (should (string-match-p "250" out))
+        ;; the ratio is over 1 and stated as an excess, not silence
+        (should (string-match-p "초과" out))
+        ;; the oversized-note count and the actual largest offender, named
+        (should (string-match-p "1" out))
+        (should (string-match-p "the-big-one" out))
+        (should (string-match-p "16\\.4K" out))))))
+
+(ert-deftest cc-butler-governance/regenerate-tool-reports-explicit-zero-violations ()
+  "Positive control: a store safely under BOTH caps must still print the cap
+line, explicitly saying zero violations -- silence here is indistinguishable
+from the check never having run, which is exactly the ambiguity that let 4
+straight silent successes through on 2026-09-08."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-notes 250)
+          (cc-butler-governance-max-note-bytes 2048))
+      (with-temp-file (expand-file-name "a-rule.md" store)
+        (insert (cc-butler-governance--render "a-rule" "d" "small body" "feedback")))
+      (let ((out (cc-butler-tool-regenerate-governance)))
+        (should (string-match-p "1" out))
+        (should (string-match-p "250" out))
+        (should (string-match-p "이내" out))
+        (should (string-match-p "0개" out))))))
