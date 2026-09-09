@@ -164,9 +164,14 @@ def handle_room_events(events, room_id):
         if not content.get("msgtype"):
             continue  # redaction or state-ish payload, nothing to deliver
         body = describe(content)
-        marks = envelope(ev.get("event_id", ""), content, room_label(room_id))
+        event_id = ev.get("event_id", "")
+        marks = envelope(event_id, content, room_label(room_id))
         text = f"[matrix · {attribution(sender)}{marks}] {body}"
-        log(f"RECV from {sender}: {body[:200]!r}")
+        # Log the FULL body, not a 200-char slice: this line is the only durable
+        # record of an inbound message, and a compacted session reconstructs from
+        # it.  Truncating here silently loses the tail of exactly the long, dense
+        # messages worth reconstructing.  event_id makes the entry addressable.
+        log(f"RECV [{room_label(room_id)}] own={event_id} from {sender}: {body!r}")
         inject_into_session(text)
 
 
