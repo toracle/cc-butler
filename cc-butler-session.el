@@ -2163,10 +2163,15 @@ territory, not this function's."
 ;;;; `list_claude_sessions' reported the single status WAITING-FOR-INPUT
 ;;;; for both a genuinely idle prompt and a session stuck inside an open
 ;;;; dialog -- indistinguishable to any caller, worker or human, without
-;;;; reading the terminal by eye. `monocle-jarvice-978' sat nine hours
-;;;; inside the feedback-draft dialog below before anyone noticed
+;;;; reading the terminal by eye. The original trigger was a claim that
+;;;; `monocle-jarvice-978' sat nine hours inside the feedback-draft dialog
+;;;; below -- RETRACTED 2026-09-09: the session itself couldn't say what
+;;;; caused that window, and the dialog card it showed was independently
+;;;; confirmed to be resolved scrollback, not a live pending prompt. See
+;;;; `cc-butler--blocked-on-dialog-p' below for why the feedback-draft
+;;;; fingerprint itself was removed as a confirmed false positive.
 ;;;; (an-open-menu-cannot-be-answered-remotely.md: there is no remote way
-;;;; to answer an open dialog, so this is visibility-only -- report a
+;;;; to answer an open dialog, so this remains visibility-only -- report a
 ;;;; distinct status, never auto-answer or auto-dismiss).
 ;;;;
 ;;;; Detection follows the same shape as the trust-dialog detectors above:
@@ -2179,22 +2184,6 @@ territory, not this function's."
 ;;;; `cc-butler--border-rule-char'), and both fingerprints below are
 ;;;; dialog chrome rendered ABOVE that row, never inside it -- exactly
 ;;;; the same reasoning the trust-dialog detectors already rely on.
-
-(defconst cc-butler--feedback-draft-dialog-marker
-  "1 to review · 2 to send · 0 to dismiss"
-  "Literal option line of the feedback-draft dialog box (captured live
-2026-09-06/2026-09-08 on `monocle-jarvice-978'). Distinct from the
-statusline's mere \"1 feedback draft\" mention -- that string never
-appears here, so a session merely reporting one pending draft (not an
-open box) does not match.")
-
-(defun cc-butler--feedback-draft-dialog-showing-p (buf)
-  "Non-nil if BUF's live screen tail shows the feedback-draft dialog
-(`cc-butler--feedback-draft-dialog-marker')."
-  (with-current-buffer buf
-    (save-excursion
-      (goto-char (cc-butler--live-screen-tail-start buf))
-      (search-forward cc-butler--feedback-draft-dialog-marker nil t))))
 
 (defconst cc-butler--classifier-confirmation-dialog-marker
   "requires confirmation for this command"
@@ -2210,7 +2199,13 @@ fragment (`cc-butler--classifier-confirmation-dialog-marker') and the
 highlighted option are required together, scoped to the live tail -- the
 same belt-and-suspenders `cc-butler--trust-dialog-showing-p' uses, so a
 screen that merely mentions confirmation, or a stray \"1. Yes\" elsewhere,
-cannot match alone."
+cannot match alone.
+
+[미확인] 이 지문이 실제로 입력을 막는지는 아직 독립적으로 검증되지
+않았다. `cc-butler--feedback-draft-dialog-showing-p'(2026-09-09 제거,
+세 건의 실관측으로 false positive 확인됨)와 달리 반증된 적은 없지만,
+그렇다고 확인된 것도 아니다 -- \"아직 반증되지 않음\"을 \"확인됨\"으로
+착각하지 말 것."
   (with-current-buffer buf
     (save-excursion
       (goto-char (cc-butler--live-screen-tail-start buf))
@@ -2221,14 +2216,26 @@ cannot match alone."
 
 (defun cc-butler--blocked-on-dialog-p (buf)
   "Non-nil if BUF's live screen shows a known open-dialog fingerprint --
-either `cc-butler--feedback-draft-dialog-showing-p' or
-`cc-butler--classifier-confirmation-dialog-showing-p'. Add a new disjunct
-here, not a new caller, when a third shape is identified -- false
-positives are worse than false negatives, so only exact, confirmed
-fingerprints belong in this list; an ambiguous screen must fall through
-to plain `waiting."
-  (or (cc-butler--feedback-draft-dialog-showing-p buf)
-      (cc-butler--classifier-confirmation-dialog-showing-p buf)))
+currently only `cc-butler--classifier-confirmation-dialog-showing-p'. Add
+a new disjunct here, not a new caller, when a further shape is identified
+-- false positives are worse than false negatives, so only exact,
+CONFIRMED-BLOCKING fingerprints belong in this list; an ambiguous screen
+must fall through to plain `waiting.
+
+`cc-butler--feedback-draft-dialog-showing-p' (the \"1 to review · 2 to
+send · 0 to dismiss\" box) used to be a second disjunct here. REMOVED
+2026-09-09: confirmed a false positive -- that dialog does not actually
+block input. Three independent live observations forced the removal:
+(1) `monocle-image-attach-2153' carried out dispatched work while the box
+was showing; (2) the same session answered an incoming message normally
+while it was showing; (3) `monocle-jarvice-978' itself reported no
+sensation of blocked input and answered every message normally while
+showing it, and its dialog card was separately confirmed to be resolved
+scrollback rather than a live pending prompt -- undermining the original
+nine-hour-stuck claim this whole feature was built to catch. Do not
+re-add a feedback-draft disjunct on a hunch; it would need a fingerprint
+actually shown to block input, which this one is not."
+  (cc-butler--classifier-confirmation-dialog-showing-p buf))
 
 (defun cc-butler--resume-gate-showing-p (buf)
   "Return non-nil if BUF's terminal currently shows Claude Code's

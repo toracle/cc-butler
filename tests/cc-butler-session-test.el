@@ -731,14 +731,18 @@ sessions sat at this exact gate)."
       (kill-buffer buf))))
 
 ;;;; ---- BLOCKED-ON-DIALOG: WAITING-FOR-INPUT conflated an open dialog
-;;;; with a genuinely idle prompt (2026-09-08). `monocle-jarvice-978' sat
-;;;; nine hours inside a feedback-draft dialog while `list_claude_sessions'
-;;;; reported it identically to an idle session — the only way anyone
-;;;; noticed was reading the terminal by eye. Two dialog shapes seen live:
-;;;; the feedback-draft box ("1 to review · 2 to send · 0 to dismiss") and
-;;;; the Auto Mode classifier confirmation ("❯ 1. Yes"). Per the governance
-;;;; note (an-open-menu-cannot-be-answered-remotely.md), this is
-;;;; visibility-only: no auto-answer, just a status a human can act on.
+;;;; with a genuinely idle prompt (2026-09-08). The original trigger was a
+;;;; claim that `monocle-jarvice-978' sat nine hours inside a
+;;;; feedback-draft dialog while `list_claude_sessions' reported it
+;;;; identically to an idle session -- RETRACTED 2026-09-09, see
+;;;; `cc-butler--blocked-on-dialog-p''s docstring. Two dialog shapes were
+;;;; seen live: the feedback-draft box ("1 to review · 2 to send · 0 to
+;;;; dismiss"), since REMOVED as a confirmed false positive (it does not
+;;;; actually block input), and the Auto Mode classifier confirmation
+;;;; ("❯ 1. Yes"), kept but still unverified ([미확인]). Per the
+;;;; governance note (an-open-menu-cannot-be-answered-remotely.md), this
+;;;; remains visibility-only: no auto-answer, just a status a human can
+;;;; act on.
 
 (defun cc-butler-session-test--insert-feedback-draft-dialog ()
   "Insert the feedback-draft dialog box (captured live 2026-09-06/08,
@@ -747,25 +751,30 @@ sessions sat at this exact gate)."
   (insert " │ 1 to review · 2 to send · 0 to dismiss      │\n")
   (insert " ╰──────────────────────────────────────────────╯\n"))
 
-;; RED reproduction (pre-fix): with `cc-butler--blocked-on-dialog-p'
-;; absent, `(cc-butler--session-state (list :dir "/worker/" :buffer buf))'
-;; on the feedback-draft buffer below returned plain `waiting --
-;; indistinguishable from a genuinely idle session, confirming the actual
-;; bug (`list_claude_sessions' reporting WAITING-FOR-INPUT for both).
-;; Superseded by the GREEN test immediately below once the fix landed;
-;; not kept as a separate case since it would now just assert the bug.
+;; History: this fixture originally proved a RED->GREEN pair for
+;; `blocked-on-dialog' on the feedback-draft box (cc-butler#201). That
+;; fingerprint was REMOVED 2026-09-09: confirmed a false positive by
+;; three independent live observations -- `monocle-image-attach-2153'
+;; carried out dispatched work and answered a message normally while the
+;; box was showing, and `monocle-jarvice-978' itself reported no blocked
+;; input and answered every message normally while showing it (its
+;; dialog card was separately confirmed to be resolved scrollback, not a
+;; live prompt). See `cc-butler--blocked-on-dialog-p''s docstring for the
+;; full account. This test now asserts the corrected behavior: the same
+;; buffer content must NOT be reported `blocked-on-dialog.
 
-(ert-deftest cc-butler-session/session-state-is-blocked-on-dialog-for-feedback-draft ()
-  "GREEN: once a session is `waiting' AND its screen shows the
-feedback-draft dialog fingerprint, `cc-butler--session-state' reports the
-distinct `blocked-on-dialog -- not `waiting."
+(ert-deftest cc-butler-session/session-state-is-waiting-not-blocked-on-feedback-draft-dialog ()
+  "The feedback-draft box (\"1 to review · 2 to send · 0 to dismiss\") is
+NOT a blocking dialog -- confirmed false positive, 2026-09-09 (see
+`cc-butler--blocked-on-dialog-p'). A `waiting' session whose screen shows
+it must report plain `waiting, same as any other non-fingerprint screen."
   (let ((buf (get-buffer-create " *cc-butler-test-dialog-feedback*")))
     (unwind-protect
         (progn
           (with-current-buffer buf (cc-butler-session-test--insert-feedback-draft-dialog))
           (let ((cc-butler--waiting (make-hash-table :test 'equal)))
             (puthash "/worker/" (float-time) cc-butler--waiting)
-            (should (eq 'blocked-on-dialog
+            (should (eq 'waiting
                         (cc-butler--session-state (list :dir "/worker/" :buffer buf))))))
       (kill-buffer buf))))
 
