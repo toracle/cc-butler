@@ -1708,3 +1708,44 @@ straight silent successes through on 2026-09-08."
         (should (string-match-p "250" out))
         (should (string-match-p "이내" out))
         (should (string-match-p "0개" out))))))
+
+(ert-deftest cc-butler-governance/cap-report-line-discloses-its-own-population ()
+  "REGRESSION this closes: the cap report line's \"최대\" only ever scans the
+top-level store .md files (README and roles/ excluded, user-layer never
+merged in), but said nothing about that -- a reader could mistake it for a
+store-wide max. README.md is itself over the body cap and invisible to the
+counter; a roles/ file, bigger than the true top-level max, is invisible
+too because the scan never recurses. Both must stay excluded (that
+population is correct); the line must now say so."
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-max-notes 250)
+          (cc-butler-governance-max-note-bytes 2048))
+      ;; a few small, unremarkable top-level notes.
+      (dotimes (i 3)
+        (with-temp-file (expand-file-name (format "small-note-%d.md" i) store)
+          (insert (cc-butler-governance--render
+                   (format "small-note-%d" i) "d" "tiny body" "feedback"))))
+      ;; the one note that SHOULD be reported as the max: top-level, in scope.
+      (with-temp-file (expand-file-name "top-level-biggest.md" store)
+        (insert (cc-butler-governance--render
+                 "top-level-biggest" "d" (make-string 3000 ?x) "feedback")))
+      ;; README.md: over-cap itself, but excluded by name -- must never be "최대".
+      (with-temp-file (expand-file-name "README.md" store)
+        (insert (make-string 3000 ?y)))
+      ;; roles/: a file bigger than top-level-biggest, but out of scope because
+      ;; the scan doesn't recurse -- must never be "최대" either.
+      (make-directory (expand-file-name "roles" store))
+      (with-temp-file (expand-file-name "roles/steward-role-CLAUDE.md" store)
+        (insert (cc-butler-governance--render
+                 "steward-role-CLAUDE" "d" (make-string 5000 ?z) "feedback")))
+      (let ((out (cc-butler-tool-regenerate-governance)))
+        ;; positive control: the true top-level max is named.
+        (should (string-match-p "top-level-biggest" out))
+        ;; the bigger roles/ file must never be reported as the max -- distinct,
+        ;; nameable failure if the population regresses to include roles/.
+        (should-not (string-match-p "steward-role-CLAUDE" out))
+        ;; the disclosure clause is present verbatim -- distinct, nameable
+        ;; failure if only the format string regresses (population untouched).
+        (should (string-match-p
+                 (regexp-quote "[범위: 최상위 .md · README·roles/·사용자층 제외 · 바이트는 body 기준]")
+                 out))))))
