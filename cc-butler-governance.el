@@ -1414,12 +1414,18 @@ being over, which is strictly worse — this function never blocks anything.
 And it always prints, over-cap or not: a line that only speaks up when
 something is wrong is indistinguishable, from outside, from a check that
 never ran at all — which is exactly the ambiguity 4 straight silent
-successes exploited."
+successes exploited.
+
+The printed line names its own population and byte basis (top-level .md
+only, README/roles//user-layer excluded, bytes measured on note body) so
+it can never be misread as a store-wide max — this docstring does not
+duplicate that count independently, so it can't drift from what the line
+actually says."
   (let* ((count (cc-butler-governance--store-note-count))
          (max cc-butler-governance-max-notes)
          (oversized (cc-butler-governance--oversized-notes))
          (n-over (length oversized)))
-    (format "창고 %d / 상한 %d — %s. 2K 초과 노트 %d개%s\n"
+    (format "창고 %d / 상한 %d — %s. 2K 초과 노트 %d개%s [범위: 최상위 .md · README·roles/·사용자층 제외 · 바이트는 body 기준]\n"
             count max
             (if (> count max)
                 (format "%.1f배 초과" (/ (float count) max))
