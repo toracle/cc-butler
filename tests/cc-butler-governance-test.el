@@ -1116,6 +1116,47 @@ hasn't been normalized to the new shape yet."
       (with-temp-file index (insert "- butler-a-rule.md — stale old wording\n"))
       (should (equal (cc-butler-governance--stale-index-entries) '("a-rule"))))))
 
+(ert-deftest cc-butler-governance/a-user-layer-override-is-not-reported-drifted ()
+  "A user-layer file overrides the store note of the same basename
+\(`cc-butler-governance-principles'), and the index line is generated from
+the RESOLVED copy.  So the drift check must resolve the same way; reading the
+store copy reports every overridden note as drifted.
+
+Measured 2026-09-10 against the live store: after the byte-cap fix, the single
+remaining reported drift was `haiku-summarization-delegation' -- the one note
+whose basename exists in both the store and the user layer.  It was this bug,
+not a drift.  True drift count was 0."
+  (cc-butler-governance-test--with-store
+    (let* ((userdir (file-name-as-directory (make-temp-file "gov-user" t)))
+           (cc-butler-governance-user-dir userdir)
+           (index (expand-file-name "MEMORY.md" mem))
+           (store-desc "the store's own wording for this rule, long enough to be truncated")
+           (user-desc "the USER layer's overriding wording, also long enough to truncate")
+           (user-trunc (cc-butler-governance--truncate-bytes
+                        user-desc cc-butler-governance--generated-description-max-bytes)))
+      (unwind-protect
+          (progn
+            ;; Guard the premise: the two layers must actually differ, and the
+            ;; description must exceed the cap, or this test proves nothing.
+            (should-not (equal store-desc user-desc))
+            (should (> (string-bytes user-desc)
+                       cc-butler-governance--generated-description-max-bytes))
+            (with-temp-file (expand-file-name "a-rule.md" store)
+              (insert (cc-butler-governance--render "a-rule" store-desc "body" "feedback")))
+            (with-temp-file (expand-file-name "a-rule.md" userdir)
+              (insert (cc-butler-governance--render "a-rule" user-desc "body" "feedback")))
+            ;; The line matches the RESOLVED (user) wording: not drifted.
+            (with-temp-file index
+              (insert (format "- butler-a-rule.md \u2014 %s\n" user-trunc)))
+            (should-not (cc-butler-governance--stale-index-entries))
+            ;; Positive control, same test: a third wording matching NEITHER
+            ;; layer is still reported, so the assertion above cannot pass by
+            ;; the check having gone silent.
+            (with-temp-file index
+              (insert "- butler-a-rule.md \u2014 neither layer's wording\n"))
+            (should (equal (cc-butler-governance--stale-index-entries) '("a-rule"))))
+        (delete-directory userdir t)))))
+
 (ert-deftest cc-butler-governance/a-description-over-the-index-cap-is-not-reported-drifted ()
   "The index line holds a BYTE-TRUNCATED description, so the store's
 description must be truncated the same way before comparing.  Without

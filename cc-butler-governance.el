@@ -715,8 +715,22 @@ if wanted, is to call `record_principle' again or hand-edit the line."
                 (concat cc-butler-governance--index-line-regexp "\\(.*\\)$") nil t)
           (let* ((slug (match-string 1))
                  (indexed-desc (match-string 2))
-                 (store-file (expand-file-name (concat slug ".md")
-                                               (cc-butler-governance-store))))
+                 ;; Resolve the note the SAME way `cc-butler-governance-principles'
+                 ;; does: a user-layer file with this basename OVERRIDES the
+                 ;; store's, and the index line was generated from the RESOLVED
+                 ;; copy.  Reading the store copy unconditionally reports every
+                 ;; overridden note as drifted.  Measured 2026-09-10: after the
+                 ;; byte-cap fix the store reported exactly one remaining drift,
+                 ;; `haiku-summarization-delegation' -- and that is the one note
+                 ;; whose basename exists in both layers.  It was not a drift;
+                 ;; it was this bug.  True drift count was 0.
+                 (user-file (and cc-butler-governance-user-dir
+                                 (expand-file-name (concat slug ".md")
+                                                   cc-butler-governance-user-dir)))
+                 (store-file (if (and user-file (file-exists-p user-file))
+                                 user-file
+                               (expand-file-name (concat slug ".md")
+                                                 (cc-butler-governance-store)))))
             (when (file-exists-p store-file)
               (let ((current (cc-butler-governance--frontmatter-description store-file)))
                 ;; Compare like with like.  The index line holds a
