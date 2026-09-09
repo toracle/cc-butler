@@ -259,6 +259,58 @@ respond to."
         (should (= 1 (length files)))
         (should (eq 'decision (cc-butler--decision-file-kind (car files))))))))
 
+;;;; ---- filename/body :Kind: drift (issue: demoted decision still
+;;;; counted) -- a real decision demoted to a note (body `:Kind:'
+;;;; rewritten to `note', title left alone) keeps its plain `ID.org'
+;;;; filename, since only `cc-butler--decision-render' writes the
+;;;; `.note.org' suffix and nothing in this repo rewrites an existing
+;;;; file's `:Kind:' without also re-rendering (and thus renaming) it.
+;;;; `cc-butler--decision-file-kind' (filename-only) can't see this, so
+;;;; the ⚖ count keeps a closed item alive.  These tests seed the file
+;;;; directly (as the drift itself would produce it), never through
+;;;; `cc-butler-decision-create' + arrival, since that path always keeps
+;;;; filename and body `:Kind:' in lockstep.
+
+(ert-deftest cc-butler-decision/open-files-and-oldest-excludes-body-demoted-note ()
+  "Given open/ holds a plain `ID.org' file whose FILENAME says nothing
+(so the cheap filename filter alone would count it as a decision) but
+whose BODY `:Kind:' property says `note' -- the exact shape of the 3
+real files miscounted in production (20260908T112948-991-2536.org and
+siblings) -- `cc-butler--decision-open-files-and-oldest' does not count
+it."
+  (cc-butler-decision-test--with-arrival
+    (let ((id (format-time-string "%Y%m%dT%H%M%S-991-drift")))
+      (with-temp-file (expand-file-name (format "%s.org" id) (cc-butler--decision-open-dir))
+        (insert ":PROPERTIES:\n:Kind: note\n:END:\n"
+                "#+TITLE: Decision — [발신 말 것 · demoted]\n\n"
+                "* Notification (read-only)\ndemoted body\n")))
+    (should (= 0 (length (car (cc-butler--decision-open-files-and-oldest)))))))
+
+(ert-deftest cc-butler-decision/open-files-and-oldest-still-counts-genuine-decision ()
+  "Independent negative control: a file whose body `:Kind:' really is
+`decision' (unrelated to the demoted-note case above -- a fresh
+fixture, not the one just fixed) is still counted, so the drift check
+doesn't overcorrect into swallowing real open decisions."
+  (cc-butler-decision-test--with-arrival
+    (let ((id (format-time-string "%Y%m%dT%H%M%S-991-genuine")))
+      (with-temp-file (expand-file-name (format "%s.org" id) (cc-butler--decision-open-dir))
+        (insert ":PROPERTIES:\n:Kind: decision\n:END:\n"
+                "#+TITLE: Decision — genuine\n\n"
+                "* Decision\nreal open decision\n")))
+    (should (= 1 (length (car (cc-butler--decision-open-files-and-oldest)))))))
+
+(ert-deftest cc-butler-decision/open-files-and-oldest-still-excludes-note-suffix-filename ()
+  "Unaffected by the drift check: an ordinary `.note.org' filename is
+still excluded by the cheap filename filter alone (never even reaches
+the body check)."
+  (cc-butler-decision-test--with-arrival
+    (let ((id (format-time-string "%Y%m%dT%H%M%S-991-plainnote")))
+      (with-temp-file (expand-file-name (format "%s.note.org" id) (cc-butler--decision-open-dir))
+        (insert ":PROPERTIES:\n:Kind: note\n:END:\n"
+                "#+TITLE: Note — plain\n\n"
+                "* Notification (read-only)\nplain note\n")))
+    (should (= 0 (length (car (cc-butler--decision-open-files-and-oldest)))))))
+
 (ert-deftest cc-butler-decision/answer-next-skips-note-lands-on-decision ()
   "Given open/ holds a `note' created BEFORE a `decision' (so the note sorts
 first by filename/arrival order), `cc-butler-decision-answer-next' opens
