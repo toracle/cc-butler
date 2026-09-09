@@ -950,6 +950,123 @@ run -- no re-rewriting an already-current line, no re-adding, no drift."
           (should (string-match-p "steward-only-note" after-second)))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; The THIRD, even older bare-target bracket-link shape (2026-09-09
+;;;; follow-up): `- [slug](slug.md) — desc', no `butler-' prefix at all.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/bare-target-duplicate-is-removed-not-just-normalized ()
+  "RED for this bug: a bare-target bracket line (no `butler-' prefix on the
+link target) for a slug that ALREADY has a canonical current-format line
+elsewhere is a true duplicate, not merely an un-normalized one.
+`--normalize-index-format' alone does not recognize this shape at all
+\(it only rewrites a target already carrying `butler-'\), so before this
+fix the duplicate survives a regenerate untouched.  After the fix,
+regenerate must leave the slug indexed EXACTLY once."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index
+        (insert "- butler-a-rule.md — current frontmatter wording\n"
+                "- [a-rule](a-rule.md) — stale, pre-butler-prefix duplicate\n"))
+      (with-temp-file (expand-file-name "a-rule.md" store)
+        (insert (cc-butler-governance--render "a-rule" "current frontmatter wording" "body" "feedback")))
+      (cc-butler-governance-regenerate)
+      (let* ((text (with-temp-buffer (insert-file-contents index) (buffer-string)))
+             (count 0) (start 0))
+        (while (string-match "a-rule\\.md" text start)
+          (setq count (1+ count) start (match-end 0)))
+        (should (= count 1))
+        (should-not (string-match-p "stale, pre-butler-prefix duplicate" text))))))
+
+(ert-deftest cc-butler-governance/bare-target-duplicate-dedupes-by-link-target-not-display-text ()
+  "A real store line (2026-09-09) has bracket DISPLAY text that is a
+truncated, mismatched copy of its own link TARGET
+\(`[steward-externalize-is-survival-insurance]
+(steward-externalize-is-survival-insurance-not-just-compaction-hygiene.md)'\).
+The slug identity must come from the TARGET, never the display text --
+using display text here would fail to recognize this as the duplicate of
+the existing `...-not-just-compaction-hygiene' canonical line that it is."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index
+        (insert "- butler-full-slug-name.md — current wording\n"
+                "- [short-name](full-slug-name.md) — old, mismatched display text\n"))
+      (with-temp-file (expand-file-name "full-slug-name.md" store)
+        (insert (cc-butler-governance--render "full-slug-name" "current wording" "body" "feedback")))
+      (cc-butler-governance-regenerate)
+      (let* ((text (with-temp-buffer (insert-file-contents index) (buffer-string)))
+             (count 0) (start 0))
+        (while (string-match "full-slug-name\\.md" text start)
+          (setq count (1+ count) start (match-end 0)))
+        (should (= count 1))
+        (should-not (string-match-p "mismatched display text" text))))))
+
+(ert-deftest cc-butler-governance/bare-target-line-rewritten-in-place-when-not-yet-indexed ()
+  "A bare-target line for a LIVE store slug that has no canonical line yet
+must be REWRITTEN to the canonical form, not deleted -- deleting it with
+nothing to replace it would leave the slug indexed zero times until the
+next `--sync-index' pass happens to add it back (which it does, but this
+proves the dedupe step itself never transiently loses the slug)."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index
+        (insert "- [a-rule](a-rule.md) — old, pre-butler-prefix wording\n"))
+      (with-temp-file (expand-file-name "a-rule.md" store)
+        (insert (cc-butler-governance--render "a-rule" "fresh frontmatter wording" "body" "feedback")))
+      (cc-butler-governance-regenerate)
+      (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        (should (string-match-p "^- butler-a-rule\\.md — fresh frontmatter wording$" text))
+        (should-not (string-match-p "\\[a-rule\\](a-rule\\.md)" text))))))
+
+(ert-deftest cc-butler-governance/bare-target-line-left-untouched-when-dangling ()
+  "A bare-target line whose slug names no live store note at all is left
+completely untouched -- neither deleted (nothing here is this store's
+business to remove) nor rewritten (nothing current to re-read).  Same
+existing fixture other dangling-link tests in this file use."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem))
+          (hand-written "- [steward-only-note](steward-only-note.md) — hand-authored, no matching store file\n"))
+      (with-temp-file index (insert hand-written))
+      (cc-butler-governance-regenerate)
+      (should (string-match-p (regexp-quote hand-written)
+                              (with-temp-buffer (insert-file-contents index) (buffer-string)))))))
+
+(ert-deftest cc-butler-governance/bare-target-shape-never-touches-a-hand-authored-sentence-title-entry ()
+  "SAFETY NEGATIVE CONTROL (2026-09-09, steward-caught near-miss): this
+fleet's real MEMORY.md also carries genuine hand-authored, non-governance
+personal/project memory entries in the EXACT SAME bracket shape a bare-
+target legacy duplicate has -- e.g. `- [Daily standup process]
+(daily-standup-process.md) — ...'.  These 6 real lines (verbatim from the
+live file) must survive completely untouched: dedupe must never rewrite
+or remove a link-shaped line whose slug this store does not itself own,
+even though the SHAPE alone cannot tell it apart from a real legacy
+duplicate.  Two independent gates must both hold: the lowercase-kebab
+slug character class (capitalized, spaced display text like \"Daily
+standup process\" never matches the regexp at all) AND, even for a line
+that somehow did match syntactically, membership in the real store's
+slug list (`cc-butler-governance-names') before anything is touched."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem))
+          (real-hand-authored-lines
+           (concat
+            "- [Daily standup process](daily-standup-process.md) — how the butler runs the daily standup\n"
+            "- [User: SPT principle](user-spt-principle.md) — user heavily follows \"simplest thing that could work\"\n"
+            "- [Framework reuse vs build principle](framework-reuse-vs-build-principle.md) — can't get the value/don't have it is a weak reason to reject reuse\n"
+            "- [Warmblood talent philosophy](warmblood-talent-philosophy.md) — AUTHORITATIVE 인재상\n"
+            "- [Operating principles doc](operating-principles-doc.md) — team collaboration/decision principles live in warmble-jumble vault\n"
+            "- [Monocle admin panel orphaned](project-monocle-admin-panel-orphaned.md) — Monocle's admin panel screen is unreachable\n")))
+      ;; None of these 6 targets exist anywhere in the store -- exactly the
+      ;; real-fleet condition (confirmed 2026-09-09: all 6 targets absent
+      ;; from the governance store).
+      (with-temp-file index (insert real-hand-authored-lines))
+      (cc-butler-governance-regenerate)
+      (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        (dolist (fragment '("Daily standup process" "User: SPT principle"
+                             "Framework reuse vs build principle"
+                             "Warmblood talent philosophy" "Operating principles doc"
+                             "Monocle admin panel orphaned"))
+          (should (string-match-p (regexp-quote fragment) text)))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Direct unit coverage for the 4 reader functions, against
 ;;;; hand-constructed NEW-format strings (not only via a full
 ;;;; regenerate roundtrip) -- proves each recognizes the current shape
@@ -998,6 +1115,69 @@ hasn't been normalized to the new shape yet."
         (insert (cc-butler-governance--render "a-rule" "current wording" "body" "feedback")))
       (with-temp-file index (insert "- butler-a-rule.md — stale old wording\n"))
       (should (equal (cc-butler-governance--stale-index-entries) '("a-rule"))))))
+
+;;;; ------------------------------------------------------------------
+;;;; The THIRD axis: a slug indexed more than once (2026-09-09 follow-up).
+;;;; Neither store->index nor index->store can ever catch this -- a
+;;;; duplicate satisfies both perfectly.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/duplicate-index-slugs-detects-a-slug-indexed-twice ()
+  (let ((slugs (cc-butler-governance--index-butler-slugs
+                (concat "- butler-a-rule.md — desc one\n"
+                        "- butler-b-rule.md — desc two\n"
+                        "- butler-a-rule.md — desc one again, worded differently\n"))))
+    ;; Direct unit coverage of the counting logic, independent of file I/O.
+    (should (equal slugs '("a-rule" "b-rule" "a-rule")))))
+
+(ert-deftest cc-butler-governance/duplicate-index-slugs-reads-real-memory-md ()
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index
+        (insert "- butler-a-rule.md — desc one\n"
+                "- butler-b-rule.md — desc two\n"
+                "- butler-a-rule.md — desc one, indexed twice\n"))
+      (should (equal (cc-butler-governance--duplicate-index-slugs) '("a-rule"))))))
+
+(ert-deftest cc-butler-governance/duplicate-index-slugs-is-nil-when-clean ()
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index
+        (insert "- butler-a-rule.md — desc one\n" "- butler-b-rule.md — desc two\n"))
+      (should-not (cc-butler-governance--duplicate-index-slugs)))))
+
+(ert-deftest cc-butler-governance/duplicate-index-slugs-detects-cross-format-duplicate ()
+  "The gap this whole PR chain exists to fix: a CURRENT-format line for a
+slug plus a leftover bare-target LEGACY-format line (no `butler-' prefix)
+for the SAME slug -- two different shapes, one duplicated slug.  RED
+against the original, current-format-only `--duplicate-index-slugs' (it
+walks right past the legacy-shaped line and reports zero duplicates,
+since store->index and index->store both report clean too); GREEN once
+the check counts across the union of recognized shapes."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index
+        (insert "- butler-a-rule.md — current-format line\n"
+                "- [a-rule](a-rule.md) — bare-target legacy-format line, same slug\n"))
+      (should (equal (cc-butler-governance--duplicate-index-slugs) '("a-rule"))))))
+
+(ert-deftest cc-butler-governance/duplicate-index-slugs-does-not-double-count-un-normalized-legacy-line ()
+  "`--bare-legacy-index-line-regexp' is a strict textual superset of
+`--legacy-index-line-regexp' (same bracket shape, no backreference
+constraint), so an un-normalized legacy line (real ones exist in the live
+store right now) matches BOTH regexps.  Two legacy-format lines for the
+SAME slug are a genuine duplicate (correctly reported as \"a-rule\"), but
+without the \"butler-\" prefix guard they would ALSO both match
+`--bare-legacy-index-line-regexp' with target \"butler-a-rule\", so the
+report would additionally, wrongly, include a second, nonexistent slug
+literally named \"butler-a-rule\".  Asserts the real slug is reported
+exactly once, with no pollutant entry alongside it."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index
+        (insert "- [a-rule](butler-a-rule.md) — first un-normalized legacy line\n"
+                "- [a-rule](butler-a-rule.md) — same slug, indexed twice\n"))
+      (should (equal (cc-butler-governance--duplicate-index-slugs) '("a-rule"))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Syncing the MEMORY.md index (cc-butler#36 gap b)
@@ -1196,6 +1376,82 @@ so this is report-only, never an auto-edit."
                               (with-temp-buffer
                                 (insert-file-contents (expand-file-name "MEMORY.md" mem))
                                 (buffer-string)))))))
+
+(ert-deftest cc-butler-governance/regenerate-tool-reports-a-slug-indexed-twice ()
+  "RED for this bug: neither `--unindexed-names' nor `--dead-index-slugs'
+can ever catch a slug indexed twice -- the note IS indexed (at least
+once) and every line DOES point at a real note, so both existing checks
+report clean.  Two hand-seeded CURRENT-format lines for the same slug are
+not something `cc-butler-governance-regenerate' itself dedupes (that is
+`--dedupe-bare-target-lines''s job for the third bracket shape only, not
+for two already-canonical lines), so the duplicate must still be sitting
+there when the report runs -- and before this fix, nothing in the report
+text says so."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index
+        (insert "- butler-a-rule.md — d\n" "- butler-a-rule.md — d, indexed a second time\n"))
+      (let ((out (cc-butler-tool-regenerate-governance)))
+        (should (string-match-p "a-rule" out))
+        (should (string-match-p "1 slug(s) indexed more than once\\|indexed more than once" out))))))
+
+(ert-deftest cc-butler-governance/regenerate-tool-reports-zero-duplicates-explicitly ()
+  "Explicit zero, not silence -- matching this file's existing
+store->index/index->store report lines, which always state \"0\" plainly
+rather than omitting the line when there is nothing to report."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
+    (let ((out (cc-butler-tool-regenerate-governance)))
+      (should (string-match-p "0 slug(s) indexed more than once" out)))))
+
+;;;; ------------------------------------------------------------------
+;;;; The banner (2026-09-09 follow-up): generator-owned, real N-of-TOTAL
+;;;; entries-in-budget figures instead of a hand-typed, ever-staler count.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/regenerate-writes-a-banner-with-accurate-counts ()
+  "RED for this bug: before this fix, `cc-butler-governance-regenerate'
+never writes any banner at all -- MEMORY.md's first line is just whatever
+the caller happened to seed (or the first index line, if nothing was
+seeded).  After the fix, every regenerate must prepend a banner whose
+N-of-TOTAL figures are the real, freshly computed ones -- TOTAL equal to
+the number of live store notes actually indexed."
+  (cc-butler-governance-test--with-store
+    (with-temp-file (expand-file-name "a-rule.md" store)
+      (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
+    (with-temp-file (expand-file-name "b-rule.md" store)
+      (insert (cc-butler-governance--render "b-rule" "d" "body" "feedback")))
+    (cc-butler-governance-regenerate)
+    (let ((text (with-temp-buffer
+                  (insert-file-contents (expand-file-name "MEMORY.md" mem))
+                  (buffer-string))))
+      (should (string-match-p "READ THIS FIRST" text))
+      ;; Both tiny test notes trivially fit any real budget -- N and TOTAL
+      ;; must both read 2, not a stale/hardcoded figure.
+      (should (string-match-p "2 of 2 entries" text))
+      (should (string-match-p "^- butler-a-rule\\.md — " text))
+      (should (string-match-p "^- butler-b-rule\\.md — " text)))))
+
+(ert-deftest cc-butler-governance/regenerate-replaces-a-stale-hand-banner ()
+  "A previously hand-typed (or previously generated, now-stale) banner must
+be replaced wholesale on the next regenerate -- never left standing beside
+a fresh one, and never hand-patched in place."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem))
+          (stale-banner "> **READ THIS FIRST — YOU ARE SEEING ~13% OF THIS INDEX.**\n> **73 of 577 entries reach your context.**\n\n"))
+      (with-temp-file (expand-file-name "a-rule.md" store)
+        (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
+      (with-temp-file index
+        (insert stale-banner "- butler-a-rule.md — d\n"))
+      (cc-butler-governance-regenerate)
+      (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        (should-not (string-match-p "73 of 577" text))
+        (should-not (string-match-p "~13%" text))
+        (should (string-match-p "1 of 1 entries" text))
+        (should (string-match-p "^- butler-a-rule\\.md — " text))))))
 
 (provide 'cc-butler-governance-test)
 ;;; cc-butler-governance-test.el ends here
