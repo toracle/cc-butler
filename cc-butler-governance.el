@@ -225,6 +225,23 @@ first — what a caller hitting the cap is told to go merge or delete."
                         (cc-butler--governance-dir-principles (cc-butler-governance-store)))))
     (seq-take (sort sized (lambda (a b) (> (cdr a) (cdr b)))) n)))
 
+(defun cc-butler-governance--oversized-notes ()
+  "Store notes (SLUG . BYTES) whose BODY exceeds
+`cc-butler-governance-max-note-bytes', biggest first.  Bytes are read via
+`cc-butler-governance--body-in-file' — the same body text
+`cc-butler-governance-record' measures at write time — so this reports the
+identical thing the record-time cap enforces, just applied to whatever is
+ALREADY on disk (the direct-Write/Edit path that never goes through
+`cc-butler-governance-record' at all, and so never hits that cap)."
+  (let (sized)
+    (dolist (f (cc-butler--governance-dir-principles (cc-butler-governance-store)))
+      (let* ((slug (file-name-sans-extension (file-name-nondirectory f)))
+             (body (cc-butler-governance--body-in-file f))
+             (bytes (and body (string-bytes body))))
+        (when (and bytes (> bytes cc-butler-governance-max-note-bytes))
+          (push (cons slug bytes) sized))))
+    (sort sized (lambda (a b) (> (cdr a) (cdr b))))))
+
 (defun cc-butler-governance--cap-message (slug)
   "Rejection text for `record_principle' hitting `cc-butler-governance-max-notes'.
 
@@ -1363,6 +1380,42 @@ one source of truth."
       (unless (equal write read)
         (format "write path (%s) != independently-derived read path (%s)" write read)))))
 
+(defun cc-butler-governance--cap-report-line ()
+  "Unconditional one-line report of the store's cap state — count against
+`cc-butler-governance-max-notes', and any note whose body is over
+`cc-butler-governance-max-note-bytes' — independent of whatever else this
+regenerate call finds to fix.
+
+THE GAP THIS CLOSES (2026-09-08): a note edited directly with Write/Edit
+never goes through `cc-butler-governance-record', so it never hits either
+cap — see `cc-butler-tool-regenerate-governance''s own HONEST GAP note.
+`regenerate_governance' was called 4 times the night this was written while
+the store sat at 566/250 notes and one note's body sat at 16.4KB/2KB; every
+call reported plain success, because nothing in this report ever looked at
+the caps again once a note had bypassed them.
+
+Report-only, on purpose: refusing to regenerate because the store is
+over-cap would leave the cache/index stale ON TOP of the store already
+being over, which is strictly worse — this function never blocks anything.
+And it always prints, over-cap or not: a line that only speaks up when
+something is wrong is indistinguishable, from outside, from a check that
+never ran at all — which is exactly the ambiguity 4 straight silent
+successes exploited."
+  (let* ((count (cc-butler-governance--store-note-count))
+         (max cc-butler-governance-max-notes)
+         (oversized (cc-butler-governance--oversized-notes))
+         (n-over (length oversized)))
+    (format "창고 %d / 상한 %d — %s. 2K 초과 노트 %d개%s\n"
+            count max
+            (if (> count max)
+                (format "%.1f배 초과" (/ (float count) max))
+              "이내")
+            n-over
+            (if oversized
+                (format " (최대 %.1fK: %s)"
+                        (/ (cdar oversized) 1024.0) (caar oversized))
+              "."))))
+
 (defun cc-butler-tool-regenerate-governance ()
   "MCP tool: bare-trigger governance regeneration, no arguments.
 
@@ -1409,6 +1462,7 @@ duplicate slugs."
          (stale (cc-butler-governance--stale-index-entries))
          (dup (cc-butler-governance--duplicate-index-slugs)))
     (concat
+     (cc-butler-governance--cap-report-line)
      (format "Regenerated %d principle(s) from the store.\n" n)
      "Checked: store->index (notes missing an index line), index->store (index lines whose principle no longer exists), description drift (index text vs each note's current frontmatter), and duplicate slugs (any slug indexed more than once).\n"
      (if before
