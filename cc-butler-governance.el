@@ -702,7 +702,20 @@ if wanted, is to call `record_principle' again or hand-edit the line."
                                                (cc-butler-governance-store))))
             (when (file-exists-p store-file)
               (let ((current (cc-butler-governance--frontmatter-description store-file)))
-                (when (and current (not (equal current indexed-desc)))
+                ;; Compare like with like.  The index line holds a
+                ;; BYTE-TRUNCATED copy of the description (`--index-line'
+                ;; truncates to `--generated-description-max-bytes'), so
+                ;; comparing it against the store's FULL description marks
+                ;; every note whose description exceeds the cap as drifted
+                ;; forever -- measured 2026-09-10: 569 of 569 notes with a
+                ;; description, i.e. the check's signal was exactly zero and
+                ;; it could never report a real drift.  Truncate the same way
+                ;; before comparing.
+                (when (and current
+                           (not (equal (cc-butler-governance--truncate-bytes
+                                        current
+                                        cc-butler-governance--generated-description-max-bytes)
+                                       indexed-desc)))
                   (push slug stale))))))))
     (nreverse stale)))
 

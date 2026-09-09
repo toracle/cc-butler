@@ -1116,6 +1116,35 @@ hasn't been normalized to the new shape yet."
       (with-temp-file index (insert "- butler-a-rule.md — stale old wording\n"))
       (should (equal (cc-butler-governance--stale-index-entries) '("a-rule"))))))
 
+(ert-deftest cc-butler-governance/a-description-over-the-index-cap-is-not-reported-drifted ()
+  "The index line holds a BYTE-TRUNCATED description, so the store's
+description must be truncated the same way before comparing.  Without
+that, every note whose description exceeds
+`cc-butler-governance--generated-description-max-bytes' reports as drifted
+forever -- measured 2026-09-10 against the live store: 569 of the 569 notes
+carrying a description, i.e. the check could never report a real drift and
+its signal was exactly zero."
+  (cc-butler-governance-test--with-store
+    (let* ((index (expand-file-name "MEMORY.md" mem))
+           (desc "a description comfortably longer than the forty-eight byte index cap")
+           (truncated (cc-butler-governance--truncate-bytes
+                       desc cc-butler-governance--generated-description-max-bytes)))
+      ;; Guard the premise: this test is vacuous if the description fits.
+      (should (> (string-bytes desc)
+                 cc-butler-governance--generated-description-max-bytes))
+      (with-temp-file (expand-file-name "a-rule.md" store)
+        (insert (cc-butler-governance--render "a-rule" desc "body" "feedback")))
+      (with-temp-file index
+        (insert (format "- butler-a-rule.md — %s\n" truncated)))
+      ;; The line holds exactly what the renderer would write: not drifted.
+      (should-not (cc-butler-governance--stale-index-entries))
+      ;; Positive control, in the same test: a genuinely different wording is
+      ;; still reported.  Without this the assertion above would also pass if
+      ;; the check were broken into always returning nil.
+      (with-temp-file index
+        (insert "- butler-a-rule.md — genuinely different wording\n"))
+      (should (equal (cc-butler-governance--stale-index-entries) '("a-rule"))))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; The THIRD axis: a slug indexed more than once (2026-09-09 follow-up).
 ;;;; Neither store->index nor index->store can ever catch this -- a
