@@ -707,21 +707,59 @@ if wanted, is to call `record_principle' again or hand-edit the line."
     (nreverse stale)))
 
 (defun cc-butler-governance--duplicate-index-slugs ()
-  "Slugs (this store's own generated lines only, see
-`cc-butler-governance--index-butler-slugs') that appear more than once in
-`MEMORY.md' -- the THIRD axis, alongside store->index
-\(`--unindexed-names') and index->store (`--dead-index-slugs'), neither of
-which can ever catch this: a duplicated slug satisfies both of those
-perfectly (the note IS indexed, at least once; every index line DOES
-point at a real note), so a real duplication -- exactly the shape
-`--dedupe-bare-target-lines' cleans up for its one known historical
-cause, but any OTHER cause too, e.g. two separately hand-curated current-
-format lines for the same slug -- sits there wasting budget while both
-existing checks report clean.  Read-only, unlike
-`--dedupe-bare-target-lines': there is no single correct way to collapse
-an arbitrary duplicate automatically (which of two hand-curated wordings
-wins?), so this only surfaces the slug for a human or agent to resolve.
-Returns each duplicated slug once, sorted, not once per extra occurrence."
+  "Slugs that appear more than once in `MEMORY.md', counted across the
+UNION of every generated-line shape this file currently recognizes: the
+CURRENT format (`cc-butler-governance--index-line-regexp' /
+`--index-butler-slugs'), the OLD prefixed-bracket format
+\(`--legacy-index-line-regexp'), and the OLDEST bare-target bracket format
+\(`--bare-legacy-index-line-regexp').  This is the THIRD axis, alongside
+store->index (`--unindexed-names') and index->store (`--dead-index-slugs'),
+neither of which can ever catch this: a duplicated slug satisfies both of
+those perfectly (the note IS indexed, at least once; every index line DOES
+point at a real note).
+
+Counting only CURRENT-format lines (`--index-butler-slugs' alone, per its
+own docstring) would miss the real-world case this check exists for: one
+current-format line for a slug PLUS a leftover legacy-shaped line for the
+SAME slug -- two different shapes, one duplicated slug, invisible to a
+same-shape-only scan because it literally cannot see a line in a shape it
+does not look for.  `--dedupe-bare-target-lines' only runs at regenerate
+time, so a `MEMORY.md' that has not been regenerated since carries exactly
+this cross-format duplication right now -- a check that can't see the
+thing it exists to catch is worse than no check.  Widening the COUNTING
+side here is safe (read-only, can only report) even though the ACTING
+side (`--dedupe-bare-target-lines') deliberately stays narrow -- widening
+that would risk rewriting/deleting a hand-authored line in the same
+bracket shape, a risk pure counting never carries.
+
+Slug identity is always the link TARGET, never bracket display text (see
+`--dedupe-bare-target-lines' on why display text is untrustworthy) -- which
+is why group 1 of all three regexps can be used directly with no
+prefix/format massaging: the current format's only group IS the slug;
+`--legacy-index-line-regexp' forces display=target via a `\\1' backreference
+so its group 1 is the slug either way; `--bare-legacy-index-line-regexp's
+group 1 is explicitly documented as the target.  Reuses the existing
+`defconst's and `--index-butler-slugs' rather than re-deriving the
+patterns.
+
+`--bare-legacy-index-line-regexp' is a strict textual superset of
+`--legacy-index-line-regexp' (same `- [DISPLAY](TARGET.md) — ' shape, just
+without the backreference pinning TARGET to \"butler-DISPLAY\"), so an
+un-normalized legacy line matches both -- real ones exist in the live
+store right now.  A bare-legacy match whose captured target still starts
+with \"butler-\" is therefore skipped: it is a `--legacy-index-line-regexp'
+line the pipeline has not normalized yet, not a genuine bare-target line,
+and counting it under that bogus \"butler-<slug>\" key would name a slug
+that exists nowhere.  `--dedupe-bare-target-lines' never needs this guard
+because it always runs AFTER `--normalize-index-format' has already
+rewritten every `--legacy-index-line-regexp' line away; this read-only
+counter has no such ordering guarantee, since the whole point of it is to
+inspect a file that may not have been normalized yet.
+
+Read-only, unlike `--dedupe-bare-target-lines': there is no single correct
+way to collapse an arbitrary duplicate automatically (which wording wins?),
+so this only surfaces the slug for a human or agent to resolve.  Returns
+each duplicated slug once, sorted, not once per extra occurrence."
   (let ((index (cc-butler-governance--memory-index-file)))
     (when (file-readable-p index)
       (let* ((text (with-temp-buffer (insert-file-contents index) (buffer-string)))
@@ -729,6 +767,30 @@ Returns each duplicated slug once, sorted, not once per extra occurrence."
              dups)
         (dolist (slug (cc-butler-governance--index-butler-slugs text))
           (puthash slug (1+ (gethash slug counts 0)) counts))
+        (let ((start 0))
+          (while (string-match cc-butler-governance--legacy-index-line-regexp text start)
+            (let ((slug (match-string 1 text)))
+              (puthash slug (1+ (gethash slug counts 0)) counts))
+            (setq start (match-end 0))))
+        ;; `--bare-legacy-index-line-regexp' is a strict textual superset of
+        ;; `--legacy-index-line-regexp' -- same `- [DISPLAY](TARGET.md) — '
+        ;; shape, just without the backreference pinning TARGET to
+        ;; "butler-DISPLAY".  An un-normalized legacy line (real ones exist
+        ;; in the live store right now) therefore matches BOTH regexps, and
+        ;; without this guard would double-count under a bogus
+        ;; "butler-<slug>" key that names no real store slug -- the two
+        ;; regexes are only mutually exclusive downstream, in
+        ;; `--dedupe-bare-target-lines', because it always runs AFTER
+        ;; `--normalize-index-format' has already rewritten every
+        ;; `--legacy-index-line-regexp' line away; this read-only counter has
+        ;; no such ordering guarantee, since it exists precisely to inspect a
+        ;; file that may not have been normalized yet.
+        (let ((start 0))
+          (while (string-match cc-butler-governance--bare-legacy-index-line-regexp text start)
+            (let ((slug (match-string 1 text)))
+              (unless (string-prefix-p "butler-" slug)
+                (puthash slug (1+ (gethash slug counts 0)) counts)))
+            (setq start (match-end 0))))
         (maphash (lambda (slug n) (when (> n 1) (push slug dups))) counts)
         (sort dups #'string<)))))
 

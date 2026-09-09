@@ -1146,6 +1146,39 @@ hasn't been normalized to the new shape yet."
         (insert "- butler-a-rule.md — desc one\n" "- butler-b-rule.md — desc two\n"))
       (should-not (cc-butler-governance--duplicate-index-slugs)))))
 
+(ert-deftest cc-butler-governance/duplicate-index-slugs-detects-cross-format-duplicate ()
+  "The gap this whole PR chain exists to fix: a CURRENT-format line for a
+slug plus a leftover bare-target LEGACY-format line (no `butler-' prefix)
+for the SAME slug -- two different shapes, one duplicated slug.  RED
+against the original, current-format-only `--duplicate-index-slugs' (it
+walks right past the legacy-shaped line and reports zero duplicates,
+since store->index and index->store both report clean too); GREEN once
+the check counts across the union of recognized shapes."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index
+        (insert "- butler-a-rule.md — current-format line\n"
+                "- [a-rule](a-rule.md) — bare-target legacy-format line, same slug\n"))
+      (should (equal (cc-butler-governance--duplicate-index-slugs) '("a-rule"))))))
+
+(ert-deftest cc-butler-governance/duplicate-index-slugs-does-not-double-count-un-normalized-legacy-line ()
+  "`--bare-legacy-index-line-regexp' is a strict textual superset of
+`--legacy-index-line-regexp' (same bracket shape, no backreference
+constraint), so an un-normalized legacy line (real ones exist in the live
+store right now) matches BOTH regexps.  Two legacy-format lines for the
+SAME slug are a genuine duplicate (correctly reported as \"a-rule\"), but
+without the \"butler-\" prefix guard they would ALSO both match
+`--bare-legacy-index-line-regexp' with target \"butler-a-rule\", so the
+report would additionally, wrongly, include a second, nonexistent slug
+literally named \"butler-a-rule\".  Asserts the real slug is reported
+exactly once, with no pollutant entry alongside it."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index
+        (insert "- [a-rule](butler-a-rule.md) — first un-normalized legacy line\n"
+                "- [a-rule](butler-a-rule.md) — same slug, indexed twice\n"))
+      (should (equal (cc-butler-governance--duplicate-index-slugs) '("a-rule"))))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Syncing the MEMORY.md index (cc-butler#36 gap b)
 ;;;; ------------------------------------------------------------------
