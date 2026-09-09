@@ -737,12 +737,23 @@ exactly the forbidden re-send. And a false \"awaiting reply\" (답변대기)
 is just as bad in the other direction: a real not-sent item hides
 silently in a bucket nobody re-checks.
 
-Of the two, a wrongly-답변대기 file is the harder failure to catch after
-the fact -- nothing else ever re-examines something believed
-answered-and-waiting, whereas an operator noticing an empty backlog or
-a suspiciously-stale 답변대기 item has some chance of catching a false
-미발신. That asymmetry is a reason to get this right, not license to
-bias the regex toward either bucket."
+Over-counting into 미발신 is NOT harmless -- it triggers a re-send, and
+the human pays the cost (reading the same thing twice). So this
+function's goal is not \"lean toward the safe side\" but ACCURACY --
+missing a format variant (like the indentation bug just fixed above)
+is itself a defect, not a tolerable bias.
+
+That said, when a case is genuinely ambiguous, the tie-break still
+falls toward 미발신 -- not because over-counting there is cheap, but
+because the failure mode that follows from it (someone opens the
+file) passes through a checkpoint that already exists in the file's
+own text (the \"재게시 금지\" line above, `:Verified:', and a real
+event id) right before the risky action. The opposite error --
+wrongly landing in 답변대기 -- has NO such checkpoint: nobody re-opens
+a file already believed answered-and-waiting. On 2026-09-09 this
+exact gap produced a real 5-hour blind spot on an unrelated item that
+butler had drafted but never actually sent -- undiscovered until
+someone happened to look at the empty field."
   (with-temp-buffer
     (insert-file-contents file)
     (goto-char (point-min))
