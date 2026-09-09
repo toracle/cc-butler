@@ -717,6 +717,43 @@ filename-narrowed survivors below, never the whole open/ directory."
     (and (re-search-forward "^:Kind: \\([a-z]+\\)" nil t)
          (not (equal (match-string 1) "decision")))))
 
+(defun cc-butler--decision-delivered-to-matrix-p (file)
+  "Non-nil when FILE's body has a `:Delivered-to-matrix:' property, i.e. it
+was actually pushed to 정수님 via Matrix (the property holds the real
+Matrix event id, written only by the deliverer at delivery time -- it
+cannot be faked cheaply, which is what makes this a trustworthy signal
+rather than a self-reported flag).
+
+Absence is read as \"not sent\" (미발신) even though it technically has
+two causes: the common one (genuinely never delivered) and a rarer one
+(delivered, but the property write itself failed/was skipped). Both
+must fold into \"not sent\" -- that is the SAFE direction, since it only
+prompts someone to check/resend a possibly-already-sent item, which is
+harmless. The dangerous direction, which this function must never
+produce, is the reverse: reading a genuinely-unsent file as \"already
+sent, awaiting reply\" -- that would let a real not-sent item hide
+silently in a 답변대기 bucket nobody checks. Do not invert this."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (and (re-search-forward "^:Delivered-to-matrix: " nil t) t)))
+
+(defun cc-butler--decision-file-title (file)
+  "Return FILE's `#+TITLE:' line content, truncated to 40 chars (+ \"…\" if
+longer), or \"제목 없음\" if FILE has none or can't be read. The bare
+FILENAME (a timestamp+id) means nothing to a human reader, so the
+backlog line needs this to name the oldest un-sent item."
+  (or (ignore-errors
+        (with-temp-buffer
+          (insert-file-contents file)
+          (goto-char (point-min))
+          (when (re-search-forward "^#\\+TITLE: \\(.*\\)$" nil t)
+            (let ((title (match-string 1)))
+              (if (> (length title) 40)
+                  (concat (substring title 0 40) "…")
+                title)))))
+      "제목 없음"))
+
 (defun cc-butler--decision-open-files-and-oldest ()
   "Return (FILES . OLDEST-FLOAT-TIME-OR-NIL) for `decision'-kind documents
 in the open/ dir -- the answer-required subset -- one `directory-files'
@@ -772,23 +809,55 @@ decision-proposal-format.md and this PR's body."
 
 (defun cc-butler--decision-open-backlog-line ()
   "One-line, read-only summary of the open/ decision-doc backlog, or nil
-when empty: count plus the oldest item's age, from filenames alone (no
-file content read).  Exists so `cc-butler-tool-pending-decisions' can
-stop asserting \"No pending decisions\" while decisions actually sit
-in open/ -- see that function's docstring for why the two queues can
+when empty.  Exists so `cc-butler-tool-pending-decisions' can stop
+asserting \"No pending decisions\" while decisions actually sit in
+open/ -- see that function's docstring for why the two queues can
 diverge.
 
-This is a queued-duration signal, not a read/answered one: it cannot
-tell a decision nobody has seen from one already answered elsewhere
-and never moved to done/, or from a status report that never needed
-an answer at all -- a manual sample of this backlog on 2026-08-13
-found all three shapes mixed together. Treat it as \"worth a look\",
-not as ground truth about what's actually pending."
-  (pcase-let ((`(,files . ,oldest) (cc-butler--decision-open-files-and-oldest)))
+A bare count can't create action -- it reads the same whether the
+human's turn or ours is the one holding things up.  So this splits the
+already-filtered `files' list into exactly two buckets by whether each
+file's body carries a `:Delivered-to-matrix:' property (see
+`cc-butler--decision-delivered-to-matrix-p' for the fail-direction
+reasoning): 미발신 (never actually sent -- our turn) vs 답변대기
+(sent, awaiting his reply).  There is no third machine-readable bucket
+-- nothing in a file body marks \"needs judgment\" -- so only these two
+exist; do not add one without a real signal to back it.  For 미발신,
+the oldest file's age and title are named, since a bare id is
+meaningless to a human reader (`cc-butler--decision-file-title').
+
+Reading two more properties per file on top of the filename/body-Kind
+check `cc-butler--decision-open-files-and-oldest' already does means
+this is no longer \"from filenames alone (no file content read)\" --
+it reads file content on the small filtered candidate set, same cost
+discipline as that function, never the whole directory.
+
+This is still a queued-duration signal, not ground truth about who has
+actually SEEN a decision: 답변대기 means \"delivered\", not \"read and
+being thought about\" -- see the function's prior docstring note (a
+manual sample on 2026-08-13 found delivered-but-forgotten items too).
+Treat it as \"worth a look\", not gospel."
+  (pcase-let ((`(,files . ,_oldest) (cc-butler--decision-open-files-and-oldest))
+              (dir (cc-butler--decision-open-dir)))
     (when files
-      (format "⚖ %d decision(s) queued in the open/ workflow (not this drain) — oldest %s ago; see decisions/open/ or the mode-line ⚖ indicator"
-              (length files)
-              (if oldest (cc-butler--decision-format-age (- (float-time) oldest)) "?")))))
+      (let* ((not-sent (seq-remove (lambda (f) (cc-butler--decision-delivered-to-matrix-p
+                                            (expand-file-name f dir)))
+                                    files))
+             (awaiting (- (length files) (length not-sent)))
+             (not-sent-oldest
+              (car (sort (copy-sequence not-sent)
+                         (lambda (a b) (< (or (cc-butler--decision-file-time a) 0)
+                                          (or (cc-butler--decision-file-time b) 0))))))
+             (not-sent-clause
+              (if not-sent-oldest
+                  (format " (우리 차례, oldest %s: 「%s」)"
+                          (let ((tm (cc-butler--decision-file-time not-sent-oldest)))
+                            (if tm (cc-butler--decision-format-age (- (float-time) tm)) "?"))
+                          (cc-butler--decision-file-title
+                           (expand-file-name not-sent-oldest dir)))
+                "")))
+        (format "⚖ %d decision(s) queued in the open/ workflow (not this drain) — 미발신 %d%s · 답변대기 %d — see decisions/open/ or the mode-line ⚖ indicator"
+                (length files) (length not-sent) not-sent-clause awaiting)))))
 
 (defun cc-butler--decision-display (file)
   "Show decision FILE in a side window without stealing focus."
