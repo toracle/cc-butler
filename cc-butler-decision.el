@@ -704,6 +704,19 @@ filename is written once, at creation, and never rewritten."
         ((< seconds 86400) (format "%dh" (round (/ seconds 3600))))
         (t (format "%dd" (round (/ seconds 86400))))))
 
+(defun cc-butler--decision-body-kind-demoted-p (file)
+  "Non-nil when FILE's body `:Kind:' property is present and says
+something other than `decision' -- i.e. FILE was demoted after being
+rendered (the property rewritten in place, e.g. by hand) while its
+filename, written once at creation, stayed a plain `ID.org'.  Opens
+FILE, unlike `cc-butler--decision-file-kind'; call this ONLY on the
+filename-narrowed survivors below, never the whole open/ directory."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (and (re-search-forward "^:Kind: \\([a-z]+\\)" nil t)
+         (not (equal (match-string 1) "decision")))))
+
 (defun cc-butler--decision-open-files-and-oldest ()
   "Return (FILES . OLDEST-FLOAT-TIME-OR-NIL) for `decision'-kind documents
 in the open/ dir -- the answer-required subset -- one `directory-files'
@@ -715,12 +728,22 @@ open/ directory (see `cc-butler--decision-render') but needs no answer,
 so counting it here would reproduce, under a new label, the exact
 backlog-inflation this counting feature exists to fix -- see the governance
 note titled escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes.
-Classification reads the FILENAME only (`cc-butler--decision-file-kind'),
-never file content, so this stays cheap even at hundreds of files and on
-every arrival, where `cc-butler--decision-update-indicator' calls it."
-  (let ((files (delq nil (mapcar (lambda (f) (and (eq (cc-butler--decision-file-kind f) 'decision) f))
-                                  (ignore-errors (directory-files (cc-butler--decision-open-dir) nil
-                                                                   cc-butler--decision-org-re))))))
+Classification is two-stage: the FILENAME alone (`cc-butler--decision-file-kind')
+first narrows hundreds of files down to the handful of plain `ID.org'
+candidates -- no file content read, so this stays cheap at any backlog
+size and on every arrival -- and only THOSE survivors get their body
+`:Kind:' property checked (`cc-butler--decision-body-kind-demoted-p'),
+to catch a file demoted in place after rendering (property rewritten,
+filename never renamed to match)."
+  (let* ((dir (cc-butler--decision-open-dir))
+         (files (delq nil (mapcar (lambda (f) (and (eq (cc-butler--decision-file-kind f) 'decision) f))
+                                   (ignore-errors (directory-files dir nil
+                                                                    cc-butler--decision-org-re)))))
+         (files (delq nil (mapcar (lambda (f)
+                                     (unless (cc-butler--decision-body-kind-demoted-p
+                                              (expand-file-name f dir))
+                                       f))
+                                   files))))
     (cons files
           (let ((times (delq nil (mapcar #'cc-butler--decision-file-time files))))
             (and times (apply #'min times))))))
