@@ -383,8 +383,9 @@ back to the bare count -- no crash, no fabricated age."
     (should (null (cc-butler--decision-open-backlog-line)))))
 
 (ert-deftest cc-butler-decision/backlog-line-reports-count-and-oldest-age ()
-  "Given two open/ files of different ages, Then the backlog line reports
-the total count and the OLDEST one's age, not the newest or an average."
+  "Given two 미발신 (never delivered) open/ files of different ages, Then the
+backlog line reports the total count, splits into the 미발신/답변대기
+buckets, and names the OLDER not-sent file's age -- not the newer one's."
   (cc-butler-decision-test--with-arrival
     (let ((older (- (float-time) (* 10 86400)))
           (newer (- (float-time) 3600)))
@@ -397,7 +398,206 @@ the total count and the OLDEST one's age, not the newest or an average."
           (insert "* Decision\nplaceholder\n"))))
     (let ((line (cc-butler--decision-open-backlog-line)))
       (should (string-match-p "\\`⚖ 2 decision(s)" line))
-      (should (string-match-p "oldest 10d ago" line)))))
+      (should (string-match-p "미발신 2" line))
+      (should (string-match-p "oldest 10d" line))
+      (should (string-match-p "답변대기 0" line)))))
+
+;;;; ---- 미발신/답변대기 buckets (:Delivered-to-matrix: signal) --------
+;;;; A bare count reads the same regardless of whose turn it is. These
+;;;; tests exercise the delivered-vs-not-delivered split that fixes that:
+;;;; the deliverer writes a real Matrix event id into `:Delivered-to-matrix:'
+;;;; only when delivery actually happened -- see
+;;;; `cc-butler--decision-delivered-to-matrix-p' for why absence must always
+;;;; read as "not sent", never the reverse.
+
+(defun cc-butler-decision-test--seed-decision (id-suffix &optional delivered title time)
+  "Write a `:Kind: decision' open/ file with optional :Delivered-to-matrix:
+property and #+TITLE:.  TIME (a float-time) controls the id's timestamp,
+default now."
+  (with-temp-file (expand-file-name
+                    (format "%s-991-%s.org"
+                            (format-time-string "%Y%m%dT%H%M%S" (or time (float-time)))
+                            id-suffix)
+                    (cc-butler--decision-open-dir))
+    (insert ":PROPERTIES:\n:Kind: decision\n"
+            (if delivered ":Delivered-to-matrix: $fakeEventId1234567890\n" "")
+            ":END:\n"
+            (if title (format "#+TITLE: %s\n" title) "")
+            "\n* Decision\nplaceholder\n")))
+
+(ert-deftest cc-butler-decision/delivered-to-matrix-lands-in-awaiting-reply ()
+  "A file WITH `:Delivered-to-matrix:' lands in 답변대기, never 미발신."
+  (cc-butler-decision-test--with-arrival
+    (cc-butler-decision-test--seed-decision "delivered" t)
+    (let ((line (cc-butler--decision-open-backlog-line)))
+      (should (string-match-p "미발신 0" line))
+      (should (string-match-p "답변대기 1" line)))))
+
+(ert-deftest cc-butler-decision/delivered-to-matrix-indented-verification-block-lands-in-awaiting-reply ()
+  "Real-shaped fixture, copied verbatim from
+`20260908T134606-991-2593.org' lines 74-79 (a butler-written `* 발신됨'
+heading whose `:Delivered-to-matrix:'/`:Room:'/`:Verified:' lines are
+indented 2 spaces, not at column 0) -- must land in 답변대기, never
+미발신. This is the exact shape steward found two real delivered files
+misread as 미발신 because the old regex only matched column 0."
+  (cc-butler-decision-test--with-arrival
+    (with-temp-file (expand-file-name
+                      (format "%s-991-2593.org"
+                              (format-time-string "%Y%m%dT%H%M%S"))
+                      (cc-butler--decision-open-dir))
+      (insert ":PROPERTIES:\n:Kind: decision\n:END:\n"
+              "#+TITLE: 분류기 자가수정 허가\n\n"
+              "* 발신됨 — butler, 2026-09-09 13:5x\n"
+              "  :Delivered-to-matrix: $9wtDsTbeNvZuXYV_Dni_VwssmWwdZ1vxFGAcDrXa7vU\n"
+              "  :Room: !Xzr8aryxldHJ8XQvps:warmblood-lounge (butlers)\n"
+              "  :Subject: 분류기 자가수정 허가 — 「저희 손으로 고쳐도 됩니까」 한 줄로 좁힘\n"
+              "  :Verified: m.mentions=@jeongsoo [확인] · 방 귀속 /messages [확인] · 최상위 새 스레드 [확인]\n"
+              "  ⚠ 이제 «답 대기»다. 재게시 금지 — 다시 올리면 그분은 같은 것을 두 번 읽으신다.\n"))
+    (let ((line (cc-butler--decision-open-backlog-line)))
+      (should (string-match-p "미발신 0" line))
+      (should (string-match-p "답변대기 1" line)))))
+
+(ert-deftest cc-butler-decision/no-property-lands-in-not-sent ()
+  "A file WITHOUT `:Delivered-to-matrix:' lands in 미발신."
+  (cc-butler-decision-test--with-arrival
+    (cc-butler-decision-test--seed-decision "notsent" nil)
+    (let ((line (cc-butler--decision-open-backlog-line)))
+      (should (string-match-p "미발신 1" line))
+      (should (string-match-p "답변대기 0" line)))))
+
+(ert-deftest cc-butler-decision/note-suffix-excluded-from-both-buckets ()
+  "A `.note.org' filename is excluded from both buckets entirely -- this is
+just `cc-butler--decision-open-files-and-oldest' still doing its existing
+job; the new bucketing must not break it."
+  (cc-butler-decision-test--with-arrival
+    (let ((id (format-time-string "%Y%m%dT%H%M%S-991-anote")))
+      (with-temp-file (expand-file-name (format "%s.note.org" id) (cc-butler--decision-open-dir))
+        (insert ":PROPERTIES:\n:Kind: note\n:END:\n#+TITLE: Note\n\n* Notification\nhi\n")))
+    (should (null (cc-butler--decision-open-backlog-line)))))
+
+(ert-deftest cc-butler-decision/delivered-file-independent-negative-control ()
+  "Independent negative control (a fresh fixture, not reused from the
+no-property test above): a file that verifiably HAS
+`:Delivered-to-matrix:' must NOT be counted in 미발신 -- assert the
+backlog line's 답변대기 count is exactly 1 when only this file exists."
+  (cc-butler-decision-test--with-arrival
+    (cc-butler-decision-test--seed-decision "controlfile" t "독립 대조군")
+    (let ((line (cc-butler--decision-open-backlog-line)))
+      (should (string-match-p "\\`⚖ 1 decision(s)" line))
+      (should (string-match-p "답변대기 1" line))
+      (should-not (string-match-p "미발신 [1-9]" line)))))
+
+(ert-deftest cc-butler-decision/format-mismatch-suspect-flagged-in-backlog-line ()
+  "A file where the strict classifier finds nothing (lands in 미발신) but
+the loose `cc-butler--decision-file-mentions-delivery-p' probe fires --
+the bare phrase \"Delivered-to-matrix\" shows up in prose, not in the
+strict `^[ \t]*:Delivered-to-matrix: ' shape -- gets its own `⚠ 형식
+불일치 의심' clause instead of being silently trusted as 미발신 with no
+signal at all. This is the exact failure shape steward flagged: a
+wrongly-미발신 file with no hand-written checkpoint has nothing else to
+catch it."
+  (cc-butler-decision-test--with-arrival
+    (with-temp-file (expand-file-name
+                      (format "%s-991-mismatch.org" (format-time-string "%Y%m%dT%H%M%S"))
+                      (cc-butler--decision-open-dir))
+      (insert ":PROPERTIES:\n:Kind: decision\n:END:\n"
+              "#+TITLE: 형식 불일치 의심 사례\n\n"
+              "* Decision\n"
+              "⇒ 잡은 방법: 파일의 Delivered-to-matrix 부재 확인 (콜론 없이 본문에만 등장)\n"))
+    (let ((line (cc-butler--decision-open-backlog-line)))
+      (should (string-match-p "미발신 1" line))
+      (should (string-match-p "⚠ 형식 불일치 의심 1건" line)))))
+
+(ert-deftest cc-butler-decision/no-mismatch-warning-when-strict-classifier-already-matched ()
+  "A normally-delivered file (strict AND loose both match) produces NO
+format-mismatch warning -- the clause fires only on strict-absent +
+loose-present, never merely because the loose probe also happens to
+match a genuinely-delivered file."
+  (cc-butler-decision-test--with-arrival
+    (cc-butler-decision-test--seed-decision "normal" t)
+    (let ((line (cc-butler--decision-open-backlog-line)))
+      (should (string-match-p "답변대기 1" line))
+      (should-not (string-match-p "형식 불일치" line)))))
+
+(ert-deftest cc-butler-decision/not-sent-oldest-title-names-older-not-newer ()
+  "Two 미발신 files of different synthetic ages, each with a #+TITLE:.  The
+backlog line's oldest-title clause names the OLDER file's title, not the
+newer one's, and truncates a long title to 40 chars + an ellipsis."
+  (cc-butler-decision-test--with-arrival
+    (let ((older (- (float-time) (* 5 86400)))
+          (newer (- (float-time) 3600))
+          (long-title (make-string 60 ?가)))
+      (cc-butler-decision-test--seed-decision "older" nil long-title older)
+      (cc-butler-decision-test--seed-decision "newer" nil "짧은 제목" newer))
+    (let ((line (cc-butler--decision-open-backlog-line)))
+      (should (string-match-p "미발신 2" line))
+      (should (string-match-p (regexp-quote (concat (make-string 40 ?가) "…")) line))
+      (should-not (string-match-p "짧은 제목" line)))))
+
+(ert-deftest cc-butler-decision/not-sent-oldest-title-falls-back-when-missing ()
+  "A 미발신 file with no #+TITLE: line shows 제목 없음 in the oldest-title
+clause, not an error."
+  (cc-butler-decision-test--with-arrival
+    (cc-butler-decision-test--seed-decision "notitle" nil)
+    (let ((line (cc-butler--decision-open-backlog-line)))
+      (should (string-match-p "미발신 1" line))
+      (should (string-match-p "제목 없음" line)))))
+
+;;;; ---- unit-level tests for the two new file-reading helpers --------
+
+(ert-deftest cc-butler-decision/delivered-to-matrix-p-true-when-present ()
+  (let ((f (make-temp-file "cc-butler-dtm")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Delivered-to-matrix: $abc123\n:END:\n"))
+          (should (cc-butler--decision-delivered-to-matrix-p f)))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivered-to-matrix-p-true-when-indented-in-verification-block ()
+  "Real-shaped fixture, copied verbatim from
+`20260908T134606-991-2593.org' lines 74-79: the property sits 2 spaces
+in, under a `* 발신됨' heading, not at column 0 under `:PROPERTIES:'.
+The old `\"^:Delivered-to-matrix: \"' regex missed this shape entirely."
+  (let ((f (make-temp-file "cc-butler-dtm")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert "* 발신됨 — butler, 2026-09-09 13:5x\n"
+                    "  :Delivered-to-matrix: $9wtDsTbeNvZuXYV_Dni_VwssmWwdZ1vxFGAcDrXa7vU\n"
+                    "  :Room: !Xzr8aryxldHJ8XQvps:warmblood-lounge (butlers)\n"
+                    "  :Subject: 분류기 자가수정 허가 — 「저희 손으로 고쳐도 됩니까」 한 줄로 좁힘\n"
+                    "  :Verified: m.mentions=@jeongsoo [확인] · 방 귀속 /messages [확인] · 최상위 새 스레드 [확인]\n"
+                    "  ⚠ 이제 «답 대기»다. 재게시 금지 — 다시 올리면 그분은 같은 것을 두 번 읽으신다.\n"))
+          (should (cc-butler--decision-delivered-to-matrix-p f)))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivered-to-matrix-p-false-when-absent ()
+  (let ((f (make-temp-file "cc-butler-dtm")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Kind: decision\n:END:\n"))
+          (should-not (cc-butler--decision-delivered-to-matrix-p f)))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/file-title-reads-and-truncates ()
+  (let ((f (make-temp-file "cc-butler-title")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert (format "#+TITLE: %s\n" (make-string 50 ?a))))
+          (should (equal (concat (make-string 40 ?a) "…")
+                         (cc-butler--decision-file-title f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/file-title-fallback-no-title-line ()
+  (let ((f (make-temp-file "cc-butler-title")))
+    (unwind-protect
+        (progn
+          (with-temp-file f (insert "* Decision\nno title here\n"))
+          (should (equal "제목 없음" (cc-butler--decision-file-title f))))
+      (delete-file f))))
 
 ;;;; ---- create-path (escalate :options) + full flow -----------------
 
