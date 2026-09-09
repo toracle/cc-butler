@@ -323,24 +323,82 @@ after it, so a leading blank line no longer matters."
 hand — the one formatter `cc-butler-governance--index-line' (reads
 DESCRIPTION off disk, after the note exists) and the record-time length
 check (has DESCRIPTION in the call already, before anything is written)
-both go through, so the two can never render the line differently."
-  (format "- [%s](butler-%s.md) — %s\n" slug slug description))
+both go through, so the two can never render the line differently.
+
+Format (2026-09-09, steward: only ~74 of ~598 generated lines fit the
+hook's real read budget): `- butler-SLUG.md — DESC', SLUG written ONCE.
+The prior format wrote SLUG twice -- once as markdown link text, once
+inside the link target (`- [SLUG](butler-SLUG.md) — DESC') -- which was
+most of the per-line overhead. `butler-SLUG.md' stays PLAIN TEXT (no
+`[]()' brackets) rather than being dropped altogether: that literal
+substring is the sole marker `--index-has-slug-p',
+`--index-butler-slugs', `--prune-dead-entries' and
+`--stale-index-entries' use to tell a line this store generated (and may
+therefore reformat/prune) from one a human hand-authored in a different
+shape (see the `steward-only-note' fixture in the test file, which
+deliberately has no `butler-' prefix) -- dropping the marker to save a
+few more bytes would make that distinction unrecoverable."
+  (format "- butler-%s.md — %s\n" slug description))
+
+(defconst cc-butler-governance--generated-description-max-bytes 48
+  "Byte cap `cc-butler-governance--index-line' truncates a note's
+frontmatter description to before rendering it into `MEMORY.md'.
+
+Generation-time only -- NEVER applied to
+`cc-butler-governance-max-index-line-bytes' (80), the record-time cap
+`cc-butler-governance-record' checks against the FULL, untruncated
+description and refuses over it (an author-facing gate, not silent
+truncation; see `cc-butler-governance/record-refuses-a-description-over-the-index-line-cap').
+This is the separate silent-truncation step steward asked for so a
+LEGACY note (recorded before that 80-byte cap existed, or simply long)
+still renders a short index line on every `cc-butler-governance-regenerate'
+with no refusal and no manual edit.")
+
+(defun cc-butler-governance--truncate-bytes (s max-bytes)
+  "S truncated to at most MAX-BYTES UTF-8 bytes, byte-safe.
+
+Most descriptions in this store are Korean, where `string-bytes' !=
+`length' (one character is 3 bytes) -- a byte-substring would risk
+cutting a multi-byte character in half. This drops whole CHARACTERS
+\(via `substring', which indexes by character, never by byte) from the
+end, one at a time, until what remains plus the ellipsis both fit,
+so a cut can never land mid-character."
+  (if (<= (string-bytes s) max-bytes)
+      s
+    (let ((out s)
+          (ellipsis-bytes (string-bytes "…")))
+      (while (and (> (length out) 0)
+                  (> (+ (string-bytes out) ellipsis-bytes) max-bytes))
+        (setq out (substring out 0 (1- (length out)))))
+      (concat out "…"))))
 
 (defun cc-butler-governance--index-line (slug)
-  "Render the `MEMORY.md' line for SLUG, using the note's own description."
+  "Render the `MEMORY.md' line for SLUG, using the note's own description,
+truncated to `cc-butler-governance--generated-description-max-bytes'."
   (let* ((note (expand-file-name (concat "butler-" slug ".md")
                                  (cc-butler-governance-memory-store)))
          (desc (or (cc-butler-governance--frontmatter-description note)
                    "(no description in store)")))
-    (cc-butler-governance--render-index-line slug desc)))
+    (cc-butler-governance--render-index-line
+     slug (cc-butler-governance--truncate-bytes
+           desc cc-butler-governance--generated-description-max-bytes))))
 
 (defun cc-butler-governance--index-has-slug-p (index slug)
-  "Non-nil when INDEX (a file that may not exist yet) already links SLUG's note."
+  "Non-nil when INDEX (a file that may not exist yet) already links SLUG's
+note, in either the current plain-text `butler-SLUG.md' shape or the
+older `[SLUG](butler-SLUG.md)' shape a not-yet-normalized legacy line may
+still be in.  Recognizing both here is what keeps `--sync-index' from
+appending a duplicate NEW-format line for a slug whose only line hasn't
+been rewritten yet by `--normalize-index-format' (which
+`cc-butler-governance-regenerate' always runs first, but this function is
+also called standalone, before any regenerate, by `--unindexed-names')."
   (and (file-readable-p index)
        (with-temp-buffer
          (insert-file-contents index)
          (goto-char (point-min))
-         (search-forward (format "(butler-%s.md)" slug) nil t))))
+         (or (search-forward (format "butler-%s.md — " slug) nil t)
+             (progn (goto-char (point-min))
+                    (search-forward (format "(butler-%s.md)" slug) nil t))))))
 
 (defun cc-butler-governance--sync-index (slugs)
   "Add-only merge of SLUGS into `MEMORY.md': append a line for any slug that
@@ -365,14 +423,75 @@ actually appended."
         (write-region (point-min) (point-max) index nil 'quiet)))
     missing))
 
+(defun cc-butler-governance--normalize-index-format ()
+  "Rewrite every OLD-format generated `MEMORY.md' line (see
+`cc-butler-governance--legacy-index-line-regexp') to the CURRENT format,
+for a slug whose store note still exists (`cc-butler-governance-names',
+the same source `--dead-index-slugs' uses).
+
+The single mechanism that actually shrinks a real `MEMORY.md': changing
+`--render-index-line' alone only affects lines written from here on —
+`--sync-index' is deliberately add-only and never touches a line that
+already exists, so the ~566-598 lines already on disk in the old,
+double-slug shape would otherwise sit there forever.
+
+Calls `cc-butler-governance--index-line' per matched slug — the SAME
+formatter `--sync-index' uses for a brand-new line — rather than
+re-implementing description-lookup + truncate + render a second time, so
+there is exactly one place that decides what a slug's rendered line looks
+like.  This also means the description is freshly re-read from the
+note's CURRENT frontmatter (truncated to
+`cc-butler-governance--generated-description-max-bytes'), not preserved
+from whatever text the old line held — the old line is being regenerated,
+not merely reshaped.
+
+A slug with no matching store note (a dangling legacy link) is left
+untouched here — `--prune-dead-entries' recognizes only the current
+format, so such a line will not be auto-pruned either; this is a known,
+narrow gap (see the PR description), not a silent one.
+
+Idempotent: a line already in the current format never matches the legacy
+regexp, so a second call changes nothing.  Never deletes a line — a
+matched legacy line is always replaced by exactly one new-format line for
+the same slug, never removed outright.  Returns the slugs rewritten."
+  (let ((index (cc-butler-governance--memory-index-file))
+        (live (cc-butler-governance-names))
+        (rewritten nil))
+    (when (file-readable-p index)
+      (with-temp-buffer
+        (insert-file-contents index)
+        (goto-char (point-min))
+        (while (re-search-forward cc-butler-governance--legacy-index-line-regexp nil t)
+          ;; Match positions captured explicitly and acted on with
+          ;; goto-char/delete-region/insert rather than `replace-match' --
+          ;; `--index-line' below does its OWN regex search (reading the
+          ;; note's frontmatter, in a different buffer), and Emacs's match
+          ;; data is a single global stack, not per-buffer: computing the
+          ;; new line first and calling `replace-match' after would act on
+          ;; already-clobbered match bounds.
+          (let ((slug (match-string 1))
+                (beg (match-beginning 0))
+                (end (match-end 0)))
+            (when (member slug live)
+              (let ((new-line (cc-butler-governance--index-line slug)))
+                (goto-char beg)
+                (delete-region beg end)
+                (insert new-line)
+                (push slug rewritten)))))
+        (write-region (point-min) (point-max) index nil 'quiet)))
+    (nreverse rewritten)))
+
 ;;;###autoload
 (defun cc-butler-governance-regenerate ()
   "Regenerate the Claude Code memory cache from the neutral store — the store is
 the source of truth; the memory is derived.  Also syncs `MEMORY.md's index
-against it in both directions: merges in any note missing from the index
-(add-only — see `cc-butler-governance--sync-index'), and prunes any index
-line whose principle no longer exists in the store (see
-`cc-butler-governance--prune-dead-entries').  Returns the count of
+against it in three ways: rewrites any OLD-format generated line to the
+current, shorter format (see `cc-butler-governance--normalize-index-format'
+— run FIRST, so `--sync-index' below never mistakes a not-yet-normalized
+legacy line for a genuinely missing one), merges in any note still missing
+an index line afterward (add-only — see `cc-butler-governance--sync-index'),
+and prunes any index line whose principle no longer exists in the store
+(see `cc-butler-governance--prune-dead-entries').  Returns the count of
 principles written."
   (interactive)
   (let ((memory-dir (cc-butler-governance-memory-store)))
@@ -384,21 +503,44 @@ principles written."
                    t)
         (push (file-name-sans-extension (file-name-nondirectory f)) slugs)
         (setq n (1+ n)))
+      (cc-butler-governance--normalize-index-format)
       (cc-butler-governance--sync-index (nreverse slugs))
       (cc-butler-governance--prune-dead-entries)
       (when (called-interactively-p 'interactive)
         (message "cc-butler: regenerated %d principle(s) from the store" n))
       n)))
 
+(defconst cc-butler-governance--index-line-regexp
+  "^- butler-\\([a-z0-9][a-z0-9-]*\\)\\.md — "
+  "The one shape this store's CURRENT generated `MEMORY.md' lines are
+recognized by (2026-09-09 single-slug format): `- butler-SLUG.md — DESC',
+group 1 = SLUG.  Shared by `--index-butler-slugs', `--prune-dead-entries'
+and `--stale-index-entries' (each appends its own tail on top of this
+prefix) so a future format change is made in exactly one place — this
+exact regex used to be duplicated 2-3x with matching risk, the same
+\"same regex, only one copy updated\" shape this repo's CLAUDE.md warns
+about from a real incident (#136/#146).  Anything hand-authored in a
+different shape (no `butler-' marker, or a mismatched slug) never matches
+— deliberately narrow, so nothing here can touch a line this store did
+not itself generate.  See `cc-butler-governance--legacy-index-line-regexp'
+for the OLD (pre-2026-09-09) shape, recognized only by
+`--normalize-index-format'.")
+
+(defconst cc-butler-governance--legacy-index-line-regexp
+  "^- \\[\\([a-z0-9][a-z0-9-]*\\)\\](butler-\\1\\.md) — .*\n?"
+  "The OLD (pre-2026-09-09) shape of a generated `MEMORY.md' line —
+`- [SLUG](butler-SLUG.md) — DESC', SLUG written twice.  Recognized ONLY by
+`--normalize-index-format', the one-time-per-line migration step that
+rewrites each such line (for a slug whose store note still exists) to the
+current shape via `--index-line'.  No other function in this file should
+ever need this regex again once a store's `MEMORY.md' has been through one
+`cc-butler-governance-regenerate' under the new format.")
+
 (defun cc-butler-governance--index-butler-slugs (text)
-  "Slugs of every line in TEXT shaped like this store's own generated entry:
-`- [S](butler-S.md) — ...'.  Anything hand-authored in a different shape
-(a different link target, or a slug that doesn't match on both sides) is
-never returned — this is deliberately narrow, so pruning below can never
-touch a line this store did not itself write."
+  "Slugs of every line in TEXT shaped like this store's own generated entry
+\(current format only — see `cc-butler-governance--index-line-regexp')."
   (let (slugs (start 0))
-    (while (string-match "^- \\[\\([a-z0-9][a-z0-9-]*\\)\\](butler-\\1\\.md) — "
-                         text start)
+    (while (string-match cc-butler-governance--index-line-regexp text start)
       (push (match-string 1 text) slugs)
       (setq start (match-end 0)))
     (nreverse slugs)))
@@ -435,7 +577,7 @@ Returns the removed slugs."
         (insert-file-contents index)
         (goto-char (point-min))
         (while (re-search-forward
-                "^- \\[\\([a-z0-9][a-z0-9-]*\\)\\](butler-\\1\\.md) — .*\n?" nil t)
+                (concat cc-butler-governance--index-line-regexp ".*\n?") nil t)
           (when (member (match-string 1) dead)
             (delete-region (match-beginning 0) (match-end 0))))
         (write-region (point-min) (point-max) index nil 'quiet)))
@@ -459,7 +601,7 @@ if wanted, is to call `record_principle' again or hand-edit the line."
         (insert-file-contents index)
         (goto-char (point-min))
         (while (re-search-forward
-                "^- \\[\\([a-z0-9][a-z0-9-]*\\)\\](butler-\\1\\.md) — \\(.*\\)$" nil t)
+                (concat cc-butler-governance--index-line-regexp "\\(.*\\)$") nil t)
           (let* ((slug (match-string 1))
                  (indexed-desc (match-string 2))
                  (store-file (expand-file-name (concat slug ".md")
