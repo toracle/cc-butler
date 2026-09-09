@@ -722,21 +722,31 @@ filename-narrowed survivors below, never the whole open/ directory."
 was actually pushed to 정수님 via Matrix (the property holds the real
 Matrix event id, written only by the deliverer at delivery time -- it
 cannot be faked cheaply, which is what makes this a trustworthy signal
-rather than a self-reported flag).
+rather than a self-reported flag). The property appears at column 0
+(older files) or indented under a `* 발신됨' heading's
+property/verification block (newer files written by butler after
+delivery) -- the regex below matches either indentation.
 
-Absence is read as \"not sent\" (미발신) even though it technically has
-two causes: the common one (genuinely never delivered) and a rarer one
-(delivered, but the property write itself failed/was skipped). Both
-must fold into \"not sent\" -- that is the SAFE direction, since it only
-prompts someone to check/resend a possibly-already-sent item, which is
-harmless. The dangerous direction, which this function must never
-produce, is the reverse: reading a genuinely-unsent file as \"already
-sent, awaiting reply\" -- that would let a real not-sent item hide
-silently in a 답변대기 bucket nobody checks. Do not invert this."
+This function must be accurate in BOTH directions -- it is not
+acceptable to lean either way. A false \"not sent\" (미발신) does not
+harmlessly prompt a resend-and-check: a genuinely-delivered file
+carries the line \"⚠ 이제 «답 대기»다. 재게시 금지 -- 다시 올리면 그분은
+같은 것을 두 번 읽으신다.\" (now awaiting reply; do NOT re-post -- reposting
+means he reads the same thing twice), so misreading it as 미발신 invites
+exactly the forbidden re-send. And a false \"awaiting reply\" (답변대기)
+is just as bad in the other direction: a real not-sent item hides
+silently in a bucket nobody re-checks.
+
+Of the two, a wrongly-답변대기 file is the harder failure to catch after
+the fact -- nothing else ever re-examines something believed
+answered-and-waiting, whereas an operator noticing an empty backlog or
+a suspiciously-stale 답변대기 item has some chance of catching a false
+미발신. That asymmetry is a reason to get this right, not license to
+bias the regex toward either bucket."
   (with-temp-buffer
     (insert-file-contents file)
     (goto-char (point-min))
-    (and (re-search-forward "^:Delivered-to-matrix: " nil t) t)))
+    (and (re-search-forward "^[ \t]*:Delivered-to-matrix: " nil t) t)))
 
 (defun cc-butler--decision-file-title (file)
   "Return FILE's `#+TITLE:' line content, truncated to 40 chars (+ \"…\" if

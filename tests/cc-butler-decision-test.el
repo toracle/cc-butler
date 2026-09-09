@@ -433,6 +433,30 @@ default now."
       (should (string-match-p "미발신 0" line))
       (should (string-match-p "답변대기 1" line)))))
 
+(ert-deftest cc-butler-decision/delivered-to-matrix-indented-verification-block-lands-in-awaiting-reply ()
+  "Real-shaped fixture, copied verbatim from
+`20260908T134606-991-2593.org' lines 74-79 (a butler-written `* 발신됨'
+heading whose `:Delivered-to-matrix:'/`:Room:'/`:Verified:' lines are
+indented 2 spaces, not at column 0) -- must land in 답변대기, never
+미발신. This is the exact shape steward found two real delivered files
+misread as 미발신 because the old regex only matched column 0."
+  (cc-butler-decision-test--with-arrival
+    (with-temp-file (expand-file-name
+                      (format "%s-991-2593.org"
+                              (format-time-string "%Y%m%dT%H%M%S"))
+                      (cc-butler--decision-open-dir))
+      (insert ":PROPERTIES:\n:Kind: decision\n:END:\n"
+              "#+TITLE: 분류기 자가수정 허가\n\n"
+              "* 발신됨 — butler, 2026-09-09 13:5x\n"
+              "  :Delivered-to-matrix: $9wtDsTbeNvZuXYV_Dni_VwssmWwdZ1vxFGAcDrXa7vU\n"
+              "  :Room: !Xzr8aryxldHJ8XQvps:warmblood-lounge (butlers)\n"
+              "  :Subject: 분류기 자가수정 허가 — 「저희 손으로 고쳐도 됩니까」 한 줄로 좁힘\n"
+              "  :Verified: m.mentions=@jeongsoo [확인] · 방 귀속 /messages [확인] · 최상위 새 스레드 [확인]\n"
+              "  ⚠ 이제 «답 대기»다. 재게시 금지 — 다시 올리면 그분은 같은 것을 두 번 읽으신다.\n"))
+    (let ((line (cc-butler--decision-open-backlog-line)))
+      (should (string-match-p "미발신 0" line))
+      (should (string-match-p "답변대기 1" line)))))
+
 (ert-deftest cc-butler-decision/no-property-lands-in-not-sent ()
   "A file WITHOUT `:Delivered-to-matrix:' lands in 미발신."
   (cc-butler-decision-test--with-arrival
@@ -495,6 +519,24 @@ clause, not an error."
         (progn
           (with-temp-file f
             (insert ":PROPERTIES:\n:Delivered-to-matrix: $abc123\n:END:\n"))
+          (should (cc-butler--decision-delivered-to-matrix-p f)))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivered-to-matrix-p-true-when-indented-in-verification-block ()
+  "Real-shaped fixture, copied verbatim from
+`20260908T134606-991-2593.org' lines 74-79: the property sits 2 spaces
+in, under a `* 발신됨' heading, not at column 0 under `:PROPERTIES:'.
+The old `\"^:Delivered-to-matrix: \"' regex missed this shape entirely."
+  (let ((f (make-temp-file "cc-butler-dtm")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert "* 발신됨 — butler, 2026-09-09 13:5x\n"
+                    "  :Delivered-to-matrix: $9wtDsTbeNvZuXYV_Dni_VwssmWwdZ1vxFGAcDrXa7vU\n"
+                    "  :Room: !Xzr8aryxldHJ8XQvps:warmblood-lounge (butlers)\n"
+                    "  :Subject: 분류기 자가수정 허가 — 「저희 손으로 고쳐도 됩니까」 한 줄로 좁힘\n"
+                    "  :Verified: m.mentions=@jeongsoo [확인] · 방 귀속 /messages [확인] · 최상위 새 스레드 [확인]\n"
+                    "  ⚠ 이제 «답 대기»다. 재게시 금지 — 다시 올리면 그분은 같은 것을 두 번 읽으신다.\n"))
           (should (cc-butler--decision-delivered-to-matrix-p f)))
       (delete-file f))))
 
