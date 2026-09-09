@@ -6,3 +6,7 @@
 # (statusLine command) and live process locks (PID/session-id/timestamp) —
 # never meaningful outside the machine that created them.
 /.claude/
+
+# Git worktrees created under the checkout. Not ignored until 2026-09-10, so a
+# `git add -A` staged them as embedded git repositories (they are real repos).
+/.worktrees/
