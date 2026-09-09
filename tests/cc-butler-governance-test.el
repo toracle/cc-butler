@@ -778,6 +778,228 @@ offending line itself, so the author can shorten it on the spot."
         (should (string-match-p "Shorten the description" msg))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; Single-slug index-line format (2026-09-09, steward: only ~74 of
+;;;; ~598 generated lines fit the hook's real read budget) --
+;;;; `--render-index-line' writes the slug ONCE, plain-text
+;;;; `butler-SLUG.md' kept (no `[]()' brackets) as the ownership marker,
+;;;; plus generation-time description truncation via `--truncate-bytes'.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/render-index-line-writes-the-slug-once ()
+  "The new line shape: `- butler-SLUG.md — DESC', slug written exactly
+once, no markdown link brackets around it."
+  (let ((line (cc-butler-governance--render-index-line "verify-delivery" "Confirm it landed")))
+    (should (equal line "- butler-verify-delivery.md — Confirm it landed\n"))
+    ;; the marker appears exactly once, not twice as the old `[S](butler-S.md)' did
+    (let ((count 0) (start 0))
+      (while (string-match "verify-delivery" line start)
+        (setq count (1+ count) start (match-end 0)))
+      (should (= count 1)))
+    (should-not (string-match-p "\\[" line))))
+
+(ert-deftest cc-butler-governance/truncate-bytes-leaves-a-short-string-alone ()
+  "A description already under the budget is returned unchanged -- no
+ellipsis added, nothing marked."
+  (should (equal (cc-butler-governance--truncate-bytes "short" 48) "short")))
+
+(ert-deftest cc-butler-governance/truncate-bytes-is-byte-exact ()
+  "An over-budget ASCII description is cut with an ellipsis appended, and the
+RESULT (ellipsis included) fits the byte budget exactly -- not the input."
+  (let* ((s (make-string 80 ?x))
+         (out (cc-butler-governance--truncate-bytes s 48)))
+    (should (<= (string-bytes out) 48))
+    (should (string-suffix-p "…" out))
+    (should (string-prefix-p (substring out 0 (1- (length out))) s))))
+
+(ert-deftest cc-butler-governance/truncate-bytes-does-not-corrupt-a-korean-character ()
+  "This store's real descriptions are almost all Korean, where one character
+is 3 UTF-8 bytes -- `string-bytes' != `length'.  A naive byte-substring
+would risk slicing a multi-byte character in half.  Cutting by CHARACTER
+\(never by byte) guarantees the result is always whole characters plus the
+ellipsis, and still fits the budget."
+  (let* ((s (make-string 40 ?정))   ; 40 chars * 3 bytes = 120 bytes, well over 48
+         (out (cc-butler-governance--truncate-bytes s 48)))
+    (should (<= (string-bytes out) 48))
+    (should (string-suffix-p "…" out))
+    (let ((kept (substring out 0 (1- (length out)))))
+      ;; every kept character is a real, unmangled prefix character of S --
+      ;; if a byte-slice had cut mid-character this would not hold, or
+      ;; `kept' would contain a replacement/garbage character instead.
+      (should (string-prefix-p kept s))
+      (dotimes (i (length kept))
+        (should (= (aref kept i) ?정))))))
+
+(ert-deftest cc-butler-governance/generation-time-truncates-a-long-legacy-description ()
+  "`--index-line' (generation-time, reads the note's CURRENT frontmatter off
+disk) truncates to 48 bytes even for a description that predates any
+length cap -- silently, no refusal, since a legacy note authored before
+`cc-butler-governance-max-index-line-bytes' existed must still get a short,
+recallable index line on every regenerate with no manual intervention."
+  (cc-butler-governance-test--with-store
+    (let ((long-desc (make-string 200 ?d)))
+      ;; Bypass record_principle's own refusal so an over-length legacy
+      ;; description can exist in the store at all, the way a genuinely
+      ;; old note (predating the cap) would.
+      (with-temp-file (expand-file-name "legacy.md" store)
+        (insert (cc-butler-governance--render "legacy" long-desc "body" "feedback")))
+      (cc-butler-governance-regenerate)
+      (let* ((index (expand-file-name "MEMORY.md" mem))
+             (text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        (should (string-match "^- butler-legacy\\.md — \\(.*\\)$" text))
+        (should (<= (string-bytes (match-string 1 text)) 48))
+        (should (string-suffix-p "…" (match-string 1 text)))))))
+
+(ert-deftest cc-butler-governance/record-time-cap-still-measures-the-full-untruncated-description ()
+  "REGRESSION GUARD: generation-time truncation
+\(`cc-butler-governance--generated-description-max-bytes', 48) must never
+leak into the record-time index-line-length check
+\(`cc-butler-governance-max-index-line-bytes', an author-facing gate that
+refuses rather than silently truncating).  A description just over 48
+bytes but comfortably under a wide record-time cap must be accepted
+AS-IS -- not silently shortened -- proving the two code paths
+\(`--render-index-line' direct vs `--index-line' off-disk) stay independent."
+  (cc-butler-governance-test--with-store
+    (let* ((desc (make-string 60 ?d))                    ; over the 48B generation truncation
+           (cc-butler-governance-max-index-line-bytes 1000))  ; wide open record-time cap
+      (let ((res (cc-butler-governance-record "x" desc "body")))
+        (should (plist-get res :verified))
+        (let ((text (with-temp-buffer (insert-file-contents (plist-get res :path))
+                                      (buffer-string))))
+          ;; the STORE note (record-time write) keeps the full description,
+          ;; never truncated -- only the GENERATED index line is shortened
+          (should (string-match-p (regexp-quote desc) text)))))))
+
+;;;; ------------------------------------------------------------------
+;;;; Normalizing already-generated legacy (OLD-format) index lines
+;;;; (2026-09-09) -- the missing piece: changing the writer alone only
+;;;; affects brand-new lines; `--sync-index' is add-only and never
+;;;; touches an existing line, so the ~566-598 lines already on disk in
+;;;; the OLD `- [S](butler-S.md) — desc' shape need an explicit rewrite
+;;;; step, run every `cc-butler-governance-regenerate'.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/legacy-line-is-normalized-with-a-fresh-description ()
+  "An OLD-format line for a slug whose store note still exists is rewritten
+to the NEW format, with the description freshly re-read from the note's
+CURRENT frontmatter (and truncated to 48 bytes) -- not the stale text the
+old line held."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem))
+          (legacy "- [a-rule](butler-a-rule.md) — an old, stale wording\n"))
+      (with-temp-file index (insert legacy))
+      (with-temp-file (expand-file-name "a-rule.md" store)
+        (insert (cc-butler-governance--render "a-rule" "current frontmatter wording" "body" "feedback")))
+      (cc-butler-governance-regenerate)
+      (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        (should-not (string-match-p (regexp-quote legacy) text))
+        (should-not (string-match-p "an old, stale wording" text))
+        (should (string-match-p "^- butler-a-rule\\.md — current frontmatter wording$" text))))))
+
+(ert-deftest cc-butler-governance/normalize-leaves-a-dead-legacy-slug-untouched ()
+  "An OLD-format line whose slug no longer has a matching store note is left
+exactly as-is by normalize -- it is neither rewritten (there is nothing
+current to re-read) nor deleted (this step never deletes)."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem))
+          (dangling "- [gone](butler-gone.md) — a principle no longer in the store\n"))
+      (with-temp-file index (insert dangling))
+      (cc-butler-governance--normalize-index-format)
+      (should (string-match-p (regexp-quote dangling)
+                              (with-temp-buffer (insert-file-contents index) (buffer-string)))))))
+
+(ert-deftest cc-butler-governance/normalize-and-sync-together-never-produce-two-lines ()
+  "A slug with a not-yet-normalized OLD-format line must end up with EXACTLY
+ONE line after a full regenerate -- never zero (normalize must not drop
+it), never two (`--sync-index' must not mistake the not-yet-normalized
+line for a missing one and append a second, new-format line beside it)."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index
+        (insert "- [a-rule](butler-a-rule.md) — old wording\n"))
+      (with-temp-file (expand-file-name "a-rule.md" store)
+        (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
+      (cc-butler-governance-regenerate)
+      (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string)))
+            (count 0) (start 0))
+        (while (string-match "butler-a-rule\\.md" text start)
+          (setq count (1+ count) start (match-end 0)))
+        (should (= count 1))))))
+
+(ert-deftest cc-butler-governance/normalize-is-idempotent-on-a-mixed-old-new-hand-authored-file ()
+  "Running `cc-butler-governance-regenerate' a second time on a file already
+containing an OLD-format line (now normalized), a NEW-format line, and a
+hand-authored line must produce a BYTE-IDENTICAL `MEMORY.md' to the first
+run -- no re-rewriting an already-current line, no re-adding, no drift."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index
+        (insert "- [old-rule](butler-old-rule.md) — stale text\n"
+                "- [steward-only-note](steward-only-note.md) — hand-authored, no matching store file\n"))
+      (with-temp-file (expand-file-name "old-rule.md" store)
+        (insert (cc-butler-governance--render "old-rule" "fresh description" "body" "feedback")))
+      (with-temp-file (expand-file-name "new-rule.md" store)
+        (insert (cc-butler-governance--render "new-rule" "already new" "body" "feedback")))
+      (cc-butler-governance-regenerate)
+      (let ((after-first (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        (cc-butler-governance-regenerate)
+        (let ((after-second (with-temp-buffer (insert-file-contents index) (buffer-string))))
+          (should (equal after-first after-second))
+          ;; and nothing was lost along the way: all three slugs still present
+          (should (string-match-p "old-rule" after-second))
+          (should (string-match-p "new-rule" after-second))
+          (should (string-match-p "steward-only-note" after-second)))))))
+
+;;;; ------------------------------------------------------------------
+;;;; Direct unit coverage for the 4 reader functions, against
+;;;; hand-constructed NEW-format strings (not only via a full
+;;;; regenerate roundtrip) -- proves each recognizes the current shape
+;;;; on its own.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/index-has-slug-p-recognizes-new-format ()
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index (insert "- butler-a-rule.md — some description\n"))
+      (should (cc-butler-governance--index-has-slug-p index "a-rule"))
+      (should-not (cc-butler-governance--index-has-slug-p index "other-rule")))))
+
+(ert-deftest cc-butler-governance/index-has-slug-p-still-recognizes-old-format ()
+  "So `--sync-index' never appends a duplicate for a slug whose only line
+hasn't been normalized to the new shape yet."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index (insert "- [a-rule](butler-a-rule.md) — some description\n"))
+      (should (cc-butler-governance--index-has-slug-p index "a-rule")))))
+
+(ert-deftest cc-butler-governance/index-butler-slugs-reads-new-format-only ()
+  (let ((slugs (cc-butler-governance--index-butler-slugs
+                (concat "- butler-a-rule.md — desc one\n"
+                        "- [old-rule](butler-old-rule.md) — desc two\n"   ; old shape, ignored
+                        "- steward-only-note.md — hand-authored, no marker\n"
+                        "- butler-b-rule.md — desc three\n"))))
+    (should (equal slugs '("a-rule" "b-rule")))))
+
+(ert-deftest cc-butler-governance/prune-dead-entries-recognizes-new-format ()
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file index
+        (insert "- butler-gone.md — a principle no longer in the store\n"
+                "- steward-only-note.md — hand-authored, untouched\n"))
+      ;; No matching store note for "gone" -- store is empty.
+      (cc-butler-governance--prune-dead-entries)
+      (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        (should-not (string-match-p "butler-gone\\.md" text))
+        (should (string-match-p "steward-only-note" text))))))
+
+(ert-deftest cc-butler-governance/stale-index-entries-recognizes-new-format ()
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem)))
+      (with-temp-file (expand-file-name "a-rule.md" store)
+        (insert (cc-butler-governance--render "a-rule" "current wording" "body" "feedback")))
+      (with-temp-file index (insert "- butler-a-rule.md — stale old wording\n"))
+      (should (equal (cc-butler-governance--stale-index-entries) '("a-rule"))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Syncing the MEMORY.md index (cc-butler#36 gap b)
 ;;;; ------------------------------------------------------------------
 
@@ -793,7 +1015,7 @@ pulling the hook text from the note's own frontmatter description."
     (let ((index (expand-file-name "MEMORY.md" mem)))
       (should (file-exists-p index))
       (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
-        (should (string-match-p "\\[verify-delivery\\](butler-verify-delivery\\.md)" text))
+        (should (string-match-p "^- butler-verify-delivery\\.md — " text))
         (should (string-match-p "Confirm it landed" text))))))
 
 (ert-deftest cc-butler-governance/regenerate-index-merge-preserves-hand-written-lines ()
@@ -809,7 +1031,7 @@ overwrite or drop a line it didn't add."
       (cc-butler-governance-regenerate)
       (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
         (should (string-match-p (regexp-quote hand-written) text))
-        (should (string-match-p "\\[a-rule\\](butler-a-rule\\.md)" text))))))
+        (should (string-match-p "^- butler-a-rule\\.md — " text))))))
 
 (ert-deftest cc-butler-governance/regenerate-index-merge-is-idempotent ()
   "Running regenerate twice must not duplicate an already-indexed note's line."
@@ -821,17 +1043,22 @@ overwrite or drop a line it didn't add."
     (let* ((index (expand-file-name "MEMORY.md" mem))
            (text (with-temp-buffer (insert-file-contents index) (buffer-string)))
            (count 0) (start 0))
-      (while (string-match "\\[a-rule\\](butler-a-rule\\.md)" text start)
+      (while (string-match "^- butler-a-rule\\.md — " text start)
         (setq count (1+ count) start (match-end 0)))
       (should (= count 1)))))
 
 (ert-deftest cc-butler-governance/regenerate-does-not-duplicate-an-already-curated-entry ()
   "If a slug already has a hand-curated line (worded differently from the
 frontmatter description), regenerate must not add a second, auto-generated
-line for the same note — that would produce two competing entries for one slug."
+line for the same note — that would produce two competing entries for one
+slug.  The curated line here is already in the CURRENT format on purpose:
+only an OLD-format line is rewritten by `--normalize-index-format' (see
+`cc-butler-governance/legacy-line-is-normalized-with-a-fresh-description'
+for that case) -- a curated line already in the current shape must survive
+completely untouched, wording and all."
   (cc-butler-governance-test--with-store
     (let ((index (expand-file-name "MEMORY.md" mem))
-          (curated "- [a-rule](butler-a-rule.md) — a human's own curated wording, not the frontmatter description\n"))
+          (curated "- butler-a-rule.md — a human's own curated wording, not the frontmatter description\n"))
       (with-temp-file index (insert curated))
       (with-temp-file (expand-file-name "a-rule.md" store)
         (insert (cc-butler-governance--render
@@ -849,7 +1076,7 @@ a placeholder hook instead of crashing the whole regenerate call."
     (cc-butler-governance-regenerate)
     (let* ((index (expand-file-name "MEMORY.md" mem))
            (text (with-temp-buffer (insert-file-contents index) (buffer-string))))
-      (should (string-match-p "\\[raw-rule\\](butler-raw-rule\\.md)" text)))))
+      (should (string-match-p "^- butler-raw-rule\\.md — " text)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Bare-trigger regeneration for direct writes (cc-butler#36 gap a)
@@ -870,7 +1097,7 @@ the cache and the MEMORY.md index, and say so in its report."
       (let ((index-text (with-temp-buffer
                           (insert-file-contents (expand-file-name "MEMORY.md" mem))
                           (buffer-string))))
-        (should (string-match-p "\\[direct-write-rule\\](butler-direct-write-rule\\.md)"
+        (should (string-match-p "^- butler-direct-write-rule\\.md — "
                                 index-text)))
       (should (string-match-p "direct-write-rule" out)))))
 
@@ -908,7 +1135,7 @@ a store principle must be pruned."
       (insert (cc-butler-governance--render "a-rule" "d" "body" "feedback")))
     (cc-butler-governance-regenerate)
     (let ((index (expand-file-name "MEMORY.md" mem)))
-      (should (string-match-p "\\[a-rule\\](butler-a-rule\\.md)"
+      (should (string-match-p "^- butler-a-rule\\.md — "
                               (with-temp-buffer (insert-file-contents index) (buffer-string))))
       ;; Simulate the hand-cleanup: the principle is gone from the store
       ;; and its generated note is gone from memory, but nobody touched
@@ -916,7 +1143,7 @@ a store principle must be pruned."
       (delete-file (expand-file-name "a-rule.md" store))
       (delete-file (expand-file-name "butler-a-rule.md" mem))
       (cc-butler-governance-regenerate)
-      (should-not (string-match-p "\\[a-rule\\](butler-a-rule\\.md)"
+      (should-not (string-match-p "^- butler-a-rule\\.md — "
                                   (with-temp-buffer (insert-file-contents index) (buffer-string)))))))
 
 (ert-deftest cc-butler-governance/prune-never-touches-a-non-generated-line ()
