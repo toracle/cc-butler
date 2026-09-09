@@ -487,6 +487,38 @@ backlog line's 답변대기 count is exactly 1 when only this file exists."
       (should (string-match-p "답변대기 1" line))
       (should-not (string-match-p "미발신 [1-9]" line)))))
 
+(ert-deftest cc-butler-decision/format-mismatch-suspect-flagged-in-backlog-line ()
+  "A file where the strict classifier finds nothing (lands in 미발신) but
+the loose `cc-butler--decision-file-mentions-delivery-p' probe fires --
+the bare phrase \"Delivered-to-matrix\" shows up in prose, not in the
+strict `^[ \t]*:Delivered-to-matrix: ' shape -- gets its own `⚠ 형식
+불일치 의심' clause instead of being silently trusted as 미발신 with no
+signal at all. This is the exact failure shape steward flagged: a
+wrongly-미발신 file with no hand-written checkpoint has nothing else to
+catch it."
+  (cc-butler-decision-test--with-arrival
+    (with-temp-file (expand-file-name
+                      (format "%s-991-mismatch.org" (format-time-string "%Y%m%dT%H%M%S"))
+                      (cc-butler--decision-open-dir))
+      (insert ":PROPERTIES:\n:Kind: decision\n:END:\n"
+              "#+TITLE: 형식 불일치 의심 사례\n\n"
+              "* Decision\n"
+              "⇒ 잡은 방법: 파일의 Delivered-to-matrix 부재 확인 (콜론 없이 본문에만 등장)\n"))
+    (let ((line (cc-butler--decision-open-backlog-line)))
+      (should (string-match-p "미발신 1" line))
+      (should (string-match-p "⚠ 형식 불일치 의심 1건" line)))))
+
+(ert-deftest cc-butler-decision/no-mismatch-warning-when-strict-classifier-already-matched ()
+  "A normally-delivered file (strict AND loose both match) produces NO
+format-mismatch warning -- the clause fires only on strict-absent +
+loose-present, never merely because the loose probe also happens to
+match a genuinely-delivered file."
+  (cc-butler-decision-test--with-arrival
+    (cc-butler-decision-test--seed-decision "normal" t)
+    (let ((line (cc-butler--decision-open-backlog-line)))
+      (should (string-match-p "답변대기 1" line))
+      (should-not (string-match-p "형식 불일치" line)))))
+
 (ert-deftest cc-butler-decision/not-sent-oldest-title-names-older-not-newer ()
   "Two 미발신 files of different synthetic ages, each with a #+TITLE:.  The
 backlog line's oldest-title clause names the OLDER file's title, not the

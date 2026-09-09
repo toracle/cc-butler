@@ -759,6 +759,24 @@ someone happened to look at the empty field."
     (goto-char (point-min))
     (and (re-search-forward "^[ \t]*:Delivered-to-matrix: " nil t) t)))
 
+(defun cc-butler--decision-file-mentions-delivery-p (file)
+  "Non-nil when the bare string \"Delivered-to-matrix\" appears ANYWHERE in
+FILE -- no `^' anchor, no colon, no indentation requirement. Deliberately
+broader than `cc-butler--decision-delivered-to-matrix-p': that function is
+the classifier and must stay precise; this one exists only to catch the
+classifier missing a THIRD physical format nobody anticipated yet, same as
+column-0-only missed the indented `* 발신됨' shape before.
+
+A false positive here (the phrase showing up in prose, e.g. a line
+explaining a past bug) is a FEATURE, not a bug -- it is not itself a
+delivery claim, only a \"worth a human look\" signal. See
+`cc-butler--decision-open-backlog-line' for how a strict-absent/loose-present
+mismatch is surfaced."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (and (search-forward "Delivered-to-matrix" nil t) t)))
+
 (defun cc-butler--decision-file-title (file)
   "Return FILE's `#+TITLE:' line content, truncated to 40 chars (+ \"…\" if
 longer), or \"제목 없음\" if FILE has none or can't be read. The bare
@@ -857,7 +875,19 @@ This is still a queued-duration signal, not ground truth about who has
 actually SEEN a decision: 답변대기 means \"delivered\", not \"read and
 being thought about\" -- see the function's prior docstring note (a
 manual sample on 2026-08-13 found delivered-but-forgotten items too).
-Treat it as \"worth a look\", not gospel."
+Treat it as \"worth a look\", not gospel.
+
+A 미발신 file additionally gets the loose
+`cc-butler--decision-file-mentions-delivery-p' probe. When that fires on
+a file the strict classifier called 미발신, the file is a
+format-mismatch suspect -- delivery text exists somewhere in it, just
+not in the one shape the strict regex reads -- and is called out with
+its own `⚠ 형식 불일치 의심' clause instead of silently trusting the
+classifier, since a wrongly-미발신 file with no such flag would
+otherwise have no checkpoint at all (see
+`cc-butler--decision-delivered-to-matrix-p''s docstring). A suspect
+stays counted inside 미발신's total -- this is additive detail about a
+subset of it, not a third bucket."
   (pcase-let ((`(,files . ,_oldest) (cc-butler--decision-open-files-and-oldest))
               (dir (cc-butler--decision-open-dir)))
     (when files
@@ -865,6 +895,15 @@ Treat it as \"worth a look\", not gospel."
                                             (expand-file-name f dir)))
                                     files))
              (awaiting (- (length files) (length not-sent)))
+             (mismatch-suspects
+              (seq-filter (lambda (f) (cc-butler--decision-file-mentions-delivery-p
+                                   (expand-file-name f dir)))
+                          not-sent))
+             (mismatch-clause
+              (if mismatch-suspects
+                  (format " ⚠ 형식 불일치 의심 %d건 — 파일에 배달 표식 흔적은 있으나 속성으로 안 읽힘"
+                          (length mismatch-suspects))
+                ""))
              (not-sent-oldest
               (car (sort (copy-sequence not-sent)
                          (lambda (a b) (< (or (cc-butler--decision-file-time a) 0)
@@ -877,8 +916,8 @@ Treat it as \"worth a look\", not gospel."
                           (cc-butler--decision-file-title
                            (expand-file-name not-sent-oldest dir)))
                 "")))
-        (format "⚖ %d decision(s) queued in the open/ workflow (not this drain) — 미발신 %d%s · 답변대기 %d — see decisions/open/ or the mode-line ⚖ indicator"
-                (length files) (length not-sent) not-sent-clause awaiting)))))
+        (format "⚖ %d decision(s) queued in the open/ workflow (not this drain) — 미발신 %d%s%s · 답변대기 %d — see decisions/open/ or the mode-line ⚖ indicator"
+                (length files) (length not-sent) not-sent-clause mismatch-clause awaiting)))))
 
 (defun cc-butler--decision-display (file)
   "Show decision FILE in a side window without stealing focus."
