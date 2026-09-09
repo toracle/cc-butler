@@ -481,18 +481,91 @@ the same slug, never removed outright.  Returns the slugs rewritten."
         (write-region (point-min) (point-max) index nil 'quiet)))
     (nreverse rewritten)))
 
+(defun cc-butler-governance--dedupe-bare-target-lines ()
+  "Resolve every THIRD, even OLDER `MEMORY.md' line shape (see
+`cc-butler-governance--bare-legacy-index-line-regexp') -- a bracket link
+whose TARGET carries no `butler-' prefix at all, predating even the
+prefix convention `--legacy-index-line-regexp' already assumes.  Real
+store measured 2026-09-09: 20 such lines, ALL with a TARGET that already
+has a canonical `- butler-TARGET.md — ' line elsewhere in the file --
+true duplicates, not merely un-normalized ones, so unlike
+`--normalize-index-format' this does not always rewrite in place:
+
+  - TARGET already indexed elsewhere (the common real case) -> DELETE
+    this line outright; rewriting it too would leave the slug indexed
+    twice, which is exactly the bug this closes.
+  - TARGET has no canonical line yet, but IS a live store slug -> REWRITE
+    to the canonical form (same renderer `--normalize-index-format'
+    uses), so the slug ends up indexed once, not zero times.
+  - TARGET names no live store note at all -> leave the line completely
+    untouched, the same as a dangling `--legacy-index-line-regexp' match.
+
+The slug identity used throughout is the link TARGET (group 1 of the
+regexp below), never the bracket DISPLAY text -- a real line found
+2026-09-09 has display text truncated relative to its own target
+\(`[steward-externalize-is-survival-insurance]
+(steward-externalize-is-survival-insurance-not-just-compaction-hygiene.md)'\),
+and only the target actually names a real store note.  This also doubles
+as the safety gate against a line this store never generated at all: a
+hand-authored personal-memory entry in the SAME bracket shape (real
+examples found in the same file: `- [Daily standup process]
+(daily-standup-process.md) — ...`) is excluded on TWO independent
+grounds -- its display text fails the lowercase-kebab-slug character
+class the regexp below requires, and even if it somehow matched
+syntactically, its target names nothing in `cc-butler-governance-names',
+so it falls into the untouched branch above, same as any other
+non-store target.
+
+Run AFTER `cc-butler-governance--normalize-index-format' (so an
+un-normalized OLD-format, `butler-'-prefixed line has already become the
+canonical shape and cannot be mistaken here for a duplicate TARGET) and
+BEFORE `--sync-index' (so a slug this rewrites in place is not ALSO
+appended as a second, brand-new line).  Returns a plist :removed
+:rewritten of the TARGET slugs affected."
+  (let* ((index (cc-butler-governance--memory-index-file))
+         (live (cc-butler-governance-names))
+         removed rewritten)
+    (when (file-readable-p index)
+      (with-temp-buffer
+        (insert-file-contents index)
+        (let ((canonical (cc-butler-governance--index-butler-slugs (buffer-string))))
+          (goto-char (point-min))
+          (while (re-search-forward
+                  cc-butler-governance--bare-legacy-index-line-regexp nil t)
+            (let ((target (match-string 1))
+                  (beg (match-beginning 0))
+                  (end (match-end 0)))
+              (cond
+               ((member target canonical)
+                (delete-region beg end)
+                (push target removed))
+               ((member target live)
+                (let ((new-line (cc-butler-governance--index-line target)))
+                  (goto-char beg)
+                  (delete-region beg end)
+                  (insert new-line))
+                (push target canonical)
+                (push target rewritten))
+               (t nil)))))
+        (write-region (point-min) (point-max) index nil 'quiet)))
+    (list :removed (nreverse removed) :rewritten (nreverse rewritten))))
+
 ;;;###autoload
 (defun cc-butler-governance-regenerate ()
   "Regenerate the Claude Code memory cache from the neutral store — the store is
 the source of truth; the memory is derived.  Also syncs `MEMORY.md's index
-against it in three ways: rewrites any OLD-format generated line to the
+against it in four ways: rewrites any OLD-format generated line to the
 current, shorter format (see `cc-butler-governance--normalize-index-format'
 — run FIRST, so `--sync-index' below never mistakes a not-yet-normalized
-legacy line for a genuinely missing one), merges in any note still missing
-an index line afterward (add-only — see `cc-butler-governance--sync-index'),
-and prunes any index line whose principle no longer exists in the store
-(see `cc-butler-governance--prune-dead-entries').  Returns the count of
-principles written."
+legacy line for a genuinely missing one), removes/rewrites any even-OLDER
+bare-target-link duplicate (see
+`cc-butler-governance--dedupe-bare-target-lines' — run SECOND, same
+reason), merges in any note still missing an index line afterward
+(add-only — see `cc-butler-governance--sync-index'), and prunes any index
+line whose principle no longer exists in the store (see
+`cc-butler-governance--prune-dead-entries').  Finally refreshes the
+banner (see `cc-butler-governance--refresh-banner') with the real, current
+entries-in-budget figures.  Returns the count of principles written."
   (interactive)
   (let ((memory-dir (cc-butler-governance-memory-store)))
     (make-directory memory-dir t)
@@ -504,8 +577,10 @@ principles written."
         (push (file-name-sans-extension (file-name-nondirectory f)) slugs)
         (setq n (1+ n)))
       (cc-butler-governance--normalize-index-format)
+      (cc-butler-governance--dedupe-bare-target-lines)
       (cc-butler-governance--sync-index (nreverse slugs))
       (cc-butler-governance--prune-dead-entries)
+      (cc-butler-governance--refresh-banner)
       (when (called-interactively-p 'interactive)
         (message "cc-butler: regenerated %d principle(s) from the store" n))
       n)))
@@ -535,6 +610,25 @@ rewrites each such line (for a slug whose store note still exists) to the
 current shape via `--index-line'.  No other function in this file should
 ever need this regex again once a store's `MEMORY.md' has been through one
 `cc-butler-governance-regenerate' under the new format.")
+
+(defconst cc-butler-governance--bare-legacy-index-line-regexp
+  "^- \\[[a-z0-9][a-z0-9-]*\\](\\([a-z0-9][a-z0-9-]*\\)\\.md) — .*\n?"
+  "A THIRD, even OLDER generated `MEMORY.md' line shape, predating even
+the `butler-' filename-prefix convention `--legacy-index-line-regexp'
+already assumes: `- [DISPLAY](TARGET.md) — DESC' with NO `butler-' prefix
+on the link target at all.  Group 1 is the link TARGET -- deliberately
+NOT the bracket display text, which `--dedupe-bare-target-lines' treats
+as untrustworthy (a real line found 2026-09-09 has display text that is a
+truncated, mismatched copy of its own target).
+
+Recognized ONLY by `--dedupe-bare-target-lines'.  The lowercase-kebab
+character class on BOTH the display and target halves is what keeps this
+from ever matching a genuinely hand-authored personal-memory entry in the
+same bracket shape (real examples in the same file: `- [Daily standup
+process](daily-standup-process.md) — ...` -- capitalized, spaced display
+text fails this class outright); `--dedupe-bare-target-lines' also never
+trusts shape alone; it additionally requires the extracted TARGET to
+appear in the real store's slug list before touching anything.")
 
 (defun cc-butler-governance--index-butler-slugs (text)
   "Slugs of every line in TEXT shaped like this store's own generated entry
@@ -611,6 +705,126 @@ if wanted, is to call `record_principle' again or hand-edit the line."
                 (when (and current (not (equal current indexed-desc)))
                   (push slug stale))))))))
     (nreverse stale)))
+
+(defun cc-butler-governance--duplicate-index-slugs ()
+  "Slugs (this store's own generated lines only, see
+`cc-butler-governance--index-butler-slugs') that appear more than once in
+`MEMORY.md' -- the THIRD axis, alongside store->index
+\(`--unindexed-names') and index->store (`--dead-index-slugs'), neither of
+which can ever catch this: a duplicated slug satisfies both of those
+perfectly (the note IS indexed, at least once; every index line DOES
+point at a real note), so a real duplication -- exactly the shape
+`--dedupe-bare-target-lines' cleans up for its one known historical
+cause, but any OTHER cause too, e.g. two separately hand-curated current-
+format lines for the same slug -- sits there wasting budget while both
+existing checks report clean.  Read-only, unlike
+`--dedupe-bare-target-lines': there is no single correct way to collapse
+an arbitrary duplicate automatically (which of two hand-curated wordings
+wins?), so this only surfaces the slug for a human or agent to resolve.
+Returns each duplicated slug once, sorted, not once per extra occurrence."
+  (let ((index (cc-butler-governance--memory-index-file)))
+    (when (file-readable-p index)
+      (let* ((text (with-temp-buffer (insert-file-contents index) (buffer-string)))
+             (counts (make-hash-table :test 'equal))
+             dups)
+        (dolist (slug (cc-butler-governance--index-butler-slugs text))
+          (puthash slug (1+ (gethash slug counts 0)) counts))
+        (maphash (lambda (slug n) (when (> n 1) (push slug dups))) counts)
+        (sort dups #'string<)))))
+
+;;;; ------------------------------------------------------------------
+;;;; The banner (the first ~N lines of MEMORY.md every session reads first)
+;;;; ------------------------------------------------------------------
+
+(defconst cc-butler-governance--memory-read-budget-bytes 24712
+  "The Claude Code memory-load hook's real cumulative read-in budget for
+`MEMORY.md', in bytes -- measured directly against the hook's own
+behavior (2026-09-09, the same real-store measurement PR #209 relied on
+by hand), NOT derived from anything this file generates.  Treat this as
+an externally observed constant and re-measure it against the hook
+itself if it ever needs updating -- recomputing it from the banner's own
+old text would be exactly the self-referential-budget mistake the
+#207/#209 chain already made once.")
+
+(defun cc-butler-governance--entries-within-budget (text)
+  "How many of TEXT's current-format index lines (see
+`cc-butler-governance--index-line-regexp') are still fully inside
+`cc-butler-governance--memory-read-budget-bytes' cumulative bytes counted
+from the very start of TEXT -- banner included, since the read-in hook
+has no way to skip past it.  The same cumulative-byte-budget technique
+PR #209 used by hand to measure the hook's real behavior, now run by the
+generator itself so a banner claim built from this never goes stale
+between regenerates the way a hand-typed one silently did."
+  (let ((n 0) (bytes 0))
+    (with-temp-buffer
+      (insert text)
+      (goto-char (point-min))
+      (while (not (eobp))
+        (let* ((eol (min (point-max) (1+ (line-end-position))))
+               (line (buffer-substring-no-properties (line-beginning-position) eol)))
+          (setq bytes (+ bytes (string-bytes line)))
+          (when (and (<= bytes cc-butler-governance--memory-read-budget-bytes)
+                     (string-match-p cc-butler-governance--index-line-regexp line))
+            (setq n (1+ n))))
+        (forward-line 1)))
+    n))
+
+(defun cc-butler-governance--strip-banner (text)
+  "TEXT with any leading banner block -- every line at the very start that
+begins with `> ', plus any blank line right after it -- removed.  Applies
+regardless of whether that banner is one `--generate-banner' itself wrote
+on a prior regenerate or a hand-typed one predating this mechanism; either
+way `--refresh-banner' replaces it wholesale, so what mattered was only
+finding where it ends, not what it said."
+  (with-temp-buffer
+    (insert text)
+    (goto-char (point-min))
+    (while (and (not (eobp)) (looking-at-p "^>"))
+      (forward-line 1))
+    (while (and (not (eobp)) (looking-at-p "^$"))
+      (forward-line 1))
+    (buffer-substring-no-properties (point) (point-max))))
+
+(defun cc-butler-governance--generate-banner (n total)
+  "The banner text for `MEMORY.md', stating the real N-of-TOTAL
+entries-in-budget figures.  Fully generator-owned from here on, like a
+single index line: `--refresh-banner' replaces this in full on every
+`cc-butler-governance-regenerate', so a hand edit here survives only
+until the next call -- the same rule already applied to a single index
+line, now applied to this whole block instead of leaving it to drift
+\(the block this replaces stated a fixed \"73 of 577\" that only ever grew
+more wrong; see the PR that closed this gap)."
+  (format
+   "> **READ THIS FIRST — %d of %d entries (%d%%) reach your context; the rest sit below a byte budget and will not fire.**
+> Grep the store directly before concluding \"no principle covers this\": `~/obsidian/warmble-jumble/3-resources/cc-butler-governance/`
+> Recording a new principle does NOT make it fire immediately — new entries append at the bottom, past the cut, until the store is re-triaged.
+
+"
+   n total (round (* 100 (/ (float n) (float (max total 1)))))))
+
+(defun cc-butler-governance--refresh-banner ()
+  "Rewrite `MEMORY.md's leading banner block with the real, current
+N-of-TOTAL entries-in-budget figures (see `cc-butler-governance--generate-banner'),
+replacing whatever banner -- generated or hand-edited -- currently sits
+there.  Run LAST in `cc-butler-governance-regenerate', after every other
+index mutation, so the entries counted are the final ones a session will
+actually see.
+
+The N used here is computed against a banner already carrying its own
+real TOTAL (only N starts as a 0-byte placeholder for the one pass this
+takes to measure) -- close enough that the 1-2 byte difference between a
+placeholder and the real N's digit count could only ever matter if a line
+sits exactly on the budget boundary, the same tolerance PR #209's own
+by-hand measurement already accepted."
+  (let ((index (cc-butler-governance--memory-index-file)))
+    (when (file-readable-p index)
+      (let* ((text (with-temp-buffer (insert-file-contents index) (buffer-string)))
+             (entries (cc-butler-governance--strip-banner text))
+             (total (length (cc-butler-governance--index-butler-slugs entries)))
+             (n (cc-butler-governance--entries-within-budget
+                 (concat (cc-butler-governance--generate-banner 0 total) entries))))
+        (write-region (concat (cc-butler-governance--generate-banner n total) entries)
+                       nil index nil 'quiet)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Recording a principle
@@ -1104,18 +1318,24 @@ entries) and reported \"0 un-indexed\" as if the index were fully verified,
 when a dangling link (index -> store: the principle was deleted) and a
 stale description (content drift after an in-place update) both went
 completely unchecked.  A check that reports itself as more thorough than
-it is is worse than no check — it ends the search.  The report below now
-states plainly what was actually verified, in three directions: store ->
-index, index -> store, and description drift."
+it is is worse than no check — it ends the search.  A FOURTH axis closed
+2026-09-09: store->index and index->store both report clean when a slug
+is indexed TWICE (the note IS indexed, at least once; every line DOES
+point at a real note), so neither ever catches a real duplication —
+`cc-butler-governance--duplicate-index-slugs' is the check that does.
+The report below now states plainly what was actually verified, in four
+directions: store -> index, index -> store, description drift, and
+duplicate slugs."
   (let* ((before (cc-butler-governance--unindexed-names))
          (dead-before (cc-butler-governance--dead-index-slugs))
          (n (cc-butler-governance-regenerate))
          (after (cc-butler-governance--unindexed-names))
          (dead-after (cc-butler-governance--dead-index-slugs))
-         (stale (cc-butler-governance--stale-index-entries)))
+         (stale (cc-butler-governance--stale-index-entries))
+         (dup (cc-butler-governance--duplicate-index-slugs)))
     (concat
      (format "Regenerated %d principle(s) from the store.\n" n)
-     "Checked: store->index (notes missing an index line), index->store (index lines whose principle no longer exists), and description drift (index text vs each note's current frontmatter).\n"
+     "Checked: store->index (notes missing an index line), index->store (index lines whose principle no longer exists), description drift (index text vs each note's current frontmatter), and duplicate slugs (any slug indexed more than once).\n"
      (if before
          (format "Merged %d previously un-indexed note(s) into MEMORY.md: %s\n"
                  (length before) (string-join before ", "))
@@ -1136,6 +1356,10 @@ index, index -> store, and description drift."
          (format "%d indexed description(s) no longer match the store's current wording (left as-is — this may be deliberate curation rather than staleness, so it is reported, not auto-edited; review and re-run record_principle or hand-edit MEMORY.md if it should change): %s\n"
                  (length stale) (string-join stale ", "))
        "Description drift: all indexed descriptions match the store's current wording.\n")
+     (if dup
+         (format "Index self-check: %d slug(s) indexed more than once: %s — store->index and index->store both report clean on a duplicate, so this is the only check that catches it; investigate cc-butler-governance--duplicate-index-slugs.\n"
+                 (length dup) (string-join dup ", "))
+       "Index self-check: 0 slug(s) indexed more than once.\n")
      (let ((drift (cc-butler-governance--memory-dir-drift-detail)))
        (if drift
            (format "MEMORY-DIR MISMATCH: %s — this regenerate wrote somewhere a session may not actually read from; see the governance principle one-path-for-write-and-read.\n" drift)
