@@ -64,19 +64,33 @@ tradeoff steward's measurement showed is worth it.")
     "test_bridge.py")
   "Files exempt from the scan below. Stay short, and every entry needs a
 reason on its own line here -- this is a DELIBERATE allowlist, not a
-convenience: it turns off real-identifier detection for that file.
+convenience: it turns off real-identifier detection for that file. Every
+entry's justification is machine-checked, not just asserted in this comment
+-- see `cc-butler-fixture-hygiene/every-exception-still-contains-a-violation':
+if a file listed here ever goes genuinely clean, that test fails and NAMES
+it, so an exception cannot quietly outlive the reason it was added for.
 
-All five entries are the SAME already-known, already out-of-scope issue:
-the Matrix bridge's own human/fleet identifiers
-(`matrix-bridge-human-user-id', `matrix-bridge-self-user-id', and their
-`warmblood-lounge'-homeserver values) are deliberately hardcoded, in both
-the bridge's production defaults and its own protocol-level tests, because
-the bridge cannot identify \"the human\" or \"itself\" on Matrix without
-them. Fixing THAT is a separate, already-scoped, already-coordinated-with-
-the-butler change (it touches the live human-facing channel, so it cannot
-be done as a side effect of a fixture-hygiene PR). This file's job is to
-catch a NEW leak riding along with something else, not to re-flag a known,
-tracked one every time the suite runs.")
+`matrix-bridge-test.el', `bridge.py', `config.sh', `test_bridge.py': the
+SAME already-known, already out-of-scope issue -- the Matrix bridge's own
+human/fleet identifiers (`warmblood-lounge'-homeserver mxids) are
+deliberately hardcoded in the bridge's protocol-level tests, because those
+tests exist to prove the bridge correctly identifies \"the human\" and
+\"itself\" on Matrix, which cannot be done with a fake id. This file's job
+is to catch a NEW leak riding along with something else, not to re-flag a
+known, tracked one every time the suite runs.
+
+`matrix-bridge.el': narrower than the above, and changed by this same
+commit (2026-09-10) -- `matrix-bridge-human-user-id' and
+`matrix-bridge-self-user-id' no longer default to a real id (both are nil,
+guarded at `matrix-bridge-start'; see those defvars' own docstrings), so
+this file is no longer exempt for its PRODUCTION DEFAULTS. It stays
+exempt only because it carries its own in-file protocol-test self-check,
+`matrix-bridge-self-test' -- the OTHER test surface named in this repo's
+CLAUDE.md (\"there are two test surfaces here\") -- which hardcodes the
+same real mxids as `matrix-bridge-test.el' above, for the identical
+protocol-testing reason. Redacting THAT self-test is the same
+already-scoped, already-coordinated-with-the-butler change referenced
+above, not a side effect of this fix.")
 
 (defconst cc-butler-fixture-hygiene-test--shape-res
   (list (concat "![A-Za-z0-9_-]\\{10,\\}:"
@@ -86,13 +100,32 @@ tracked one every time the suite runs.")
                 (regexp-quote cc-butler-fixture-hygiene-test--homeserver))) ; Matrix mxid
   "Shapes real Matrix identifiers take in THIS fleet specifically -- the
 room-id and mxid shapes require our actual homeserver name (see
-`cc-butler-fixture-hygiene-test--homeserver'); the event-id shape is
-length-bounded to the 40-45 char window real Matrix event ids in this
-fleet actually fall in, not an open-ended \"20 or more\" (an earlier,
-looser version of these shapes was never actually run against real event
-ids to check the bound was tight; steward's own measurement supplied
-40-45). A match is a VIOLATION unless it carries its own \"this is fake\"
-marker -- see `cc-butler-fixture-hygiene-test--safe-match-p'.")
+`cc-butler-fixture-hygiene-test--homeserver').
+
+The event-id shape is length-bounded to a 40-45 char window, measured
+against 800 real event ids on this homeserver (butler-x600 plus two
+`butlers' rooms, the most recent 400 from each): all 800 were exactly 43
+characters, no other length appeared (min = max = 43). Room v4+ event ids
+are `$' followed by a 32-byte SHA-256 digest, unpadded urlsafe-base64
+encoded -- that is a FIXED 43-char width by construction, not a
+coincidence of this sample. 800/800 identical would normally be reason to
+suspect the measuring instrument rather than the thing measured, but here
+the uniformity is exactly what the encoding predicts, so it is not a red
+flag. The sample is one homeserver, though, so the honest claim is
+\"event ids in OUR rooms are 43 chars\", not \"Matrix event ids are 43
+chars\" generally -- widening that claim past what was actually measured
+would just hand the next reader an unearned premise.
+
+The bound stays 40-45, not tightened to the measured {43}: not because
+older room versions need the slack (the homeserver anchor, not the
+length, is what would catch those), but because a future spec change is
+the actual risk, and the two kinds of error this bound trades off are not
+symmetric -- missing a leaked event id defeats the whole point of this
+check, silently and unrecoverably, while one false positive costs a
+single triage and `$' followed by 40-45 base64-ish characters is already
+a rare shape to hit by accident. A match is a VIOLATION unless it carries
+its own \"this is fake\" marker -- see
+`cc-butler-fixture-hygiene-test--safe-match-p'.")
 
 (defun cc-butler-fixture-hygiene-test--safe-match-p (str)
   "Non-nil when STR (an identifier-shaped match) is self-evidently synthetic:
@@ -131,6 +164,21 @@ not a copy of it that can drift."
     (seq-remove (lambda (f) (member (file-name-nondirectory f)
                                      cc-butler-fixture-hygiene-test--file-exceptions))
                 (mapcar #'expand-file-name raw))))
+
+(defun cc-butler-fixture-hygiene-test--exception-files ()
+  "Absolute paths of every file in
+`cc-butler-fixture-hygiene-test--file-exceptions', resolved against `git
+ls-files' the same way `--repo-files' resolves its population -- so a
+renamed, typo'd, or duplicated-basename exception entry shows up as a COUNT
+mismatch (see `cc-butler-fixture-hygiene/every-exception-still-contains-a-
+violation') instead of silently matching zero files and vanishing from both
+scans at once."
+  (let* ((default-directory cc-butler-fixture-hygiene-test--repo-root)
+         (raw (split-string (shell-command-to-string "git ls-files") "\n" t))
+         (abs (mapcar #'expand-file-name raw)))
+    (seq-filter (lambda (f) (member (file-name-nondirectory f)
+                                     cc-butler-fixture-hygiene-test--file-exceptions))
+                abs)))
 
 (defun cc-butler-fixture-hygiene-test--binary-p (file)
   "Non-nil when FILE looks binary (contains a NUL byte in its first 4KB) --
@@ -181,7 +229,17 @@ visible that a narrower check could never have seen. Triage each one:
 redact a genuine leak to a synthetic value, or add a reasoned, anchored
 entry to `cc-butler-fixture-hygiene-test--file-exceptions' /
 `cc-butler-fixture-hygiene-test--safe-match-p' for something legitimate.
-Loosening a shape or widening a marker to make this pass is not triage."
+Loosening a shape or widening a marker to make this pass is not triage.
+
+SCOPE: this check only sees identifier SHAPES -- a room id, event id, or
+mxid matching the patterns above. It does not and cannot see shapeless
+internal prose: the `cc-butler-decision.el:903' leak this docstring
+names above contained no identifier substring at all, so no population
+change here would ever have caught it; only manual redaction did. Do not
+try to close that gap by adding word- or phrase-based detection to this
+file -- that is exactly the self-defeating confession-word gate this
+file's own history (above) already removed once. A prose leak needs a
+human reader, not a wider regex."
   (let ((files (cc-butler-fixture-hygiene-test--repo-files)))
     ;; Sanity guard: if `git ls-files' ever failed or returned nothing (wrong
     ;; cwd, git missing, a shallow/detached checkout), the scan below would
@@ -199,6 +257,36 @@ Loosening a shape or widening a marker to make this pass is not triage."
                           :lines lines)
                     violations)))))
       (should (equal violations nil)))))
+
+(ert-deftest cc-butler-fixture-hygiene/every-exception-still-contains-a-violation ()
+  "Each entry in `cc-butler-fixture-hygiene-test--file-exceptions' turns OFF
+identifier scanning for that file -- so an exception that no longer needs to
+exist (the file was cleaned up, or the identifier redacted some other way)
+would sit there forever as a silent, permanent blind spot with a green light
+next to it: the main scan test cannot ever notice, because it excludes
+exactly these files from its population by design (2026-09-10: this is the
+same shape as `an-upstream-list-walk-is-blind-to-what-is-not-on-the-list' --
+a control that cannot fail is not a control).
+
+Disabling is worse than deleting: deleting a check leaves a visible gap
+someone can notice; disabling it via a stale exception leaves a green light
+nobody looks at twice. So this test inverts the exclusion -- it scans ONLY
+the exception files, with the exact same shape+safe-match-p logic the main
+check uses -- and requires every one of them to still contain at least one
+real violation right now. The moment one goes clean, this fails, NAMING that
+file, and the fix is to remove its entry from the list, not to keep the
+now-unjustified exception around."
+  (let ((files (cc-butler-fixture-hygiene-test--exception-files)))
+    ;; A renamed/typo'd/duplicate-basename entry would otherwise resolve to
+    ;; fewer files than entries and silently vanish from the scan below.
+    (should (equal (length files)
+                   (length cc-butler-fixture-hygiene-test--file-exceptions)))
+    (let (clean)
+      (dolist (file files)
+        (unless (cc-butler-fixture-hygiene-test--violation-lines file)
+          (push (file-relative-name file cc-butler-fixture-hygiene-test--repo-root)
+                clean)))
+      (should (equal clean nil)))))
 
 (provide 'cc-butler-fixture-hygiene-test)
 ;;; cc-butler-fixture-hygiene-test.el ends here
