@@ -603,8 +603,24 @@ this function reports using the PRE-change behavior; only the second
 reload runs the new code. (2026-09-05: PR #162's drift report showed
 nothing on the reload that installed it, then showed the real drift on the
 very next reload — `cc-butler-reload' loaded at that point was still the
-pre-#162 version with no drift check at all.)"
+pre-#162 version with no drift check at all.)
+
+Does NOT refuse on a dirty source checkout — see `cc-butler-tool-reload-code's
+docstring for why (a human at the keyboard routinely reloads their own
+uncommitted work on purpose, and that must not be blocked).  But an
+unattended, non-interactive call to THIS function reaching a dirty checkout
+\(e.g. via an eval channel like `mcp__ide__executeCode') is exactly the case
+that guard exists to catch and cannot, so it is logged via `cc-butler--log'
+instead: the porcelain status, and this call's `called-interactively-p'
+result as a diagnostic breadcrumb (not a security signal — see PR #220 on
+why that predicate must never decide who an actor is; here it only records
+how this particular call arrived, for a human to weigh later)."
   (interactive)
+  (let* ((dir (cc-butler-source-dir))
+         (dirty (cc-butler--checkout-dirty-p dir)))
+    (when dirty
+      (cc-butler--log "cc-butler-reload: reloading a dirty checkout at %s — called-interactively-p: %s (breadcrumb only, not a gate):\n%s"
+                       dir (called-interactively-p 'interactive) dirty)))
   (let ((self (expand-file-name "cc-butler.el" (cc-butler-source-dir))))
     (when (file-exists-p self) (load self nil t)))
   ;; Re-read the source directory AFTER the self-load: that load is what makes
@@ -834,9 +850,20 @@ that function is also called by `M-x cc-butler-reload' and by
 `cc-butler-use-checkout'/`cc-butler-use-installed' — a human already at the
 keyboard, routinely testing their own uncommitted local changes on
 purpose.  Blocking that legitimate interactive workflow the same way as an
-agent-driven MCP call would be the wrong call; the risk this guards
-against — an agent silently hot-loading unreviewed code with no human in
-the loop — exists only at the MCP boundary."
+agent-driven MCP call would be the wrong call.
+
+That does NOT mean the risk this guards against — an agent silently
+hot-loading unreviewed code with no human in the loop — exists only at the
+MCP boundary.  A direct, non-interactive Elisp call to `cc-butler-reload'
+\(e.g. via an eval channel like `mcp__ide__executeCode', or any other
+future direct-call path\) is a plain function call, indistinguishable, from
+`cc-butler-reload's own perspective, from `M-x cc-butler-reload' typed by a
+human — and it is NOT blocked by this guard.  That gap is real; it is
+currently closed only by policy/operator discipline (a standing instruction
+not to route unreviewed code around this guard that way), not by any
+mechanism here.  `cc-butler-reload' now logs when it reloads a dirty
+checkout (see its docstring) so a call of that shape at least leaves a
+trace after the fact — but nothing refuses it."
   (let* ((dir (cc-butler-source-dir))
          (dirty (cc-butler--checkout-dirty-p dir)))
     (if (and dirty (not allow-dirty))

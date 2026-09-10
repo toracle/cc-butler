@@ -37,6 +37,39 @@ the thing callers most often get wrong."
       (should (equal (plist-get res :count) (length cc-butler--modules)))
       (should (equal (plist-get res :dir) cc-butler--dir)))))
 
+(ert-deftest cc-butler-reload/logs-when-source-checkout-is-dirty ()
+  "REGRESSION GUARD: `cc-butler-tool-reload-code's dirty-checkout refusal
+guards only the MCP call path (see its docstring). A direct, non-interactive
+Elisp call to `cc-butler-reload' itself — e.g. via an eval channel like
+`mcp__ide__executeCode' — reaches a dirty checkout completely ungated and,
+before this fix, left zero trace. `cc-butler-reload' must log that case via
+`cc-butler--log', porcelain status included, so it is at least visible
+after the fact."
+  (let (logged)
+    (cl-letf (((symbol-function 'load) (lambda (&rest _) t))
+              ((symbol-function 'cc-butler--stale-elc) (lambda () nil))
+              ((symbol-function 'cc-butler-source-dir) (lambda () "/x/"))
+              ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) " M cc-butler.el"))
+              ((symbol-function 'cc-butler--log)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) logged))))
+      (cc-butler-reload))
+    (should logged)
+    (should (string-match-p "cc-butler.el" (car logged)))
+    (should (string-match-p "/x/" (car logged)))))
+
+(ert-deftest cc-butler-reload/does-not-log-when-checkout-is-clean ()
+  "Protects against an overly broad log call: the ordinary clean-checkout
+case must not spam the log."
+  (let (logged)
+    (cl-letf (((symbol-function 'load) (lambda (&rest _) t))
+              ((symbol-function 'cc-butler--stale-elc) (lambda () nil))
+              ((symbol-function 'cc-butler-source-dir) (lambda () "/x/"))
+              ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil))
+              ((symbol-function 'cc-butler--log)
+               (lambda (&rest _) (push t logged))))
+      (cc-butler-reload))
+    (should-not logged)))
+
 (ert-deftest cc-butler-reload/detects-stale-byte-code ()
   "A .elc newer-than-source wins on the next Emacs start and silently undoes
 the reload, so it has to be surfaced rather than discovered later."
