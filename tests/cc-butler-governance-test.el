@@ -948,6 +948,98 @@ error, and `--index-line' must still return normally rather than hang."
         (should-not (string-match-p "perfectly ordinary description" line))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; The ellipsis floor (2026-09-10): a description budget SMALLER than the
+;;;; ellipsis's own byte size (3) still let `--truncate-bytes' emit a lone
+;;;; \"…\" -- itself over the requested budget -- and `--render-index-line'
+;;;; then kept the ` — ' separator even with nothing after it.  Real slug
+;;;; `another-sessions-committed-docs-are-a-corpus-nobody-searches' is one
+;;;; of 20 real store slugs whose budget is 1 or 2 bytes, confirmed below.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/truncate-bytes-floor-is-empty-not-an-over-budget-ellipsis ()
+  "MAX-BYTES below the ellipsis's own 3-byte size has no truncation that
+actually fits -- the old code stripped S to nothing and still appended
+the ellipsis, returning a 3-byte string that is ITSELF over budget.
+Must now return the empty string instead."
+  (let ((slug "another-sessions-committed-docs-are-a-corpus-nobody-searches"))
+    ;; Guard the premise against this worktree's actual code: this real
+    ;; slug's budget really is 1 or 2 bytes, both below the ellipsis's own
+    ;; `string-bytes' (3).
+    (let ((budget (cc-butler-governance--description-budget-bytes slug)))
+      (should (member budget '(1 2)))
+      (should (equal (cc-butler-governance--truncate-bytes
+                       "a genuinely long description text, irrelevant content" budget)
+                     "")))))
+
+(ert-deftest cc-butler-governance/index-line-drops-separator-when-description-is-empty ()
+  "A slug whose budget floors the description to empty must render WITHOUT
+the ` — ' separator -- `- butler-SLUG.md\\n', not a dangling
+`- butler-SLUG.md — \\n' with nothing after it -- and the whole line must
+fit the 80-byte cap."
+  (cc-butler-governance-test--with-store
+    (let ((slug "another-sessions-committed-docs-are-a-corpus-nobody-searches"))
+      (with-temp-file (expand-file-name (concat "butler-" slug ".md") mem)
+        (insert (cc-butler-governance--render
+                 slug "a genuinely long description text, irrelevant content" "body" "feedback")))
+      (let ((line (cc-butler-governance--index-line slug)))
+        (should (<= (string-bytes line) cc-butler-governance-max-index-line-bytes))
+        (should-not (string-match-p " — " line))
+        (should (equal line (format "- butler-%s.md\n" slug)))))))
+
+(ert-deftest cc-butler-governance/index-has-slug-p-recognizes-a-bare-no-description-line ()
+  "The exact regression risk named in the fix: a slug whose only `MEMORY.md'
+line is already in the new bare (no-separator) shape must still be
+recognized as indexed, or `--sync-index' would append a duplicate line
+for it on every regenerate."
+  (cc-butler-governance-test--with-store
+    (let* ((slug "another-sessions-committed-docs-are-a-corpus-nobody-searches")
+           (index (expand-file-name "MEMORY.md" mem))
+           (bare-line (format "- butler-%s.md\n" slug)))
+      (with-temp-file index (insert bare-line))
+      (should (cc-butler-governance--index-has-slug-p index slug))
+      ;; End-to-end: regenerate must not duplicate it.
+      (with-temp-file (expand-file-name (concat slug ".md") store)
+        (insert (cc-butler-governance--render
+                 slug "a genuinely long description text, irrelevant content" "body" "feedback")))
+      (cc-butler-governance-regenerate)
+      (let* ((text (with-temp-buffer (insert-file-contents index) (buffer-string)))
+             (count 0) (start 0))
+        (while (string-match (regexp-quote (format "butler-%s.md" slug)) text start)
+          (setq count (1+ count) start (match-end 0)))
+        (should (= count 1))))))
+
+(ert-deftest cc-butler-governance/regenerate-repairs-an-old-over-budget-ellipsis-line-to-bare-form ()
+  "Full round trip on the exact real-world bug state: `MEMORY.md' holds the
+OLD buggy line this store actually wrote for a tiny-budget slug -- a lone,
+over-budget `…' after the separator (81-82 bytes against the 80-byte
+cap). After `cc-butler-governance-regenerate', that slug's line must be
+the bare, <=80-byte, separator-free form."
+  (cc-butler-governance-test--with-store
+    (let* ((slug "another-sessions-committed-docs-are-a-corpus-nobody-searches")
+           (index (expand-file-name "MEMORY.md" mem))
+           (old-buggy-line (cc-butler-governance--render-index-line slug "…")))
+      ;; Guard the premise: this really is the over-budget shape the
+      ;; pre-fix code actually wrote for these 20 real slugs.
+      (should (> (string-bytes old-buggy-line) cc-butler-governance-max-index-line-bytes))
+      (with-temp-file index (insert old-buggy-line))
+      (with-temp-file (expand-file-name (concat slug ".md") store)
+        (insert (cc-butler-governance--render
+                 slug "a genuinely long description text, irrelevant content" "body" "feedback")))
+      (cc-butler-governance-regenerate)
+      (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        (should-not (string-search old-buggy-line text))
+        (should-not (string-match-p (concat "butler-" (regexp-quote slug) "\\.md — ") text))
+        (with-temp-buffer
+          (insert text)
+          (goto-char (point-min))
+          (should (re-search-forward
+                   (concat "^- butler-" (regexp-quote slug) "\\.md$") nil t))
+          (let* ((beg (match-beginning 0))
+                 (end (min (point-max) (1+ (line-end-position))))
+                 (full-line (buffer-substring-no-properties beg end)))
+            (should (<= (string-bytes full-line) cc-butler-governance-max-index-line-bytes))))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Normalizing already-generated legacy (OLD-format) index lines
 ;;;; (2026-09-09) -- the missing piece: changing the writer alone only
 ;;;; affects brand-new lines; `--sync-index' is add-only and never

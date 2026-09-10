@@ -354,8 +354,19 @@ substring is the sole marker `--index-has-slug-p',
 therefore reformat/prune) from one a human hand-authored in a different
 shape (see the `steward-only-note' fixture in the test file, which
 deliberately has no `butler-' prefix) -- dropping the marker to save a
-few more bytes would make that distinction unrecoverable."
-  (format "- butler-%s.md — %s\n" slug description))
+few more bytes would make that distinction unrecoverable.
+
+DESCRIPTION may come back empty (`\"\"') from `--truncate-bytes' when a
+slug's own boilerplate leaves less than 3 bytes of budget -- see that
+function's docstring. In that case the separator is dropped too:
+`- butler-SLUG.md\\n', never a dangling `- butler-SLUG.md — \\n' with
+nothing after it. The invariant every reader of this shape (
+`--index-line-regexp', `--index-has-slug-p', and everything built on
+either) now honours: the ` — ' separator is present if and only if a
+description follows it, never on its own."
+  (if (equal description "")
+      (format "- butler-%s.md\n" slug)
+    (format "- butler-%s.md — %s\n" slug description)))
 
 (defconst cc-butler-governance--generated-description-max-bytes 48
   "Byte cap `cc-butler-governance--index-line' truncates a note's
@@ -379,15 +390,29 @@ Most descriptions in this store are Korean, where `string-bytes' !=
 cutting a multi-byte character in half. This drops whole CHARACTERS
 \(via `substring', which indexes by character, never by byte) from the
 end, one at a time, until what remains plus the ellipsis both fit,
-so a cut can never land mid-character."
-  (if (<= (string-bytes s) max-bytes)
-      s
-    (let ((out s)
-          (ellipsis-bytes (string-bytes "…")))
-      (while (and (> (length out) 0)
-                  (> (+ (string-bytes out) ellipsis-bytes) max-bytes))
-        (setq out (substring out 0 (1- (length out)))))
-      (concat out "…"))))
+so a cut can never land mid-character.
+
+MAX-BYTES below the ellipsis's own `string-bytes' (3 -- \"…\" is itself a
+multi-byte character) has no truncation that actually fits: the loop
+below would strip S all the way to the empty string and still append
+the ellipsis, handing back a 3-byte result that is ITSELF over
+MAX-BYTES. Confirmed on the live store: exactly 20 real slugs whose
+`cc-butler-governance--description-budget-bytes' computes to 1 or 2
+hit this and rendered a lone `…' that overflowed the 80-byte index-line
+cap by 1-2 bytes. Return the empty string instead in that case -- an
+honest empty description beats an over-budget ellipsis (see
+`cc-butler-governance--render-index-line', which drops the ` — '
+separator too when DESCRIPTION comes back empty)."
+  (if (< max-bytes (string-bytes "…"))
+      ""
+    (if (<= (string-bytes s) max-bytes)
+        s
+      (let ((out s)
+            (ellipsis-bytes (string-bytes "…")))
+        (while (and (> (length out) 0)
+                    (> (+ (string-bytes out) ellipsis-bytes) max-bytes))
+          (setq out (substring out 0 (1- (length out)))))
+        (concat out "…")))))
 
 (defun cc-butler-governance--description-budget-bytes (slug)
   "Bytes available for SLUG's index-line description before the line
@@ -427,18 +452,24 @@ slug length, which is what let real lines run 108-124 bytes against an
 
 (defun cc-butler-governance--index-has-slug-p (index slug)
   "Non-nil when INDEX (a file that may not exist yet) already links SLUG's
-note, in either the current plain-text `butler-SLUG.md' shape or the
+note, in the current plain-text `butler-SLUG.md' shape (with OR without a
+description -- see `cc-butler-governance--render-index-line') or the
 older `[SLUG](butler-SLUG.md)' shape a not-yet-normalized legacy line may
-still be in.  Recognizing both here is what keeps `--sync-index' from
-appending a duplicate NEW-format line for a slug whose only line hasn't
-been rewritten yet by `--normalize-index-format' (which
+still be in.  Recognizing all of these here is what keeps `--sync-index'
+from appending a duplicate NEW-format line for a slug whose only line
+hasn't been rewritten yet by `--normalize-index-format' (which
 `cc-butler-governance-regenerate' always runs first, but this function is
-also called standalone, before any regenerate, by `--unindexed-names')."
+also called standalone, before any regenerate, by `--unindexed-names'),
+or -- the 2026-09-10 addition -- whose only line is already in the bare,
+description-less shape."
   (and (file-readable-p index)
        (with-temp-buffer
          (insert-file-contents index)
          (goto-char (point-min))
          (or (search-forward (format "butler-%s.md — " slug) nil t)
+             (progn (goto-char (point-min))
+                    (re-search-forward
+                     (format "butler-%s\\.md$" (regexp-quote slug)) nil t))
              (progn (goto-char (point-min))
                     (search-forward (format "(butler-%s.md)" slug) nil t))))))
 
@@ -544,21 +575,37 @@ what a fresh line for that slug would look like.
 Only ever rewrites a line it can PROVE is stale mechanical output, never
 one that shows any sign of independent hand-authored wording -- the same
 caution `--sync-index' and `--normalize-index-format' already take about
-never clobbering a human's own text.  \"Provably mechanical\" here means:
-the on-disk description, re-truncated to the OLD flat
-`cc-butler-governance--generated-description-max-bytes' (48) budget,
-byte-for-byte matches what `cc-butler-governance--truncate-bytes' would
-produce from the note's CURRENT frontmatter description at that SAME old
-48-byte budget -- the identical comparison
-`cc-butler-governance--stale-index-entries' already uses to tell drifted
-or curated text apart from text that is still exactly what the old
-generator would write.  A match means nothing about this line has
-diverged from mechanical generation since the old flat-budget formatter
-last wrote it, so it is safe to re-render at the correct slug-aware
-budget.  A mismatch -- on-disk text the old generator would not have
-produced from the current description -- is left COMPLETELY untouched,
-oversized or not: it may be a line a human curated with different
-wording on purpose (see
+never clobbering a human's own text.  \"Provably mechanical\" here means
+EITHER of two independent fingerprints:
+
+  - the on-disk description, re-truncated to the OLD flat
+    `cc-butler-governance--generated-description-max-bytes' (48) budget,
+    byte-for-byte matches what `cc-butler-governance--truncate-bytes'
+    would produce from the note's CURRENT frontmatter description at
+    that SAME old 48-byte budget -- the identical comparison
+    `cc-butler-governance--stale-index-entries' already uses to tell
+    drifted or curated text apart from text that is still exactly what
+    the old generator would write; or
+  - (2026-09-10, the ellipsis-floor fix) the on-disk description is the
+    bare ellipsis `\"…\"' AND this slug's
+    `cc-butler-governance--description-budget-bytes' is below the
+    ellipsis's own byte size (3) -- CONTENT-INDEPENDENT proof: the
+    pre-fix `--truncate-bytes' deterministically produced exactly `\"…\"'
+    at any such budget, regardless of what the description actually
+    said, so a lone on-disk `\"…\"' at a sub-3-byte budget could only
+    ever be that bug's output, never a human's.  (The first fingerprint
+    above cannot recognize this case on its own: it compares against the
+    48-byte budget, not the slug-aware one, and no real description
+    truncates to a bare `\"…\"' at 48 bytes.)
+
+A match on either means nothing about this line has diverged from
+mechanical generation, so it is safe to re-render at the correct
+slug-aware budget (which, for the second fingerprint, now correctly
+renders the bare no-separator shape -- see
+`cc-butler-governance--render-index-line').  A mismatch on BOTH -- on-disk
+text neither generator would have produced from the current description
+-- is left COMPLETELY untouched, oversized or not: it may be a line a
+human curated with different wording on purpose (see
 `cc-butler-governance/regenerate-does-not-duplicate-an-already-curated-entry'),
 and this function has no way to tell that apart from real drift, so
 neither is safe to overwrite here.  A note whose current description is
@@ -596,18 +643,38 @@ slugs rewritten."
             (if (and (member slug live)
                      (> (string-bytes (buffer-substring-no-properties beg end))
                         cc-butler-governance-max-index-line-bytes)
-                     ;; Same comparison `--stale-index-entries' uses (just
-                     ;; the positive sense of it): on-disk text must equal
-                     ;; the OLD 48-byte-budget rendering of the note's
-                     ;; CURRENT description, or this is curated/drifted
-                     ;; text, not mechanical output, and must be left alone.
-                     (let* ((note (expand-file-name (concat "butler-" slug ".md")
-                                                    (cc-butler-governance-memory-store)))
-                            (current (or (cc-butler-governance--frontmatter-description note)
-                                         "(no description in store)")))
-                       (equal (cc-butler-governance--truncate-bytes
-                               current cc-butler-governance--generated-description-max-bytes)
-                              indexed-desc)))
+                     (or
+                      ;; Fingerprint 1: on-disk text must equal the OLD
+                      ;; 48-byte-budget rendering of the note's CURRENT
+                      ;; description (same comparison `--stale-index-entries'
+                      ;; uses, positive sense), or this is curated/drifted
+                      ;; text, not mechanical output.
+                      (let* ((note (expand-file-name (concat "butler-" slug ".md")
+                                                      (cc-butler-governance-memory-store)))
+                             (current (or (cc-butler-governance--frontmatter-description note)
+                                          "(no description in store)")))
+                        (equal (cc-butler-governance--truncate-bytes
+                                current cc-butler-governance--generated-description-max-bytes)
+                               indexed-desc))
+                      ;; Fingerprint 2 (2026-09-10, ellipsis-floor fix):
+                      ;; on-disk description is the bare ellipsis at a
+                      ;; sub-3-byte slug-aware budget -- content-independent
+                      ;; proof of the pre-fix `--truncate-bytes' bug, since
+                      ;; that budget deterministically produced exactly "…"
+                      ;; regardless of what the description said. This
+                      ;; fingerprint's lifetime is the bug's lifetime: fixed
+                      ;; `--truncate-bytes' returns "" (not "…") for any
+                      ;; sub-3-byte budget, so no line generated AFTER this
+                      ;; commit can ever match it again -- it exists only to
+                      ;; repair lines a PRE-fix regenerate already wrote to
+                      ;; disk, and stays dead code once those are gone. Safe
+                      ;; to delete once no store's `MEMORY.md' can still hold
+                      ;; a leftover pre-fix line (i.e. once every fleet
+                      ;; member's `MEMORY.md' has been regenerated at least
+                      ;; once on this commit or later).
+                      (and (equal indexed-desc "…")
+                           (< (cc-butler-governance--description-budget-bytes slug)
+                              (string-bytes "…")))))
                 (let ((new-line (cc-butler-governance--index-line slug)))
                   (goto-char beg)
                   (delete-region beg end)
@@ -726,7 +793,7 @@ entries-in-budget figures.  Returns the count of principles written."
       n)))
 
 (defconst cc-butler-governance--index-line-regexp
-  "^- butler-\\([a-z0-9][a-z0-9-]*\\)\\.md — "
+  "^- butler-\\([a-z0-9][a-z0-9-]*\\)\\.md\\(?: — \\)?"
   "The one shape this store's CURRENT generated `MEMORY.md' lines are
 recognized by (2026-09-09 single-slug format): `- butler-SLUG.md — DESC',
 group 1 = SLUG.  Shared by `--index-butler-slugs', `--prune-dead-entries'
@@ -739,7 +806,35 @@ different shape (no `butler-' marker, or a mismatched slug) never matches
 — deliberately narrow, so nothing here can touch a line this store did
 not itself generate.  See `cc-butler-governance--legacy-index-line-regexp'
 for the OLD (pre-2026-09-09) shape, recognized only by
-`--normalize-index-format'.")
+`--normalize-index-format'.
+
+The ` — ' separator (2026-09-10, the ellipsis-floor fix) is OPTIONAL --
+`\\(?: — \\)?', a non-capturing group -- because `--render-index-line' now
+omits it entirely for a slug whose description truncated to empty (see
+`cc-butler-governance--truncate-bytes'): the bare shape is
+`- butler-SLUG.md\\n', with nothing between `.md' and the newline.  Group
+1 is unaffected either way, and this still matches the OLD with-separator
+shape identically -- the optional group happily consumes ` — ' when it is
+there.
+
+Deliberately still has NO anchor on the right edge (no `$', no length
+requirement after the optional separator) -- it never did, even before
+this change: this constant is always used as a shared PREFIX, and every
+caller appends its own tail (`.*\\n?', `\\(.*\\)$', etc.) to consume
+whatever comes after, exactly the shared-regex discipline documented
+above.  So a hypothetical malformed line like `- butler-slug.mdxyz' (no
+separator, and NOT immediately followed by a newline) would technically
+still match this prefix (`- butler-slug.md', with `xyz' left over for
+whatever tail pattern a caller appends) -- but this is not a new risk
+introduced by making the separator optional, nor a realistic one: the
+prefix's right edge was never anchored to begin with (a pre-existing
+`- butler-slug.md — DESC-running-on-forever' line matched exactly the
+same unanchored prefix), and the only producer of lines in this shape at
+all is `--render-index-line' in this same file, which only ever emits
+`.md — DESC\\n' or bare `.md\\n' -- never `.mdxyz'.  A hand-authored line
+would also need the exact `butler-' marker and a well-formed lowercase-
+kebab slug to match this far in the first place, which is precisely the
+narrow-match property the rest of this docstring already relies on.")
 
 (defconst cc-butler-governance--legacy-index-line-regexp
   "^- \\[\\([a-z0-9][a-z0-9-]*\\)\\](butler-\\1\\.md) — .*\n?"
