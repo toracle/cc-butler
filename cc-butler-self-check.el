@@ -256,7 +256,7 @@ tonight's exact mistake one level up."
 ;;;; Check 5: persisted vs. live -- would this survive a restart?
 ;;;; ------------------------------------------------------------------
 
-(defcustom cc-butler-self-check-tracked-variables nil
+(defcustom cc-butler-self-check-tracked-variables '(claude-code-ide-mcp-server-port)
   "EXTRA variables checked for persisted-vs-live drift by check 5
 \(`cc-butler-self-check--persisted-vs-live'), beyond the automatic scan
 \(`cc-butler--defcustom-symbols-all').  The automatic scan is now the
@@ -266,8 +266,17 @@ the codebase grows the way a hand-maintained list did: on 2026-09-10 this
 list tracked 2 of ~8 variables that actually mattered that day, the exact
 \"hand-maintained population silently narrows\" failure this closes.
 
-Only useful now for a symbol the scan genuinely cannot see -- e.g. one
-defined inside a macro the read-don't-eval reader does not expand."
+Only useful now for a symbol the scan genuinely cannot see -- the
+canonical case is `claude-code-ide-mcp-server-port' itself: it belongs to
+the third-party `claude-code-ide' package, not to cc-butler.el or any
+module in `cc-butler--modules', so `cc-butler--defcustom-symbols-all'
+structurally cannot ever see it no matter how thorough the scan gets
+\(confirmed live, 2026-09-10: `cc-butler-north-star-file' was dropped from
+this list at the same time as genuinely redundant with the scan, which
+was correct -- but `claude-code-ide-mcp-server-port' was dropped alongside
+it, which was not, and is the textbook case this EXTRA list exists for).
+Also useful for a symbol defined inside a macro the read-don't-eval reader
+does not expand."
   :type '(repeat symbol)
   :group 'cc-butler)
 

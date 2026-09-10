@@ -327,6 +327,20 @@ returned only by `cc-butler--defcustom-symbols-all', absent from the
           (should (memq 'cc-butler-test-check5-autoscanned checked)))
       (makunbound 'cc-butler-test-check5-autoscanned))))
 
+(ert-deftest cc-butler-self-check/tracked-variables-default-includes-external-mcp-port ()
+  "REGRESSION GUARD (2026-09-10, live): PR #225 dropped the default to nil,
+reasoning `cc-butler-north-star-file' was redundant with the auto-scan
+\(`cc-butler--defcustom-symbols-all') -- true for that symbol, but wrong to
+also drop `claude-code-ide-mcp-server-port': it belongs to a third-party
+package, not to cc-butler.el or any module in `cc-butler--modules', so the
+auto-scan structurally cannot ever see it (confirmed live:
+`(memq 'claude-code-ide-mcp-server-port (cc-butler--defcustom-symbols-all))'
+is nil). Compares against the defcustom's own `standard-value' rather than
+hardcoding a literal default, matching `cc-butler-ops-log-dir's own
+default-value test (tests/cc-butler-session-test.el)."
+  (should (equal (eval (car (get 'cc-butler-self-check-tracked-variables 'standard-value)) t)
+                 '(claude-code-ide-mcp-server-port))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Check 6: vault path
 ;;;; ------------------------------------------------------------------
