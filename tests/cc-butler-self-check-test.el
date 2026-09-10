@@ -844,43 +844,6 @@ treated as \"not configured\", not a failure."
         (should (plist-get r :ok))
         (should (string-match-p "skipped" (plist-get r :detail)))))))
 
-(ert-deftest cc-butler-self-check/queue-room-stale-when-room-shows-self-followup ()
-  "The actionable defect: a locally-open decision whose room thread already
-carries a reply from THIS fleet's own Matrix identity -- the file is
-STALE.  `:ok' fails, and the file + its scanned-reply count are named."
-  (cc-butler-self-check-test--with-decision-dir
-    (cc-butler-self-check-test--with-matrix-configured
-      (cc-butler-self-check-test--seed-open-decision
-       "stale" "$fake-event-1" "!fake-room:example.org")
-      (cc-butler-self-check-test--with-thread-replies-stub
-          (lambda (_room _event-id)
-            (list :status 'ok
-                  :events '(((sender . "@butler-test:example.org")))
-                  :scanned 1 :truncated nil))
-        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
-          (should-not (plist-get r :ok))
-          (should (string-match-p "stale 1" (plist-get r :detail)))
-          (should (string-match-p "991-stale" (plist-get r :detail)))
-          (should (string-match-p "scanned 1" (plist-get r :detail))))))))
-
-(ert-deftest cc-butler-self-check/queue-room-genuinely-open-when-no-self-reply ()
-  "A locally-open decision whose thread has replies, but none from THIS
-fleet's own identity, is genuinely still open -- not flagged, and counted
-in the open bucket."
-  (cc-butler-self-check-test--with-decision-dir
-    (cc-butler-self-check-test--with-matrix-configured
-      (cc-butler-self-check-test--seed-open-decision
-       "open" "$fake-event-2" "!fake-room:example.org")
-      (cc-butler-self-check-test--with-thread-replies-stub
-          (lambda (_room _event-id)
-            (list :status 'ok
-                  :events '(((sender . "@someone-else:example.org")))
-                  :scanned 1 :truncated nil))
-        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
-          (should (plist-get r :ok))
-          (should (string-match-p "stale 0" (plist-get r :detail)))
-          (should (string-match-p "open 1" (plist-get r :detail))))))))
-
 (ert-deftest cc-butler-self-check/queue-room-empty-thread-is-genuinely-open ()
   "A successful fetch that finds NOTHING is a real, meaningful \"checked, all
 clear\" -- genuinely open, not unverifiable, not an error."
@@ -961,10 +924,30 @@ and is paired with the reconciled-decision count so a reader can tell
           (should (string-match-p "2 decision(s) reconciled, 7 total thread message(s) scanned"
                                    (plist-get r :detail))))))))
 
-;;;; ---- the two PERMANENT negative controls --------------------------
+(ert-deftest cc-butler-self-check/queue-room-detail-shows-per-sender-message-counts ()
+  "Requirement: `:detail' exposes sender + count as raw material, not a
+computed verdict -- multiple senders, each appearing more than once,
+formatted distinctly per sender."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "multi" "$fake-event-multi" "!fake-room:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room _event-id)
+            (list :status 'ok
+                  :events (append (make-list 3 '((sender . "@fleet-a:example.org")))
+                                  (make-list 4 '((sender . "@fleet-b:example.org"))))
+                  :scanned 7 :truncated nil))
+        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+          (should (plist-get r :ok))
+          (should (string-match-p "@fleet-a:example.org x3" (plist-get r :detail)))
+          (should (string-match-p "@fleet-b:example.org x4" (plist-get r :detail)))
+          (should (string-match-p "scanned 7" (plist-get r :detail))))))))
+
+;;;; ---- the four PERMANENT negative controls -----------------------
 
 (ert-deftest cc-butler-self-check/queue-room-no-file-means-structurally-invisible ()
-  "PERMANENT, DESIGNATED negative control (1 of 2): a real human-facing
+  "PERMANENT, DESIGNATED negative control -- coverage axis: a real human-facing
 question sent directly to the Matrix room, bypassing the decision queue
 entirely, has NO corresponding file under open/ -- and this check only
 ever iterates files that exist there, by construction.  It is not merely
@@ -989,7 +972,7 @@ calls out to Matrix at all."
           (should (= 0 cc-butler-self-check-test--thread-replies-calls)))))))
 
 (ert-deftest cc-butler-self-check/queue-room-never-delivered-lands-unverifiable-not-dropped ()
-  "PERMANENT, DESIGNATED negative control (2 of 2): an open decision file
+  "PERMANENT, DESIGNATED negative control -- coverage axis: an open decision file
 that DOES exist but has no `:Delivered-to-matrix:' property recorded at
 all (never delivered, or delivery never got logged) must land in the
 unverifiable bucket, still implicitly \"awaiting answer\" -- never silently
@@ -1005,6 +988,57 @@ dropped from the count entirely."
           (should (string-match-p "unverifiable 1" (plist-get r :detail)))
           (should-not (string-match-p "open 1" (plist-get r :detail)))
           (should (= 0 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-self-reply-alone-is-not-closure ()
+  "PERMANENT, DESIGNATED negative control -- precision axis, not coverage: a
+thread whose ONLY reply is this fleet's own delivery-body post (the shape
+actually found live, mislabeling still-open decisions as closed) must land
+in the open bucket, must not fail `:ok', and must carry no word implying
+the decision was answered. A self-authored reply is not evidence of an
+answer -- this fleet's own 2-step delivery convention (a short header
+event, with the decision body posted as a threaded reply to it) means
+every delivered decision already has exactly this reply before anyone,
+human or fleet, ever responds. A positive control that only asks \"is a
+self-reply found\" cannot distinguish this from a real closure -- it is
+the false-positive shape itself; this test is the mirror negative control
+that shape required."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "selfonly" "$fake-event-selfonly" "!fake-room:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room _event-id)
+            (list :status 'ok
+                  :events '(((sender . "@butler-test:example.org")))
+                  :scanned 1 :truncated nil))
+        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+          (should (plist-get r :ok))
+          (should (string-match-p "open 1" (plist-get r :detail)))
+          (should-not (string-match-p "stale\\|closed\\|resolved" (plist-get r :detail)))
+          (should (string-match-p "@butler-test:example.org x1" (plist-get r :detail))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-human-hold-or-recheck-is-not-closure ()
+  "PERMANENT, DESIGNATED negative control -- precision axis: a thread with a
+genuine THIRD-PARTY reply alongside the self-authored delivery reply (e.g.
+a human saying \"hold on\" or asking a follow-up, not an answer) must ALSO
+land in the open bucket and must not fail `:ok'. This is automatically
+satisfied by this check's design -- it has no closure bucket at all, for
+any sender -- pinned here as a permanent test rather than left implicit."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "holdreply" "$fake-event-hold" "!fake-room:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room _event-id)
+            (list :status 'ok
+                  :events '(((sender . "@butler-test:example.org"))
+                            ((sender . "@a-human:example.org")))
+                  :scanned 2 :truncated nil))
+        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+          (should (plist-get r :ok))
+          (should (string-match-p "open 1" (plist-get r :detail)))
+          (should-not (string-match-p "stale\\|closed\\|resolved" (plist-get r :detail)))
+          (should (string-match-p "@a-human:example.org x1" (plist-get r :detail))))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Transition detection: escalate only on ok<->fail flips, both ways
