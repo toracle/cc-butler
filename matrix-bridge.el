@@ -74,7 +74,25 @@ delivers nothing, which on screen is indistinguishable from a quiet room.
 `matrix-bridge-start' refuses to run while this is nil, so a fleet that forgets
 to set it fails loudly at startup instead of going silently deaf.  Set it in
 per-machine config, not here.")
-(defvar matrix-bridge-human-user-id "@jeongsoo:warmblood-lounge")
+(defvar matrix-bridge-human-user-id nil
+  "The human's own Matrix user id, e.g. \"@example-user:example.invalid\".
+
+Deliberately nil, mirroring `matrix-bridge-self-user-id' just above: a
+default belonging to ONE fleet's human is worse than no default, since it
+would make `matrix-bridge-attribution' and the reminder-append check in
+`matrix-bridge-event-line' silently misclassify every OTHER fleet's human
+sender as a bot -- no error, no log, just the reminder line and the
+attribution name quietly never appearing.
+
+`matrix-bridge-start' refuses to run while this is nil, for the same reason
+and with the same loudness as the `matrix-bridge-self-user-id' guard right
+below it. Set it in per-machine config, not here.
+
+2026-09-10: this was a real hardcoded fleet id here for months (public
+repo -- see `cc-butler-fixture-hygiene-test.el'). Redacting it without this
+guard would have traded a loud, visible leak for a quiet, permanent
+misclassification of the same fleet's own human sender -- a worse failure
+mode, not a fix. The guard is what makes redacting the default safe.")
 (defvar matrix-bridge-human-reminder
   "\n※ 이 메시지에 대한 답은 반드시 이 방(Matrix)에 남겨라 — 터미널 응답만으로 \
 끝내지 말 것. 답할 때는 이 줄 머리 대괄호 안의 `id:'/`thread:'/`reply:' 값을 \
@@ -478,6 +496,10 @@ t -- never silently presented as an exhaustive scan."
   (unless matrix-bridge-self-user-id
     (error "matrix-bridge: `matrix-bridge-self-user-id' is nil -- set it to \
 THIS fleet's own Matrix id before starting, or the relay cannot tell your own \
+messages from a peer's and will mis-filter them"))
+  (unless matrix-bridge-human-user-id
+    (error "matrix-bridge: `matrix-bridge-human-user-id' is nil -- set it to \
+the human's Matrix id before starting, or the relay cannot tell the human's \
 messages from a peer's and will mis-filter them"))
   (matrix-bridge-stop)
   (setq matrix-bridge--token (matrix-bridge--read-trimmed matrix-bridge-token-file)

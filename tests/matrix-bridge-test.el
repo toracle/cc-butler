@@ -70,14 +70,19 @@ must not be reported as a genuine reply."
 ;;;; --- event-line: the whole line, and what must be dropped -----------------
 
 (ert-deftest matrix-bridge/event-line-human-sender-shows-attribution ()
-  (should (equal (matrix-bridge-event-line
-                  `((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
-                    (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                 ;; The human's own messages carry `matrix-bridge-human-reminder'.
-                 ;; Built from the variable, not a copy of its wording: a reworded
-                 ;; reminder must not turn this attribution test red.
-                 (concat "[matrix · 정수님 · id:$abc] hi"
-                         matrix-bridge-human-reminder))))
+  ;; `matrix-bridge-human-user-id' defaults to nil (2026-09-10) -- bound
+  ;; explicitly here, the same way `event-line-own-outgoing-message-is-dropped'
+  ;; below binds `matrix-bridge-self-user-id', so this test does not depend on
+  ;; a fleet-specific default to reach the "this IS the human" branch at all.
+  (let ((matrix-bridge-human-user-id "@jeongsoo:warmblood-lounge"))
+    (should (equal (matrix-bridge-event-line
+                    `((type . "m.room.message") (sender . ,matrix-bridge-human-user-id)
+                      (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
+                   ;; The human's own messages carry `matrix-bridge-human-reminder'.
+                   ;; Built from the variable, not a copy of its wording: a reworded
+                   ;; reminder must not turn this attribution test red.
+                   (concat "[matrix · 정수님 · id:$abc] hi"
+                           matrix-bridge-human-reminder)))))
 
 (ert-deftest matrix-bridge/event-line-fleet-sender-shows-short-name ()
   (should (equal (matrix-bridge-event-line
@@ -103,6 +108,28 @@ must not be reported as a genuine reply."
                '((type . "m.room.member") (sender . "@jeongsoo:warmblood-lounge")
                  (event_id . "$abc")
                  (content . ((msgtype . "m.text") (body . "x")))))))
+
+;;;; --- matrix-bridge-start: refuses to run with either identity nil ---------
+;; Both guards are the very first thing `matrix-bridge-start' does, before
+;; any file I/O (token/room-id files) or network call -- so calling it with
+;; the OTHER identity var set to a fake, non-nil value isolates exactly the
+;; guard under test without touching anything real.
+
+(ert-deftest matrix-bridge/start-refuses-when-self-user-id-nil ()
+  (let ((matrix-bridge-self-user-id nil)
+        (matrix-bridge-human-user-id "@fake-human:example.org"))
+    (should-error (matrix-bridge-start))))
+
+(ert-deftest matrix-bridge/start-refuses-when-human-user-id-nil ()
+  "`matrix-bridge-human-user-id' defaults to nil (2026-09-10, this fleet's
+own id was a hardcoded leak before). Without this guard, starting the relay
+in that state would not error -- it would silently misclassify the human's
+every message as a stranger's (see `matrix-bridge-attribution' /
+`matrix-bridge-event-line'), the same failure mode PR #175 already removed
+for `matrix-bridge-self-user-id'."
+  (let ((matrix-bridge-self-user-id "@fake-self:example.org")
+        (matrix-bridge-human-user-id nil))
+    (should-error (matrix-bridge-start))))
 
 ;;;; --- JSON false is not Lisp nil (regression, 2026-09-05) ------------------
 ;; Found by replaying 248 real room events through both bridges: the Python

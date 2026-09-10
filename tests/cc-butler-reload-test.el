@@ -203,6 +203,45 @@ stuck reload. Reporting it as drift is always true and never actionable."
       (makunbound 'cc-butler-test-drift-functions)
       (makunbound 'cc-butler-test-drift-map))))
 
+(ert-deftest cc-butler-reload/defcustom-drift-skips-externally-configured-identity-vars ()
+  "REGRESSION GUARD (2026-09-10): `matrix-bridge-self-user-id' and
+`matrix-bridge-human-user-id' both ship nil in source and are meant to be
+set by per-machine config forever after, so their live value differing
+from the in-repo nil default is the PERMANENT, correct state -- not a
+stuck reload. Without this filter, check 5/7 (both built on
+`cc-butler--defcustom-drift-all', which walks this function) would flag
+every already-configured fleet's human-user-id as \"(likely stuck
+reload)\" on every single run, because the real id it is correctly set to
+also happens to be this line's own past shipped default before this
+commit changed it to nil -- a permanent false positive, not a transient
+one that a restart would clear."
+  ;; `let'-bound, NOT `setq'+`makunbound': both symbols are real,
+  ;; already-loaded module variables shared with the rest of this suite
+  ;; (`matrix-bridge.el' is required elsewhere), not fresh test-local
+  ;; symbols -- `makunbound' would leave them permanently VOID for every
+  ;; later test in the same batch run, not merely reset to nil.
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defvar matrix-bridge-self-user-id nil \"doc\")
+(defvar matrix-bridge-human-user-id nil \"doc\")\n"))
+         (matrix-bridge-self-user-id "@fake-self:example.org")
+         (matrix-bridge-human-user-id "@fake-human:example.org"))
+    (should-not (cc-butler--defcustom-drift file))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-externally-configured-filter-is-narrow ()
+  "The filter above must not swallow an unrelated symbol that merely LOOKS
+like an identity variable (a `-user-id' name) but isn't one of the two
+known cases -- only the two named symbols are exempt, nothing broader."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defvar cc-butler-test-drift-other-user-id nil \"doc\")\n")))
+    (defvar cc-butler-test-drift-other-user-id)
+    (setq cc-butler-test-drift-other-user-id "@someone:example.org")
+    (unwind-protect
+        (should (equal (cc-butler--defcustom-drift file)
+                       '((cc-butler-test-drift-other-user-id "@someone:example.org" nil))))
+      (makunbound 'cc-butler-test-drift-other-user-id))))
+
 (ert-deftest cc-butler-reload/defcustom-drift-still-reports-a-real-non-private-drift ()
   "The filters above must not swallow the actual signal — a plain,
 non-private, non-hook, non-keymap defcustom that genuinely drifted still

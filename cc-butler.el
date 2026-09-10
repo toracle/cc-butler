@@ -454,6 +454,30 @@ reporting it as drift is always true and never informative."
            (boundp sym)
            (keymapp (symbol-value sym)))))
 
+(defun cc-butler--defcustom-drift-externally-configured-p (sym)
+  "Non-nil if SYM is deliberately supplied by per-machine config outside
+this repo, so its in-repo default is a placeholder, not a value the live
+symbol is ever meant to hold — differing from that placeholder is the
+permanent, correct state, not a stuck reload.
+
+`matrix-bridge-self-user-id' and `matrix-bridge-human-user-id' are the two
+known cases: both ship nil in source (see either defvar's own docstring —
+\"set it in per-machine config, not here\") specifically because a
+same-repo default belonging to one fleet would silently misfile another
+fleet's messages. `matrix-bridge-self-user-id' was born nil and never
+collided with its own git history, so this gap stayed latent; changing
+`matrix-bridge-human-user-id''s default from a real hardcoded id to nil
+(2026-09-10, the same commit that added this predicate) is what surfaced
+it — the live value on any already-configured fleet will forever match
+THAT past shipped default, which `cc-butler--defcustom-drift-label' would
+otherwise call \"(likely stuck reload)\" on every single run, asking a
+human to chase a restart that fixes nothing. Filtering it out here, at the
+one shared walker both check 5 and check 7 call, is what keeps that false
+label from ever being computed in the first place — same precedent as
+`cc-butler--defcustom-drift-internal-p'/`-noise-p' just above, a third
+category of \"drift here is always expected, never a signal\"."
+  (memq sym '(matrix-bridge-self-user-id matrix-bridge-human-user-id)))
+
 (defun cc-butler--defcustom-drift (file)
   "For every defcustom/defvar-with-default in FILE, compare its CURRENT
 live value to what evaluating its default form fresh would give. A
@@ -470,8 +494,11 @@ two causes apart — it is a loud, honest list to check by hand, not a
 verdict. Skips symbols not currently `boundp' (the next load sets them
 fresh, so they cannot have drifted), private accumulators (see
 `cc-butler--defcustom-drift-internal-p' — always drift, and their live
-value is exactly the sensitive content this report must not leak), and
-hook/keymap noise (see `cc-butler--defcustom-drift-noise-p').
+value is exactly the sensitive content this report must not leak),
+hook/keymap noise (see `cc-butler--defcustom-drift-noise-p'), and
+externally-configured identity variables (see
+`cc-butler--defcustom-drift-externally-configured-p' — always drift on any
+already-configured fleet, by design, not a stuck reload).
 
 This is not \"nice to have\" — it is the ONLY thing that can catch this
 class of bug at all. An ERT suite always loads its files fresh into an
@@ -489,7 +516,8 @@ every test would keep passing."
       (let ((sym (car pair)))
         (when (and (boundp sym)
                    (not (cc-butler--defcustom-drift-internal-p sym))
-                   (not (cc-butler--defcustom-drift-noise-p sym)))
+                   (not (cc-butler--defcustom-drift-noise-p sym))
+                   (not (cc-butler--defcustom-drift-externally-configured-p sym)))
           (let ((code-default (ignore-errors (eval (cdr pair) t))))
             (unless (equal (symbol-value sym) code-default)
               (push (list sym (symbol-value sym) code-default) drift))))))
