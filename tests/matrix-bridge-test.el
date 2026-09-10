@@ -5,6 +5,7 @@
 ;; this repo. Covers the pure formatting functions only -- no network.
 
 (require 'ert)
+(require 'cl-lib)
 (require 'matrix-bridge)
 
 ;;;; --- envelope: what the courier stamps on the outside ---------------------
@@ -130,6 +131,123 @@ JSON false parses to :json-false, which is non-nil -- the naive test dropped it.
                                  (rel_type . "m.thread")))))))
     (should (string-match-p "thread:\\$root" env))
     (should-not (string-match-p "reply:" env))))
+
+;;;; --- matrix-bridge-thread-replies: synchronous thread fetch ---------------
+;;
+;; No real network call anywhere here -- every test stubs
+;; `matrix-bridge--thread-fetch-page' (the one function that actually calls
+;; `url-retrieve-synchronously'), so the pagination/classification logic in
+;; `matrix-bridge-thread-replies' runs against canned responses only.  All
+;; ids below are synthetic (`!fake-room:example.org', `$fake-event-N').
+
+(defmacro matrix-bridge-test--with-fetch-page-stub (responses &rest body)
+  "Run BODY with `matrix-bridge--thread-fetch-page' stubbed to return the
+next element of RESPONSES (a list of plists) on each call, in order.  Binds
+`matrix-bridge-test--fetch-page-calls' to the number of calls made, visible
+to BODY."
+  (declare (indent 1))
+  `(let ((responses-left (copy-sequence ,responses))
+         (matrix-bridge-test--fetch-page-calls 0))
+     (cl-letf (((symbol-function 'matrix-bridge--thread-fetch-page)
+                (lambda (&rest _args)
+                  (setq matrix-bridge-test--fetch-page-calls
+                        (1+ matrix-bridge-test--fetch-page-calls))
+                  (let ((r (car responses-left)))
+                    (setq responses-left (cdr responses-left))
+                    r))))
+       ,@body)))
+
+(defun matrix-bridge-test--full-page (n)
+  "N synthetic events, one page's worth (for a full `chunk')."
+  (let (evs)
+    (dotimes (i n) (push `((sender . ,(format "@fake-user-%d:example.org" i))) evs))
+    (nreverse evs)))
+
+(ert-deftest matrix-bridge/thread-replies-empty-thread-is-a-real-ok ()
+  "A successful fetch that finds nothing is `:status ok', N=0 -- not an error."
+  (matrix-bridge-test--with-fetch-page-stub
+      (list (list :http-status 200 :parsed '((chunk . []))))
+    (let ((r (matrix-bridge-thread-replies "!fake-room:example.org" "$fake-event-1")))
+      (should (eq 'ok (plist-get r :status)))
+      (should (= 0 (plist-get r :scanned)))
+      (should (null (plist-get r :events)))
+      (should-not (plist-get r :truncated))
+      (should (= 1 matrix-bridge-test--fetch-page-calls)))))
+
+(ert-deftest matrix-bridge/thread-replies-paginates-across-next-batch ()
+  "Two pages: page 1 is full (limit-sized) with `next_batch', page 2 is
+short with no `next_batch' -- both pages' events are accumulated."
+  (matrix-bridge-test--with-fetch-page-stub
+      (list (list :http-status 200
+                   :parsed `((chunk . ,(matrix-bridge-test--full-page
+                                        matrix-bridge--thread-fetch-page-limit))
+                             (next_batch . "page2token")))
+            (list :http-status 200
+                   :parsed '((chunk . (((sender . "@fake-user-x:example.org")))))))
+    (let ((r (matrix-bridge-thread-replies "!fake-room:example.org" "$fake-event-1")))
+      (should (eq 'ok (plist-get r :status)))
+      (should (= (1+ matrix-bridge--thread-fetch-page-limit) (plist-get r :scanned)))
+      (should-not (plist-get r :truncated))
+      (should (= 2 matrix-bridge-test--fetch-page-calls)))))
+
+(ert-deftest matrix-bridge/thread-replies-stops-on-short-chunk-even-with-next-batch ()
+  "Counterintuitive real behavior (observed live against conduit): a page's
+`next_batch' can be present even though its `chunk' came back shorter than
+the requested limit.  Pagination must stop there anyway -- relying on
+\"`next_batch' absent\" alone would wrongly fetch a second, needless page."
+  (matrix-bridge-test--with-fetch-page-stub
+      (list (list :http-status 200
+                   :parsed '((chunk . (((sender . "@fake-user-1:example.org"))))
+                             (next_batch . "page2token"))))
+    (let ((r (matrix-bridge-thread-replies "!fake-room:example.org" "$fake-event-1")))
+      (should (eq 'ok (plist-get r :status)))
+      (should (= 1 (plist-get r :scanned)))
+      (should-not (plist-get r :truncated))
+      ;; Only ONE call -- a naive "stop only when next_batch is absent"
+      ;; implementation would have made a second, needless call here.
+      (should (= 1 matrix-bridge-test--fetch-page-calls)))))
+
+(ert-deftest matrix-bridge/thread-replies-page-cap-sets-truncated ()
+  "Hitting the page cap before natural exhaustion sets `:truncated t' --
+never silently presenting a partial scan as exhaustive."
+  (let ((matrix-bridge-thread-fetch-max-pages 2)
+        (full-chunk (matrix-bridge-test--full-page matrix-bridge--thread-fetch-page-limit)))
+    (matrix-bridge-test--with-fetch-page-stub
+        (list (list :http-status 200 :parsed `((chunk . ,full-chunk) (next_batch . "t1")))
+              (list :http-status 200 :parsed `((chunk . ,full-chunk) (next_batch . "t2")))
+              (list :http-status 200 :parsed `((chunk . ,full-chunk) (next_batch . "t3"))))
+      (let ((r (matrix-bridge-thread-replies "!fake-room:example.org" "$fake-event-1")))
+        (should (eq 'ok (plist-get r :status)))
+        (should (plist-get r :truncated))
+        ;; Cap is 2 -- the stub's 3rd response must never be consumed.
+        (should (= 2 matrix-bridge-test--fetch-page-calls))))))
+
+(ert-deftest matrix-bridge/thread-replies-not-in-room-on-m-not-found ()
+  "The specific Matrix M_NOT_FOUND error (wrong/stale recorded room) is
+reported distinctly from a generic error."
+  (matrix-bridge-test--with-fetch-page-stub
+      (list (list :http-status 404
+                   :parsed '((errcode . "M_NOT_FOUND") (error . "Event not found in room"))))
+    (let ((r (matrix-bridge-thread-replies "!fake-room:example.org" "$fake-event-1")))
+      (should (eq 'not-in-room (plist-get r :status))))))
+
+(ert-deftest matrix-bridge/thread-replies-generic-http-error-is-status-error ()
+  (matrix-bridge-test--with-fetch-page-stub
+      (list (list :http-status 500 :parsed '((errcode . "M_UNKNOWN") (error . "boom"))))
+    (let ((r (matrix-bridge-thread-replies "!fake-room:example.org" "$fake-event-1")))
+      (should (eq 'error (plist-get r :status)))
+      (should (stringp (plist-get r :detail))))))
+
+(ert-deftest matrix-bridge/thread-replies-underlying-exception-never-escapes ()
+  "A network failure (the underlying fetch signals) must never escape as an
+uncaught exception -- it becomes `:status error' instead."
+  (matrix-bridge-test--with-fetch-page-stub
+      (list 'unused)  ; response is never reached; the stub below signals instead
+    (cl-letf (((symbol-function 'matrix-bridge--thread-fetch-page)
+               (lambda (&rest _) (error "simulated network failure"))))
+      (let ((r (matrix-bridge-thread-replies "!fake-room:example.org" "$fake-event-1")))
+        (should (eq 'error (plist-get r :status)))
+        (should (stringp (plist-get r :detail)))))))
 
 (provide 'matrix-bridge-test)
 ;;; matrix-bridge-test.el ends here

@@ -674,6 +674,77 @@ The old `\"^:Delivered-to-matrix: \"' regex missed this shape entirely."
           (should (equal "제목 없음" (cc-butler--decision-file-title f))))
       (delete-file f))))
 
+;;;; ---- value-capturing readers: event id + room (queue-room reconciliation) --
+;;;; `:Delivered-to-matrix:' now also captures ITS OWN VALUE (an extended
+;;;; regex, not a second parallel one); `:Room:' is a fresh reader following
+;;;; the identical dual-shape (flat vs. indented-under-heading) approach.
+;;;; Every id below is synthetic.
+
+(ert-deftest cc-butler-decision/delivered-to-matrix-event-id-flat-shape ()
+  (let ((f (make-temp-file "cc-butler-dtm-id")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Delivered-to-matrix: $fake-event-1\n:END:\n"))
+          (should (equal "$fake-event-1"
+                         (cc-butler--decision-delivered-to-matrix-event-id f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivered-to-matrix-event-id-indented-shape ()
+  (let ((f (make-temp-file "cc-butler-dtm-id")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert "* 발신됨 — butler, synthetic\n"
+                    "  :Delivered-to-matrix: $fake-event-2\n"
+                    "  :Room: !fake-room:example.org (test)\n"))
+          (should (equal "$fake-event-2"
+                         (cc-butler--decision-delivered-to-matrix-event-id f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivered-to-matrix-event-id-nil-when-absent ()
+  (let ((f (make-temp-file "cc-butler-dtm-id")))
+    (unwind-protect
+        (progn
+          (with-temp-file f (insert ":PROPERTIES:\n:Kind: decision\n:END:\n"))
+          (should (null (cc-butler--decision-delivered-to-matrix-event-id f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/room-id-flat-shape ()
+  (let ((f (make-temp-file "cc-butler-room")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Room: !fake-room:example.org\n:END:\n"))
+          (should (equal "!fake-room:example.org" (cc-butler--decision-room-id f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/room-id-indented-shape-strips-trailing-label ()
+  "Same dual-shape approach as `:Delivered-to-matrix:'.  A real `:Room:'
+value is followed by a human-readable room label in parens -- the reader
+must return only the room id, not the whole line."
+  (let ((f (make-temp-file "cc-butler-room")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert "* 발신됨 — butler, synthetic\n"
+                    "  :Delivered-to-matrix: $fake-event-3\n"
+                    "  :Room: !fake-room:example.org (butlers)\n"))
+          (should (equal "!fake-room:example.org" (cc-butler--decision-room-id f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/room-id-nil-when-absent ()
+  "A real, confirmed-live gap: some files have `:Delivered-to-matrix:' but
+no `:Room:' at all -- this reader must return nil cleanly, never guess or
+default to any room."
+  (let ((f (make-temp-file "cc-butler-room")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Delivered-to-matrix: $fake-event-4\n:END:\n"))
+          (should (null (cc-butler--decision-room-id f))))
+      (delete-file f))))
+
 ;;;; ---- create-path (escalate :options) + full flow -----------------
 
 (ert-deftest cc-butler-decision/parse-options ()

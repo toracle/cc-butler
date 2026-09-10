@@ -95,6 +95,28 @@ Set it to the empty string to switch the reminder off.")
 (defvar matrix-bridge-sync-timeout-ms 30000)
 (defvar matrix-bridge-retry-seconds 5)
 
+(defgroup matrix-bridge nil
+  "Matrix lounge -> cc-butler session relay."
+  :group 'applications)
+
+(defcustom matrix-bridge-thread-fetch-timeout-seconds 10
+  "Defense timeout (seconds) around each request `matrix-bridge-thread-replies'
+makes.  That function's request is a single bounded fetch -- unlike
+`matrix-bridge--poll''s 30s `/sync' long-poll (see the file commentary on why
+THAT one must stay async), so a synchronous call is fine here; this timeout
+only guards against a wedged connection."
+  :type 'number
+  :group 'matrix-bridge)
+
+(defcustom matrix-bridge-thread-fetch-max-pages 5
+  "Hard cap on pages fetched by one `matrix-bridge-thread-replies' call (at
+`matrix-bridge--thread-fetch-page-limit' events per page, so 5*50=250 events
+by default).  Hitting this cap before the thread is naturally exhausted sets
+`:truncated t' on the result rather than silently presenting a partial scan
+as exhaustive."
+  :type 'integer
+  :group 'matrix-bridge)
+
 (defvar matrix-bridge--generation 0
   "Bumped by start and stop.  A callback or timer from an older generation
 does nothing, so a stopped loop cannot resurrect itself and a second start
@@ -229,6 +251,118 @@ point is that they stop vanishing silently."
       (error
        (matrix-bridge--log "FAIL inject: %S -- shadowing instead" err)
        (matrix-bridge--shadow-deliver text))))))
+
+;;; --- synchronous thread-relations fetch ------------------------------------
+;;
+;; Unlike the `/sync' long-poll below, this is a single bounded request (one
+;; Matrix room's thread, capped page count) so `url-retrieve-synchronously'
+;; is safe here -- it must never be used for `/sync' itself (see the file
+;; commentary at the top).
+
+(defconst matrix-bridge--thread-fetch-page-limit 50
+  "Events requested per page by `matrix-bridge-thread-replies' (the `limit'
+query param).  Also the yardstick pagination stops against: a page whose
+`chunk' comes back shorter than this is the last page, `next_batch' or not.")
+
+(defun matrix-bridge--thread-relations-url (room event-id from)
+  "URL for one page of EVENT-ID's thread relations in ROOM.  FROM (a
+`next_batch' token, or nil for the first page) is passed back as the `from'
+query param.  ROOM and EVENT-ID are URL-path-encoded."
+  (concat matrix-bridge-homeserver
+          "/_matrix/client/v1/rooms/" (url-hexify-string room)
+          "/relations/" (url-hexify-string event-id) "/m.thread"
+          "?limit=" (number-to-string matrix-bridge--thread-fetch-page-limit)
+          (if from (concat "&from=" (url-hexify-string from)) "")))
+
+(defun matrix-bridge--thread-fetch-page (room event-id from)
+  "Fetch one page of EVENT-ID's thread relations in ROOM (FROM for
+pagination, nil for the first page).  Return (:http-status STATUS-OR-NIL
+:parsed PARSED-JSON-ALIST-OR-NIL).  May signal on a network failure or a
+request that never completes -- the caller (`matrix-bridge-thread-replies')
+wraps this in `condition-case'."
+  (unless matrix-bridge--token
+    (setq matrix-bridge--token (matrix-bridge--read-trimmed matrix-bridge-token-file)))
+  (let* ((url (matrix-bridge--thread-relations-url room event-id from))
+         (url-request-method "GET")
+         (url-request-extra-headers
+          (list (cons "Authorization" (concat "Bearer " matrix-bridge--token))))
+         (buf (url-retrieve-synchronously
+               url t t matrix-bridge-thread-fetch-timeout-seconds)))
+    (unless buf
+      (error "matrix-bridge: thread relations request timed out with no response"))
+    (unwind-protect
+        (with-current-buffer buf
+          (list :http-status (bound-and-true-p url-http-response-status)
+                :parsed (ignore-errors
+                          (json-parse-string (matrix-bridge--response-body)
+                                             :object-type 'alist
+                                             :null-object nil :false-object nil))))
+      (kill-buffer buf))))
+
+(defun matrix-bridge-thread-replies (room event-id)
+  "Synchronously fetch the Matrix thread rooted at EVENT-ID in ROOM (the
+`/relations/.../m.thread' endpoint), paginating via `next_batch' up to
+`matrix-bridge-thread-fetch-max-pages' pages.
+
+Returns one of exactly three shapes:
+  (:status ok :events LIST :scanned N :truncated BOOL) -- a successful
+    fetch; N (and LIST) may be empty -- a real, successful \"nothing found\"
+    is a valid, common result, not an error.  Each element of LIST is the
+    raw parsed Matrix event alist (has at least a `sender' key).
+  (:status not-in-room) -- the specific Matrix error M_NOT_FOUND /
+    \"Event not found in room\" -- ROOM does not actually contain EVENT-ID,
+    a data problem (a wrong/stale recorded room), distinct from a
+    connectivity problem.
+  (:status error :detail STRING) -- anything else (timeout, other HTTP
+    error, JSON parse failure, network failure).  Never an uncaught
+    exception -- the whole fetch is wrapped in `condition-case'.
+
+Pagination stops when a page's `next_batch' is absent, OR when that page's
+`chunk' came back shorter than the requested limit -- BOTH are
+independently sufficient to stop.  Confirmed live against a real
+homeserver (conduit): `next_batch' can be present even when `chunk' is
+short, so relying on \"`next_batch' absent\" alone under-terminates.  If the
+page cap is hit before either natural-stop condition fires, `:truncated' is
+t -- never silently presented as an exhaustive scan."
+  (condition-case err
+      (let ((events nil) (page 0) (from nil)
+            (not-in-room nil) (err-detail nil) (more t))
+        (with-timeout (matrix-bridge-thread-fetch-timeout-seconds
+                       (setq err-detail "matrix-bridge-thread-replies: timed out"
+                             more nil))
+          (while (and more (< page matrix-bridge-thread-fetch-max-pages))
+            (setq page (1+ page))
+            (let* ((resp (matrix-bridge--thread-fetch-page room event-id from))
+                   (http-status (plist-get resp :http-status))
+                   (parsed (plist-get resp :parsed)))
+              (cond
+               ((and parsed (equal (matrix-bridge--get parsed 'errcode) "M_NOT_FOUND"))
+                (setq not-in-room t more nil))
+               ((or (null http-status) (>= http-status 300))
+                (setq err-detail
+                      (format "matrix-bridge-thread-replies: HTTP %s%s"
+                              (or http-status "?")
+                              (if parsed
+                                  (format " (%s)"
+                                          (or (matrix-bridge--get parsed 'error)
+                                              (matrix-bridge--get parsed 'errcode)
+                                              ""))
+                                ""))
+                      more nil))
+               (t
+                (let* ((chunk (append (matrix-bridge--get parsed 'chunk) nil))
+                       (next (matrix-bridge--get parsed 'next_batch)))
+                  (setq events (append events chunk))
+                  (if (and next (>= (length chunk) matrix-bridge--thread-fetch-page-limit))
+                      (setq from next)
+                    (setq more nil))))))))
+        (cond
+         (not-in-room (list :status 'not-in-room))
+         (err-detail (list :status 'error :detail err-detail))
+         (t (list :status 'ok :events events :scanned (length events)
+                  :truncated (and more t)))))
+    (error (list :status 'error
+                 :detail (format "matrix-bridge-thread-replies: %S" err)))))
 
 ;;; --- the poll loop --------------------------------------------------------
 ;;

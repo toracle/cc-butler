@@ -55,6 +55,11 @@
 ;; `subr-x', none of which requires this file back — safe to reuse its
 ;; `cc-butler--decision-format-age' below instead of writing a duplicate.
 (require 'cc-butler-decision)
+;; `matrix-bridge' is a standalone, co-located file (not one of
+;; `cc-butler--modules') that already owns all Matrix connection config
+;; (homeserver, token, self-identity) — check 9 below reuses that config and
+;; its synchronous thread-fetch function rather than duplicating either.
+(require 'matrix-bridge)
 
 ;; `cc-butler-source-dir' lives in cc-butler.el, which requires THIS file --
 ;; the reference is forward at compile time and resolved at run time, the
@@ -741,6 +746,156 @@ must never silently create an arbitrary directory."
   slug)
 
 ;;;; ------------------------------------------------------------------
+;;;; Check 9: queue vs. room -- forward-only reconciliation
+;;;; ------------------------------------------------------------------
+;;
+;; A real incident: a decision was already answered/closed in the Matrix
+;; room (a follow-up reply existed in that event's thread), but the local
+;; open/ queue file was never updated to reflect that -- so the queue kept
+;; counting it as "awaiting answer" and the same closure notice was sent a
+;; second time, hours later, because the stale count was trusted.
+;;
+;; This is FORWARD-ONLY: for each locally-open decision with a recorded
+;; Matrix delivery, check whether the room's thread already shows THIS
+;; fleet followed up (a reply from its own Matrix identity, posted after
+;; delivery) -- if so, the file is stale and must not be counted as
+;; "awaiting answer".  Starts from the file (a declared, bounded
+;; population), never from the room.
+;;
+;; Deliberately NOT built: a reverse check (scanning the room for
+;; un-registered questions).  The room has no way to self-label "this
+;; message is a question", so a reverse detector would be an unfalsifiable
+;; heuristic over an unconstrained population.  This check only ever
+;; iterates files that already exist under open/, by construction -- see
+;; this check's own test file for the two permanent negative controls that
+;; follow from that, and why neither is a defect to fix here.
+
+(defun cc-butler-self-check--queue-room-matrix-configured-p ()
+  "Non-nil when this fleet has Matrix bridging configured enough for check 9
+to attempt reconciliation at all: a self identity AND an on-disk token
+file.  `matrix-bridge-self-user-id' is genuinely nil on a fleet that never
+set up Matrix -- a normal, valid state, not a defect -- so this check must
+not fail for that reason; it skips instead (see the caller)."
+  (and matrix-bridge-self-user-id
+       matrix-bridge-token-file
+       (file-exists-p matrix-bridge-token-file)))
+
+(defun cc-butler-self-check--queue-room-reason-label (reason)
+  "Human-readable label for one `cc-butler-self-check--queue-room-reconcile-one'
+unverifiable REASON symbol -- kept distinct per reason in `:detail' rather
+than collapsed into one undifferentiated \"unverifiable\" count, since each
+points at a different, useful diagnostic (never delivered vs. delivered but
+un-recorded room vs. a wrong recorded room vs. a fetch failure)."
+  (pcase reason
+    ('no-delivery "no :Delivered-to-matrix: recorded")
+    ('no-room "no :Room: recorded")
+    ('not-in-room "recorded room does not contain the event (M_NOT_FOUND)")
+    ('fetch-error "fetch failed")
+    (_ (symbol-name reason))))
+
+(defun cc-butler-self-check--queue-room-reconcile-one (path)
+  "Reconcile one open/ decision file at PATH.  Returns a plist:
+  (:bucket stale :scanned N)          -- room shows we already followed up.
+  (:bucket open :scanned N)           -- checked; genuinely still open.
+  (:bucket unverifiable :reason R)    -- R one of `no-delivery' `no-room'
+                                          `not-in-room' `fetch-error'.
+Either property missing (`no-delivery'/`no-room') is checked BEFORE ever
+calling out to Matrix at all -- an unverifiable decision must never guess
+at a room to fetch from."
+  (let ((event-id (cc-butler--decision-delivered-to-matrix-event-id path))
+        (room (cc-butler--decision-room-id path)))
+    (cond
+     ((not event-id) (list :bucket 'unverifiable :reason 'no-delivery))
+     ((not room) (list :bucket 'unverifiable :reason 'no-room))
+     (t
+      (let ((resp (matrix-bridge-thread-replies room event-id)))
+        (pcase (plist-get resp :status)
+          ('not-in-room (list :bucket 'unverifiable :reason 'not-in-room))
+          ('error (list :bucket 'unverifiable :reason 'fetch-error))
+          ('ok
+           (let ((scanned (plist-get resp :scanned)))
+             (if (seq-some (lambda (ev) (equal (matrix-bridge--get ev 'sender)
+                                               matrix-bridge-self-user-id))
+                           (plist-get resp :events))
+                 (list :bucket 'stale :scanned scanned)
+               (list :bucket 'open :scanned scanned))))))))))
+
+(defun cc-butler-self-check--queue-room-reconciliation ()
+  "Check 9: forward-only reconciliation between the open/ decision queue and
+the Matrix room a delivered decision was posted into -- see the section
+commentary above for the incident this exists to catch and why a reverse
+(room->queue) scan is explicitly out of scope.
+
+Candidates are `cc-butler--decision-open-files-and-oldest''s existing
+`Kind: decision' population (reused, not re-scanned).  When Matrix is not
+configured on this fleet at all (`cc-butler-self-check--queue-room-matrix-configured-p'),
+reconciliation is skipped entirely and `:ok' is t -- a fleet without
+Matrix wired up is a normal state, not a defect.
+
+Otherwise, each candidate lands in exactly one of three buckets
+(`cc-butler-self-check--queue-room-reconcile-one'): STALE (the room
+already shows we followed up -- the actionable defect), OPEN (checked,
+genuinely still awaiting an answer), or UNVERIFIABLE (missing
+`:Delivered-to-matrix:'/`:Room:', the recorded room turned out wrong, or
+the fetch itself failed -- still implicitly \"awaiting answer\", the
+unchanged conservative default, but named as its own bucket rather than
+folded into either of the other two).
+
+`:ok' is nil IFF at least one decision is STALE.  Being unable to verify
+some decisions does NOT by itself fail `:ok' -- that is a known, permanent
+limitation of a best-effort signal (see this check's negative-control
+tests), not a new problem each tick.  `:detail' always names: total
+candidates, the stale count (with each file + its own scanned-reply count
+as evidence), the open count, the unverifiable count (broken down by
+reason), and the aggregate scanned-message total paired with how many
+decisions were actually reconciled -- so a reader can tell \"the check ran
+and found nothing\" apart from \"the check silently didn't run\"."
+  (if (not (cc-butler-self-check--queue-room-matrix-configured-p))
+      (let ((n (length (car (cc-butler--decision-open-files-and-oldest)))))
+        (list :ok t
+              :detail (format "queue-room reconciliation: skipped — Matrix not configured on this fleet (%s); %d open decision(s) left unreconciled"
+                               (if (not matrix-bridge-self-user-id)
+                                   "matrix-bridge-self-user-id is nil"
+                                 "matrix-bridge-token-file does not exist")
+                               n)))
+    (let* ((dir (cc-butler--decision-open-dir))
+           (files (car (cc-butler--decision-open-files-and-oldest)))
+           stale open unverifiable (scanned-total 0) (reconciled 0))
+      (dolist (f files)
+        (let ((r (cc-butler-self-check--queue-room-reconcile-one (expand-file-name f dir))))
+          (pcase (plist-get r :bucket)
+            ('stale
+             (setq reconciled (1+ reconciled) scanned-total (+ scanned-total (plist-get r :scanned)))
+             (push (cons f (plist-get r :scanned)) stale))
+            ('open
+             (setq reconciled (1+ reconciled) scanned-total (+ scanned-total (plist-get r :scanned)))
+             (push f open))
+            ('unverifiable
+             (push (cons f (plist-get r :reason)) unverifiable)))))
+      (setq stale (nreverse stale) open (nreverse open) unverifiable (nreverse unverifiable))
+      (let* ((reason-counts
+              (mapcar (lambda (reason)
+                        (cons reason (length (seq-filter (lambda (u) (eq (cdr u) reason)) unverifiable))))
+                      '(no-delivery no-room not-in-room fetch-error)))
+             (detail
+              (format "queue-room reconciliation: %d candidate(s) — stale %d%s · open %d · unverifiable %d (%s) — %d decision(s) reconciled, %d total thread message(s) scanned"
+                      (length files)
+                      (length stale)
+                      (if stale
+                          (format " [%s]"
+                                  (mapconcat (lambda (s) (format "%s (scanned %d)" (car s) (cdr s)))
+                                             stale "; "))
+                        "")
+                      (length open)
+                      (length unverifiable)
+                      (mapconcat (lambda (rc) (format "%s %d"
+                                                       (cc-butler-self-check--queue-room-reason-label (car rc))
+                                                       (cdr rc)))
+                                 reason-counts "; ")
+                      reconciled scanned-total)))
+        (list :ok (null stale) :detail detail)))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Registry
 ;;;; ------------------------------------------------------------------
 
@@ -752,7 +907,8 @@ must never silently create an arbitrary directory."
     ("persisted-vs-live" . cc-butler-self-check--persisted-vs-live)
     ("vault-path" . cc-butler-self-check--vault-path)
     ("code-vs-live-defcustom" . cc-butler-self-check--code-vs-live-defcustom)
-    ("orphaned-inboxes" . cc-butler-self-check--orphaned-inboxes))
+    ("orphaned-inboxes" . cc-butler-self-check--orphaned-inboxes)
+    ("queue-room-reconciliation" . cc-butler-self-check--queue-room-reconciliation))
   "Alist of (NAME . FUNCTION).  FUNCTION takes no args, returns a plist
 \(:ok BOOL :detail STRING).  Extensible -- new checks are just new entries,
 so this does not stay a fixed list of six forever.
@@ -889,7 +1045,7 @@ just silent."
   (claude-code-ide-make-tool
    :function #'cc-butler-tool-self-check
    :name "self_check"
-   :description "Pull the full state of cc-butler's periodic consistency self-check (existence -> consistency), on demand, from any fleet session. Eight checks: MCP bound port vs. each live session's actual connection port; governance memory write-path vs. read-path; the North Star file's existence + location inside the current governance store; the running module code's ancestry vs. origin/main (deliberately partial -- pending a separate stable-install-path decision); tracked customizable variables' persisted-vs-live state (would this survive a restart); WARMBLE_JUMBLE_PATH vs. the governance store (a cross-tool vault-drift canary); code-vs-live defcustom drift (is a live value already stuck on a superseded code default RIGHT NOW, restart or not); and orphaned mail inboxes (a not-live agent's inbox with old unread mail nobody will ever read). Returns EVERY check's state, ok and failing both -- a clean run is positively confirmable, not just silent."
+   :description "Pull the full state of cc-butler's periodic consistency self-check (existence -> consistency), on demand, from any fleet session. Nine checks: MCP bound port vs. each live session's actual connection port; governance memory write-path vs. read-path; the North Star file's existence + location inside the current governance store; the running module code's ancestry vs. origin/main (deliberately partial -- pending a separate stable-install-path decision); tracked customizable variables' persisted-vs-live state (would this survive a restart); WARMBLE_JUMBLE_PATH vs. the governance store (a cross-tool vault-drift canary); code-vs-live defcustom drift (is a live value already stuck on a superseded code default RIGHT NOW, restart or not); orphaned mail inboxes (a not-live agent's inbox with old unread mail nobody will ever read); and queue-room reconciliation (a locally-open decision whose Matrix thread already shows this fleet followed up -- the local queue file went stale, forward-only, file-driven only, never a reverse room scan). Returns EVERY check's state, ok and failing both -- a clean run is positively confirmable, not just silent."
    :args nil))
 
 (defun cc-butler-tool-acknowledge-orphan-inbox (slug reason)
