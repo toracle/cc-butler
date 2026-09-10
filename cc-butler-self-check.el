@@ -558,7 +558,7 @@ carries a stale failure notification forever)."
                    (format "cc-butler self-check: `%s' %s — %s"
                            name (if ok "RECOVERED" "started FAILING")
                            (plist-get (cdr r) :detail))
-                   nil nil "notification")))
+                   nil nil "notification" "cc-butler (self-check)")))
               (setcdr cell ok))
           (push (cons name ok) cc-butler-self-check--previous)))))
   results)

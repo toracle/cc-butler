@@ -108,11 +108,16 @@ From MSG's explicit :topic, else its normalized summary/body."
   "An org PROPERTIES-drawer envelope (From/Via/To/When/Kind/Re) at the top of an
 inbox document — the provenance graph edges made visible.  `From' is the ORIGIN
 author (:origin, else :from) — never the last relayer; `Via' is the relay-path
-(:via, a hop list or string) carried alongside, so origin and path both show."
+(:via, a hop list or string) carried alongside, so origin and path both show.
+When MSG carries neither, `From' falls back to a descriptive placeholder
+rather than a bare `?' — so the absence of a sender is visible on its face
+(a system default meaning nobody supplied one) instead of reading as a
+rendering bug or truncation."
   (let* ((kind (or (plist-get msg :kind) 'decision))
          (whenstr (cc-butler--decision-when (plist-get msg :id)))
          (re (plist-get msg :in-reply-to))
-         (from (or (plist-get msg :origin) (plist-get msg :from) "?"))
+         (from (or (plist-get msg :origin) (plist-get msg :from)
+                   "cc-butler (unidentified sender)"))
          (via (plist-get msg :via)))
     (concat
      ":PROPERTIES:\n"                        ; the document's own org properties
@@ -226,7 +231,7 @@ One option per line, `Label — tradeoff' (the tradeoff, after - or —, optiona
                    (list :label l)))))
            (split-string s "\n")))))
 
-(defun cc-butler-decision-create (from-dir summary needs options &optional kind)
+(defun cc-butler-decision-create (from-dir summary needs options &optional kind sender-label)
   "Deliver a decision, or (KIND `note') a read-only notification, to
 정수님's inbox (the human-adapter create-path).
 FROM-DIR is the escalating session; for a decision, 정수님's answer
@@ -234,12 +239,22 @@ returns to it via the correlation -- a note has no answer to
 correlate, but FROM-DIR is still shown as the sender. OPTIONS is a
 list of (:label :tradeoff), meaningful only for a decision. KIND
 defaults to `decision'. Returns the id.
+
+SENDER-LABEL is an explicit, human-identifiable sender name for a
+caller with no live session to derive one from at all -- FROM-DIR nil,
+e.g. a timer-driven escalation with no MCP session context -- so the
+rendered document names something a reader can recognize instead of
+falling through to the envelope's generic \"nobody supplied a sender\"
+placeholder. It overrides the derived `:from' only; `:reply-to' still
+comes from FROM-DIR alone, since there is nowhere to route an answer
+for a caller with no live session either way.
 The arrival watcher renders it when the workflow is active."
-  (let ((id (cc-butler--mail-id))
-        (from (and from-dir (cc-butler--display-name from-dir))))
+  (let* ((id (cc-butler--mail-id))
+         (from-dir-name (and from-dir (cc-butler--display-name from-dir)))
+         (from (or sender-label from-dir-name)))
     (cc-butler--ch-deliver
      cc-butler-human-agent
-     (list :id id :kind (or kind 'decision) :from from :reply-to from
+     (list :id id :kind (or kind 'decision) :from from :reply-to from-dir-name
            :summary summary :needs needs :options options))
     id))
 

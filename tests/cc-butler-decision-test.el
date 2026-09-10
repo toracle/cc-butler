@@ -731,6 +731,23 @@ rendering."
           (should (string-match-p "Notification (read-only)" doc))
           (should-not (string-match-p (regexp-quote cc-butler--decision-answer-begin) doc)))))))
 
+(ert-deftest cc-butler-decision/create-path-no-session-uses-sender-label ()
+  "A caller with no live session at all (FROM-DIR nil -- e.g. a timer-driven
+escalation with no MCP session context to derive a sender from, such as
+the self-check module's automatic FAILING/RECOVERED notifications) must
+still render an identifiable `:From:' when it supplies SENDER-LABEL
+explicitly, instead of the bare `?' a nil FROM-DIR would otherwise
+produce with nothing to name the sender."
+  (cc-butler-decision-test--with-arrival
+    (cc-butler-decision-create
+     nil "cc-butler self-check: `x' started FAILING" nil nil
+     'note "cc-butler (self-check)")
+    (let ((m (car (cc-butler--ch-drain cc-butler-human-agent))))
+      (should (equal "cc-butler (self-check)" (plist-get m :from)))
+      (let ((doc (cc-butler--decision-doc-string m)))
+        (should (string-match-p "^:From: cc-butler (self-check)$" doc))
+        (should-not (string-match-p "^:From: \\?$" doc))))))
+
 (ert-deftest cc-butler-decision/full-flow-create-to-route ()
   "End to end: create → arrival render → answer + submit → routed back to the
 escalator via correlation."
@@ -1016,6 +1033,19 @@ example block."
     (should (string-match-p "^:From: worker-a$" doc))            ; origin, not steward
     (should (string-match-p "^:Via: worker-a → steward$" doc))
     (should-not (string-match-p "^:From: steward$" doc))))
+
+(ert-deftest cc-butler-decision/envelope-fallback-is-descriptive-not-bare-question-mark ()
+  "A message with genuinely no sender info at all (:origin and :from both
+absent -- e.g. a future caller that forgot to supply one) must not render
+the bare `?' fallback, which gives a reader zero signal that anything is
+missing at all and could pass for a rendering bug or truncation. The
+general fallback must name itself explicitly instead, so both a human
+reader and a future maintainer grepping for it can tell this is a system
+default meaning nobody supplied a sender."
+  (let ((doc (cc-butler--decision-doc-string
+              '(:id "x1" :kind note :summary "no sender at all"))))
+    (should-not (string-match-p "^:From: \\?$" doc))
+    (should (string-match-p "^:From: cc-butler (unidentified sender)$" doc))))
 
 (ert-deftest cc-butler-decision/briefing-renders-readonly ()
   "C: a briefing (up-direction deliverable) renders read-only — Kind=briefing, no

@@ -267,12 +267,15 @@ Return the recipient agent."
          :from (and from-dir (cc-butler--display-name from-dir))
          :body body)))
 
-(defun cc-butler-mail-up-decision (from-dir summary needs)
-  "Deliver a decision (SUMMARY/NEEDS, from FROM-DIR) to the butler inbox."
+(defun cc-butler-mail-up-decision (from-dir summary needs &optional sender-label)
+  "Deliver a decision (SUMMARY/NEEDS, from FROM-DIR) to the butler inbox.
+SENDER-LABEL, when given, overrides the derived `:from' for a caller
+with no live session (FROM-DIR nil) to derive one from -- see
+`cc-butler-decision-create' for the same shape on the human adapter."
   (cc-butler--ch-deliver
    (cc-butler--mail-butler-agent)
    (list :kind 'decision
-         :from (and from-dir (cc-butler--display-name from-dir))
+         :from (or sender-label (and from-dir (cc-butler--display-name from-dir)))
          :summary summary :needs needs)))
 
 (defun cc-butler-mail-up-drain (agent-dir)

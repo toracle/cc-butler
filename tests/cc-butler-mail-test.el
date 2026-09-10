@@ -234,6 +234,16 @@ never surface the other's message."
       (should (equal "pick one" (plist-get m :needs))))
     (should (null cc-butler-mail-test--pokes))))
 
+(ert-deftest cc-butler-mail/up-escalate-no-session-uses-sender-label ()
+  "A caller with no live session (FROM-DIR nil) still delivers an
+identifiable `:from' when it supplies SENDER-LABEL explicitly, instead of
+the nil a nil FROM-DIR would otherwise derive."
+  (cc-butler-mail-test--with-up
+    (cc-butler-mail-up-decision
+     nil "cc-butler self-check: `x' started FAILING" nil "cc-butler (self-check)")
+    (let ((m (cc-butler-mail-test--only (cc-butler--ch-drain "butler"))))
+      (should (equal "cc-butler (self-check)" (plist-get m :from))))))
+
 (ert-deftest cc-butler-mail/file-audit-trail ()
   "Given a delivered message, When it is drained, Then it is moved to archive/
 (the audit trail) — never deleted."

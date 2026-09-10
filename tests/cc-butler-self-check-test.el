@@ -548,8 +548,9 @@ stubbed to record calls instead of touching any real butler state, and
          (cc-butler-self-check-test--logs nil)
          (cc-butler-self-check--previous nil))
      (cl-letf (((symbol-function 'cc-butler-tool-escalate-to-butler)
-                (lambda (summary &optional needs options kind)
-                  (push (list :summary summary :needs needs :options options :kind kind)
+                (lambda (summary &optional needs options kind sender-label)
+                  (push (list :summary summary :needs needs :options options :kind kind
+                              :sender-label sender-label)
                         cc-butler-self-check-test--escalations)))
                ((symbol-function 'cc-butler-tool-log)
                 (lambda (entry &optional kind)
@@ -596,6 +597,17 @@ notification for an unchanged failure."
     (should (= 1 (length cc-butler-self-check-test--escalations)))
     (cc-butler-self-check--report (cc-butler-self-check-test--fake-results nil))
     (should (= 1 (length cc-butler-self-check-test--escalations)))))
+
+(ert-deftest cc-butler-self-check/report-escalates-with-identifiable-sender-label ()
+  "The self-check timer path fires from a timer callback with no MCP session
+context to derive a sender from at all, so it must pass an explicit,
+human-identifiable SENDER-LABEL through to escalate_to_butler -- never
+leave the callee to fall back to an unidentifiable sender."
+  (cc-butler-self-check-test--with-stubs
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results t))
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results nil))
+    (should (equal "cc-butler (self-check)"
+                   (plist-get (car cc-butler-self-check-test--escalations) :sender-label)))))
 
 (ert-deftest cc-butler-self-check/report-fail-to-ok-escalates-recovery ()
   "tick 3 fail -> tick 4 ok must fire exactly one MORE escalate call (the
