@@ -769,7 +769,7 @@ exactly the failure check 8 exists to prevent."
         (should (string-match-p "kept pending separate disposal" (plist-get r :detail)))))))
 
 ;;;; ------------------------------------------------------------------
-;;;; Check 9: queue vs. room -- forward-only reconciliation
+;;;; Check 9: queue vs. room -- thread activity surfaced, never judged
 ;;;; ------------------------------------------------------------------
 ;;;; All ids below are synthetic (`!fake-room:example.org',
 ;;;; `$fake-event-N', `@butler-test:example.org', `old-decision') -- never
@@ -824,11 +824,11 @@ the number of calls made, visible to BODY."
 
 (ert-deftest cc-butler-self-check/queue-room-not-configured-self-user-id-nil ()
   "No Matrix identity set on this fleet at all -- a normal, valid state, not
-a defect: `:ok t', reconciliation explicitly skipped, open count named."
+a defect: `:ok t', this check is explicitly skipped, open count named."
   (cc-butler-self-check-test--with-decision-dir
     (let ((matrix-bridge-self-user-id nil))
       (cc-butler-self-check-test--seed-open-decision "a")
-      (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+      (let ((r (cc-butler-self-check--queue-room-thread-activity)))
         (should (plist-get r :ok))
         (should (string-match-p "skipped" (plist-get r :detail)))
         (should (string-match-p "1 open decision" (plist-get r :detail)))))))
@@ -840,23 +840,25 @@ treated as \"not configured\", not a failure."
     (let ((matrix-bridge-self-user-id "@butler-test:example.org")
           (matrix-bridge-token-file "/nonexistent/cc-butler-qrr-token-missing"))
       (cc-butler-self-check-test--seed-open-decision "a")
-      (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+      (let ((r (cc-butler-self-check--queue-room-thread-activity)))
         (should (plist-get r :ok))
         (should (string-match-p "skipped" (plist-get r :detail)))))))
 
 (ert-deftest cc-butler-self-check/queue-room-empty-thread-is-genuinely-open ()
-  "A successful fetch that finds NOTHING is a real, meaningful \"checked, all
-clear\" -- genuinely open, not unverifiable, not an error."
+  "A successful fetch that finds NOTHING is still a real, meaningful result
+-- \"fetched, found nothing\", not \"all clear\": this check makes no
+judgment about what an empty thread means, only that the fetch itself
+succeeded.  Lands in the open bucket, not unverifiable, not an error."
   (cc-butler-self-check-test--with-decision-dir
     (cc-butler-self-check-test--with-matrix-configured
       (cc-butler-self-check-test--seed-open-decision
        "empty" "$fake-event-3" "!fake-room:example.org")
       (cc-butler-self-check-test--with-thread-replies-stub
           (lambda (_room _event-id) (list :status 'ok :events nil :scanned 0 :truncated nil))
-        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
           (should (plist-get r :ok))
           (should (string-match-p "open 1" (plist-get r :detail)))
-          (should (string-match-p "1 decision(s) reconciled, 0 total thread message(s) scanned"
+          (should (string-match-p "1 decision(s) checked, 0 total thread message(s) scanned"
                                    (plist-get r :detail))))))))
 
 (ert-deftest cc-butler-self-check/queue-room-unverifiable-no-room-property ()
@@ -869,7 +871,7 @@ check) and is named separately, not folded into `open' or `stale'."
       (cc-butler-self-check-test--seed-open-decision "noroom" "$fake-event-4" nil)
       (cc-butler-self-check-test--with-thread-replies-stub
           (lambda (_room _event-id) (error "must not be called -- no :Room: to fetch with"))
-        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
           (should (plist-get r :ok))
           (should (string-match-p "unverifiable 1" (plist-get r :detail)))
           (should (string-match-p "no :Room:" (plist-get r :detail)))
@@ -884,7 +886,7 @@ distinct in `:detail' from \"never delivered\" or \"fetch failed\"."
        "wrongroom" "$fake-event-5" "!fake-room:example.org")
       (cc-butler-self-check-test--with-thread-replies-stub
           (lambda (_room _event-id) (list :status 'not-in-room))
-        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
           (should (plist-get r :ok))
           (should (string-match-p "unverifiable 1" (plist-get r :detail)))
           (should (string-match-p "M_NOT_FOUND\\|does not contain" (plist-get r :detail))))))))
@@ -899,14 +901,14 @@ distinct from the not-in-room and no-property cases -- and never fails
        "fetcherr" "$fake-event-6" "!fake-room:example.org")
       (cc-butler-self-check-test--with-thread-replies-stub
           (lambda (_room _event-id) (list :status 'error :detail "simulated timeout"))
-        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
           (should (plist-get r :ok))
           (should (string-match-p "unverifiable 1" (plist-get r :detail)))
           (should (string-match-p "fetch failed\\|error" (plist-get r :detail))))))))
 
 (ert-deftest cc-butler-self-check/queue-room-aggregate-scanned-total-sums-across-candidates ()
   "The aggregate scanned-message total sums across every successful fetch,
-and is paired with the reconciled-decision count so a reader can tell
+and is paired with the checked-decision count so a reader can tell
 \"nothing ran\" apart from \"ran and found nothing\"."
   (cc-butler-self-check-test--with-decision-dir
     (cc-butler-self-check-test--with-matrix-configured
@@ -919,9 +921,9 @@ and is paired with the reconciled-decision count so a reader can tell
             (if (equal event-id "$fake-event-7")
                 (list :status 'ok :events nil :scanned 3 :truncated nil)
               (list :status 'ok :events nil :scanned 4 :truncated nil)))
-        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
           (should (plist-get r :ok))
-          (should (string-match-p "2 decision(s) reconciled, 7 total thread message(s) scanned"
+          (should (string-match-p "2 decision(s) checked, 7 total thread message(s) scanned"
                                    (plist-get r :detail))))))))
 
 (ert-deftest cc-butler-self-check/queue-room-detail-shows-per-sender-message-counts ()
@@ -938,7 +940,7 @@ formatted distinctly per sender."
                   :events (append (make-list 3 '((sender . "@fleet-a:example.org")))
                                   (make-list 4 '((sender . "@fleet-b:example.org"))))
                   :scanned 7 :truncated nil))
-        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
           (should (plist-get r :ok))
           (should (string-match-p "@fleet-a:example.org x3" (plist-get r :detail)))
           (should (string-match-p "@fleet-b:example.org x4" (plist-get r :detail)))
@@ -958,16 +960,16 @@ reverse room->queue scanner was explicitly rejected in this check's design
 reverse detector would be an unfalsifiable heuristic over an unconstrained
 population.  There is no file for the bypassing message, so there is
 nothing to assert against except its absence: with zero decision files
-present, the reconciliation trivially finds zero candidates and never
+present, this check trivially finds zero candidates and never
 calls out to Matrix at all."
   (cc-butler-self-check-test--with-decision-dir
     (cc-butler-self-check-test--with-matrix-configured
       (cc-butler-self-check-test--with-thread-replies-stub
           (lambda (_room _event-id) (error "must not be called -- no candidate files exist"))
-        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
           (should (plist-get r :ok))
           (should (string-match-p "0 candidate(s)" (plist-get r :detail)))
-          (should (string-match-p "0 decision(s) reconciled, 0 total thread message(s) scanned"
+          (should (string-match-p "0 decision(s) checked, 0 total thread message(s) scanned"
                                    (plist-get r :detail)))
           (should (= 0 cc-butler-self-check-test--thread-replies-calls)))))))
 
@@ -982,7 +984,7 @@ dropped from the count entirely."
       (cc-butler-self-check-test--seed-open-decision "old-decision" nil nil)
       (cc-butler-self-check-test--with-thread-replies-stub
           (lambda (_room _event-id) (error "must not be called -- never delivered"))
-        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
           (should (plist-get r :ok))
           (should (string-match-p "1 candidate(s)" (plist-get r :detail)))
           (should (string-match-p "unverifiable 1" (plist-get r :detail)))
@@ -1011,7 +1013,7 @@ that shape required."
             (list :status 'ok
                   :events '(((sender . "@butler-test:example.org")))
                   :scanned 1 :truncated nil))
-        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
           (should (plist-get r :ok))
           (should (string-match-p "open 1" (plist-get r :detail)))
           (should-not (string-match-p "stale\\|closed\\|resolved" (plist-get r :detail)))
@@ -1034,7 +1036,7 @@ any sender -- pinned here as a permanent test rather than left implicit."
                   :events '(((sender . "@butler-test:example.org"))
                             ((sender . "@a-human:example.org")))
                   :scanned 2 :truncated nil))
-        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
           (should (plist-get r :ok))
           (should (string-match-p "open 1" (plist-get r :detail)))
           (should-not (string-match-p "stale\\|closed\\|resolved" (plist-get r :detail)))

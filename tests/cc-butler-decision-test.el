@@ -674,7 +674,7 @@ The old `\"^:Delivered-to-matrix: \"' regex missed this shape entirely."
           (should (equal "제목 없음" (cc-butler--decision-file-title f))))
       (delete-file f))))
 
-;;;; ---- value-capturing readers: event id + room (queue-room reconciliation) --
+;;;; ---- value-capturing readers: event id + room (queue-room thread activity) --
 ;;;; `:Delivered-to-matrix:' now also captures ITS OWN VALUE (an extended
 ;;;; regex, not a second parallel one); `:Room:' is a fresh reader following
 ;;;; the identical dual-shape (flat vs. indented-under-heading) approach.

@@ -774,7 +774,7 @@ must never silently create an arbitrary directory."
 ;; locally-open decision with a recorded Matrix delivery, it fetches that
 ;; event's thread and reports what is there -- scanned message count and a
 ;; raw sender/count breakdown -- as material for a human to read.  Every
-;; candidate this check can reconcile stays counted as "awaiting answer"
+;; candidate this check examines stays counted as "awaiting answer"
 ;; regardless of what its thread shows; nothing here ever removes a
 ;; decision from that count.  See this check's own test file for the
 ;; permanent negative controls pinning this down, including the exact
@@ -791,7 +791,7 @@ must never silently create an arbitrary directory."
 
 (defun cc-butler-self-check--queue-room-matrix-configured-p ()
   "Non-nil when this fleet has Matrix bridging configured enough for check 9
-to attempt reconciliation at all: a self identity AND an on-disk token
+to attempt this check at all: a self identity AND an on-disk token
 file.  `matrix-bridge-self-user-id' is genuinely nil on a fleet that never
 set up Matrix -- a normal, valid state, not a defect -- so this check must
 not fail for that reason; it skips instead (see the caller)."
@@ -800,7 +800,7 @@ not fail for that reason; it skips instead (see the caller)."
        (file-exists-p matrix-bridge-token-file)))
 
 (defun cc-butler-self-check--queue-room-reason-label (reason)
-  "Human-readable label for one `cc-butler-self-check--queue-room-reconcile-one'
+  "Human-readable label for one `cc-butler-self-check--queue-room-thread-activity-one'
 unverifiable REASON symbol -- kept distinct per reason in `:detail' rather
 than collapsed into one undifferentiated \"unverifiable\" count, since each
 points at a different, useful diagnostic (never delivered vs. delivered but
@@ -831,8 +831,9 @@ whether any of it means a decision is answered."
 as \"sender x N; sender x N\", for `:detail'."
   (mapconcat (lambda (s) (format "%s x%d" (car s) (cdr s))) senders "; "))
 
-(defun cc-butler-self-check--queue-room-reconcile-one (path)
-  "Reconcile one open/ decision file at PATH.  Returns a plist:
+(defun cc-butler-self-check--queue-room-thread-activity-one (path)
+  "Surface Matrix thread activity for one open/ decision file at PATH.
+Returns a plist:
   (:bucket open :scanned N :senders ALIST)  -- thread fetched; ALIST (from
                                                 `cc-butler-self-check--queue-room-sender-counts')
                                                 is raw material for a human
@@ -876,20 +877,20 @@ controls pinning this down."
                  :senders (cc-butler-self-check--queue-room-sender-counts
                            (plist-get resp :events))))))))))
 
-(defun cc-butler-self-check--queue-room-reconciliation ()
-  "Check 9: reconciliation between the open/ decision queue and the Matrix
-room a delivered decision was posted into -- see the section commentary
+(defun cc-butler-self-check--queue-room-thread-activity ()
+  "Check 9: surfaces Matrix thread activity for each open/ decision queue
+file that recorded delivery into a room -- see the section commentary
 above for the incident this exists to catch and why a reverse (room->queue)
 scan is explicitly out of scope.
 
 Candidates are `cc-butler--decision-open-files-and-oldest''s existing
 `Kind: decision' population (reused, not re-scanned).  When Matrix is not
 configured on this fleet at all (`cc-butler-self-check--queue-room-matrix-configured-p'),
-reconciliation is skipped entirely and `:ok' is t -- a fleet without
+this check is skipped entirely and `:ok' is t -- a fleet without
 Matrix wired up is a normal state, not a defect.
 
 Otherwise, each candidate lands in one of two buckets
-(`cc-butler-self-check--queue-room-reconcile-one'): OPEN (the thread was
+(`cc-butler-self-check--queue-room-thread-activity-one'): OPEN (the thread was
 fetched -- `:detail' carries its scanned-message count and a raw
 sender/count breakdown, for a human to read) or UNVERIFIABLE (missing
 `:Delivered-to-matrix:'/`:Room:', the recorded room turned out wrong, or
@@ -898,7 +899,7 @@ the same \"still awaiting answer\" total -- nothing here ever removes a
 decision from that count.
 
 `:ok' is unconditionally t whenever Matrix is configured -- this check has
-NO closure verdict to fail on (see `cc-butler-self-check--queue-room-reconcile-one''s
+NO closure verdict to fail on (see `cc-butler-self-check--queue-room-thread-activity-one''s
 docstring for why: thread activity, even from this fleet's own identity,
 is not evidence of an answer). Its entire value is surfacing raw
 per-candidate thread material in `:detail' for a human to read and judge
@@ -906,24 +907,24 @@ per-candidate thread material in `:detail' for a human to read and judge
 the open count (with each file's scanned-reply count and sender
 breakdown), the unverifiable count (broken down by reason), and the
 aggregate scanned-message total paired with how many decisions were
-actually reconciled -- so a reader can tell \"the check ran and found
+actually checked -- so a reader can tell \"the check ran and found
 nothing\" apart from \"the check silently didn't run\"."
   (if (not (cc-butler-self-check--queue-room-matrix-configured-p))
       (let ((n (length (car (cc-butler--decision-open-files-and-oldest)))))
         (list :ok t
-              :detail (format "queue-room reconciliation: skipped — Matrix not configured on this fleet (%s); %d open decision(s) left unreconciled"
+              :detail (format "queue-room thread activity: skipped — Matrix not configured on this fleet (%s); %d open decision(s) left unchecked"
                                (if (not matrix-bridge-self-user-id)
                                    "matrix-bridge-self-user-id is nil"
                                  "matrix-bridge-token-file does not exist")
                                n)))
     (let* ((dir (cc-butler--decision-open-dir))
            (files (car (cc-butler--decision-open-files-and-oldest)))
-           open unverifiable (scanned-total 0) (reconciled 0))
+           open unverifiable (scanned-total 0) (checked 0))
       (dolist (f files)
-        (let ((r (cc-butler-self-check--queue-room-reconcile-one (expand-file-name f dir))))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity-one (expand-file-name f dir))))
           (pcase (plist-get r :bucket)
             ('open
-             (setq reconciled (1+ reconciled) scanned-total (+ scanned-total (plist-get r :scanned)))
+             (setq checked (1+ checked) scanned-total (+ scanned-total (plist-get r :scanned)))
              (push (list f (plist-get r :scanned) (plist-get r :senders)) open))
             ('unverifiable
              (push (cons f (plist-get r :reason)) unverifiable)))))
@@ -933,7 +934,7 @@ nothing\" apart from \"the check silently didn't run\"."
                         (cons reason (length (seq-filter (lambda (u) (eq (cdr u) reason)) unverifiable))))
                       '(no-delivery no-room not-in-room fetch-error)))
              (detail
-              (format "queue-room reconciliation: %d candidate(s) — open %d%s · unverifiable %d (%s) — %d decision(s) reconciled, %d total thread message(s) scanned — this check never judges closure; read each before treating any as answered"
+              (format "queue-room thread activity: %d candidate(s) — open %d%s · unverifiable %d (%s) — %d decision(s) checked, %d total thread message(s) scanned — this check never judges closure; read each before treating any as answered"
                       (length files)
                       (length open)
                       (if open
@@ -950,7 +951,7 @@ nothing\" apart from \"the check silently didn't run\"."
                                                        (cc-butler-self-check--queue-room-reason-label (car rc))
                                                        (cdr rc)))
                                  reason-counts "; ")
-                      reconciled scanned-total)))
+                      checked scanned-total)))
         (list :ok t :detail detail)))))
 
 ;;;; ------------------------------------------------------------------
@@ -966,7 +967,7 @@ nothing\" apart from \"the check silently didn't run\"."
     ("vault-path" . cc-butler-self-check--vault-path)
     ("code-vs-live-defcustom" . cc-butler-self-check--code-vs-live-defcustom)
     ("orphaned-inboxes" . cc-butler-self-check--orphaned-inboxes)
-    ("queue-room-reconciliation" . cc-butler-self-check--queue-room-reconciliation))
+    ("queue-room-thread-activity" . cc-butler-self-check--queue-room-thread-activity))
   "Alist of (NAME . FUNCTION).  FUNCTION takes no args, returns a plist
 \(:ok BOOL :detail STRING).  Extensible -- new checks are just new entries,
 so this does not stay a fixed list of six forever.
@@ -1103,7 +1104,7 @@ just silent."
   (claude-code-ide-make-tool
    :function #'cc-butler-tool-self-check
    :name "self_check"
-   :description "Pull the full state of cc-butler's periodic consistency self-check (existence -> consistency), on demand, from any fleet session. Nine checks: MCP bound port vs. each live session's actual connection port; governance memory write-path vs. read-path; the North Star file's existence + location inside the current governance store; the running module code's ancestry vs. origin/main (deliberately partial -- pending a separate stable-install-path decision); tracked customizable variables' persisted-vs-live state (would this survive a restart); WARMBLE_JUMBLE_PATH vs. the governance store (a cross-tool vault-drift canary); code-vs-live defcustom drift (is a live value already stuck on a superseded code default RIGHT NOW, restart or not); orphaned mail inboxes (a not-live agent's inbox with old unread mail nobody will ever read); and queue-room reconciliation (surfaces each locally-open decision's Matrix thread activity -- sender and message counts, not a closure verdict -- forward-only, file-driven only, never a reverse room scan). Returns EVERY check's state, ok and failing both -- a clean run is positively confirmable, not just silent."
+   :description "Pull the full state of cc-butler's periodic consistency self-check (existence -> consistency), on demand, from any fleet session. Nine checks: MCP bound port vs. each live session's actual connection port; governance memory write-path vs. read-path; the North Star file's existence + location inside the current governance store; the running module code's ancestry vs. origin/main (deliberately partial -- pending a separate stable-install-path decision); tracked customizable variables' persisted-vs-live state (would this survive a restart); WARMBLE_JUMBLE_PATH vs. the governance store (a cross-tool vault-drift canary); code-vs-live defcustom drift (is a live value already stuck on a superseded code default RIGHT NOW, restart or not); orphaned mail inboxes (a not-live agent's inbox with old unread mail nobody will ever read); and queue-room thread activity (surfaces each locally-open decision's Matrix thread -- sender and message counts, not a closure verdict -- forward-only, file-driven only, never a reverse room scan). Returns EVERY check's state, ok and failing both -- a clean run is positively confirmable, not just silent."
    :args nil))
 
 (defun cc-butler-tool-acknowledge-orphan-inbox (slug reason)
