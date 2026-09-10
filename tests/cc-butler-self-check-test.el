@@ -845,8 +845,10 @@ treated as \"not configured\", not a failure."
         (should (string-match-p "skipped" (plist-get r :detail)))))))
 
 (ert-deftest cc-butler-self-check/queue-room-empty-thread-is-genuinely-open ()
-  "A successful fetch that finds NOTHING is a real, meaningful \"checked, all
-clear\" -- genuinely open, not unverifiable, not an error."
+  "A successful fetch that finds NOTHING is still a real, meaningful result
+-- \"fetched, found nothing\", not \"all clear\": this check makes no
+judgment about what an empty thread means, only that the fetch itself
+succeeded.  Lands in the open bucket, not unverifiable, not an error."
   (cc-butler-self-check-test--with-decision-dir
     (cc-butler-self-check-test--with-matrix-configured
       (cc-butler-self-check-test--seed-open-decision
