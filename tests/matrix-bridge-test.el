@@ -231,6 +231,21 @@ reported distinctly from a generic error."
     (let ((r (matrix-bridge-thread-replies "!fake-room:example.org" "$fake-event-1")))
       (should (eq 'not-in-room (plist-get r :status))))))
 
+(ert-deftest matrix-bridge/thread-replies-unparseable-body-is-status-error-not-ok ()
+  "HTTP 200 with a body that fails to parse (`:parsed' nil, since
+`matrix-bridge--thread-fetch-page' parses via `ignore-errors') must be
+`:status error' -- NOT `:status ok :scanned 0'.  Before this guard, a
+parse failure fell through to the success branch with an empty chunk and
+absent next_batch, producing exactly the indistinguishable-0 this whole
+check's `:detail' contract exists to prevent: a caller cannot tell
+\"checked, found nothing\" apart from \"the body never parsed at all\"."
+  (matrix-bridge-test--with-fetch-page-stub
+      (list (list :http-status 200 :parsed nil))
+    (let ((r (matrix-bridge-thread-replies "!fake-room:example.org" "$fake-event-1")))
+      (should-not (eq 'ok (plist-get r :status)))
+      (should (eq 'error (plist-get r :status)))
+      (should (stringp (plist-get r :detail))))))
+
 (ert-deftest matrix-bridge/thread-replies-generic-http-error-is-status-error ()
   (matrix-bridge-test--with-fetch-page-stub
       (list (list :http-status 500 :parsed '((errcode . "M_UNKNOWN") (error . "boom"))))

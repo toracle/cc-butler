@@ -349,6 +349,11 @@ t -- never silently presented as an exhaustive scan."
                                               ""))
                                 ""))
                       more nil))
+               ((null parsed)
+                (setq err-detail
+                      (format "matrix-bridge-thread-replies: unparseable body (HTTP %s)"
+                              (or http-status "?"))
+                      more nil))
                (t
                 (let* ((chunk (append (matrix-bridge--get parsed 'chunk) nil))
                        (next (matrix-bridge--get parsed 'next_batch)))
