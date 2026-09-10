@@ -541,6 +541,31 @@ slug-aware, see `cc-butler-governance--description-budget-bytes'), the
 SAME formatter every other pass uses, so this can never diverge from
 what a fresh line for that slug would look like.
 
+Only ever rewrites a line it can PROVE is stale mechanical output, never
+one that shows any sign of independent hand-authored wording -- the same
+caution `--sync-index' and `--normalize-index-format' already take about
+never clobbering a human's own text.  \"Provably mechanical\" here means:
+the on-disk description, re-truncated to the OLD flat
+`cc-butler-governance--generated-description-max-bytes' (48) budget,
+byte-for-byte matches what `cc-butler-governance--truncate-bytes' would
+produce from the note's CURRENT frontmatter description at that SAME old
+48-byte budget -- the identical comparison
+`cc-butler-governance--stale-index-entries' already uses to tell drifted
+or curated text apart from text that is still exactly what the old
+generator would write.  A match means nothing about this line has
+diverged from mechanical generation since the old flat-budget formatter
+last wrote it, so it is safe to re-render at the correct slug-aware
+budget.  A mismatch -- on-disk text the old generator would not have
+produced from the current description -- is left COMPLETELY untouched,
+oversized or not: it may be a line a human curated with different
+wording on purpose (see
+`cc-butler-governance/regenerate-does-not-duplicate-an-already-curated-entry'),
+and this function has no way to tell that apart from real drift, so
+neither is safe to overwrite here.  A note whose current description is
+itself short enough to need no truncation at either budget trivially
+matches and \"shrinks\" as a no-op -- expected, not a false positive,
+since old-render and new-render are then identical anyway.
+
 A slug whose boilerplate alone already meets or exceeds the cap will
 still render over-length after this -- expected, not a bug (see
 `cc-butler-governance--description-budget-bytes'); this function's job
@@ -562,13 +587,27 @@ slugs rewritten."
       (with-temp-buffer
         (insert-file-contents index)
         (goto-char (point-min))
-        (while (re-search-forward cc-butler-governance--index-line-regexp nil t)
+        (while (re-search-forward
+                (concat cc-butler-governance--index-line-regexp "\\(.*\\)$") nil t)
           (let* ((slug (match-string 1))
+                 (indexed-desc (match-string 2))
                  (beg (match-beginning 0))
                  (end (min (point-max) (1+ (line-end-position)))))
             (if (and (member slug live)
                      (> (string-bytes (buffer-substring-no-properties beg end))
-                        cc-butler-governance-max-index-line-bytes))
+                        cc-butler-governance-max-index-line-bytes)
+                     ;; Same comparison `--stale-index-entries' uses (just
+                     ;; the positive sense of it): on-disk text must equal
+                     ;; the OLD 48-byte-budget rendering of the note's
+                     ;; CURRENT description, or this is curated/drifted
+                     ;; text, not mechanical output, and must be left alone.
+                     (let* ((note (expand-file-name (concat "butler-" slug ".md")
+                                                    (cc-butler-governance-memory-store)))
+                            (current (or (cc-butler-governance--frontmatter-description note)
+                                         "(no description in store)")))
+                       (equal (cc-butler-governance--truncate-bytes
+                               current cc-butler-governance--generated-description-max-bytes)
+                              indexed-desc)))
                 (let ((new-line (cc-butler-governance--index-line slug)))
                   (goto-char beg)
                   (delete-region beg end)
