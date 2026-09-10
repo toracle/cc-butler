@@ -34,6 +34,14 @@
 (require 'cc-butler-workspace)
 (require 'cc-butler-orchestrator)   ; cc-butler--send-input / cc-butler--read-output
 
+;; `cc-butler-compact' REQUIRES this file (for `cc-butler-cleanup-context-for'
+;; etc.), so a hard `require' the other way would be circular. Both are always
+;; loaded together in practice (`cc-butler.el' requires this file, then
+;; `cc-butler-compact'), so `declare-function' is enough to satisfy the
+;; byte-compiler without introducing the cycle.
+(declare-function cc-butler-compact--menu-block-reason "cc-butler-compact" (dir))
+(declare-function cc-butler-compact--pending-input-p "cc-butler-compact" (dir))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Override points (defcustom / function slots / hooks)
 ;;;; ------------------------------------------------------------------
@@ -1028,6 +1036,177 @@ select any, choose a tier, and runs `cc-butler-session-cleanup' on each."
                (length dirs) tier))))
 
 ;;;; ------------------------------------------------------------------
+;;;; Scheduled idle-worker cleanup (autonomous, tier `clear' ONLY)
+;;;; ------------------------------------------------------------------
+;;
+;; `cc-butler-cleanup-surface-candidates' only RECOMMENDS; a human still has to
+;; act.  This is the daily autonomous counterpart 정수님 asked for (2026-09-10):
+;; ordinary workers idle for days, not just over a context/notification
+;; threshold, get cleaned (`clear' tier only — never `delete-dir') without
+;; waiting on a human to notice the recommendation.
+;;
+;; Idle age is measured from the newest transcript mtime
+;; (`cc-butler--session-last-activity'), NOT the in-memory `:waiting'
+;; timestamp (`cc-butler--waiting-p') — the latter lives in a hash table that
+;; is empty after every Emacs restart, so a session idle for a week would
+;; read as freshly-idle right after a restart.  `:waiting' is used only as a
+;; fallback when no transcript exists at all, and still gates candidacy
+;; alongside the transcript age (a session must currently be WAITING, not
+;; merely once-idle-long-ago per a stale transcript).
+;;
+;; Deliberately does NOT consult `cc-butler--transcript-idle-p' /
+;; `cc-butler--forward-ops-free-p' (the short-window "busy" heuristic the
+;; North Star timer and compaction use) — measured (x600, 2026-09-10) to
+;; false-positive on genuinely WAITING sessions, which would make a cleanup
+;; gated on it skip exactly the sessions it exists to catch. Every OTHER
+;; safety guard from the interactive path still applies in full (see
+;; `cc-butler-cleanup--scheduled-blocked-reason'): butler/steward, the keep
+;; list, an open menu, unsubmitted typed input, and an in-flight cleanup.
+
+(defcustom cc-butler-cleanup-scheduled-idle-days 3
+  "Days of transcript inactivity after which an ordinary WAITING worker is a
+candidate for the scheduled daily cleanup sweep (tier `clear' only)."
+  :type 'number
+  :group 'cc-butler)
+
+(defcustom cc-butler-cleanup-scheduled-interval (* 24 60 60)
+  "Seconds between scheduled idle-worker cleanup sweeps."
+  :type 'number
+  :group 'cc-butler)
+
+(defcustom cc-butler-cleanup-scheduled-skip-limit 3
+  "Consecutive scheduled-sweep runs a candidate may be skipped (blocked by a
+menu, unsubmitted input, an in-flight cleanup, etc.) before it is SURFACED
+via `cc-butler-cleanup-surface-function' instead of merely logged again —
+logging the same skip forever becomes noise nobody reads."
+  :type 'integer
+  :group 'cc-butler)
+
+(defvar cc-butler-cleanup--scheduled-timer nil
+  "Repeating timer driving `cc-butler-cleanup--scheduled-fire', or nil.")
+
+(defvar cc-butler-cleanup--scheduled-skip-count (make-hash-table :test 'equal)
+  "Map session dir -> consecutive scheduled-sweep skip count.
+Reset to 0 (removed) the moment a dir is no longer skipped — either a
+cleanup was actually fired for it, or it stopped being a candidate.")
+
+(defvar cc-butler-cleanup--scheduled-pending (make-hash-table :test 'equal)
+  "Dirs whose CURRENT cleanup was triggered by the scheduled sweep.
+Consulted only by `cc-butler-cleanup--scheduled-promote-after-externalize',
+so a `clear'-tier scheduled cleanup still gets a durable handoff-dir copy —
+core only promotes automatically for `delete-dir' (see
+`cc-butler-cleanup--default-promote''s caller), since a `clear' tier's
+in-dir copy otherwise survives on its own.")
+
+(defun cc-butler-cleanup--scheduled-idle-seconds (dir)
+  "Seconds DIR has been idle, for the scheduled daily sweep, or nil when
+unknowable. Prefers the newest transcript mtime
+\(`cc-butler--session-last-activity'), which survives an Emacs restart;
+falls back to the in-memory `:waiting' timestamp only when no transcript
+exists at all."
+  (let ((last (cc-butler--session-last-activity dir)))
+    (if last
+        (- (float-time) last)
+      (let ((waiting (cc-butler--waiting-p dir)))
+        (and waiting (- (float-time) waiting))))))
+
+(defun cc-butler-cleanup--scheduled-candidates ()
+  "Ordinary WAITING workers idle >= `cc-butler-cleanup-scheduled-idle-days'.
+Does NOT pre-filter on the keep list or an in-flight cleanup — those are
+still-refusable-but-loggable reasons handled (and logged) by
+`cc-butler-cleanup--scheduled-blocked-reason' in the fire loop, so a kept or
+already-active session is a logged skip, not a silent omission from this
+list."
+  (let (out)
+    (dolist (s (cc-butler--sessions))
+      (let* ((dir (plist-get s :dir))
+             (idle (and (cc-butler-cleanup--worker-p dir)
+                        (cc-butler--waiting-p dir)
+                        (cc-butler-cleanup--scheduled-idle-seconds dir))))
+        (when (and idle (>= idle (* cc-butler-cleanup-scheduled-idle-days 86400)))
+          (push dir out))))
+    (nreverse out)))
+
+(defun cc-butler-cleanup--scheduled-blocked-reason (dir)
+  "Return a string explaining why DIR must not be scheduled-cleaned now, else
+nil. Mirrors `cc-butler-compact--blocked-reason' with busy ALWAYS ignored
+\(candidacy already required WAITING + a multi-day transcript age, a
+stronger and more reliable idle signal than the short busy-window check) —
+every other guard stays: butler/steward, the keep list, an in-flight
+cleanup, no live terminal, an open menu, or unsubmitted typed input."
+  (let ((name (cc-butler--display-name dir)))
+    (cond
+     ((not (cc-butler-cleanup--worker-p dir)) "not an ordinary worker")
+     ((member name cc-butler-cleanup-keep) "on `cc-butler-cleanup-keep'")
+     ((cc-butler-cleanup--active-p dir) "cleanup already in flight")
+     ((not (let ((b (get-buffer (claude-code-ide--get-buffer-name dir))))
+             (and b (buffer-live-p b))))
+      "no live terminal")
+     ((cc-butler-compact--menu-block-reason dir))
+     ((cc-butler-compact--pending-input-p dir)
+      "unsubmitted text is sitting in the input box")
+     (t nil))))
+
+(defun cc-butler-cleanup--scheduled-promote-after-externalize (session)
+  "Added to `cc-butler-cleanup-after-externalize-functions'. When SESSION's
+cleanup was triggered by the scheduled sweep
+\(`cc-butler-cleanup--scheduled-pending'), also promote its handoff record
+to `cc-butler-cleanup-handoff-dir' — core
+only does this for `delete-dir' teardowns, but a scheduled `clear' should
+still be findable outside the (unarchived) workspace dir it clears, not
+only by someone who happens to reopen that dir later."
+  (let ((dir (plist-get session :dir)))
+    (when (gethash dir cc-butler-cleanup--scheduled-pending)
+      (remhash dir cc-butler-cleanup--scheduled-pending)
+      (let ((result (funcall cc-butler-cleanup-promote-function session)))
+        (cc-butler--log "cleanup: %s │ scheduled handoff promote %s"
+                        (plist-get session :name)
+                        (if (eq result t) "ok" (format "failed: %s" result)))))))
+
+(add-hook 'cc-butler-cleanup-after-externalize-functions
+          #'cc-butler-cleanup--scheduled-promote-after-externalize)
+
+(defun cc-butler-cleanup--scheduled-fire ()
+  "Run one scheduled idle-worker cleanup sweep.
+Tier `clear' ONLY, never `delete-dir'; never the butler/steward
+\(`cc-butler-cleanup--worker-p' guards both here and, in defense of depth,
+inside `cc-butler-session-cleanup' itself). Every skip is logged with its
+reason (no silent skips) — except once a dir has been skipped
+`cc-butler-cleanup-scheduled-skip-limit' times in a row, when it is
+SURFACED instead (`cc-butler-cleanup-surface-function') and its skip count
+resets, so surfacing does not also repeat every run forever."
+  (dolist (dir (cc-butler-cleanup--scheduled-candidates))
+    (let ((name (cc-butler--display-name dir))
+          (reason (cc-butler-cleanup--scheduled-blocked-reason dir)))
+      (cond
+       ((not reason)
+        (remhash dir cc-butler-cleanup--scheduled-skip-count)
+        (puthash dir t cc-butler-cleanup--scheduled-pending)
+        (cc-butler--log "cleanup: %s │ scheduled cleanup firing (tier clear)" name)
+        (cc-butler-session-cleanup dir 'clear))
+       (t
+        (let ((n (1+ (gethash dir cc-butler-cleanup--scheduled-skip-count 0))))
+          (if (< n cc-butler-cleanup-scheduled-skip-limit)
+              (progn
+                (puthash dir n cc-butler-cleanup--scheduled-skip-count)
+                (cc-butler--log "cleanup: %s │ scheduled skip (%s) [%d/%d]"
+                                name reason n cc-butler-cleanup-scheduled-skip-limit))
+            (remhash dir cc-butler-cleanup--scheduled-skip-count)
+            (funcall cc-butler-cleanup-surface-function
+                     (cc-butler-cleanup--session dir)
+                     (format "scheduled cleanup skipped %d times in a row (%s)"
+                             n reason)))))))))
+
+(defun cc-butler-cleanup--scheduled-ensure-timer ()
+  "(Re)register the scheduled cleanup timer; idempotent for hot reloads."
+  (when (timerp cc-butler-cleanup--scheduled-timer)
+    (cancel-timer cc-butler-cleanup--scheduled-timer))
+  (setq cc-butler-cleanup--scheduled-timer
+        (run-with-timer cc-butler-cleanup-scheduled-interval
+                         cc-butler-cleanup-scheduled-interval
+                         #'cc-butler-cleanup--scheduled-fire)))
+
+;;;; ------------------------------------------------------------------
 ;;;; MCP tool: close_topic (the butler's IRREVERSIBLE teardown hand)
 ;;;; ------------------------------------------------------------------
 ;;
@@ -1254,6 +1433,8 @@ Returns the list of worker dirs a fresh settings file was written into."
 (with-eval-after-load 'cc-butler-session
   (when (boundp 'cc-butler-mode-map)
     (define-key cc-butler-mode-map "C" #'cc-butler-cleanup-scan)))
+
+(cc-butler-cleanup--scheduled-ensure-timer)
 
 (provide 'cc-butler-cleanup)
 ;;; cc-butler-cleanup.el ends here
