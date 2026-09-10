@@ -1002,5 +1002,29 @@ one thing that is actually running."
         (should (eq (plist-get norm :function) #'cc-butler-tool-runtime-source))
         (should-not (plist-get norm :args))))))
 
+(ert-deftest cc-butler-modules/matches-every-el-file-in-the-directory ()
+  "REGRESSION GUARD (2026-09-10): `cc-butler--modules' is a hand-maintained
+list, not a directory scan -- a new root `.el' file nobody adds to it is
+invisible to `cc-butler-reload' (never loaded) AND to self-checks 5/7 (both
+walk this same list for defcustom drift), and both keep reporting success.
+`matrix-bridge.el' sat in exactly this gap for weeks before this test
+existed (see the `an-upstream-list-walk-is-blind-to-what-is-not-on-the-list'
+governance note). This is the parity contract: every `.el' file at the repo
+root is either `cc-butler' itself, a tracked module, or named in
+`cc-butler--modules-directory-exceptions' with a reason -- there is no
+fourth, silent option."
+  (let* ((on-disk (sort (mapcar #'file-name-base
+                                 (directory-files cc-butler--dir nil "\\`[^.].*\\.el\\'"))
+                         #'string<))
+         (tracked (sort (mapcar #'symbol-name
+                                 (append (list 'cc-butler)
+                                         cc-butler--modules
+                                         cc-butler--modules-directory-exceptions))
+                         #'string<))
+         (only-on-disk (cl-set-difference on-disk tracked :test #'string=))
+         (only-tracked (cl-set-difference tracked on-disk :test #'string=)))
+    (should (equal (list :only-on-disk only-on-disk :only-tracked only-tracked)
+                   (list :only-on-disk nil :only-tracked nil)))))
+
 (provide 'cc-butler-reload-test)
 ;;; cc-butler-reload-test.el ends here
