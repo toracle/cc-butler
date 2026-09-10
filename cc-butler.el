@@ -478,6 +478,37 @@ every test would keep passing."
               (push (list sym (symbol-value sym) code-default) drift))))))
     (nreverse drift)))
 
+(defun cc-butler--defcustom-drift-all (&optional dir)
+  "All (SYMBOL LIVE-VALUE CODE-DEFAULT) drift triples across cc-butler.el and
+every module in `cc-butler--modules', read from DIR (default
+`cc-butler-source-dir').  The single shared enumeration `cc-butler-reload'
+and `cc-butler-self-check' both call, so \"which defcustoms count\" and
+\"what counts as drifted\" can never disagree between the two call sites —
+same one-shared-place precedent as `cc-butler--checkout-dirty-p' (PR #223)."
+  (let ((dir (or dir (cc-butler-source-dir))))
+    (cl-loop for m in (cons 'cc-butler cc-butler--modules)
+             append (cc-butler--defcustom-drift
+                     (expand-file-name (concat (symbol-name m) ".el") dir)))))
+
+(defun cc-butler--defcustom-symbols-all (&optional dir)
+  "Every trackable defcustom/defvar SYMBOL across cc-butler.el and
+`cc-butler--modules' — bound, non-noise (see
+`cc-butler--defcustom-drift-internal-p'/`-noise-p') — read from DIR's
+source text (default `cc-butler-source-dir'), regardless of whether it
+currently drifts.  The population check 5 (persisted-vs-live) auto-scans
+instead of a hand-maintained list, so it cannot silently narrow as the
+codebase grows (2026-09-10: the hand list tracked 2 of ~8 variables that
+actually mattered)."
+  (let ((dir (or dir (cc-butler-source-dir))))
+    (cl-loop for m in (cons 'cc-butler cc-butler--modules)
+             append (cl-loop for pair in (cc-butler--defcustom-forms-in-file
+                                           (expand-file-name (concat (symbol-name m) ".el") dir))
+                              for sym = (car pair)
+                              when (and (boundp sym)
+                                        (not (cc-butler--defcustom-drift-internal-p sym))
+                                        (not (cc-butler--defcustom-drift-noise-p sym)))
+                              collect sym))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Drift labeling: is a stuck reload or a deliberate customization more
 ;;;; plausible, given the file's OWN git history? Read-only, additive,
@@ -630,9 +661,7 @@ how this particular call arrived, for a human to weigh later)."
     (load (expand-file-name (concat (symbol-name m) ".el") (cc-butler-source-dir)) nil t))
   (let* ((stale (cc-butler--stale-elc))
          (dir (cc-butler-source-dir))
-         (drift (cl-loop for m in (cons 'cc-butler cc-butler--modules)
-                          append (cc-butler--defcustom-drift
-                                  (expand-file-name (concat (symbol-name m) ".el") dir)))))
+         (drift (cc-butler--defcustom-drift-all dir)))
     (when (called-interactively-p 'interactive)
       (message "cc-butler: reloaded %d modules from %s%s"
                (length cc-butler--modules) dir

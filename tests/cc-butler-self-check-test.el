@@ -6,6 +6,11 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'cc-butler-self-check)
+;; Reuses the synthetic-git-repo fixture helpers this repo already built for
+;; testing the drift machinery (`cc-butler-test--git',
+;; `cc-butler-test--make-multi-commit-git-repo',
+;; `cc-butler-test--write-fixture-module') — never a parallel copy.
+(require 'cc-butler-reload-test)
 
 ;;;; ------------------------------------------------------------------
 ;;;; Check 1: MCP port
@@ -175,6 +180,61 @@ pass -- this is the check answering \"is this correct AFTER a restart\"."
       (let ((r (cc-butler-self-check--persisted-vs-live)))
         (should (plist-get r :ok))))))
 
+(ert-deftest cc-butler-self-check/persisted-vs-live-does-not-flag-unsaved-when-matching-code-default ()
+  "REGRESSION GUARD (2026-09-10): steward set `cc-butler-launch-ready-timeout'
+live to 8 with `saved-value' nil, deliberately -- a restart gives back that
+exact same value anyway, so there is nothing to lose and this must read as
+OK, not bad.  An unsaved variable whose live value already equals the
+current code-default (i.e. absent from `cc-butler--defcustom-drift-all')
+must NOT be flagged."
+  (let ((cc-butler-self-check-tracked-variables '(cc-butler-test-check5-matching)))
+    (defvar cc-butler-test-check5-matching)
+    (setq cc-butler-test-check5-matching 8)
+    (unwind-protect
+        (cl-letf (((symbol-function 'custom-variable-state) (lambda (&rest _) 'changed))
+                  ((symbol-function 'cc-butler--defcustom-drift-all) (lambda (&optional _dir) nil))
+                  ((symbol-function 'cc-butler--defcustom-symbols-all) (lambda (&optional _dir) nil)))
+          (let ((r (cc-butler-self-check--persisted-vs-live)))
+            (should (plist-get r :ok))))
+      (makunbound 'cc-butler-test-check5-matching))))
+
+(ert-deftest cc-butler-self-check/persisted-vs-live-still-flags-unsaved-when-differing-from-code-default ()
+  "The real-risk case must still fail: unsaved AND the live value differs
+from the code-default (present in `cc-butler--defcustom-drift-all') -- a
+restart would silently revert this to something wrong."
+  (let ((cc-butler-self-check-tracked-variables '(cc-butler-test-check5-differing)))
+    (defvar cc-butler-test-check5-differing)
+    (setq cc-butler-test-check5-differing 5)
+    (unwind-protect
+        (cl-letf (((symbol-function 'custom-variable-state) (lambda (&rest _) 'changed))
+                  ((symbol-function 'cc-butler--defcustom-drift-all)
+                   (lambda (&optional _dir) (list (list 'cc-butler-test-check5-differing 5 8))))
+                  ((symbol-function 'cc-butler--defcustom-symbols-all) (lambda (&optional _dir) nil)))
+          (let ((r (cc-butler-self-check--persisted-vs-live)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "cc-butler-test-check5-differing" (plist-get r :detail)))))
+      (makunbound 'cc-butler-test-check5-differing))))
+
+(ert-deftest cc-butler-self-check/persisted-vs-live-population-includes-auto-scanned-symbol ()
+  "The auto-scanned population must genuinely widen coverage beyond
+`cc-butler-self-check-tracked-variables' -- 2026-09-10: the hand list
+tracked 2 of ~8 variables that actually mattered that day.  A symbol
+returned only by `cc-butler--defcustom-symbols-all', absent from the
+(here empty) tracked-variables list, must still be checked."
+  (let ((cc-butler-self-check-tracked-variables nil)
+        checked)
+    (defvar cc-butler-test-check5-autoscanned)
+    (setq cc-butler-test-check5-autoscanned 1)
+    (unwind-protect
+        (cl-letf (((symbol-function 'cc-butler--defcustom-symbols-all)
+                   (lambda (&optional _dir) (list 'cc-butler-test-check5-autoscanned)))
+                  ((symbol-function 'cc-butler--defcustom-drift-all) (lambda (&optional _dir) nil))
+                  ((symbol-function 'custom-variable-state)
+                   (lambda (sym &rest _) (push sym checked) 'saved)))
+          (cc-butler-self-check--persisted-vs-live)
+          (should (memq 'cc-butler-test-check5-autoscanned checked)))
+      (makunbound 'cc-butler-test-check5-autoscanned))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Check 6: vault path
 ;;;; ------------------------------------------------------------------
@@ -219,6 +279,64 @@ inside a consistency check."
       (should (string-match-p "not set" (plist-get r :detail)))
       ;; Must not read like a real match.
       (should-not (string-match-p "matches" (plist-get r :detail))))))
+
+;;;; ------------------------------------------------------------------
+;;;; Check 7: code-vs-live defcustom (the stuck-reload shape, live)
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-self-check/code-vs-live-defcustom-flags-stuck-reload ()
+  "The exact live regression this check exists for (2026-09-05:
+`cc-butler-launch-ready-timeout' raised 5->8 in source, stayed live at 5
+through a reload, for 5 days, because nothing periodic ever asked).  A
+live value matching a PAST shipped default, not the current one, must
+fail with a \"likely stuck reload\" label."
+  (skip-unless (executable-find "git"))
+  (cl-destructuring-bind (_dir file _shas)
+      (cc-butler-test--make-multi-commit-git-repo "cc-butler-test-check7-stuck" '(3 5 8))
+    (cl-letf (((symbol-function 'cc-butler--defcustom-drift-all)
+               (lambda (&optional _dir) (list (list 'cc-butler-test-check7-stuck 3 8))))
+              ((symbol-function 'cc-butler--defcustom-file-for-symbol)
+               (lambda (_dir sym) (should (eq sym 'cc-butler-test-check7-stuck)) file)))
+      (let ((r (cc-butler-self-check--code-vs-live-defcustom)))
+        (should-not (plist-get r :ok))
+        (should (string-match-p "cc-butler-test-check7-stuck" (plist-get r :detail)))
+        (should (string-match-p "likely stuck reload" (plist-get r :detail)))))))
+
+(ert-deftest cc-butler-self-check/code-vs-live-defcustom-does-not-flag-deliberate-customization ()
+  "A live value that never appeared in the file's git history is ordinary
+customization, not a stuck reload -- must pass, never page anyone."
+  (skip-unless (executable-find "git"))
+  (cl-destructuring-bind (_dir file _shas)
+      (cc-butler-test--make-multi-commit-git-repo "cc-butler-test-check7-deliberate" '(3 5 8))
+    (cl-letf (((symbol-function 'cc-butler--defcustom-drift-all)
+               (lambda (&optional _dir) (list (list 'cc-butler-test-check7-deliberate 999 8))))
+              ((symbol-function 'cc-butler--defcustom-file-for-symbol)
+               (lambda (_dir _sym) file)))
+      (let ((r (cc-butler-self-check--code-vs-live-defcustom)))
+        (should (plist-get r :ok))))))
+
+(ert-deftest cc-butler-self-check/code-vs-live-defcustom-does-not-flag-unlabelable-drift ()
+  "A default that has NEVER changed in history (no git history to walk at
+all -- the `cc-butler-decision-workflow' shape) cannot even be classified
+as a stuck-reload match.  Unlabelable drift must pass, not fail-open."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-check7-nogit" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defcustom cc-butler-test-check7-nogit 8 \"doc\")\n")))
+    (cl-letf (((symbol-function 'cc-butler--defcustom-drift-all)
+               (lambda (&optional _dir) (list (list 'cc-butler-test-check7-nogit 5 8))))
+              ((symbol-function 'cc-butler--defcustom-file-for-symbol)
+               (lambda (_dir _sym) file)))
+      (let ((r (cc-butler-self-check--code-vs-live-defcustom)))
+        (should (plist-get r :ok))))))
+
+(ert-deftest cc-butler-self-check/code-vs-live-defcustom-passes-quietly-with-no-drift ()
+  "No drift at all (the ordinary case) must pass, with a detail string that
+names how many drifted symbols were checked -- distinct from a real pass
+that found drift but no stuck-reload label among it."
+  (cl-letf (((symbol-function 'cc-butler--defcustom-drift-all) (lambda (&optional _dir) nil)))
+    (let ((r (cc-butler-self-check--code-vs-live-defcustom)))
+      (should (plist-get r :ok))
+      (should (string-match-p "0 drifted" (plist-get r :detail))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Transition detection: escalate only on ok<->fail flips, both ways
