@@ -569,12 +569,94 @@ that check/report output must never surface private runtime content
             (setq oldest mtime))))
       (float-time (time-subtract (current-time) oldest)))))
 
+(defun cc-butler-self-check--inbox-newest-mtime (files)
+  "Return the modification time of the most recently modified of FILES,
+or nil for empty FILES.  Mirror image of `cc-butler-self-check--inbox-oldest-age'
+\(that one returns an age for the oldest; this returns a raw time value
+for the newest) -- needed by the acknowledgment re-trigger comparison in
+`cc-butler-self-check--orphan-acknowledged-p', which reacts to the
+newest arrival, not the oldest."
+  (when files
+    (let (newest)
+      (dolist (f files)
+        (let ((mtime (file-attribute-modification-time (file-attributes f))))
+          (when (or (null newest) (time-less-p newest mtime))
+            (setq newest mtime))))
+      newest)))
+
+(defun cc-butler-self-check--orphan-ack-file (slug)
+  "Return the path to SLUG's orphan-acknowledgment marker file: a dotfile
+at the inbox root (<`cc-butler-mail-dir'>/SLUG/.orphan-ack), deliberately
+NOT inside new/ so it is never itself enumerated as a pending message by
+`cc-butler-self-check--inbox-new-files'."
+  (expand-file-name ".orphan-ack" (cc-butler--mail-inbox slug)))
+
+(defun cc-butler-self-check--orphan-acknowledged-p (slug files)
+  "Return non-nil when SLUG's orphan candidacy is currently acknowledged:
+its `.orphan-ack' marker exists and its modification time is >= the
+newest of FILES (the inbox's current new/ contents).  Any message newer
+than the marker -- or no marker at all -- makes this nil regardless of a
+prior acknowledgment: acknowledging silences only the mail that existed
+at ack time, not mail delivered afterward."
+  (let ((ack-file (cc-butler-self-check--orphan-ack-file slug))
+        (newest (cc-butler-self-check--inbox-newest-mtime files)))
+    (and newest
+         (file-exists-p ack-file)
+         (not (time-less-p
+               (file-attribute-modification-time (file-attributes ack-file))
+               newest)))))
+
+(defun cc-butler-self-check--orphan-candidates-format (candidates)
+  "Format CANDIDATES (a list of (slug pending-count age) as pushed by
+`cc-butler-self-check--orphaned-inboxes') the same way that check has
+always formatted its :detail entries."
+  (mapconcat
+   (lambda (c)
+     (format "%s (%d pending, oldest %s)"
+             (nth 0 c) (nth 1 c)
+             (cc-butler--decision-format-age (nth 2 c))))
+   candidates "; "))
+
+(defun cc-butler-self-check--orphan-ack-reason (slug)
+  "Return the reason text recorded in SLUG's `.orphan-ack' marker file
+\(see `cc-butler-self-check--orphan-ack-content'), or nil when the
+marker does not exist."
+  (let ((ack-file (cc-butler-self-check--orphan-ack-file slug)))
+    (when (file-exists-p ack-file)
+      (with-temp-buffer
+        (insert-file-contents ack-file)
+        (nth 1 (split-string (buffer-string) "\n"))))))
+
+(defun cc-butler-self-check--orphan-ack-candidates-format (candidates)
+  "Like `cc-butler-self-check--orphan-candidates-format', but for the
+ACKNOWLEDGED branch only: each entry also names the reason it was
+acknowledged for (`cc-butler-self-check--orphan-ack-reason') -- an
+acknowledged candidate with no visible reason repeats the exact
+erasure (who judged this fine, and why) this check exists to catch."
+  (mapconcat
+   (lambda (c)
+     (format "%s (%d pending, oldest %s, ack'd: %s)"
+             (nth 0 c) (nth 1 c)
+             (cc-butler--decision-format-age (nth 2 c))
+             (or (cc-butler-self-check--orphan-ack-reason (nth 0 c)) "unknown")))
+   candidates "; "))
+
 (defun cc-butler-self-check--orphaned-inboxes ()
   "Check 8: an inbox directory under `cc-butler-mail-dir' whose slug maps
 to no currently live session, AND whose oldest unread message in new/
 has sat for at least `cc-butler-self-check-orphan-inbox-age-threshold'
-seconds, is orphaned -- unread mail nobody will ever read.  Read-only:
-never deletes, moves, or marks a message read.
+seconds, is an orphan candidate -- unread mail nobody will ever read.
+Read-only: never deletes, moves, or marks a message read.
+
+Candidates split further into ACTIVE and ACKNOWLEDGED (see
+`cc-butler-self-check--orphan-acknowledged-p') -- a deliberate,
+documented non-fix (mail staying in place pending separate disposal
+work) must not keep this check permanently red once someone has looked
+at it, or it trains people to stop looking, same failure mode as a
+false positive.  So `:ok' is t iff there are zero ACTIVE candidates;
+an acknowledged-but-still-pending candidate never fails `:ok', but it is
+always still named in `:detail' -- acknowledgment silences the FAILURE,
+never the VISIBILITY.
 
 Two false-positive guards, both load-bearing (see this check's own
 design brief):
@@ -585,24 +667,78 @@ design brief):
    threshold is not flagged either (a worker that merely restarted
    minutes/hours ago is not evidence of anything wrong)."
   (let ((live (cc-butler-self-check--live-inbox-slugs))
-        candidates)
+        active acknowledged)
     (dolist (slug (cc-butler-self-check--inbox-dirs))
       (unless (gethash slug live)
         (let* ((files (cc-butler-self-check--inbox-new-files slug))
                (age (cc-butler-self-check--inbox-oldest-age files)))
           (when (and age (>= age cc-butler-self-check-orphan-inbox-age-threshold))
-            (push (list slug (length files) age) candidates)))))
-    (setq candidates (nreverse candidates))
-    (if candidates
-        (list :ok nil
-              :detail (format "orphaned inboxes: %s"
-                              (mapconcat
-                               (lambda (c)
-                                 (format "%s (%d pending, oldest %s)"
-                                         (nth 0 c) (nth 1 c)
-                                         (cc-butler--decision-format-age (nth 2 c))))
-                               candidates "; ")))
-      (list :ok t :detail "orphaned inboxes: none"))))
+            (let ((c (list slug (length files) age)))
+              (if (cc-butler-self-check--orphan-acknowledged-p slug files)
+                  (push c acknowledged)
+                (push c active)))))))
+    (setq active (nreverse active)
+          acknowledged (nreverse acknowledged))
+    (cond
+     ((and (null active) (null acknowledged))
+      (list :ok t :detail "orphaned inboxes: none"))
+     (active
+      (list :ok nil
+            :detail (concat
+                     (format "orphaned inboxes: %s"
+                             (cc-butler-self-check--orphan-candidates-format active))
+                     (when acknowledged
+                       (format "; acknowledged: %s"
+                               (cc-butler-self-check--orphan-ack-candidates-format acknowledged))))))
+     (t
+      (list :ok t
+            :detail (format "orphaned inboxes: none active; acknowledged: %s"
+                             (cc-butler-self-check--orphan-ack-candidates-format acknowledged)))))))
+
+;;;; ------------------------------------------------------------------
+;;;; Orphan-inbox acknowledgment -- quiets check 8 for existing mail only
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-self-check--orphan-ack-content (reason)
+  "Return the `.orphan-ack' marker file content recording REASON: two
+human-readable, greppable lines -- an ISO-ish acknowledgment timestamp,
+then REASON itself.  Content only, for a human/agent reading the marker
+-- the re-trigger mechanism in `cc-butler-self-check--orphan-acknowledged-p'
+never parses this; it keeps comparing the marker file's own mtime."
+  (concat (format-time-string "%FT%T") "\n" reason "\n"))
+
+(defun cc-butler-self-check-acknowledge-orphan-inbox (slug reason)
+  "Acknowledge SLUG's orphan-inbox candidacy for now, recording REASON --
+who judged it fine and why.  This is NOT permanent and NOT a deletion:
+it only creates/rewrites the `.orphan-ack' marker file at the inbox
+root (`cc-butler-self-check--orphan-ack-file', content from
+`cc-butler-self-check--orphan-ack-content'), which silences check 8's
+`:ok' for the mail that exists right now -- the moment one more message
+is delivered to SLUG, `cc-butler-self-check--orphan-acknowledged-p'
+goes false again and the check re-triggers automatically.  Never reads,
+moves, or deletes anything under new/, tmp/, or archive/.
+
+REASON must be a non-blank string (not empty, not only whitespace).  A
+marker recording only a timestamp says someone judged this fine but
+erases who and why -- exactly the failure this check exists to surface
+for un-actioned mail.  A blank REASON signals an error and creates or
+touches NOTHING -- not even when a marker already exists for SLUG; it
+must never overwrite a prior good acknowledgment with nothing.
+
+Signals an error, and creates nothing, when SLUG does not name an
+existing inbox directory directly under `cc-butler-mail-dir' -- this
+must never silently create an arbitrary directory."
+  (interactive
+   (list (completing-read "Acknowledge orphan inbox: "
+                           (cc-butler-self-check--inbox-dirs) nil t)
+         (read-string "Reason: ")))
+  (unless (member slug (cc-butler-self-check--inbox-dirs))
+    (error "cc-butler: %S is not a known mail inbox under `cc-butler-mail-dir'" slug))
+  (when (string-empty-p (string-trim (or reason "")))
+    (error "cc-butler: acknowledging %S requires a non-blank reason" slug))
+  (write-region (cc-butler-self-check--orphan-ack-content reason)
+                nil (cc-butler-self-check--orphan-ack-file slug) nil 'silent)
+  slug)
 
 ;;;; ------------------------------------------------------------------
 ;;;; Registry
@@ -755,6 +891,38 @@ just silent."
    :name "self_check"
    :description "Pull the full state of cc-butler's periodic consistency self-check (existence -> consistency), on demand, from any fleet session. Eight checks: MCP bound port vs. each live session's actual connection port; governance memory write-path vs. read-path; the North Star file's existence + location inside the current governance store; the running module code's ancestry vs. origin/main (deliberately partial -- pending a separate stable-install-path decision); tracked customizable variables' persisted-vs-live state (would this survive a restart); WARMBLE_JUMBLE_PATH vs. the governance store (a cross-tool vault-drift canary); code-vs-live defcustom drift (is a live value already stuck on a superseded code default RIGHT NOW, restart or not); and orphaned mail inboxes (a not-live agent's inbox with old unread mail nobody will ever read). Returns EVERY check's state, ok and failing both -- a clean run is positively confirmable, not just silent."
    :args nil))
+
+(defun cc-butler-tool-acknowledge-orphan-inbox (slug reason)
+  "MCP tool: mark an orphaned inbox (as flagged by check 8 in `self_check')
+as acknowledged for now, recording REASON.  This is NOT permanent and
+NOT a deletion -- it only rewrites a marker file, never a message; a
+new message arriving in that inbox afterward un-acknowledges it
+automatically and check 8 goes active again on its own.  REASON is
+required (not optional) because a marker recording only a timestamp
+erases who judged the inbox fine and why -- this check exists
+specifically to surface mail nobody actioned, so the acknowledgment
+itself must not repeat that same erasure."
+  (cc-butler-self-check-acknowledge-orphan-inbox slug reason)
+  (format "Acknowledged orphan inbox %s for now -- a new message delivered to it will un-acknowledge it automatically." slug))
+
+;; Idempotent registration.
+(when (fboundp 'claude-code-ide-make-tool)
+  (setq claude-code-ide-mcp-server-tools
+        (seq-remove
+         (lambda (spec)
+           (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
+                   '("acknowledge_orphan_inbox")))
+         claude-code-ide-mcp-server-tools))
+  (claude-code-ide-make-tool
+   :function #'cc-butler-tool-acknowledge-orphan-inbox
+   :name "acknowledge_orphan_inbox"
+   :description "Mark an already-known orphaned mail inbox (a not-live agent's inbox with old unread mail, as flagged by check 8 in self_check) as acknowledged-for-now. This is NOT permanent and NOT a deletion -- it only rewrites a marker file at the inbox root, never any message; a new message arriving in that inbox after acknowledgment automatically un-acknowledges it, and check 8 will flag it as failing again on its own, with no further action needed to re-arm it. Requires a reason: a marker recording only a timestamp erases who judged the inbox fine and why, which is exactly the erasure this check exists to surface -- so the acknowledgment itself must not repeat it."
+   :args '((:name "slug"
+                  :type string
+                  :description "The inbox's directory name (slug) exactly as it appears in check 8's :detail output under the `orphaned-inboxes` entry of self_check.")
+           (:name "reason"
+                  :type string
+                  :description "Why this inbox's current pending mail is fine to leave un-actioned for now, e.g. 'kept pending separate disposal work'. Required and must be non-blank -- shown back in self_check's :detail for this candidate."))))
 
 (provide 'cc-butler-self-check)
 ;;; cc-butler-self-check.el ends here
