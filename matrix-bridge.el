@@ -63,7 +63,7 @@ Set to nil to go live.  See the commentary at the top of this file.")
 
 (defvar matrix-bridge-target-session "butler")
 (defvar matrix-bridge-self-user-id nil
-  "This fleet's own Matrix user id, e.g. \"@butler-x600:warmblood-lounge\".
+  "This fleet's own Matrix user id, e.g. \"@example-self:example.invalid\".
 
 Deliberately nil: it feeds the \"don't re-deliver my own messages\" filter in
 `matrix-bridge-event-line', and a default belonging to ONE fleet is worse than
@@ -599,7 +599,7 @@ messages from a peer's and will mis-filter them"))
   ;; human" branch and the missing reminder would read as a genuine failure
   ;; of a DIFFERENT kind -- or, worse, as a pass if the branches ever changed
   ;; shape).
-  (let ((matrix-bridge-human-user-id "@jeongsoo:warmblood-lounge"))
+  (let ((matrix-bridge-human-user-id "@fake-human:example.org"))
     (cl-assert (equal (matrix-bridge-event-line
                        `((type . "m.room.message") (sender . ,matrix-bridge-human-user-id)
                          (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
@@ -609,26 +609,26 @@ messages from a peer's and will mis-filter them"))
   ;; would still pass if the reminder were appended unconditionally.
   (cl-assert (equal (matrix-bridge-event-line
                      `((type . "m.room.message")
-                       (sender . "@butler-x600:warmblood-lounge")
+                       (sender . "@fake-peer:example.org")
                        (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                    "[matrix · butler-x600 · id:$abc] hi") t)
+                    "[matrix · fake-peer · id:$abc] hi") t)
   (cl-assert (equal (matrix-bridge-event-line
                      '((type . "m.room.message")
-                       (sender . "@butler-macbook-m1-max:warmblood-lounge")
+                       (sender . "@fake-peer2:example.org")
                        (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                    "[matrix · butler-macbook-m1-max · id:$abc] hi") t)
+                    "[matrix · fake-peer2 · id:$abc] hi") t)
   ;; Bound explicitly: with the defvar now nil, reading the global here would
   ;; make this assertion pass for the wrong reason (nil sender equals nil id).
-  (let ((matrix-bridge-self-user-id "@butler-x600:warmblood-lounge"))
+  (let ((matrix-bridge-self-user-id "@fake-self:example.org"))
     (cl-assert (null (matrix-bridge-event-line
                       `((type . "m.room.message") (sender . ,matrix-bridge-self-user-id)
                         (event_id . "$abc")
                         (content . ((msgtype . "m.text") (body . "echo")))))) t))
   (cl-assert (null (matrix-bridge-event-line
-                    '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+                    '((type . "m.room.message") (sender . "@fake-human:example.org")
                       (event_id . "$abc") (content . ())))) t)
   (cl-assert (null (matrix-bridge-event-line
-                    '((type . "m.room.member") (sender . "@jeongsoo:warmblood-lounge")
+                    '((type . "m.room.member") (sender . "@fake-human:example.org")
                       (event_id . "$abc")
                       (content . ((msgtype . "m.text") (body . "x")))))) t)
   (message "matrix-bridge-self-test: ok"))
