@@ -1163,6 +1163,26 @@ attention between UserPromptSubmit turns."
       (should (string-match-p "decision needs you" (nth 0 captured)))
       (should (equal "ship it?" (nth 1 captured))))))
 
+(ert-deftest cc-butler-orchestrator/escalate-legacy-transport-no-session-uses-sender-label ()
+  "On the legacy in-memory transport, a caller with no live session
+(`cc-butler--caller-dir' nil, e.g. a timer-driven escalation) still gets an
+identifiable name in the pushed entry when SENDER-LABEL is supplied
+explicitly -- not nil, which downstream renders as an unidentifiable
+sender."
+  (let ((cc-butler-decision-workflow nil)
+        (cc-butler--caller-dir-value nil)
+        (cc-butler--butler-inbox nil))
+    (cl-letf (((symbol-function 'cc-butler--caller-dir) (lambda () cc-butler--caller-dir-value))
+              ((symbol-function 'cc-butler--append-decision) #'ignore)
+              ((symbol-function 'cc-butler--log) #'ignore)
+              ((symbol-function 'cc-butler--log-message) #'ignore)
+              ((symbol-function 'cc-butler--maybe-refresh) #'ignore)
+              ((symbol-function 'cc-butler--who-dir) (lambda (_d) "steward"))
+              ((symbol-function 'cc-butler-notify-decision) #'ignore))
+      (cc-butler-tool-escalate-to-butler
+       "cc-butler self-check: `x' started FAILING" nil nil "notification" "cc-butler (self-check)")
+      (should (equal "cc-butler (self-check)" (plist-get (car cc-butler--butler-inbox) :name))))))
+
 (ert-deftest cc-butler-orchestrator/escalate-notification-kind-does-not-push ()
   "kind=\"notification\" must NOT push -- nothing the human could say would
 change anything, so paging them defeats the point of a read-only note."

@@ -32,10 +32,10 @@
 ;; (`cc-butler-mail', loaded after this file); declared so the byte-compiler is
 ;; content and the runtime dispatch on `cc-butler-message-transport' works.
 (declare-function cc-butler-mail-up-report "cc-butler-mail" (from-dir body))
-(declare-function cc-butler-mail-up-decision "cc-butler-mail" (from-dir summary needs))
+(declare-function cc-butler-mail-up-decision "cc-butler-mail" (from-dir summary needs &optional sender-label))
 (declare-function cc-butler-mail-up-drain "cc-butler-mail" (agent-dir))
 (declare-function cc-butler--check-inbox-drain-as "cc-butler-mail" (agent-name))
-(declare-function cc-butler-decision-create "cc-butler-decision" (from-dir summary needs options &optional kind))
+(declare-function cc-butler-decision-create "cc-butler-decision" (from-dir summary needs options &optional kind sender-label))
 (declare-function cc-butler--decision-parse-options "cc-butler-decision" (s))
 (declare-function cc-butler-docs--auto-log "cc-butler-docs" (dir body))
 (defvar cc-butler-decision-workflow)
@@ -1567,13 +1567,22 @@ reject such a payload outright rather than silently store it."
   (and s (stringp s) (string-match "</?invoke\\b\\|</?parameter\\b" s)
        (match-string 0 s)))
 
-(defun cc-butler-tool-escalate-to-butler (summary &optional needs options kind)
+(defun cc-butler-tool-escalate-to-butler (summary &optional needs options kind sender-label)
   "MCP tool (steward -> butler): raise a DECISION or a NOTIFICATION for
 the butler to relay to the human.
 SUMMARY is the question or status, NEEDS is what is needed (decisions
 only), OPTIONS an optional string of choices (one `Label — tradeoff'
 per line) for a pick-one answer, and KIND \"decision\" (default) or
 \"notification\". Types NOTHING into any terminal.
+
+SENDER-LABEL is NOT part of the MCP tool surface (deliberately absent
+from the `:args' below, so an MCP caller can never supply one and spoof
+a sender identity) -- it exists only for a non-interactive Lisp caller
+with no MCP session context to derive a sender from at all, e.g. a
+timer-driven escalation (`cc-butler-self-check--report' passes one for
+its own FAILING/RECOVERED notifications). Without it, such a caller's
+`self' (`cc-butler--caller-dir') is nil and the rendered document would
+otherwise show an unidentifiable sender.
 
 KIND governs whether this needs an answer at all. Ask before calling:
 would anything the human could say change what happens next? If not,
@@ -1644,13 +1653,13 @@ the next one."
     (cond
      ;; human adapter create-path: decision/note → 정수님's inbox (the watcher renders it)
      ((bound-and-true-p cc-butler-decision-workflow)
-      (cc-butler-decision-create self s n (cc-butler--decision-parse-options options) k))
+      (cc-butler-decision-create self s n (cc-butler--decision-parse-options options) k sender-label))
      ;; durable agent path: butler's maildir inbox
      ((eq cc-butler-message-transport 'maildir)
-      (cc-butler-mail-up-decision self s n))
+      (cc-butler-mail-up-decision self s n sender-label))
      ;; legacy in-memory queue
      (t (push (list :time (current-time) :dir self
-                    :name (and self (cc-butler--display-name self))
+                    :name (or sender-label (and self (cc-butler--display-name self)))
                     :summary s :needs n)
               cc-butler--butler-inbox)))
     (cc-butler--append-decision self s needs)   ; decisions.org audit doc, all paths
