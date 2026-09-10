@@ -74,7 +74,7 @@ must not be reported as a genuine reply."
   ;; explicitly here, the same way `event-line-own-outgoing-message-is-dropped'
   ;; below binds `matrix-bridge-self-user-id', so this test does not depend on
   ;; a fleet-specific default to reach the "this IS the human" branch at all.
-  (let ((matrix-bridge-human-user-id "@jeongsoo:warmblood-lounge"))
+  (let ((matrix-bridge-human-user-id "@fake-human:example.org"))
     (should (equal (matrix-bridge-event-line
                     `((type . "m.room.message") (sender . ,matrix-bridge-human-user-id)
                       (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
@@ -87,12 +87,12 @@ must not be reported as a genuine reply."
 (ert-deftest matrix-bridge/event-line-fleet-sender-shows-short-name ()
   (should (equal (matrix-bridge-event-line
                   '((type . "m.room.message")
-                    (sender . "@butler-macbook-m1-max:warmblood-lounge")
+                    (sender . "@fake-peer:example.org")
                     (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                 "[matrix · butler-macbook-m1-max · id:$abc] hi")))
+                 "[matrix · fake-peer · id:$abc] hi")))
 
 (ert-deftest matrix-bridge/event-line-own-outgoing-message-is-dropped ()
-  (let ((matrix-bridge-self-user-id "@butler-x600:warmblood-lounge"))
+  (let ((matrix-bridge-self-user-id "@fake-self:example.org"))
     (should-not (matrix-bridge-event-line
                  `((type . "m.room.message") (sender . ,matrix-bridge-self-user-id)
                    (event_id . "$abc")
@@ -100,12 +100,12 @@ must not be reported as a genuine reply."
 
 (ert-deftest matrix-bridge/event-line-no-msgtype-is-dropped ()
   (should-not (matrix-bridge-event-line
-               '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+               '((type . "m.room.message") (sender . "@fake-human:example.org")
                  (event_id . "$abc") (content . ())))))
 
 (ert-deftest matrix-bridge/event-line-non-message-type-is-dropped ()
   (should-not (matrix-bridge-event-line
-               '((type . "m.room.member") (sender . "@jeongsoo:warmblood-lounge")
+               '((type . "m.room.member") (sender . "@fake-human:example.org")
                  (event_id . "$abc")
                  (content . ((msgtype . "m.text") (body . "x")))))))
 

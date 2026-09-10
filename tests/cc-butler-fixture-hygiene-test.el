@@ -57,9 +57,7 @@ one, at the cost of missing a leak that used some OTHER homeserver -- the
 tradeoff steward's measurement showed is worth it.")
 
 (defconst cc-butler-fixture-hygiene-test--file-exceptions
-  '("matrix-bridge.el"
-    "matrix-bridge-test.el"
-    "bridge.py"
+  '("bridge.py"
     "config.sh"
     "test_bridge.py")
   "Files exempt from the scan below. Stay short, and every entry needs a
@@ -70,37 +68,34 @@ entry's justification is machine-checked, not just asserted in this comment
 if a file listed here ever goes genuinely clean, that test fails and NAMES
 it, so an exception cannot quietly outlive the reason it was added for.
 
-`matrix-bridge-test.el', `bridge.py', `config.sh', `test_bridge.py': the
-SAME already-known issue, tracked in #239 -- the Matrix bridge's own
-human/fleet identifiers (`warmblood-lounge'-homeserver mxids) are
-deliberately hardcoded in the bridge's protocol-level tests, because those
-tests exist to prove the bridge correctly identifies \"the human\" and
-\"itself\" on Matrix, which cannot be done with a fake id. This file's job
-is to catch a NEW leak riding along with something else, not to re-flag one
-already tracked there every time the suite runs.
+`bridge.py', `config.sh', `test_bridge.py': the Python side of the Matrix
+bridge, tracked in #239, UNMEASURED -- whether these genuinely need a real
+id (a structural constraint in Python-side protocol tests) or just inherited
+one by convention has not been checked. Two `bridge.py' files exist:
+`~/services/matrix-bridge/bridge.py' (the one actually running, PID
+tracked separately, NOT this repo) and this repo's own copy under
+`matrix-bridge/'. Only the repo copy is in scope for this scan or any
+future redaction; the deployed one is out of scope entirely and must never
+be touched by a fixture-hygiene change.
 
-`matrix-bridge.el': narrower than the above, and partly closed by an
-earlier commit (2026-09-10) -- `matrix-bridge-human-user-id' and
-`matrix-bridge-self-user-id' no longer default to a real id (both are nil,
-guarded at `matrix-bridge-start'; see those defvars' own docstrings), so
-this file is no longer exempt for its PRODUCTION DEFAULTS. Two real
-literals still keep the exception justified, not one:
-
-  1. its own in-file protocol-test self-check, `matrix-bridge-self-test'
-     -- the OTHER test surface named in this repo's CLAUDE.md (\"there are
-     two test surfaces here\") -- which hardcodes the same real mxids as
-     `matrix-bridge-test.el' above, for the identical protocol-testing
-     reason (same #239, not a separate issue);
-  2. `matrix-bridge-self-user-id''s own docstring `e.g.' example, a real
-     mxid with no protocol constraint on it at all -- unlike (1), nothing
-     stops this one being replaced with a synthetic example today. It has
-     not been, simply because nobody has done it yet; its presence here is
-     not evidence that it NEEDS to stay real.
-
-Either alone would keep this file exempt -- removing (1) without (2), or
-(2) without (1), still leaves a real violation for
-`every-exception-still-contains-a-violation' to find. Only once BOTH are
-gone does that test start naming this file as stale.")
+`matrix-bridge.el' and `tests/matrix-bridge-test.el' were exempt here until
+2026-09-10, for hardcoded real Matrix identifiers in `matrix-bridge-self-
+test' (the OTHER test surface this repo's CLAUDE.md names, \"there are two
+test surfaces here\"), in the ERT suite's own fixtures, and in one
+defvar's docstring `e.g.' example. Measured, not assumed, before removing
+them: `matrix-bridge-attribution' (matrix-bridge.el) compares SENDER
+against the `matrix-bridge-human-user-id'/`-self-user-id' *variables*,
+then falls back to a plain `string-split' on the localpart -- there is no
+lookup table anywhere that only recognizes real fleet ids, and
+`@fake-self:example.org'-shaped values were already passing in #238/#240
+before this change. So \"cannot be done with a fake id\" was true for the
+Python side's unmeasured claim above, but false for the elisp side -- the
+elisp identifiers were incidental (copied from a real example when the
+tests were written), not structural. Every real literal in both files was
+synthesized on that basis and both were removed from this list the same
+commit -- see `matrix-bridge-self-test' and the `event-line-*'/`start-
+refuses-*'/`deliver-*' tests below it in `tests/matrix-bridge-test.el' for
+the synthetic replacements now in place.")
 
 (defconst cc-butler-fixture-hygiene-test--shape-res
   (list (concat "![A-Za-z0-9_-]\\{10,\\}:"
