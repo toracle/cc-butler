@@ -1945,6 +1945,67 @@ first store-owned line happened to sit."
           (should (<= (+ pos-1 (string-bytes orphan-1)) cc-butler-governance--memory-read-budget-bytes))
           (should (<= (+ pos-2 (string-bytes orphan-2)) cc-butler-governance--memory-read-budget-bytes)))))))
 
+(ert-deftest cc-butler-governance/regenerate-normalize-skips-legacy-line-with-no-live-store-slug ()
+  "Coverage gap closed (2026-09-10): the two tests above
+\(`regenerate-orphan-legacy-line-can-fall-out-of-budget-after-sort' and
+`regenerate-non-store-lines-keep-relative-order-and-budget-after-sort')
+use a fixture shaped `- [SLUG](SLUG.md) — ...' -- NO `butler-' prefix on
+the link target -- which never matches
+`cc-butler-governance--legacy-index-line-regexp' (that regexp requires
+`(butler-\\1\\.md)') in the first place, so `--normalize-index-format'
+never even considers those lines. That leaves the REAL production shape
+-- `- [SLUG](butler-SLUG.md) — DESC', e.g. the actual
+`[model-pinned-fable](butler-model-pinned-fable.md)' lines once live in
+`MEMORY.md' -- completely uncovered: a line that DOES match
+`--legacy-index-line-regexp' but whose slug has no corresponding note in
+the live store, so `--normalize-index-format''s own guard,
+
+    (when (member slug live) ...)
+
+\(`live' bound to `(cc-butler-governance-names)'), must skip rewriting it.
+Skipped, it never matches the CURRENT-format `--index-line-regexp'
+either (still bracketed), so `--prune-dead-entries' -- which only
+recognizes current-format lines -- never touches it. And
+`--rewrite-sorted-index' hoists it above the sorted block same as any
+other non-store line, same as the two tests above. This test walks that
+exact chain end to end (normalize's guard skip -> stays legacy-shaped ->
+hoisted by sort -> ignored by prune), not just one function in
+isolation."
+  (cc-butler-governance-test--with-store
+    (let* ((index (expand-file-name "MEMORY.md" mem))
+           (dead-slug "orphan-real-legacy")
+           (legacy-line (format "- [%s](butler-%s.md) — hand-authored, no live store note backs this slug\n"
+                                 dead-slug dead-slug)))
+      (cc-butler-governance-test--git-init store)
+      ;; Seed: the real legacy shape sandwiched between two store-owned
+      ;; lines, both of which get pulled into the sorted block -- same
+      ;; interleaving the two tests above use, so the hoist-above-sort step
+      ;; is actually exercised too, not just normalize in isolation.
+      (with-temp-file index
+        (insert "- butler-note-a.md — d\n" legacy-line "- butler-note-b.md — d\n"))
+      (cc-butler-governance-test--commit-note
+       store "note-a" (cc-butler-governance--render "note-a" "d" "body" "feedback") 1000)
+      (cc-butler-governance-test--commit-note
+       store "note-b" (cc-butler-governance--render "note-b" "d" "body" "feedback") 2000)
+      ;; Budget big enough for the banner plus the legacy line alone, not
+      ;; big enough to also cover the two-line sorted store block that now
+      ;; sits behind it.
+      (let ((cc-butler-governance--memory-read-budget-bytes
+             (+ (string-bytes (cc-butler-governance--generate-banner 0 2))
+                (string-bytes legacy-line)
+                20)))
+        (cc-butler-governance-regenerate)
+        (let* ((text (with-temp-buffer (insert-file-contents index) (buffer-string)))
+               (legacy-start (string-search legacy-line text)))
+          ;; (a) not silently pruned -- present, byte-for-byte, still in its
+          ;; original legacy bracket shape (never normalized, since its
+          ;; slug is absent from the live store).
+          (should legacy-start)
+          ;; (b) still visible -- within the read budget after the sort
+          ;; hoists it above the store's sorted block.
+          (should (<= (+ legacy-start (string-bytes legacy-line))
+                      cc-butler-governance--memory-read-budget-bytes)))))))
+
 (provide 'cc-butler-governance-test)
 ;;; cc-butler-governance-test.el ends here
 
