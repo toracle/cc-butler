@@ -255,8 +255,26 @@ point is that they stop vanishing silently."
 ;;; --- delivery -------------------------------------------------------------
 
 (defun matrix-bridge--deliver (text)
+  "Deliver TEXT for real, unless shadowed or unsafe to.
+
+`matrix-bridge-start' guards against a nil identity var only at its own
+call site. Two other paths reach here without ever calling it: a hot-reload
+of an already-running daemon (`defvar' leaves an unbound variable nil
+straight through it, and `emacs-startup-hook' does not fire again), and
+`matrix-bridge-shadow' being flipped to nil directly (documented at the
+top of this file as how to \"go live\" -- it does not route through
+`matrix-bridge-start' either). This function is the one choke point every
+real delivery passes through regardless of which path reached it, so a nil
+identity var is caught HERE -- by falling back to the shadow path, the
+same graceful degradation the clause below already uses when injection
+isn't available at all, not by signaling: this runs inside an async poll
+loop, and one bad message must not be able to take the whole loop down."
   (cond
    (matrix-bridge-shadow
+    (matrix-bridge--shadow-deliver text))
+   ((not (and matrix-bridge-self-user-id matrix-bridge-human-user-id))
+    (matrix-bridge--log "WARN identity var(s) nil -- shadowing instead of injecting \
+with broken sender classification")
     (matrix-bridge--shadow-deliver text))
    ((not (and (fboundp 'cc-butler--send-input) (fboundp 'cc-butler--dir-by-name)))
     (matrix-bridge--log "WARN cc-butler injection unavailable; shadowing instead")
