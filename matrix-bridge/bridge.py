@@ -12,6 +12,7 @@ stdlib only -- no pip install needed. See ~/.../warmble-jumble/.../
 "Matrix 릴레이 핸드오프" doc for the design this implements (candidate B).
 """
 import json
+import re
 import subprocess
 import sys
 import time
@@ -30,6 +31,19 @@ TARGET_SESSION = "butler"
 SELF_USER_ID = "@butler-x600:warmblood-lounge"
 HUMAN_USER_ID = "@jeongsoo:warmblood-lounge"
 SYNC_TIMEOUT_MS = 30000
+
+MEDIA_DIR = SERVICE_DIR / "media"
+MEDIA_DIR.mkdir(exist_ok=True)
+# Absolute paths: this service runs under `systemctl --user`, whose PATH
+# (measured 2026-09-10: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
+# /sbin:/bin) does not include ~/.local/bin, so a bare "monocle"/"ffprobe"
+# raises FileNotFoundError even though both work fine from a terminal.
+MONOCLE = "/home/toracle/.local/bin/monocle"
+FFPROBE = "/usr/bin/ffprobe"
+# In-flight {"proc", "audio_path", "prefix"} dicts, drained once per main-loop
+# tick by poll_pending_transcriptions(). Not persisted -- a transcription
+# in flight at restart time is lost (the audio file on disk survives).
+PENDING_TRANSCRIPTIONS = []
 
 TOKEN = TOKEN_FILE.read_text().strip()
 ROOM_ID = ROOM_ID_FILE.read_text().strip()
@@ -67,7 +81,46 @@ def elisp_string(s):
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+# Off by default -- every importer (test, REPL, a future wrapper) gets the
+# safe, non-delivering behavior with nothing to remember. Flipped to True by
+# exactly one explicit call, enable_live_delivery(), made from exactly one
+# place: main(), right before it starts the real event loop.
+#
+# Deliberately NOT `__name__ == "__main__"`. That was this guard's first
+# version, and a reviewer caught why it's wrong: it INFERS liveness from how
+# the interpreter happened to invoke this file, so it silently flips to
+# False the moment anything changes that shape -- `python -m bridge`, a
+# supervisor that imports this module and calls main() directly, anything
+# that wraps it. A silently disabled delivery path is exactly the failure
+# mode this whole task exists to fix (41 voice messages, 5 days, nobody
+# noticed because nothing said so) -- so this listens for an explicit
+# decision instead of inferring one from execution shape, and the state is
+# always logged (see the module-level log call near the bottom of this
+# file, and enable_live_delivery() itself) so it can never be silently
+# wrong either way.
+#
+# Incident, 2026-09-10, that led to this guard existing at all: a test that
+# forgot to stub inject_into_session() actually shelled out to emacsclient
+# and injected a fabricated message into the live "butler" session. The
+# guard lives inside inject_into_session() itself (the one place that calls
+# emacsclient), not at each call site, so no caller can forget it.
+LIVE = False
+
+
+def enable_live_delivery():
+    """Call exactly once, only from main(), immediately before it starts
+    the real event loop. This is the one explicit statement "this process
+    is genuinely running as the live service" -- everything else (import,
+    test, REPL) leaves LIVE False."""
+    global LIVE
+    LIVE = True
+    log("delivery: LIVE")
+
+
 def inject_into_session(text):
+    if not LIVE:
+        log(f"SUPPRESSED inject (not LIVE, {len(text)} chars)")
+        return
     expr = (
         f'(cc-butler--send-input (cc-butler--dir-by-name "{TARGET_SESSION}") '
         f"{elisp_string(text)} t)"
@@ -153,6 +206,164 @@ def describe(content):
     return "[첨부 " + " · ".join(str(b) for b in bits if b) + "]"
 
 
+def sanitize_filename(name):
+    """Reduce NAME (sender-controlled `body` text) to a safe filename
+    component -- replaces everything outside alnum/dot/dash/underscore, so
+    "../../etc/passwd" collapses to a plain filename with no directory
+    component."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name or "")
+    return safe[:100]
+
+
+def media_path(event_id, body):
+    """Where a downloaded attachment for EVENT_ID/BODY is written. The
+    event id is server-assigned (not sender-controlled) and already unique."""
+    return MEDIA_DIR / f"{event_id}-{sanitize_filename(body)}"
+
+
+def download_media(mxc_url, timeout=30):
+    """Fetch an attachment's bytes via the authenticated media endpoint
+    (MSC3916) -- this homeserver (Tuwunel) supports it; no legacy
+    /_matrix/media/v3/download fallback needed."""
+    m = re.match(r"mxc://([^/]+)/(.+)", mxc_url or "")
+    if not m:
+        return None
+    server, media_id = m.group(1), m.group(2)
+    url = f"{HOMESERVER}/_matrix/client/v1/media/download/{server}/{media_id}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TOKEN}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def is_decodable(path):
+    """True if ffprobe finds an actual audio stream in PATH.
+
+    This is what tells a broken/empty recording (real case, 09-10 10:52:
+    valid OggS/Opus headers, 493,446 bytes, but 99.8% null bytes -- ffmpeg
+    cannot decode it) apart from a monocle/API failure on a genuine
+    recording. Only the former needs a resend -- asking 정수님 to repeat
+    himself for the latter would be wrong."""
+    result = subprocess.run(
+        [FFPROBE, "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, timeout=15,
+    )
+    return result.returncode == 0 and "audio" in result.stdout
+
+
+def start_audio_transcription(ev, sender, content, room_id):
+    """Download a voice message and hand it to `monocle audio transcribe`
+    in the background (PENDING_TRANSCRIPTIONS is why this is non-blocking).
+
+    Ported from macbook-m1-max's bridge.py:257-333 (verbatim reference:
+    cc-butler commit ac09068, reference/audio-transcription-from-bridge-py)
+    -- same three-branch failure-preserves-original structure (download
+    fails / bad url / monocle won't start), same async poll-based
+    completion. Two deliberate changes from that reference:
+      (a) `monocle` needs only its absolute path here, not m1's MONOCLE_ENV
+          HOME override -- measured 2026-09-10 that this systemd --user
+          service already has a correct $HOME (unlike m1's launchd job);
+          only PATH is restricted, and the absolute path alone covers it.
+      (b) an is_decodable() gate runs before monocle is ever invoked, so a
+          broken recording is classified (and reported: please resend)
+          without spending an API call or misfiling it as a tool failure.
+    """
+    event_id = ev.get("event_id", "")
+    body = content.get("body") or "voice"
+    url = content.get("url", "")
+    marks = envelope(event_id, content, room_label(room_id))
+    prefix = f"[matrix · {attribution(sender)}{marks}]"
+    audio_path = media_path(event_id, body)
+
+    try:
+        data = download_media(url)
+    except Exception as e:
+        log(f"audio download failed: {e!r}")
+        inject_into_session(f"{prefix} (음성 메시지 다운로드 실패: {e!r})")
+        return
+    if data is None:
+        log(f"audio: could not parse mxc url {url!r}")
+        inject_into_session(f"{prefix} (음성 메시지 도착 — url 형식 이상: {url!r})")
+        return
+
+    # Original bytes hit disk BEFORE anything else runs -- this ordering is
+    # the whole mechanism behind "preserved regardless of outcome".
+    audio_path.write_bytes(data)
+    log(f"audio saved: {audio_path} ({len(data)} bytes)")
+
+    if not is_decodable(audio_path):
+        log(f"audio: input broken, ffprobe cannot decode it -- {audio_path}")
+        inject_into_session(
+            f"{prefix} (음성 메시지가 빈 채로 도착했습니다 — 다시 보내 주셔야 합니다)\n"
+            f"첨부: {audio_path}"
+        )
+        return
+
+    try:
+        proc = subprocess.Popen(
+            [MONOCLE, "audio", "transcribe", str(audio_path)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+    except Exception as e:
+        log(f"audio: failed to start monocle: {e!r}")
+        inject_into_session(
+            f"{prefix} (음성 메시지, 텍스트 변환 시작 실패: {e!r})\n첨부: {audio_path}"
+        )
+        return
+
+    PENDING_TRANSCRIPTIONS.append({"proc": proc, "audio_path": audio_path, "prefix": prefix})
+    log(f"audio: transcription started pid={proc.pid} for {audio_path}")
+
+
+def poll_pending_transcriptions():
+    """Called once per main-loop tick. Popen.poll() is instantaneous, so
+    this never delays the room poll."""
+    if not PENDING_TRANSCRIPTIONS:
+        return
+    still_pending = []
+    for item in PENDING_TRANSCRIPTIONS:
+        proc = item["proc"]
+        if proc.poll() is None:
+            still_pending.append(item)
+            continue
+        stdout, stderr = proc.communicate()
+        finish_transcription(item, proc.returncode, stdout, stderr)
+    PENDING_TRANSCRIPTIONS[:] = still_pending
+
+
+def finish_transcription(item, returncode, stdout, stderr):
+    """Deliver the transcription result. All three branches reference
+    `첨부: {audio_path}` -- the original file is never dropped from the
+    message regardless of how transcription went.
+
+    Success is logged as its own distinct line (length only, never the
+    transcribed text) -- not just the absence of a failure line. Steward
+    09-10: this gap sat unnoticed for 5 days because the butler was manually
+    transcribing, so the tool's own silent non-operation read as "handled".
+    A machine that logs identically whether it ran or not can reproduce
+    that exact blind spot in the opposite direction."""
+    audio_path = item["audio_path"]
+    prefix = item["prefix"]
+    if returncode == 0:
+        try:
+            transcribed = (json.loads(stdout).get("text") or "").strip()
+        except Exception:
+            transcribed = ""
+        if transcribed:
+            log(f"audio: transcription OK ({len(transcribed)} chars) for {audio_path}")
+            text = f"{prefix} (음성 메시지 텍스트 변환) {transcribed}\n첨부: {audio_path}"
+        else:
+            log(f"audio: transcription OK but empty text for {audio_path}")
+            text = f"{prefix} (음성 메시지, 변환 결과 비어있음)\n첨부: {audio_path}"
+    else:
+        log(f"audio: transcription tool failure rc={returncode} for {audio_path}: {stderr.strip()[:300]!r}")
+        text = (
+            f"{prefix} (음성 메시지, 텍스트 변환 실패: rc={returncode} {stderr.strip()[:300]!r})\n"
+            f"첨부: {audio_path}"
+        )
+    inject_into_session(text)
+
+
 def handle_room_events(events, room_id):
     for ev in events:
         if ev.get("type") != "m.room.message":
@@ -163,14 +374,24 @@ def handle_room_events(events, room_id):
         content = ev.get("content", {})
         if not content.get("msgtype"):
             continue  # redaction or state-ish payload, nothing to deliver
+        event_id = ev.get("event_id", "")
+        if content.get("msgtype") == "m.audio":
+            log(f"RECV [{room_label(room_id)}] own={event_id} from {sender}: <audio {content.get('body', '')!r}>")
+            start_audio_transcription(ev, sender, content, room_id)
+            continue
         body = describe(content)
-        marks = envelope(ev.get("event_id", ""), content, room_label(room_id))
+        marks = envelope(event_id, content, room_label(room_id))
         text = f"[matrix · {attribution(sender)}{marks}] {body}"
-        log(f"RECV from {sender}: {body[:200]!r}")
+        # Log the FULL body, not a 200-char slice: this line is the only durable
+        # record of an inbound message, and a compacted session reconstructs from
+        # it.  Truncating here silently loses the tail of exactly the long, dense
+        # messages worth reconstructing.  event_id makes the entry addressable.
+        log(f"RECV [{room_label(room_id)}] own={event_id} from {sender}: {body!r}")
         inject_into_session(text)
 
 
 def main():
+    enable_live_delivery()
     log("bridge starting")
     log(f"lounge label: {room_label(ROOM_ID)!r}")
     since = load_since()
@@ -207,8 +428,21 @@ def main():
             if events:
                 handle_room_events(events, room_id)
 
+        # Runs every tick (at least every SYNC_TIMEOUT_MS, even with no new
+        # events) -- a transcription in flight must not wait on the next
+        # message to be noticed as done.
+        poll_pending_transcriptions()
+
         since = resp["next_batch"]
         save_since(since)
+
+
+# Runs on every import, always -- proves the delivery state out loud rather
+# than leaving it to be inferred. At this point LIVE is still False even for
+# the real service (main() hasn't run yet); main() logs "delivery: LIVE" a
+# moment later when it actually starts. Anything that only ever imports
+# this module (a test, a REPL) logs this line and nothing else.
+log(f"delivery: {'LIVE' if LIVE else 'DISABLED(imported)'}")
 
 
 if __name__ == "__main__":
