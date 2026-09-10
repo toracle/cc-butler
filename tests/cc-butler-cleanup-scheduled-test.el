@@ -3,7 +3,8 @@
 ;; Copyright (C) 2026 Jeongsoo Park
 ;; SPDX-License-Identifier: MIT
 
-;; Covers: idle-age computation (transcript mtime, with the `:waiting'
+;; Covers: idle-age computation (newest TIMESTAMPED transcript row, immune
+;; to a metadata-only tail bumping the file mtime, with the `:waiting'
 ;; fallback), candidate selection, and the consecutive-skip -> surface
 ;; escalation. Nothing real is sent, cleaned, or timed — `cc-butler-session-cleanup'
 ;; and the surface function are stubbed throughout.
@@ -19,8 +20,9 @@
 ;;;; ---- idle-age computation -------------------------------------------
 
 (ert-deftest cc-butler-cleanup/scheduled-idle-seconds-prefers-transcript ()
-  "Transcript mtime wins over the in-memory `:waiting' timestamp."
-  (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+  "The newest timestamped transcript row wins over the in-memory `:waiting'
+timestamp."
+  (cl-letf (((symbol-function 'cc-butler-cleanup--transcript-last-timestamp)
              (lambda (_dir) (- (float-time) 500)))
             ((symbol-function 'cc-butler--waiting-p)
              (lambda (_dir) (- (float-time) 999999))))
@@ -29,8 +31,8 @@
       (should (< (abs (- secs 500)) 5)))))
 
 (ert-deftest cc-butler-cleanup/scheduled-idle-seconds-falls-back-to-waiting ()
-  "With no transcript at all, falls back to `:waiting'."
-  (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+  "With no timestamped transcript row at all, falls back to `:waiting'."
+  (cl-letf (((symbol-function 'cc-butler-cleanup--transcript-last-timestamp)
              (lambda (_dir) nil))
             ((symbol-function 'cc-butler--waiting-p)
              (lambda (_dir) (- (float-time) 300))))
@@ -39,10 +41,41 @@
       (should (< (abs (- secs 300)) 5)))))
 
 (ert-deftest cc-butler-cleanup/scheduled-idle-seconds-nil-when-unknown ()
-  "Neither a transcript nor a `:waiting' timestamp -> unknowable, not zero."
-  (cl-letf (((symbol-function 'cc-butler--session-last-activity) (lambda (_dir) nil))
+  "Neither a timestamped row nor a `:waiting' timestamp -> unknowable, not zero."
+  (cl-letf (((symbol-function 'cc-butler-cleanup--transcript-last-timestamp) (lambda (_dir) nil))
             ((symbol-function 'cc-butler--waiting-p) (lambda (_dir) nil)))
     (should (null (cc-butler-cleanup--scheduled-idle-seconds "/x/")))))
+
+(ert-deftest cc-butler-cleanup/transcript-last-timestamp-skips-untimestamped-tail ()
+  "A metadata-only tail (ai-title, mode, permission-mode, bridge-session —
+none carrying a `timestamp' field) must not hide an older real timestamp
+behind a fresh file mtime. Regression for the bug measured 2026-09-10:
+`cc-butler--session-last-activity' (file mtime) read every one of 25 live
+sessions as 0.0 days idle because such tail rows kept bumping the mtime
+with zero real conversation activity, permanently silencing the sweep."
+  (let* ((proj (file-name-as-directory (make-temp-file "cc-transcript" t)))
+         (file (expand-file-name "session.jsonl" proj))
+         (four-days-ago (format-time-string
+                         "%Y-%m-%dT%H:%M:%S.000Z"
+                         (time-subtract (current-time) (seconds-to-time (* 4 86400)))
+                         t)))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert (format "{\"type\":\"assistant\",\"timestamp\":\"%s\"}\n" four-days-ago))
+            (insert "{\"type\":\"system\",\"subtype\":\"ai-title\"}\n")
+            (insert "{\"type\":\"system\",\"subtype\":\"mode\"}\n")
+            (insert "{\"type\":\"system\",\"subtype\":\"permission-mode\"}\n")
+            (insert "{\"type\":\"system\",\"subtype\":\"bridge-session\"}\n"))
+          ;; the file's mtime is "now" (just written) -- the whole point.
+          (cl-letf (((symbol-function 'cc-butler--claude-project-dir) (lambda (_dir) proj)))
+            (let ((ts (cc-butler-cleanup--transcript-last-timestamp "/whatever/")))
+              (should (numberp ts))
+              (should (< (abs (- (- (float-time) ts) (* 4 86400))) 5)))
+            (cl-letf (((symbol-function 'cc-butler--waiting-p) (lambda (_dir) (float-time))))
+              (should (>= (cc-butler-cleanup--scheduled-idle-seconds "/whatever/")
+                          (* 3 86400))))))
+      (delete-directory proj t))))
 
 ;;;; ---- candidate selection ---------------------------------------------
 
@@ -57,7 +90,7 @@
                (lambda (dir) (not (equal dir "/c/"))))   ; c = butler/steward
               ((symbol-function 'cc-butler--waiting-p)
                (lambda (dir) (unless (equal dir "/b/") (float-time)))) ; b = not waiting
-              ((symbol-function 'cc-butler--session-last-activity)
+              ((symbol-function 'cc-butler-cleanup--transcript-last-timestamp)
                (lambda (dir)
                  (- (float-time) (pcase dir
                                     ("/a/" (* 4 day))    ; over threshold

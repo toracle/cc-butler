@@ -33,6 +33,7 @@
 (require 'cc-butler-session)
 (require 'cc-butler-workspace)
 (require 'cc-butler-orchestrator)   ; cc-butler--send-input / cc-butler--read-output
+(require 'iso8601)                  ; parsing a transcript row's `timestamp' field
 
 ;; `cc-butler-compact' REQUIRES this file (for `cc-butler-cleanup-context-for'
 ;; etc.), so a hard `require' the other way would be circular. Both are always
@@ -1045,14 +1046,20 @@ select any, choose a tier, and runs `cc-butler-session-cleanup' on each."
 ;; threshold, get cleaned (`clear' tier only — never `delete-dir') without
 ;; waiting on a human to notice the recommendation.
 ;;
-;; Idle age is measured from the newest transcript mtime
-;; (`cc-butler--session-last-activity'), NOT the in-memory `:waiting'
-;; timestamp (`cc-butler--waiting-p') — the latter lives in a hash table that
-;; is empty after every Emacs restart, so a session idle for a week would
-;; read as freshly-idle right after a restart.  `:waiting' is used only as a
-;; fallback when no transcript exists at all, and still gates candidacy
-;; alongside the transcript age (a session must currently be WAITING, not
-;; merely once-idle-long-ago per a stale transcript).
+;; Idle age is measured from the newest TIMESTAMPED transcript row
+;; (`cc-butler-cleanup--transcript-last-timestamp'), NOT the transcript file's
+;; mtime (`cc-butler--session-last-activity') and NOT the in-memory `:waiting'
+;; timestamp (`cc-butler--waiting-p'). File mtime is wrong here for a reason
+;; measured directly (2026-09-10): a metadata-only tail (ai-title, mode,
+;; permission-mode, bridge-session, ...) carries no `timestamp' field at all
+;; but still bumps the file's mtime with zero real conversation activity — a
+;; session whose last actual turn was 2026-09-08T16:24Z had a file mtime of
+;; 09-10 21:47 from six such rows, reading as 0.0 days idle to EVERY live
+;; session and permanently silencing this sweep. `:waiting' is used only as a
+;; fallback when the transcript itself carries no timestamped row at all, and
+;; still gates candidacy alongside the transcript age (a session must
+;; currently be WAITING, not merely once-idle-long-ago per a stale
+;; transcript).
 ;;
 ;; Deliberately does NOT consult `cc-butler--transcript-idle-p' /
 ;; `cc-butler--forward-ops-free-p' (the short-window "busy" heuristic the
@@ -1098,13 +1105,79 @@ core only promotes automatically for `delete-dir' (see
 `cc-butler-cleanup--default-promote''s caller), since a `clear' tier's
 in-dir copy otherwise survives on its own.")
 
+(defconst cc-butler-cleanup--transcript-timestamp-re
+  "\"timestamp\":\"\\([^\"]+\\)\""
+  "An ISO-8601 `timestamp' field on a transcript row.")
+
+(defun cc-butler-cleanup--transcript-timestamp-in-line (line)
+  "Return the float-time of LINE's `timestamp' field, or nil if it has none.
+A metadata-only row (ai-title, mode, permission-mode, bridge-session, ...)
+carries no `timestamp' field at all — that absence is exactly the signal
+this exists to find, not an error to swallow silently past."
+  (when (string-match cc-butler-cleanup--transcript-timestamp-re line)
+    (ignore-errors
+      (float-time (encode-time (iso8601-parse (match-string 1 line)))))))
+
+(defun cc-butler-cleanup--transcript-last-timestamp (dir)
+  "Return the newest TIMESTAMPED row's time in DIR's main transcript, or nil
+when none is found (no transcript, or every row lacks `timestamp').
+
+Unlike `cc-butler--session-last-activity' (the transcript FILE's mtime —
+when it was last WRITTEN), this is when a real conversation TURN last
+happened. A metadata-only tail bumps the file mtime with zero new rows that
+carry a `timestamp' at all, which is exactly wrong for THIS gate: measured
+2026-09-10, a session whose last real turn was 2026-09-08T16:24Z had a file
+mtime of 09-10 21:47 from six such untimestamped tail rows (ai-title, mode,
+permission-mode, bridge-session, ...), reading as 0.0 days idle to every one
+of 25 live sessions and permanently silencing the scheduled cleanup sweep.
+`cc-butler--session-last-activity' itself is deliberately left untouched —
+the compaction gate depends on its \"fails BUSY when unknown\" polarity;
+this cleanup gate needs the opposite failure mode; a stuck-open mtime must
+not read as perpetually fresh.
+
+Scans only the newest MAIN transcript (not sub-agent files, matching
+`cc-butler--transcript-model') backwards in growing chunks, mirroring that
+function's approach — transcripts reach tens of MB, so the whole file is
+never loaded."
+  (when-let* ((proj (cc-butler--claude-project-dir dir))
+              (files (file-expand-wildcards (expand-file-name "*.jsonl" proj) t))
+              (newest (car (sort files
+                                 (lambda (a b)
+                                   (time-less-p
+                                    (file-attribute-modification-time (file-attributes b))
+                                    (file-attribute-modification-time (file-attributes a)))))))
+              (size (file-attribute-size (file-attributes newest))))
+    (let ((window 262144) (limit 4194304) ts)
+      (while (and (not ts) (<= window limit))
+        (let ((from (max 0 (- size window))))
+          (with-temp-buffer
+            (insert-file-contents-literally newest nil from size)
+            (decode-coding-region (point-min) (point-max) 'utf-8 t)
+            ;; a non-zero start almost certainly lands mid-row; that partial
+            ;; first line is unparseable, and a wider window re-reads it whole
+            (when (> from 0)
+              (goto-char (point-min))
+              (forward-line 1)
+              (delete-region (point-min) (point)))
+            (goto-char (point-max))
+            (while (and (not ts) (> (point) (point-min)))
+              (forward-line -1)
+              (setq ts (cc-butler-cleanup--transcript-timestamp-in-line
+                        (buffer-substring-no-properties
+                         (line-beginning-position) (line-end-position)))))))
+        (when (and (not ts) (>= (- size window) 0))
+          (setq window (* window 4)))
+        (when (>= window (* size 2)) (setq window (1+ limit))))  ; whole file seen
+      ts)))
+
 (defun cc-butler-cleanup--scheduled-idle-seconds (dir)
   "Seconds DIR has been idle, for the scheduled daily sweep, or nil when
-unknowable. Prefers the newest transcript mtime
-\(`cc-butler--session-last-activity'), which survives an Emacs restart;
-falls back to the in-memory `:waiting' timestamp only when no transcript
-exists at all."
-  (let ((last (cc-butler--session-last-activity dir)))
+unknowable. Prefers the newest TIMESTAMPED transcript row
+\(`cc-butler-cleanup--transcript-last-timestamp'), which survives an Emacs
+restart and is immune to a metadata-only tail bumping the file mtime; falls
+back to the in-memory `:waiting' timestamp only when the transcript itself
+carries no timestamped row at all (including no transcript existing)."
+  (let ((last (cc-butler-cleanup--transcript-last-timestamp dir)))
     (if last
         (- (float-time) last)
       (let ((waiting (cc-butler--waiting-p dir)))
