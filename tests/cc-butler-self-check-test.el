@@ -397,6 +397,36 @@ surface as a distinctly-worded check failure naming the symbol."
             (should (string-match-p "no standard-value\\|not a defcustom" (plist-get r :detail)))))
       (makunbound 'cc-butler-test-check5-no-standard-value))))
 
+(ert-deftest cc-butler-self-check/persisted-vs-live-does-not-flag-non-drifted-in-repo-defvar-without-standard-value ()
+  "The `:no-standard-value' fallback above must fire ONLY for a symbol that
+reached this check EXCLUSIVELY via `cc-butler-self-check-tracked-variables'
+-- never for a genuine in-repo symbol the automatic scan
+(`cc-butler--defcustom-symbols-all') already returns.  cc-butler's own
+codebase has real public (non `--', non hook/keymap) top-level `defvar'
+forms with a literal value (e.g. `cc-butler-project-templates') --
+`custom-variable-state' reports `rogue' (not `saved'/`standard') for ANY
+plain `defvar', drifted or not, since Customize never tracks a `standard'
+state for a variable it didn't declare.  Such a symbol, when its live
+value still matches its own source-text default (so it is NOT present in
+`cc-butler--defcustom-drift-all'), must fall through as \"nothing to
+report\" -- flagging it `:no-standard-value' would be a live false
+positive on an ordinary, entirely healthy in-repo variable, wrongly
+telling a reader it \"is not a defcustom, cannot be monitored\" when in
+fact `cc-butler--defcustom-drift-all' COULD monitor it (via its own
+code-default), it simply has nothing to report right now."
+  (let ((cc-butler-self-check-tracked-variables nil))
+    (defvar cc-butler-test-check5-inrepo-defvar)
+    (setq cc-butler-test-check5-inrepo-defvar 7)
+    (unwind-protect
+        (cl-letf (((symbol-function 'custom-variable-state) (lambda (&rest _) 'rogue))
+                  ((symbol-function 'cc-butler--defcustom-symbols-all)
+                   (lambda (&optional _dir) (list 'cc-butler-test-check5-inrepo-defvar)))
+                  ((symbol-function 'cc-butler--defcustom-drift-all) (lambda (&optional _dir) nil)))
+          (let ((r (cc-butler-self-check--persisted-vs-live)))
+            (should (plist-get r :ok))
+            (should-not (string-match-p "cc-butler-test-check5-inrepo-defvar" (plist-get r :detail)))))
+      (makunbound 'cc-butler-test-check5-inrepo-defvar))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Check 6: vault path
 ;;;; ------------------------------------------------------------------
