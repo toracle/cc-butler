@@ -2080,18 +2080,44 @@ stamp that says `?' — absence keeps people asking, a wrong answer stops them."
         (should-not (string-match-p "최초 기록" text))))))
 
 (ert-deftest cc-butler-governance/a-stamp-pasted-into-the-body-is-not-duplicated ()
-  "A caller that copies the stamp back into BODY must not produce two."
+  "A caller that copies back the note's ACTUAL current stamp verbatim (e.g.
+from a prior tool response) must not produce two.  Uses the real stamp text
+read back off disk, not a hand-typed guess at the date -- since the fix for
+issue #140 recognises a duplicate only by exact content, a mismatched date
+in the test fixture would no longer be recognised as \"the same stamp\" and
+would (correctly) be treated as unrelated text instead."
   (cc-butler-governance-test--with-store
-    (cc-butler-governance-test--as-session "worker-a (sess-1)"
-      (cc-butler-governance-record "p" "d" "Body."))
-    (let* ((text (cc-butler-governance-test--as-session "worker-b (sess-2)"
+    (let* ((path (expand-file-name "p.md" (cc-butler-governance-store)))
+           (real-stamp (cc-butler-governance-test--as-session "worker-a (sess-1)"
+                         (cc-butler-governance-record "p" "d" "Body.")
+                         (cc-butler-governance--existing-stamp path)))
+           (text (cc-butler-governance-test--as-session "worker-b (sess-2)"
                    (cc-butler-governance-test--text
                     (cc-butler-governance-record
-                     "p" "d" "Body.\n\n(최초 기록: worker-a (sess-1), 01-01)"))))
+                     "p" "d" (concat "Body.\n\n" real-stamp)))))
            (n 0) (start 0))
+      (should real-stamp)
       (while (string-match "최초 기록" text start)
         (setq n (1+ n) start (match-end 0)))
       (should (= n 1)))))
+
+(ert-deftest cc-butler-governance/a-near-miss-paste-is-not-treated-as-the-real-stamp ()
+  "The other side of the same fix: a stamp-shaped last line that is CLOSE to
+but not identical with the note's real stamp (wrong date, wrong session) is
+not a recognised duplicate -- it is unrelated text and must survive, exactly
+like the #140 write-side bug this whole fix addresses."
+  (cc-butler-governance-test--with-store
+    (cc-butler-governance-test--as-session "worker-a (sess-1)"
+      (cc-butler-governance-record "p" "d" "Body."))
+    (let ((text (cc-butler-governance-test--as-session "worker-b (sess-2)"
+                  (cc-butler-governance-test--text
+                   (cc-butler-governance-record
+                    "p" "d" "Body.\n\n(최초 기록: worker-a (sess-1), 01-01)")))))
+      ;; the near-miss line (wrong date) survives verbatim
+      (should (string-match-p (regexp-quote "worker-a (sess-1), 01-01") text))
+      ;; and the note's real stamp is still appended after it
+      (should (cc-butler-governance--stamp-line text))
+      (should (string-match-p "최초 기록: worker-a (sess-1), [0-9][0-9]-[0-9][0-9])$" (cc-butler-governance--stamp-line text))))))
 
 (ert-deftest cc-butler-governance/a-quoted-stamp-in-the-body-is-not-promoted ()
   "A note that WRITES ABOUT stamping quotes a stamp line.  Recognising the
@@ -2232,3 +2258,40 @@ population is correct); the line must now say so."
         (should (string-match-p
                  (regexp-quote "[범위: 최상위 .md · README·roles/·사용자층 제외 · 바이트는 body 기준]")
                  out))))))
+
+(ert-deftest cc-butler-governance/a-genuine-last-line-shaped-like-a-stamp-survives-creation ()
+  "Issue #140 (write side): if a BRAND-NEW note's own author-written body
+happens to end with a line shaped exactly like a stamp, `--strip-stamps' must
+not treat it as a caller-pasted copy and delete it.  There is no existing
+stamp on a note that does not yet exist, so nothing here can legitimately be
+a stripped duplicate — the last line is just the author's real content."
+  (cc-butler-governance-test--with-store
+    (let* ((body "Field notes.\n\n(최초 기록: an example from the manual, 01-01)")
+           (text (cc-butler-governance-test--as-session "worker-a (sess-1)"
+                   (cc-butler-governance-test--text
+                    (cc-butler-governance-record "p" "d" body)))))
+      ;; the author's real last line must still be there verbatim
+      (should (string-match-p
+               (regexp-quote "(최초 기록: an example from the manual, 01-01)") text))
+      ;; AND the tool's own real stamp must also be appended after it
+      (should (string-match-p "최초 기록: worker-a (sess-1)" text))
+      ;; the two must not have collapsed into one line
+      (should-not (equal
+                   (cc-butler-governance--stamp-line text)
+                   "(최초 기록: an example from the manual, 01-01)")))))
+
+(ert-deftest cc-butler-governance/a-genuine-updated-last-line-shaped-like-a-stamp-survives ()
+  "Same failure mode on an UPDATE: the caller's new body ends, coincidentally,
+in a stamp-shaped line that is NOT a copy of this note's actual existing
+stamp.  It must be kept, not silently treated as a duplicate to strip."
+  (cc-butler-governance-test--with-store
+    (cc-butler-governance-test--as-session "worker-a (sess-1)"
+      (cc-butler-governance-record "p" "d" "First body."))
+    (let* ((new-body "Revised notes.\n\n(최초 기록: a different unrelated line, 02-02)")
+           (text (cc-butler-governance-test--as-session "worker-b (sess-2)"
+                   (cc-butler-governance-test--text
+                    (cc-butler-governance-record "p" "d" new-body)))))
+      (should (string-match-p
+               (regexp-quote "(최초 기록: a different unrelated line, 02-02)") text))
+      ;; the note's REAL original stamp still carries forward, unchanged
+      (should (string-match-p "최초 기록: worker-a (sess-1)" text)))))

@@ -1379,15 +1379,26 @@ whoever edits a legacy note today is not its first recorder."
     (cc-butler-governance--stamp-line
      (with-temp-buffer (insert-file-contents path) (buffer-string)))))
 
-(defun cc-butler-governance--strip-stamps (body)
-  "BODY with a trailing creation stamp removed, if it has one.
-Only a trailing stamp is removed, for the same reason only a trailing one is
-recognised: a stamp-shaped line elsewhere in BODY is the author's text and
-deleting it would be silent data loss."
-  (let* ((body (string-trim-right (or body "")))
-         (stamp (cc-butler-governance--stamp-line body)))
+(defun cc-butler-governance--strip-stamps (body expected)
+  "BODY with a trailing copy of EXPECTED removed, if BODY ends with exactly
+that line.
+
+EXPECTED is the note's actual existing stamp (nil for a brand-new note that
+has none).  Root-cause fix for issue #140's write-side half: the old version
+stripped ANY line merely shaped like a stamp, so an author's own genuine last
+line — coincidentally shaped that way, on a brand-new note where no real
+stamp can possibly exist yet — was silently deleted as if it were a
+caller-pasted duplicate.  Comparing against the specific stamp this call
+already knows to be real, rather than against the generic shape, means a
+line only gets removed when it truly IS a copy of something the tool itself
+already wrote — never merely because it resembles one."
+  (let* ((body (string-trim-right (or body ""))))
     (string-trim
-     (if stamp (substring body 0 (- (length body) (length stamp))) body))))
+     (if (and expected
+              (>= (length body) (length expected))
+              (equal (substring body (- (length body) (length expected))) expected))
+         (substring body 0 (- (length body) (length expected)))
+       body))))
 
 (defun cc-butler-governance--mint-stamp ()
   "A creation stamp naming the calling session, or nil if it cannot be known.
@@ -1418,12 +1429,16 @@ the record-time index-line length check (what gets measured before
 anything is written) can never disagree about what the text actually is."
   (replace-regexp-in-string "\"" "'" (string-trim (or description ""))))
 
-(defun cc-butler-governance--render (slug description body type &optional stamp)
+(defun cc-butler-governance--render (slug description body type &optional stamp existing)
   "The full file text for a principle, frontmatter included.
 Written here rather than by the caller so the schema cannot be got wrong —
 `name:' matching the generated note, the quoting of DESCRIPTION, and the
 `metadata:' block are all things a caller would have to know and would
-eventually get subtly wrong."
+eventually get subtly wrong.
+
+EXISTING is the note's real prior stamp (nil if it has none), passed through
+to `cc-butler-governance--strip-stamps' so only a genuine duplicate of it is
+ever removed from BODY — never a line that merely looks like a stamp."
   (concat "---\n"
           "name: " cc-butler-governance--name-prefix slug "\n"
           "description: \""
@@ -1432,7 +1447,7 @@ eventually get subtly wrong."
           "  node_type: memory\n"
           "  type: " (or type "feedback") "\n"
           "---\n\n"
-          (cc-butler-governance--strip-stamps body)
+          (cc-butler-governance--strip-stamps body existing)
           "\n"
           (if stamp (concat "\n" stamp "\n") "")))
 
@@ -1488,8 +1503,14 @@ the same question cannot disagree."
         (when end
           (goto-char end)
           (forward-line 1)
-          (cc-butler-governance--strip-stamps
-           (buffer-substring-no-properties (point) (point-max))))))))
+          ;; This reads the note's OWN file back -- a trailing stamp-shaped
+          ;; line here, unlike a freshly-submitted BODY, cannot be a pasted
+          ;; foreign copy: it is by definition whatever this note's real
+          ;; stamp already is, so shape-matching it is exactly the "expected"
+          ;; value (never a false strip of genuine content).
+          (let ((text (buffer-substring-no-properties (point) (point-max))))
+            (cc-butler-governance--strip-stamps
+             text (cc-butler-governance--stamp-line text))))))))
 
 (defun cc-butler-governance--shrink-guard-message (slug old-bytes new-bytes)
   "Rejection text for `record_principle' hitting the shrink guard.
@@ -1631,7 +1652,12 @@ question this function asks."
          (store (cc-butler-governance-store))
          (path (expand-file-name (concat slug ".md") store))
          (existed (file-exists-p path))
-         (before (cc-butler-governance--note-count)))
+         (before (cc-butler-governance--note-count))
+         ;; Computed once, here, and reused by every cap/guard check below
+         ;; AND by `--render' at write time -- so "what counts as this
+         ;; note's real existing stamp" can never disagree between the size
+         ;; checks and the actual write (issue #140 write-side fix).
+         (prior (and existed (cc-butler-governance--existing-stamp path))))
     (when (string-empty-p (string-trim (or body "")))
       (user-error "Refusing to record an empty principle: %s" slug))
     ;; "Does this already exist?" is asked before anything else -- a
@@ -1649,7 +1675,7 @@ question this function asks."
     (when (and existed (not (cc-butler-governance--truthy-p confirm-shrink)))
       (let* ((old-body (cc-butler-governance--body-in-file path))
              (old-bytes (and old-body (string-bytes old-body)))
-             (new-bytes (string-bytes (cc-butler-governance--strip-stamps body))))
+             (new-bytes (string-bytes (cc-butler-governance--strip-stamps body prior))))
         (when (and old-bytes (> old-bytes 0)
                    (< new-bytes (* old-bytes cc-butler-governance-shrink-guard-fraction)))
           (user-error "%s" (cc-butler-governance--shrink-guard-message
@@ -1657,10 +1683,10 @@ question this function asks."
     ;; Checked on every call, not only new ones — an update that pads an
     ;; existing note past the cap is the append-instead-of-add workaround
     ;; the count cap alone opens up (정수님, 2026-09-08).
-    (when (> (string-bytes (cc-butler-governance--strip-stamps body))
+    (when (> (string-bytes (cc-butler-governance--strip-stamps body prior))
              cc-butler-governance-max-note-bytes)
       (user-error "%s" (cc-butler-governance--length-message
-                        slug (cc-butler-governance--strip-stamps body))))
+                        slug (cc-butler-governance--strip-stamps body prior))))
     ;; Also checked on every call, same reason: a DESCRIPTION that only
     ;; grows the index line, never the body, would otherwise dodge the
     ;; body-length cap entirely while still blowing the index-read budget
@@ -1680,9 +1706,8 @@ question this function asks."
                ;; and the caller resubmits the whole body without ever having
                ;; seen the stamp, so an update must read the old one back off
                ;; disk or it is silently erased on the first edit.
-               (if existed
-                   (cc-butler-governance--existing-stamp path)
-                 (cc-butler-governance--mint-stamp)))))
+               (if existed prior (cc-butler-governance--mint-stamp))
+               prior)))
     (cc-butler-governance-regenerate)
     (let* ((note (cc-butler-governance--memory-note slug))
            (verified (and (file-readable-p note)
