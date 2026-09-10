@@ -769,6 +769,244 @@ exactly the failure check 8 exists to prevent."
         (should (string-match-p "kept pending separate disposal" (plist-get r :detail)))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; Check 9: queue vs. room -- forward-only reconciliation
+;;;; ------------------------------------------------------------------
+;;;; All ids below are synthetic (`!fake-room:example.org',
+;;;; `$fake-event-N', `@butler-test:example.org', `old-decision') -- never
+;;;; a real event id, room id, decision id, or the real self-user-id.
+;;;; No test here makes a real network call: `matrix-bridge-thread-replies'
+;;;; is always stubbed.
+
+(defmacro cc-butler-self-check-test--with-decision-dir (&rest body)
+  "Fresh temp mail + decision dirs (mirrors
+`cc-butler-decision-test--with-arrival', not reused directly to avoid a
+cross-test-file `require' for one macro)."
+  (declare (indent 0))
+  `(let* ((cc-butler-mail-dir (make-temp-file "cc-butler-qrr-mail" t))
+          (cc-butler-decision-dir (make-temp-file "cc-butler-qrr-dec" t)))
+     (unwind-protect (progn ,@body)
+       (delete-directory cc-butler-mail-dir t)
+       (delete-directory cc-butler-decision-dir t))))
+
+(defun cc-butler-self-check-test--seed-open-decision (id-suffix &optional event-id room)
+  "Write a `Kind: decision' open/ file, optionally with
+`:Delivered-to-matrix:'/`:Room:' properties."
+  (with-temp-file (expand-file-name
+                    (format "%s-991-%s.org" (format-time-string "%Y%m%dT%H%M%S") id-suffix)
+                    (cc-butler--decision-open-dir))
+    (insert ":PROPERTIES:\n:Kind: decision\n"
+            (if event-id (format ":Delivered-to-matrix: %s\n" event-id) "")
+            (if room (format ":Room: %s\n" room) "")
+            ":END:\n#+TITLE: synthetic\n\n* Decision\nplaceholder\n")))
+
+(defmacro cc-butler-self-check-test--with-matrix-configured (&rest body)
+  "Run BODY with Matrix bridging looking configured: a synthetic self-user-id
+and an existing (empty) token file."
+  (declare (indent 0))
+  `(let* ((token-file (make-temp-file "cc-butler-qrr-token"))
+          (matrix-bridge-self-user-id "@butler-test:example.org")
+          (matrix-bridge-token-file token-file))
+     (unwind-protect (progn ,@body)
+       (delete-file token-file))))
+
+(defmacro cc-butler-self-check-test--with-thread-replies-stub (fn &rest body)
+  "Run BODY with `matrix-bridge-thread-replies' stubbed to FN (a function of
+ROOM EVENT-ID).  Binds `cc-butler-self-check-test--thread-replies-calls' to
+the number of calls made, visible to BODY."
+  (declare (indent 1))
+  `(let ((cc-butler-self-check-test--thread-replies-calls 0))
+     (cl-letf (((symbol-function 'matrix-bridge-thread-replies)
+                (lambda (room event-id)
+                  (setq cc-butler-self-check-test--thread-replies-calls
+                        (1+ cc-butler-self-check-test--thread-replies-calls))
+                  (funcall ,fn room event-id))))
+       ,@body)))
+
+(ert-deftest cc-butler-self-check/queue-room-not-configured-self-user-id-nil ()
+  "No Matrix identity set on this fleet at all -- a normal, valid state, not
+a defect: `:ok t', reconciliation explicitly skipped, open count named."
+  (cc-butler-self-check-test--with-decision-dir
+    (let ((matrix-bridge-self-user-id nil))
+      (cc-butler-self-check-test--seed-open-decision "a")
+      (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+        (should (plist-get r :ok))
+        (should (string-match-p "skipped" (plist-get r :detail)))
+        (should (string-match-p "1 open decision" (plist-get r :detail)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-not-configured-no-token-file ()
+  "A self-user-id is set but the token file does not exist on disk -- still
+treated as \"not configured\", not a failure."
+  (cc-butler-self-check-test--with-decision-dir
+    (let ((matrix-bridge-self-user-id "@butler-test:example.org")
+          (matrix-bridge-token-file "/nonexistent/cc-butler-qrr-token-missing"))
+      (cc-butler-self-check-test--seed-open-decision "a")
+      (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+        (should (plist-get r :ok))
+        (should (string-match-p "skipped" (plist-get r :detail)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-stale-when-room-shows-self-followup ()
+  "The actionable defect: a locally-open decision whose room thread already
+carries a reply from THIS fleet's own Matrix identity -- the file is
+STALE.  `:ok' fails, and the file + its scanned-reply count are named."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "stale" "$fake-event-1" "!fake-room:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room _event-id)
+            (list :status 'ok
+                  :events '(((sender . "@butler-test:example.org")))
+                  :scanned 1 :truncated nil))
+        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+          (should-not (plist-get r :ok))
+          (should (string-match-p "stale 1" (plist-get r :detail)))
+          (should (string-match-p "991-stale" (plist-get r :detail)))
+          (should (string-match-p "scanned 1" (plist-get r :detail))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-genuinely-open-when-no-self-reply ()
+  "A locally-open decision whose thread has replies, but none from THIS
+fleet's own identity, is genuinely still open -- not flagged, and counted
+in the open bucket."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "open" "$fake-event-2" "!fake-room:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room _event-id)
+            (list :status 'ok
+                  :events '(((sender . "@someone-else:example.org")))
+                  :scanned 1 :truncated nil))
+        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+          (should (plist-get r :ok))
+          (should (string-match-p "stale 0" (plist-get r :detail)))
+          (should (string-match-p "open 1" (plist-get r :detail))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-empty-thread-is-genuinely-open ()
+  "A successful fetch that finds NOTHING is a real, meaningful \"checked, all
+clear\" -- genuinely open, not unverifiable, not an error."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "empty" "$fake-event-3" "!fake-room:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room _event-id) (list :status 'ok :events nil :scanned 0 :truncated nil))
+        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+          (should (plist-get r :ok))
+          (should (string-match-p "open 1" (plist-get r :detail)))
+          (should (string-match-p "1 decision(s) reconciled, 0 total thread message(s) scanned"
+                                   (plist-get r :detail))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-unverifiable-no-room-property ()
+  "A real, confirmed-live gap: `:Delivered-to-matrix:' present but no
+`:Room:' at all -- structurally unverifiable, must not be guessed at with
+any default room.  Stays `:ok t' (unverifiable alone never fails the
+check) and is named separately, not folded into `open' or `stale'."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision "noroom" "$fake-event-4" nil)
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room _event-id) (error "must not be called -- no :Room: to fetch with"))
+        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+          (should (plist-get r :ok))
+          (should (string-match-p "unverifiable 1" (plist-get r :detail)))
+          (should (string-match-p "no :Room:" (plist-get r :detail)))
+          (should (= 0 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-unverifiable-not-in-room ()
+  "The recorded room turns out wrong (M_NOT_FOUND) -- a data problem, kept
+distinct in `:detail' from \"never delivered\" or \"fetch failed\"."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "wrongroom" "$fake-event-5" "!fake-room:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room _event-id) (list :status 'not-in-room))
+        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+          (should (plist-get r :ok))
+          (should (string-match-p "unverifiable 1" (plist-get r :detail)))
+          (should (string-match-p "M_NOT_FOUND\\|does not contain" (plist-get r :detail))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-unverifiable-fetch-error ()
+  "A network/timeout failure fetching the thread is unverifiable too -- kept
+distinct from the not-in-room and no-property cases -- and never fails
+`:ok' by itself."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "fetcherr" "$fake-event-6" "!fake-room:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room _event-id) (list :status 'error :detail "simulated timeout"))
+        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+          (should (plist-get r :ok))
+          (should (string-match-p "unverifiable 1" (plist-get r :detail)))
+          (should (string-match-p "fetch failed\\|error" (plist-get r :detail))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-aggregate-scanned-total-sums-across-candidates ()
+  "The aggregate scanned-message total sums across every successful fetch,
+and is paired with the reconciled-decision count so a reader can tell
+\"nothing ran\" apart from \"ran and found nothing\"."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "one" "$fake-event-7" "!fake-room:example.org")
+      (cc-butler-self-check-test--seed-open-decision
+       "two" "$fake-event-8" "!fake-room:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room event-id)
+            (if (equal event-id "$fake-event-7")
+                (list :status 'ok :events nil :scanned 3 :truncated nil)
+              (list :status 'ok :events nil :scanned 4 :truncated nil)))
+        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+          (should (plist-get r :ok))
+          (should (string-match-p "2 decision(s) reconciled, 7 total thread message(s) scanned"
+                                   (plist-get r :detail))))))))
+
+;;;; ---- the two PERMANENT negative controls --------------------------
+
+(ert-deftest cc-butler-self-check/queue-room-no-file-means-structurally-invisible ()
+  "PERMANENT, DESIGNATED negative control (1 of 2): a real human-facing
+question sent directly to the Matrix room, bypassing the decision queue
+entirely, has NO corresponding file under open/ -- and this check only
+ever iterates files that exist there, by construction.  It is not merely
+untested that this check catches that gap; it CANNOT, structurally,
+because there is nothing to iterate.  This is NOT a bug to fix here: a
+reverse room->queue scanner was explicitly rejected in this check's design
+-- the room has no way to self-label \"this message is a question\", so a
+reverse detector would be an unfalsifiable heuristic over an unconstrained
+population.  There is no file for the bypassing message, so there is
+nothing to assert against except its absence: with zero decision files
+present, the reconciliation trivially finds zero candidates and never
+calls out to Matrix at all."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room _event-id) (error "must not be called -- no candidate files exist"))
+        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+          (should (plist-get r :ok))
+          (should (string-match-p "0 candidate(s)" (plist-get r :detail)))
+          (should (string-match-p "0 decision(s) reconciled, 0 total thread message(s) scanned"
+                                   (plist-get r :detail)))
+          (should (= 0 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-never-delivered-lands-unverifiable-not-dropped ()
+  "PERMANENT, DESIGNATED negative control (2 of 2): an open decision file
+that DOES exist but has no `:Delivered-to-matrix:' property recorded at
+all (never delivered, or delivery never got logged) must land in the
+unverifiable bucket, still implicitly \"awaiting answer\" -- never silently
+dropped from the count entirely."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision "old-decision" nil nil)
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room _event-id) (error "must not be called -- never delivered"))
+        (let ((r (cc-butler-self-check--queue-room-reconciliation)))
+          (should (plist-get r :ok))
+          (should (string-match-p "1 candidate(s)" (plist-get r :detail)))
+          (should (string-match-p "unverifiable 1" (plist-get r :detail)))
+          (should-not (string-match-p "open 1" (plist-get r :detail)))
+          (should (= 0 cc-butler-self-check-test--thread-replies-calls)))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Transition detection: escalate only on ok<->fail flips, both ways
 ;;;; ------------------------------------------------------------------
 

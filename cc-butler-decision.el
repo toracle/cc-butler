@@ -876,6 +876,17 @@ filename-narrowed survivors below, never the whole open/ directory."
     (and (re-search-forward "^:Kind: \\([a-z]+\\)" nil t)
          (not (equal (match-string 1) "decision")))))
 
+(defconst cc-butler--decision-delivered-to-matrix-re
+  "^[ \t]*:Delivered-to-matrix: \\(.*\\)$"
+  "Regex matching a `:Delivered-to-matrix:' property line in either physical
+shape this codebase's decision files use -- flat at column 0 under a top
+`:PROPERTIES:' drawer (older files) or indented 2 spaces under a
+`* 발신됨' heading (newer files) -- capturing its raw value (the Matrix
+event id, e.g. `$abc...') as group 1.  Shared by
+`cc-butler--decision-delivered-to-matrix-p' (presence only) and
+`cc-butler--decision-delivered-to-matrix-event-id' (the value) -- ONE
+regex, extended with a capturing group, never a second parallel one.")
+
 (defun cc-butler--decision-delivered-to-matrix-p (file)
   "Non-nil when FILE's body has a `:Delivered-to-matrix:' property, i.e. it
 was actually pushed to 정수님 via Matrix (the property holds the real
@@ -916,7 +927,48 @@ someone happened to look at the empty field."
   (with-temp-buffer
     (insert-file-contents file)
     (goto-char (point-min))
-    (and (re-search-forward "^[ \t]*:Delivered-to-matrix: " nil t) t)))
+    (and (re-search-forward cc-butler--decision-delivered-to-matrix-re nil t) t)))
+
+(defun cc-butler--decision-delivered-to-matrix-event-id (file)
+  "Return FILE's `:Delivered-to-matrix:' value (the raw Matrix event id, e.g.
+`$abc...'), or nil when the property is absent.  Reads the same
+`cc-butler--decision-delivered-to-matrix-re' `cc-butler--decision-delivered-to-matrix-p'
+uses -- extended with a capturing group, not a second, parallel regex --
+so the two can never disagree about what counts as \"present\"."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (and (re-search-forward cc-butler--decision-delivered-to-matrix-re nil t)
+         (string-trim (match-string 1)))))
+
+(defconst cc-butler--decision-room-re
+  "^[ \t]*:Room: \\(.*\\)$"
+  "Regex matching a `:Room:' property line, capturing its whole raw value as
+group 1.  `:Room:' is not parsed anywhere else in this codebase -- this
+follows the identical dual-shape approach already solved for
+`:Delivered-to-matrix:' (`cc-butler--decision-delivered-to-matrix-re'): flat
+at column 0 under a top `:PROPERTIES:' drawer (older files), or indented 2
+spaces under a `* 발신됨' heading alongside `:Delivered-to-matrix:' (newer
+files) -- this one regex matches either, since both shapes only differ by
+leading whitespace, which `^[ \t]*' already absorbs.")
+
+(defun cc-butler--decision-room-id (file)
+  "Return FILE's `:Room:' property value (a Matrix room id, `!xxxx:servername'
+shape), or nil when absent.  A real `:Room:' line's raw value can carry a
+trailing human-readable label in parens (e.g. `!abc:server (butlers)') --
+this returns only the leading whitespace-delimited token, the room id
+itself, never the label.
+
+Absence must stay nil, never a guessed default: more than one room is in
+real use, so defaulting to \"the\" room would silently produce a false
+\"not found\" indistinguishable from a genuine absence unless callers keep
+these as separate states -- which is the whole point of returning nil here
+rather than guessing."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (and (re-search-forward cc-butler--decision-room-re nil t)
+         (car (split-string (string-trim (match-string 1)) "[ \t]+" t)))))
 
 (defun cc-butler--decision-file-mentions-delivery-p (file)
   "Non-nil when the bare string \"Delivered-to-matrix\" appears ANYWHERE in
