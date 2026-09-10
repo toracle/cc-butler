@@ -32,14 +32,21 @@
   :group 'cc-butler)
 
 (defcustom cc-butler-decision-workflow nil
-  "When non-nil, escalations are also rendered as answerable decision documents.
-A reversible toggle, independent of `cc-butler-message-transport'.
+  "When non-nil, escalations route ENTIRELY to answerable decision documents
+under `open/' instead of the plain `pending_decisions' queue -- never both;
+see `cc-butler-tool-pending-decisions''s own docstring for the routing
+`cond'.  A reversible toggle, independent of `cc-butler-message-transport'.
 
-KNOWN GAP before enabling: with this on, escalations are rendered into the
-decision documents under `open/', which `cc-butler-tool-pending-decisions'
-does NOT scan — while `escalate_to_butler' returns the same success string
-either way.  Escalations would be answerable by the human but invisible to a
-butler that drains `pending_decisions'.  Dormant while this is nil."
+KNOWN GAP before enabling: `cc-butler-tool-pending-decisions' does not scan
+`open/' itself, and `escalate_to_butler' returns the same success string
+either way, so nothing at the call site signals the switch happened.
+Escalations are answerable by the human but invisible to a butler that only
+ever drains `pending_decisions' directly. Partially mitigated (not closed):
+with this on, `cc-butler-tool-pending-decisions' appends a read-only backlog
+line (`cc-butler--decision-open-backlog-line') naming the open/ count and
+the oldest item's age, so the tool stops asserting \"No pending decisions\"
+while items sit unaddressed -- it still does not list or drain those
+documents individually. Dormant while this is nil."
   :type 'boolean
   :group 'cc-butler)
 
