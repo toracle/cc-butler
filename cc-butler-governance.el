@@ -661,7 +661,17 @@ slugs rewritten."
                       ;; sub-3-byte slug-aware budget -- content-independent
                       ;; proof of the pre-fix `--truncate-bytes' bug, since
                       ;; that budget deterministically produced exactly "…"
-                      ;; regardless of what the description said.
+                      ;; regardless of what the description said. This
+                      ;; fingerprint's lifetime is the bug's lifetime: fixed
+                      ;; `--truncate-bytes' returns "" (not "…") for any
+                      ;; sub-3-byte budget, so no line generated AFTER this
+                      ;; commit can ever match it again -- it exists only to
+                      ;; repair lines a PRE-fix regenerate already wrote to
+                      ;; disk, and stays dead code once those are gone. Safe
+                      ;; to delete once no store's `MEMORY.md' can still hold
+                      ;; a leftover pre-fix line (i.e. once every fleet
+                      ;; member's `MEMORY.md' has been regenerated at least
+                      ;; once on this commit or later).
                       (and (equal indexed-desc "…")
                            (< (cc-butler-governance--description-budget-bytes slug)
                               (string-bytes "…")))))
