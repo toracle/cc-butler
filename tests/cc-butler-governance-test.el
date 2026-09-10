@@ -1840,6 +1840,65 @@ contiguous run)."
           (should (or (and (< pos-a curated-pos) (< pos-b curated-pos))
                       (and (> pos-a curated-pos) (> pos-b curated-pos)))))))))
 
+(ert-deftest cc-butler-governance/regenerate-orphan-legacy-line-can-fall-out-of-budget-after-sort ()
+  "Risk assessment for PR #216 (2026-09-10), RED BY DESIGN -- do not fix the
+underlying code to silence this; it exists to make the risk visible for a
+merge decision, not to be closed unilaterally.
+
+Invariant this encodes: a legacy/hand-authored index line pointing to a
+note that exists ONLY outside the vault store (no `butler-' counterpart --
+its MEMORY.md line is the ONLY surviving pointer to that content) must
+remain within `cc-butler-governance--memory-read-budget-bytes' after
+`cc-butler-governance-regenerate', even when it was originally sandwiched
+close to the front of the file, between store-owned lines that the sort
+pulls into a block elsewhere.
+
+Why this fails: `cc-butler-governance--rewrite-sorted-index' reinserts
+ALL store-owned lines as one contiguous block at the position of the
+file's FIRST store-owned line (see that function). Any line after that
+point -- however close to the front it started -- is shoved past the
+WHOLE block, however large. This fixture is a tiny deterministic stand-in
+for what real ~575-note-store ground truth already showed (2026-09-10,
+scratch-copy run against PR #216 @ 8ca4c84): two orphan-target legacy
+lines that sat well within the live 24712-byte budget before the sort
+landed ~45KB into the file after it -- a real visibility regression, not
+a hypothetical one."
+  (cc-butler-governance-test--with-store
+    (let* ((index (expand-file-name "MEMORY.md" mem))
+           (orphan-line "- [legacy-orphan](legacy-orphan.md) — hand-authored, only ever lived in the memory dir, no store file backs it\n")
+           (first-store-line "- butler-note-a.md — d\n"))
+      (cc-butler-governance-test--git-init store)
+      ;; Seed: one store line, then the orphan sandwiched right after it,
+      ;; then three MORE store lines -- all of which get pulled into the
+      ;; same sorted block ahead of the orphan once regenerate runs.
+      (with-temp-file index
+        (insert first-store-line orphan-line
+                "- butler-note-b.md — d\n"
+                "- butler-note-c.md — d\n"
+                "- butler-note-d.md — d\n"))
+      (cc-butler-governance-test--commit-note
+       store "note-a" (cc-butler-governance--render "note-a" "d" "body" "feedback") 1000)
+      (cc-butler-governance-test--commit-note
+       store "note-b" (cc-butler-governance--render "note-b" "d" "body" "feedback") 2000)
+      (cc-butler-governance-test--commit-note
+       store "note-c" (cc-butler-governance--render "note-c" "d" "body" "feedback") 3000)
+      (cc-butler-governance-test--commit-note
+       store "note-d" (cc-butler-governance--render "note-d" "d" "body" "feedback") 4000)
+      ;; A budget just big enough to cover the orphan line at its PRE-sort
+      ;; position (right after the single store line ahead of it), but not
+      ;; big enough once all four store lines are glued in front of it.
+      (let ((cc-butler-governance--memory-read-budget-bytes
+             (+ (string-bytes (concat first-store-line orphan-line)) 5)))
+        (cc-butler-governance-regenerate)
+        (let* ((text (with-temp-buffer (insert-file-contents index) (buffer-string)))
+               (orphan-start (string-match (regexp-quote orphan-line) text)))
+          (should orphan-start)
+          ;; The invariant: the orphan line must still end within budget.
+          ;; Currently false -- the sort pushes it well past the budget
+          ;; chosen above, which is why this test is RED by design.
+          (should (<= (+ orphan-start (string-bytes orphan-line))
+                      cc-butler-governance--memory-read-budget-bytes)))))))
+
 (provide 'cc-butler-governance-test)
 ;;; cc-butler-governance-test.el ends here
 
