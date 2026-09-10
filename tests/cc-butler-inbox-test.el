@@ -99,7 +99,7 @@ LEAVES the queue (archived to done/) — the inbox reflects sign & next."
                  (create-lockfiles nil) (kill-buffer-query-functions nil))
             (with-temp-file file (insert (cc-butler-decision-test--fill doc ?A "go")))
             (let ((buf (find-file-noselect file)))
-              (unwind-protect (with-current-buffer buf (cc-butler-decision-submit))
+              (unwind-protect (with-current-buffer buf (cc-butler-decision-submit cc-butler-human-agent))
                 (ignore-errors (kill-buffer buf)))))
           (should (= 0 (cc-butler-inbox-count))))   ; signed → gone from the queue
       (delete-directory cc-butler-decision-dir t)

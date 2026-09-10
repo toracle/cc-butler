@@ -314,21 +314,36 @@ only; the answer itself travels in the maildir inbox (read via pending_events)."
         (cc-butler--send-input
          dir "[cc-butler] 정수님 answered a decision — run pending_events to read it." t)))))
 
-(defun cc-butler--decision-cc-butler (summary &optional id)
-  "CC a terse receipt SUMMARY to the butler's inbox so the butler stays COHERENT
-with 정수님's decision state (visibility, not routing — never a hop that can drop
-or delay the answer).  No-op if the butler is unset or is the human node itself."
+(defun cc-butler--decision-cc-butler (actor summary &optional id)
+  "CC a terse receipt SUMMARY to the butler's inbox, attributed to ACTOR, so the
+butler stays COHERENT with 정수님's decision state (visibility, not routing —
+never a hop that can drop or delay the answer).  No-op if the butler is unset
+or is the human node itself.  ACTOR is an explicit argument, not a default —
+see `cc-butler-decision-submit' for why callers must never default it to the
+human on this caller's behalf."
   (let ((butler (cc-butler--mail-butler-agent)))
     (when (and butler (not (equal butler cc-butler-human-agent)))
       (cc-butler--ch-deliver
-       butler (list :kind 'receipt :from cc-butler-human-agent
+       butler (list :kind 'receipt :from actor
                     :in-reply-to id :body summary)))))
 
-(defun cc-butler-decision-submit ()
+(defun cc-butler-decision-submit (&optional actor)
   "Submit the current decision document's answer (bound to `C-c C-c').
-Routes 정수님's answer back to the asker via the maildir correlation, then
-moves the file to done/."
-  (interactive)
+Routes ACTOR's answer back to the asker via the maildir correlation, then
+moves the file to done/.
+
+ACTOR is who is REALLY performing this action, and is a required explicit
+argument -- there is no default, and in particular it never silently
+defaults to 정수님.  A genuine keybinding/M-x/hydra dispatch supplies his
+identity automatically via the `interactive' spec below (that is the ONE
+place entitled to assert it).  A programmatic caller must pass its OWN
+identity explicitly (e.g. \"worker\") -- this function fabricates an
+\"ACTOR answered: ...\" message under ACTOR's name, so a caller that
+defaults or lies about ACTOR fabricates a real decision answer someone
+never gave.  Passing no ACTOR at all refuses outright rather than guessing."
+  (interactive (list cc-butler-human-agent))
+  (unless actor
+    (user-error "cc-butler-decision-submit requires an explicit ACTOR -- it will not guess who is answering, and never defaults to 정수님.  A worker/programmatic caller must identify itself explicitly, e.g. (cc-butler-decision-submit \"worker\"); to close a Kind=decision item programmatically WITHOUT fabricating an answer at all, use cc-butler-decision-close-with-reason instead, or escalate to a human decision"))
   (let ((parsed (cc-butler--decision-parse)))
     (unless parsed
       (user-error "Not an answerable decision document"))
@@ -340,12 +355,12 @@ moves the file to done/."
       (when (string-empty-p (or answer ""))
         (user-error "No answer selected or written"))
       (cc-butler--ch-deliver
-       to (list :kind 'reply :from cc-butler-human-agent
+       to (list :kind 'reply :from actor
                 :in-reply-to id :body answer))
       (cc-butler--decision-notify-recipient to)
       (unless (equal to (cc-butler--mail-butler-agent))   ; butler already got the direct reply
         (cc-butler--decision-cc-butler
-         (format "정수님 answered decision %s (routed to %s): %s" id to answer) id))
+         actor (format "%s answered decision %s (routed to %s): %s" actor id to answer) id))
       (let ((file (buffer-file-name)))
         (when (and file (file-exists-p file))
           (let ((dest (expand-file-name (file-name-nondirectory file)
@@ -393,12 +408,24 @@ navigation lives in the list)."
     (set-buffer-modified-p nil)))
 
 ;;;###autoload
-(defun cc-butler-decision-mark-read ()
-  "Mark the current inbox document read: send a read-receipt to its sender.
-For a `note'/`relay' this also closes it (open/ → done/).  A `decision' stays
-open — only `C-c C-c' closes a decision (an unanswered decision is never lost).
-A plain document with no sender is marked read locally (no receipt)."
-  (interactive)
+(defun cc-butler-decision-mark-read (&optional actor)
+  "Mark the current inbox document read: send a read-receipt from ACTOR to its
+sender.  For a `note'/`relay' this also closes it (open/ → done/).  A
+`decision' stays open — only `C-c C-c' closes a decision (an unanswered
+decision is never lost).  A plain document with no sender is marked read
+locally (no receipt).
+
+ACTOR is who is REALLY marking this read, and is a required explicit
+argument -- there is no default, and in particular it never silently
+defaults to 정수님.  A genuine keybinding/M-x/hydra dispatch (`r') supplies
+his identity automatically via the `interactive' spec below.  A programmatic
+caller must pass its OWN identity explicitly -- this function sends a
+receipt under ACTOR's name, so a caller that defaults or lies about ACTOR
+puts words in someone's mouth they never said.  Passing no ACTOR at all
+refuses outright rather than guessing."
+  (interactive (list cc-butler-human-agent))
+  (unless actor
+    (user-error "cc-butler-decision-mark-read requires an explicit ACTOR -- it will not guess who is reading, and never defaults to 정수님.  A worker/programmatic caller must identify itself explicitly, e.g. (cc-butler-decision-mark-read \"worker\"); to close a Kind=decision item programmatically WITHOUT fabricating an identity at all, use cc-butler-decision-close-with-reason instead, or escalate to a human decision"))
   (let ((footer (cc-butler--decision-footer))
         (decisionp (cc-butler--decision-answer-bounds)))
     (if (not footer)
@@ -407,7 +434,7 @@ A plain document with no sender is marked read locally (no receipt)."
       (let ((id (car footer)) (to (cdr footer)))
         (unless (equal to "?")
           (cc-butler--ch-deliver
-           to (list :kind 'read :from cc-butler-human-agent :in-reply-to id
+           to (list :kind 'read :from actor :in-reply-to id
                     :body (format "read: %s" (cc-butler--decision-doc-title)))))
         (if decisionp
             (message "cc-butler: read-receipt sent to %s (decision stays open — answer with C-c C-c)." to)
@@ -608,7 +635,11 @@ org-edit-special pattern): edit freely — no command-key collisions — then
     (let ((win (get-buffer-window cbuf)))
       (when (and win (window-live-p win) (not (one-window-p))) (delete-window win)))
     (let ((kill-buffer-query-functions nil)) (kill-buffer cbuf))
-    (with-current-buffer src (cc-butler-decision-submit)))) ; record + channel push + sign&next
+    ;; This compose flow is itself only reachable via a real C-c C-c keypress
+    ;; in the dedicated compose buffer (a human action), so it is entitled to
+    ;; assert 정수님's identity explicitly -- `cc-butler-decision-submit' no
+    ;; longer infers ACTOR from call style, so this must pass it, not omit it.
+    (with-current-buffer src (cc-butler-decision-submit cc-butler-human-agent)))) ; record + channel push + sign&next
 
 (defun cc-butler-decision-compose-abort ()
   "Discard the compose buffer without sending."
@@ -1087,7 +1118,12 @@ Returns the count of docs newly surfaced (new or superseded)."
         (when (memq (cdr r) '(new superseded))
           (push (car r) surfaced)
           ;; CC the butler: a decision/note is now pending for 정수님 (visibility).
+          ;; Unchanged behavior (out of scope for this fix): this receipt is
+          ;; system/arrival-driven, not an answer or read attributed to a
+          ;; caller, so it keeps asserting `cc-butler-human-agent' explicitly
+          ;; rather than threading an ACTOR through the arrival path.
           (cc-butler--decision-cc-butler
+           cc-butler-human-agent
            (format "Pending for 정수님: %s — %s [%s]"
                    (or (plist-get m :kind) 'decision)
                    (car (split-string (or (plist-get m :summary)

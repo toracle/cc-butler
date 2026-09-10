@@ -106,7 +106,7 @@ and moves the file open/ → done/."
               (insert (cc-butler-decision-test--fill doc ?A "sandbox"))))
           (let ((buf (find-file-noselect file)))
             (unwind-protect
-                (with-current-buffer buf (cc-butler-decision-submit))
+                (with-current-buffer buf (cc-butler-decision-submit cc-butler-human-agent))
               (kill-buffer buf)))
           ;; the reply reached the asker's inbox, correlated to the decision
           (let ((r (car (cc-butler--ch-drain "worker-a"))))
@@ -127,7 +127,7 @@ and moves the file open/ → done/."
          (doc (cc-butler--decision-doc-string cc-butler-decision-test--msg)))
     (with-temp-buffer
       (insert doc)
-      (should-error (cc-butler-decision-submit) :type 'user-error))
+      (should-error (cc-butler-decision-submit cc-butler-human-agent) :type 'user-error))
     (should (null (cc-butler--ch-drain "worker-a")))))
 
 (ert-deftest cc-butler-decision/submit-refuses-note ()
@@ -135,7 +135,81 @@ and moves the file open/ → done/."
   (with-temp-buffer
     (insert (cc-butler--decision-doc-string
              '(:id "n1" :kind note :from "steward" :summary "CI green")))
-    (should-error (cc-butler-decision-submit) :type 'user-error)))
+    (should-error (cc-butler-decision-submit cc-butler-human-agent) :type 'user-error)))
+
+;;;; ---- ACTOR: required, explicit, never defaults to 정수님 -----------
+;;
+;; Bug (2026-09-10, mail log 20260910T112559-991-2980): a worker called
+;; `cc-butler-decision-mark-read' via a raw elisp funcall (steward had
+;; authorized this for two self-declared non-decisions), and the resulting
+;; message landed `:from "정수님"' — a read-receipt he never sent, on an item
+;; he never touched.  Both this function and `cc-butler-decision-submit' used
+;; to hard-code `:from cc-butler-human-agent' unconditionally: ANY caller,
+;; human keypress or programmatic funcall alike, got attributed to him.  The
+;; fix threads an explicit ACTOR argument through instead of inferring one:
+;; a bare keybinding/M-x/hydra dispatch supplies his identity via the
+;; `interactive' spec (see the docstring); any other caller must identify
+;; itself.  No actor at all refuses outright rather than guessing — it never
+;; leans toward "it's the human".
+
+(ert-deftest cc-butler-decision/submit-refuses-with-no-actor ()
+  "A caller that supplies no ACTOR at all is refused before any mutation — it
+must never silently become 정수님's answer.  RED against the pre-fix code:
+the un-guarded `cc-butler-decision-submit' hard-coded `:from
+cc-butler-human-agent' and would have sent the fabricated reply here."
+  (let* ((cc-butler-mail-test--inboxes nil)
+         (cc-butler--channel (cc-butler-mail-test--mock-channel))
+         (doc (cc-butler-decision-test--fill
+               (cc-butler--decision-doc-string cc-butler-decision-test--msg)
+               ?A "sandbox")))
+    (with-temp-buffer
+      (insert doc)
+      (should-error (cc-butler-decision-submit) :type 'user-error))
+    ;; no fabricated reply reached the asker
+    (should (null (cc-butler--ch-drain "worker-a")))))
+
+(ert-deftest cc-butler-decision/submit-honors-explicit-non-human-actor ()
+  "A programmatic caller that identifies ITSELF (not 정수님) is honest, not
+forbidden — the bug was silent misattribution, not programmatic use itself."
+  (let* ((cc-butler-decision-dir (make-temp-file "cc-butler-dec-test" t))
+         (cc-butler-mail-test--inboxes nil)
+         (cc-butler--channel (cc-butler-mail-test--mock-channel))
+         (file (cc-butler--decision-render cc-butler-decision-test--msg)))
+    (unwind-protect
+        (progn
+          (let ((doc (with-temp-buffer (insert-file-contents file) (buffer-string))))
+            (with-temp-file file
+              (insert (cc-butler-decision-test--fill doc ?A "sandbox"))))
+          (let ((buf (find-file-noselect file)))
+            (unwind-protect
+                (with-current-buffer buf (cc-butler-decision-submit "worker-x"))
+              (kill-buffer buf)))
+          (let ((r (car (cc-butler--ch-drain "worker-a"))))
+            (should (equal "worker-x" (plist-get r :from)))))
+      (delete-directory cc-butler-decision-dir t))))
+
+(ert-deftest cc-butler-decision/submit-interactive-dispatch-supplies-human-identity ()
+  "A genuine interactive dispatch (`call-interactively', matching what a real
+keybinding/M-x invocation does) supplies 정수님's identity automatically via
+the `interactive' spec, with NO argument at the call site — the legitimate
+path keeps working exactly as before the fix."
+  (let* ((cc-butler-decision-dir (make-temp-file "cc-butler-dec-test" t))
+         (cc-butler-mail-test--inboxes nil)
+         (cc-butler--channel (cc-butler-mail-test--mock-channel))
+         (cc-butler-human-agent "정수님")
+         (file (cc-butler--decision-render cc-butler-decision-test--msg)))
+    (unwind-protect
+        (progn
+          (let ((doc (with-temp-buffer (insert-file-contents file) (buffer-string))))
+            (with-temp-file file
+              (insert (cc-butler-decision-test--fill doc ?A "sandbox"))))
+          (let ((buf (find-file-noselect file)))
+            (unwind-protect
+                (with-current-buffer buf (call-interactively #'cc-butler-decision-submit))
+              (kill-buffer buf)))
+          (let ((r (car (cc-butler--ch-drain "worker-a"))))
+            (should (equal "정수님" (plist-get r :from)))))
+      (delete-directory cc-butler-decision-dir t))))
 
 ;;;; ---- arrival-render layer (Emacs-native, arrival-driven) ---------
 
@@ -672,7 +746,7 @@ escalator via correlation."
                (doc (with-temp-buffer (insert-file-contents file) (buffer-string))))
           (with-temp-file file (insert (cc-butler-decision-test--fill doc ?A "asap")))
           (let ((buf (find-file-noselect file)))
-            (unwind-protect (with-current-buffer buf (cc-butler-decision-submit))
+            (unwind-protect (with-current-buffer buf (cc-butler-decision-submit cc-butler-human-agent))
               (kill-buffer buf))))
         (let ((r (car (cc-butler--ch-drain "worker-a"))))
           (should (eq 'reply (plist-get r :kind)))
@@ -734,7 +808,7 @@ superseded doc reflects the new content."
              (create-lockfiles nil) (kill-buffer-query-functions nil))
         (with-temp-file file (insert (cc-butler-decision-test--fill doc ?A "go")))
         (let ((buf (find-file-noselect file)))
-          (unwind-protect (with-current-buffer buf (cc-butler-decision-submit))
+          (unwind-protect (with-current-buffer buf (cc-butler-decision-submit cc-butler-human-agent))
             (ignore-errors (kill-buffer buf)))))
       (should (= 0 (length (directory-files (cc-butler--decision-open-dir) nil cc-butler--decision-org-re))))
       (should (= 1 (length (directory-files (cc-butler--decision-done-dir) nil cc-butler--decision-org-re))))
@@ -782,7 +856,7 @@ reappear in open/ looking like it never cleared."
              (create-lockfiles nil) (kill-buffer-query-functions nil))
         (with-temp-file file (insert (cc-butler-decision-test--fill doc ?A "go")))
         (let ((buf (find-file-noselect file)))
-          (unwind-protect (with-current-buffer buf (cc-butler-decision-submit))
+          (unwind-protect (with-current-buffer buf (cc-butler-decision-submit cc-butler-human-agent))
             (ignore-errors (kill-buffer buf)))))
       (cc-butler--mail-file-deliver "정수님"
         '(:id "s2" :kind decision :from "steward" :reply-to "steward"
@@ -808,7 +882,7 @@ it (open/ → done/); the indicator decrements."
       (cc-butler--decision-on-arrival)
       (let ((buf (cc-butler-decision-test--open-first))
             (kill-buffer-query-functions nil))
-        (unwind-protect (with-current-buffer buf (cc-butler-decision-mark-read))
+        (unwind-protect (with-current-buffer buf (cc-butler-decision-mark-read cc-butler-human-agent))
           (ignore-errors (kill-buffer buf))))
       (let ((r (car (cc-butler--ch-drain "steward"))))
         (should (eq 'read (plist-get r :kind)))
@@ -829,7 +903,7 @@ closes a decision (correctness: an unanswered decision is never lost)."
       (cc-butler--decision-on-arrival)
       (let ((buf (cc-butler-decision-test--open-first))
             (kill-buffer-query-functions nil))
-        (unwind-protect (with-current-buffer buf (cc-butler-decision-mark-read))
+        (unwind-protect (with-current-buffer buf (cc-butler-decision-mark-read cc-butler-human-agent))
           (ignore-errors (kill-buffer buf))))
       (let ((r (car (cc-butler--ch-drain "worker-a"))))
         (should (eq 'read (plist-get r :kind)))
@@ -842,9 +916,64 @@ closes a decision (correctness: an unanswered decision is never lost)."
   (cc-butler-decision-test--with-arrival
     (with-temp-buffer
       (insert "#+TITLE: Dashboard\n* Status\nall green\n")   ; no sender footer
-      (cc-butler-decision-mark-read)
+      (cc-butler-decision-mark-read cc-butler-human-agent)
       (should (null (cc-butler--ch-drain "steward")))
       (should (null (cc-butler--ch-drain "worker-a"))))))
+
+(ert-deftest cc-butler-decision/mark-read-refuses-with-no-actor ()
+  "A caller that supplies no ACTOR at all is refused before any mutation — the
+exact shape of the 2026-09-10 bug: a worker's plain funcall must not
+silently become a read-receipt attributed to 정수님.  RED against the
+pre-fix code, which hard-coded `:from cc-butler-human-agent' here.  Also
+confirms the guard fires before ANY mutation -- the note is neither
+receipted nor archived."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cc-butler--mail-file-deliver "정수님"
+        '(:id "n3" :kind note :from "steward" :reply-to "steward"
+              :summary "읽기만 하셔도 됩니다 — 새 결정 아니고"))
+      (cc-butler--decision-on-arrival)
+      (let ((buf (cc-butler-decision-test--open-first))
+            (kill-buffer-query-functions nil))
+        (unwind-protect
+            (with-current-buffer buf
+              (should-error (cc-butler-decision-mark-read) :type 'user-error))
+          (ignore-errors (kill-buffer buf))))
+      ;; no fabricated read-receipt reached steward
+      (should (null (cc-butler--ch-drain "steward")))
+      ;; refused before any mutation: still open, not archived
+      (should (= 1 (length (directory-files (cc-butler--decision-open-dir) nil cc-butler--decision-org-re))))
+      (should (= 0 (length (directory-files (cc-butler--decision-done-dir) nil cc-butler--decision-org-re)))))))
+
+(ert-deftest cc-butler-decision/mark-read-honors-explicit-non-human-actor ()
+  "A worker that identifies itself explicitly is honest, not forbidden."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cc-butler--mail-file-deliver "정수님"
+        '(:id "n4" :kind note :from "steward" :reply-to "steward" :summary "CI green"))
+      (cc-butler--decision-on-arrival)
+      (let ((buf (cc-butler-decision-test--open-first))
+            (kill-buffer-query-functions nil))
+        (unwind-protect (with-current-buffer buf (cc-butler-decision-mark-read "worker-x"))
+          (ignore-errors (kill-buffer buf))))
+      (let ((r (car (cc-butler--ch-drain "steward"))))
+        (should (equal "worker-x" (plist-get r :from)))))))
+
+(ert-deftest cc-butler-decision/mark-read-interactive-dispatch-supplies-human-identity ()
+  "A genuine interactive dispatch (`call-interactively') supplies 정수님's
+identity automatically via the `interactive' spec, with NO argument at the
+call site."
+  (cc-butler-decision-test--with-arrival
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (d) d)))
+      (cc-butler--mail-file-deliver "정수님"
+        '(:id "n5" :kind note :from "steward" :reply-to "steward" :summary "CI green"))
+      (cc-butler--decision-on-arrival)
+      (let ((buf (cc-butler-decision-test--open-first))
+            (kill-buffer-query-functions nil))
+        (unwind-protect (with-current-buffer buf (call-interactively #'cc-butler-decision-mark-read))
+          (ignore-errors (kill-buffer buf))))
+      (let ((r (car (cc-butler--ch-drain "steward"))))
+        (should (equal "정수님" (plist-get r :from)))))))
 
 ;;;; ---- reply notification (poke the escalator, never the butler) ---
 
@@ -1000,7 +1129,7 @@ the doc is archived out of the queue.  Faithful: assert the routed reply + state
                            (when (re-search-forward "^Other:[ \t]*$" nil t) (replace-match "Other: compose-ok"))
                            (buffer-string))))
           (cc-butler--compose-writeback src composed)
-          (with-current-buffer src (cc-butler-decision-submit))
+          (with-current-buffer src (cc-butler-decision-submit cc-butler-human-agent))
           (ignore-errors (kill-buffer src)))
         (let ((r (car (cc-butler--ch-drain "worker-a"))))
           (should (eq 'reply (plist-get r :kind)))
@@ -1033,7 +1162,7 @@ receipt to the butler (visibility, not a routing hop)."
                                (when (re-search-forward "^- \\[ \\] A" nil t) (replace-match "- [X] A"))
                                (buffer-string))))
               (cc-butler--compose-writeback src composed)
-              (with-current-buffer src (cc-butler-decision-submit))
+              (with-current-buffer src (cc-butler-decision-submit cc-butler-human-agent))
               (ignore-errors (kill-buffer src))))
           (should (cc-butler--ch-drain "worker-a"))          ; asker got the direct reply
           (let ((b (car (cc-butler--ch-drain "butler"))))    ; butler got a receipt CC
@@ -1115,7 +1244,7 @@ and auto-restores every setting (nothing leaks)."
             (with-temp-file file
               (insert (cc-butler-decision-test--fill doc ?A "sandbox")))
             (let ((buf (find-file-noselect file)))
-              (unwind-protect (with-current-buffer buf (cc-butler-decision-submit))
+              (unwind-protect (with-current-buffer buf (cc-butler-decision-submit cc-butler-human-agent))
                 (kill-buffer buf))))
           ;; the after-submit hook fired demo-result → demo-end restored settings
           (should (null cc-butler--decision-demo-state))
