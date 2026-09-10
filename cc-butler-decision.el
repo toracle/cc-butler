@@ -416,6 +416,112 @@ A plain document with no sender is marked read locally (no receipt)."
         (cc-butler--decision-update-indicator)))))
 
 ;;;; ------------------------------------------------------------------
+;;;; Closing a decision through a channel OTHER than a real answer
+;;;; ------------------------------------------------------------------
+;;
+;; `cc-butler-decision-submit' is the ONLY path that fabricates a "정수님
+;; answered: ..." message -- correct when he really typed one.  But a
+;; Kind=decision item sometimes gets resolved WITHOUT that ever happening (he
+;; answered elsewhere, it was never really a question, or the fleet itself
+;; superseded it) -- and until now the only way to make such an item stop
+;; inflating the backlog was to fabricate a fake answer through
+;; `cc-butler-decision-submit', which is not acceptable.  This gives that a
+;; real, non-fabricating close path, reusing (not reimplementing) the same
+;; archive helper `cc-butler-decision-mark-read' already uses for note/relay,
+;; and following `cc-butler-tool-close-topic''s shape for a state-changing
+;; action: ordered guards that refuse before any mutation, then a
+;; `cc-butler--log' record.
+
+(defconst cc-butler--decision-close-reasons
+  '(answered not-a-question our-side pending-evidence)
+  "Valid REASON symbols for `cc-butler-decision-close-with-reason', mapping to
+the four ways an item that LOOKS unanswered in open/ actually turns out to be:
+  ① `answered'          a real reply from 정수님 exists somewhere else.
+  ② `not-a-question'    misfiled -- it never needed an answer at all.
+  ③ `our-side'          the fleet superseded/withdrew it before he had to act.
+  ④ `pending-evidence'  not yet known which of the above applies -- stays open.")
+
+(defconst cc-butler--decision-close-reason-labels
+  '((answered . "answered — a real reply exists elsewhere")
+    (not-a-question . "not-a-question — misfiled as Kind=decision")
+    (our-side . "our-side — superseded/withdrawn before 정수님 needed to act")
+    (pending-evidence . "pending-evidence — disposition not yet known"))
+  "Human-readable label per `cc-butler--decision-close-reasons' symbol.")
+
+;;;###autoload
+(defun cc-butler-decision-close-with-reason (reason note)
+  "Close (①②③ archive) or flag (④ leave open) the current decision-queue
+document as already resolved through a channel OTHER than a real `C-c C-c'
+answer -- WITHOUT fabricating a \"정수님 answered: ...\" message the way
+`cc-butler-decision-submit' does.  REASON is one of
+`cc-butler--decision-close-reasons'; NOTE is free text -- the evidence (what
+happened, and where: a Matrix event id, a log line, another item's id).
+
+REASON `answered'/`not-a-question'/`our-side': appends a `stale/INDEX.md'-style
+reconciliation comment (reason + note + timestamp) to the buffer, then
+archives open/ → done/ via `cc-butler--decision-archive-current' -- the SAME
+helper `cc-butler-decision-mark-read' already uses for note/relay -- so the
+item stops being counted exactly the way an answered decision or a read note
+already does today.
+
+REASON `pending-evidence': appends the same shape of comment, marked
+distinctly (`# --- pending-evidence: ... ---', no `# done —' line since it
+isn't done) and does NOT archive.  The file stays in open/, still
+`decision'-kind by filename, so `cc-butler--decision-open-files-and-oldest'
+keeps counting it -- an item in this state must never look closed, or this
+function would recreate the exact fake-backlog bug it exists to fix, in a
+worse form (an unverified item silently disappearing from view).
+
+Guards, in order (refuses cleanly, no partial mutation, on the first that
+fails):
+  1. the buffer must be visiting an existing file;
+  2. REASON must be one of the four valid symbols;
+  3. NOTE must be non-blank -- a close needs evidence, not a bare reason.
+
+Does not touch `cc-butler-decision-mark-read' or its note/relay/briefing
+behavior -- this is a separate function for Kind=decision items."
+  (interactive
+   (list (intern (completing-read "Reason: "
+                                   (mapcar #'symbol-name cc-butler--decision-close-reasons)
+                                   nil t))
+         (read-string "Note (evidence — what happened, and where): ")))
+  (let ((file (buffer-file-name)))
+    (cond
+     ;; Guard 1: must be visiting an existing decision-queue file.
+     ((not (and file (file-exists-p file)))
+      (user-error "Not visiting an existing decision-queue file — refusing"))
+     ;; Guard 2: REASON must be one of the four valid symbols.
+     ((not (memq reason cc-butler--decision-close-reasons))
+      (user-error "Invalid reason %S — must be one of %s"
+                  reason cc-butler--decision-close-reasons))
+     ;; Guard 3: NOTE must carry actual evidence, not be blank.
+     ((string-empty-p (string-trim (or note "")))
+      (user-error "Empty note — closing needs evidence, not a bare reason"))
+     (t
+      (let* ((archivep (not (eq reason 'pending-evidence)))
+             (label (or (cdr (assq reason cc-butler--decision-close-reason-labels))
+                        (symbol-name reason)))
+             (ts (format-time-string "%FT%T"))
+             (inhibit-read-only t))
+        (save-excursion
+          (goto-char (point-max))
+          (unless (bolp) (insert "\n"))
+          (if archivep
+              (insert (format "\n# --- reconciled: %s ---\n# done — %s · %s\n"
+                              note label ts))
+            (insert (format "\n# --- pending-evidence: %s · %s ---\n" note ts))))
+        (save-buffer)
+        (if archivep
+            (cc-butler--decision-archive-current)
+          (set-buffer-modified-p nil))
+        (cc-butler--log "decision-close-with-reason: %s │ reason=%s │ %s"
+                        (file-name-nondirectory file) reason
+                        (if archivep "archived open/ → done/" "left open (pending-evidence)"))
+        (message "cc-butler: %s (%s)"
+                (if archivep "closed and archived" "flagged — stays open")
+                label))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Doc-view operations (item 3) — confirm / navigate / quit
 ;;;; ------------------------------------------------------------------
 
