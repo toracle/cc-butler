@@ -1693,6 +1693,153 @@ a fresh one, and never hand-patched in place."
         (should (string-match-p "1 of 1 entries" text))
         (should (string-match-p "^- butler-a-rule\\.md — " text))))))
 
+;;;; ------------------------------------------------------------------
+;;;; Reintegration: sorting MEMORY.md's index by git commit-recency
+;;;; (originally `fix/governance-index-sort-by-commit-recency' @ 983d067,
+;;;; reintegrated here against the banner/80-byte-cap/curated-line
+;;;; invariants that landed on main afterward). These three tests were
+;;;; written and confirmed RED before any of that reintegration code
+;;;; existed in this worktree.
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-governance-test--git-init (store)
+  "Turn STORE into a git repo, discarding init chatter."
+  (let ((default-directory store))
+    (call-process "git" nil nil nil "init" "-q")))
+
+(defun cc-butler-governance-test--commit-note (store slug content epoch)
+  "Write STORE/SLUG.md with CONTENT and commit it at unix EPOCH, so
+`cc-butler-governance--commit-recency-map' has a deterministic,
+test-controlled timestamp to sort by regardless of wall-clock time or
+host git config."
+  (with-temp-file (expand-file-name (concat slug ".md") store) (insert content))
+  (let* ((default-directory store)
+         (process-environment
+          (append (list (format "GIT_AUTHOR_DATE=@%d +0000" epoch)
+                        (format "GIT_COMMITTER_DATE=@%d +0000" epoch)
+                        "GIT_AUTHOR_NAME=cc-butler-test"
+                        "GIT_AUTHOR_EMAIL=test@cc-butler.invalid"
+                        "GIT_COMMITTER_NAME=cc-butler-test"
+                        "GIT_COMMITTER_EMAIL=test@cc-butler.invalid")
+                  process-environment)))
+    (call-process "git" nil nil nil "add" (concat slug ".md"))
+    (call-process "git" nil nil nil "commit" "-q" "-m" (concat "add " slug))))
+
+(ert-deftest cc-butler-governance/regenerate-sorts-index-by-commit-recency-with-fresh-banner ()
+  "Banner invariant: after a regenerate that sorts MEMORY.md's index by each
+principle's latest git commit (newest first), the banner block must still
+be the very first thing in the file, in the correct format, and its stated
+N-of-TOTAL must equal `cc-butler-governance--entries-within-budget' run
+fresh against the FINAL, post-sort content -- never a stale pre-sort
+count. Three notes committed oldest to newest (note-a, note-b, note-c)
+must come out newest-first."
+  (cc-butler-governance-test--with-store
+    (cc-butler-governance-test--git-init store)
+    (cc-butler-governance-test--commit-note
+     store "note-a" (cc-butler-governance--render "note-a" "d" "body" "feedback") 1000)
+    (cc-butler-governance-test--commit-note
+     store "note-b" (cc-butler-governance--render "note-b" "d" "body" "feedback") 2000)
+    (cc-butler-governance-test--commit-note
+     store "note-c" (cc-butler-governance--render "note-c" "d" "body" "feedback") 3000)
+    (cc-butler-governance-regenerate)
+    (let* ((index (expand-file-name "MEMORY.md" mem))
+           (text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+      (should (string-match-p "\\`> \\*\\*READ THIS FIRST" text))
+      (should (string-match-p "3 of 3 entries" text))
+      (should (equal (cc-butler-governance--entries-within-budget text) 3))
+      (let ((pos-a (string-match "butler-note-a\\.md" text))
+            (pos-b (string-match "butler-note-b\\.md" text))
+            (pos-c (string-match "butler-note-c\\.md" text)))
+        (should (and pos-a pos-b pos-c))
+        (should (< pos-c pos-b pos-a))))))
+
+(ert-deftest cc-butler-governance/regenerate-shrunk-line-is-correctly-positioned-after-sort ()
+  "80-byte-cap-survives-a-sort: a line long enough to need shrinking must come
+out of `cc-butler-governance-regenerate' BOTH correctly shrunk (<=80
+bytes) AND correctly positioned per the recency sort -- proof that
+shrink's already-fixed output is what got sorted, not stale oversized
+text repositioned unchanged. Seeded with the long-slug's oversized
+pre-shrink line SECOND and a normal-length line FIRST, while committing
+the long slug LATER (more recent) than the normal one -- so a test that
+only checked size, or that coincidentally matched seed order, would not
+catch a missing sort."
+  (cc-butler-governance-test--with-store
+    (let* ((slug "an-extremely-long-slug-name-that-mostly-fills-the-budget")
+           (desc "This is a genuinely long description text used to verify the old flat truncation overflowed the eighty byte line cap in the legacy rendering path.")
+           (old-truncated (cc-butler-governance--truncate-bytes
+                           desc cc-butler-governance--generated-description-max-bytes))
+           (old-line (cc-butler-governance--render-index-line slug old-truncated))
+           (index (expand-file-name "MEMORY.md" mem)))
+      (should (> (string-bytes old-line) cc-butler-governance-max-index-line-bytes))
+      (cc-butler-governance-test--git-init store)
+      ;; Seed order: short-note first, then the long slug's oversized line --
+      ;; the OPPOSITE of the expected post-sort order below.
+      (with-temp-file index (insert "- butler-short-note.md — d\n" old-line))
+      (cc-butler-governance-test--commit-note
+       store "short-note" (cc-butler-governance--render "short-note" "d" "body" "feedback") 1000)
+      (cc-butler-governance-test--commit-note
+       store slug (cc-butler-governance--render slug desc "body" "feedback") 2000)
+      (cc-butler-governance-regenerate)
+      (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        (should-not (string-search old-line text))
+        (with-temp-buffer
+          (insert text)
+          (goto-char (point-min))
+          (should (re-search-forward
+                   (concat "^- butler-" (regexp-quote slug) "\\.md.*$") nil t))
+          (let* ((beg (match-beginning 0))
+                 (end (min (point-max) (1+ (line-end-position))))
+                 (full-line (buffer-substring-no-properties beg end)))
+            (should (<= (string-bytes full-line) cc-butler-governance-max-index-line-bytes))))
+        (let ((pos-long (string-match (concat "butler-" (regexp-quote slug) "\\.md") text))
+              (pos-short (string-match "butler-short-note\\.md" text)))
+          (should (and pos-long pos-short))
+          ;; The long slug was committed MORE recently -- it must sort first,
+          ;; even though it was seeded second.
+          (should (< pos-long pos-short)))))))
+
+(ert-deftest cc-butler-governance/regenerate-preserves-a-hand-curated-line-across-a-sort ()
+  "Curated-line preservation invariant, interleaved case: a hand-authored
+line the store does not own at all (a different bracket shape, no
+`butler-' marker -- the same fixture
+`cc-butler-governance/regenerate-index-merge-preserves-hand-written-lines'
+already relies on) sits between two real store-generated lines. After a
+recency sort, that curated line must survive verbatim -- present exactly
+once, text untouched -- and never end up straddled by the sorted block
+(the store's own generated lines never sit on both sides of a line the
+store does not own, since the sorted block is reinserted as one
+contiguous run)."
+  (cc-butler-governance-test--with-store
+    (let ((index (expand-file-name "MEMORY.md" mem))
+          (curated "- [steward-only-note](steward-only-note.md) — hand-authored, no matching store file\n"))
+      (cc-butler-governance-test--git-init store)
+      (with-temp-file index
+        (insert "- butler-note-a.md — d\n" curated "- butler-note-b.md — d\n"))
+      (cc-butler-governance-test--commit-note
+       store "note-a" (cc-butler-governance--render "note-a" "d" "body" "feedback") 1000)
+      (cc-butler-governance-test--commit-note
+       store "note-b" (cc-butler-governance--render "note-b" "d" "body" "feedback") 2000)
+      (cc-butler-governance-regenerate)
+      (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        ;; present exactly once, byte-for-byte -- not duplicated, not deleted.
+        (let ((count 0) (start 0))
+          (while (string-match (regexp-quote curated) text start)
+            (setq count (1+ count) start (match-end 0)))
+          (should (= count 1)))
+        ;; recency actually took effect: note-b (newer) now precedes note-a,
+        ;; the opposite of how they were seeded.
+        (let ((pos-a (string-match "butler-note-a\\.md" text))
+              (pos-b (string-match "butler-note-b\\.md" text)))
+          (should (and pos-a pos-b))
+          (should (< pos-b pos-a)))
+        ;; the curated line was never pulled into the sorted block: both
+        ;; generated lines end up on the SAME side of it.
+        (let ((curated-pos (string-match (regexp-quote curated) text))
+              (pos-a (string-match "butler-note-a\\.md" text))
+              (pos-b (string-match "butler-note-b\\.md" text)))
+          (should (or (and (< pos-a curated-pos) (< pos-b curated-pos))
+                      (and (> pos-a curated-pos) (> pos-b curated-pos)))))))))
+
 (provide 'cc-butler-governance-test)
 ;;; cc-butler-governance-test.el ends here
 

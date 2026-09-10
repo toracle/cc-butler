@@ -173,6 +173,14 @@ variable directly."
   :type '(choice (const :tag "Derive from cc-butler-home" nil) directory)
   :group 'cc-butler)
 
+(defvar cc-butler-governance--last-sort-unavailable-reason nil
+  "Set by the most recent `cc-butler-governance-regenerate' call: nil when
+`MEMORY.md's index was rewritten sorted by git commit-recency; otherwise a
+short human-readable string naming why that sort was unavailable (not a
+repo, git missing, git log failed) and the fall back to plain insertion
+order happened instead. Read by `cc-butler-tool-regenerate-governance' so a
+silent fallback can never look like a normal successful run.")
+
 (defun cc-butler-governance-memory-store ()
   "Absolute path of the Claude Code memory dir actually in effect.
 Mirrors `cc-butler-governance-store': the single place this is decided,
@@ -496,6 +504,107 @@ actually appended."
         (write-region (point-min) (point-max) index nil 'quiet)))
     missing))
 
+(defun cc-butler-governance--commit-recency-map ()
+  "Cons (MAP . REASON): MAP is a hash table of every git-tracked filename
+under `cc-butler-governance-store' (relative to that directory, e.g.
+\"a-rule.md\") to its LATEST commit's unix-epoch timestamp, built from ONE
+batched `git log' call over the whole store — never one `git log -1' per
+file, which was measured too slow to repeat against the real ~564-note
+store. REASON is nil on success; otherwise a short human-readable string
+naming why the git-based sort is unavailable (not a repo, git missing,
+git log failed, or nothing usable came back), for a caller to surface
+LOUDLY rather than silently falling back to insertion order."
+  (let ((store (cc-butler-governance-store)))
+    (cond
+     ((not (and store (file-directory-p store)))
+      (cons nil "store directory does not exist"))
+     ((not (executable-find "git"))
+      (cons nil "git executable not found"))
+     (t
+      (let ((default-directory (file-name-as-directory store)))
+        (if (not (zerop (call-process "git" nil nil nil "rev-parse" "--is-inside-work-tree")))
+            (cons nil "not a git repository")
+          (with-temp-buffer
+            (let ((status (call-process "git" nil t nil
+                                         "log" "--name-only" "--format=%at"
+                                         "--relative" "--" ".")))
+              (if (not (zerop status))
+                  (cons nil (format "git log failed (exit %s)" status))
+                (let ((map (make-hash-table :test 'equal)) (ts nil))
+                  (dolist (line (split-string (buffer-string) "\n"))
+                    (cond
+                     ((string-match-p "\\`[0-9]+\\'" line)
+                      (setq ts (string-to-number line)))
+                     ((and ts (not (string-empty-p line)) (not (gethash line map)))
+                      (puthash line ts map))))
+                  (if (zerop (hash-table-count map))
+                      (cons nil "git log returned nothing usable")
+                    (cons map nil))))))))))))
+
+(defun cc-butler-governance--rewrite-sorted-index (slugs recency-map)
+  "Rewrite `MEMORY.md's block of this store's own generated lines (see
+`cc-butler-governance--index-line-regexp') so SLUGS appear as one
+contiguous run ordered by RECENCY-MAP (store filename -> unix time, from
+`cc-butler-governance--commit-recency-map') descending — the
+most-recently-committed principle first, so a note that keeps getting
+revised (still alive, still load-bearing) surfaces near the top of
+`MEMORY.md' instead of wherever it happened to land historically.
+
+Every line NOT in this store's own generated shape — hand-authored content
+the store does not own — is left byte-for-byte untouched at its original
+position, the same guarantee `cc-butler-governance--sync-index' gives (see
+`cc-butler-governance/regenerate-index-merge-preserves-hand-written-lines').
+An already-indexed slug's EXISTING line text is reused verbatim — curated
+wording is never overwritten (see
+`cc-butler-governance/regenerate-does-not-duplicate-an-already-curated-entry');
+only a slug with no line yet gets one freshly rendered. A slug not in SLUGS
+(already gone from the store) has its old line dropped here as a side
+effect — `cc-butler-governance--prune-dead-entries', called right after
+this in `cc-butler-governance-regenerate', is left in place as a
+belt-and-suspenders check, and as the ONLY cleanup mechanism left on the
+git-unavailable fallback path (plain `cc-butler-governance--sync-index',
+which is add-only and prunes nothing itself).
+
+Ownership is decided by `cc-butler-governance--index-line-regexp' — the
+SAME shared constant `--shrink-oversized-index-lines' and
+`--prune-dead-entries' already use — rather than a private copy of the
+shape, precisely to avoid the \"same regex, only one copy updated\"
+failure mode that constant's own docstring warns about (a real past
+incident, #136/#146). Must run AFTER `cc-butler-governance--shrink-oversized-index-lines'
+in `cc-butler-governance-regenerate': this reuses on-disk line text
+verbatim rather than re-rendering it, so an oversized line must already be
+fixed before it is repositioned — sorting first would just move the
+stale, still-oversized text to a new spot."
+  (let ((index (cc-butler-governance--memory-index-file)))
+    (with-temp-buffer
+      (when (file-readable-p index) (insert-file-contents index))
+      (let ((existing (make-hash-table :test 'equal))
+            (insert-pos nil))
+        (goto-char (point-min))
+        (while (re-search-forward
+                (concat cc-butler-governance--index-line-regexp ".*\n?") nil t)
+          (unless insert-pos (setq insert-pos (match-beginning 0)))
+          (puthash (match-string 1) (match-string 0) existing)
+          (delete-region (match-beginning 0) (match-end 0))
+          (goto-char (match-beginning 0)))
+        (unless insert-pos
+          (goto-char (point-max))
+          (unless (or (bobp) (bolp)) (insert "\n"))
+          (setq insert-pos (point)))
+        (let* ((ordered
+                (sort (copy-sequence slugs)
+                      (lambda (a b)
+                        (> (or (gethash (concat a ".md") recency-map) -1)
+                           (or (gethash (concat b ".md") recency-map) -1)))))
+               (block (mapconcat
+                       (lambda (slug)
+                         (or (gethash slug existing)
+                             (cc-butler-governance--index-line slug)))
+                       ordered "")))
+          (goto-char insert-pos)
+          (insert block))
+        (write-region (point-min) (point-max) index nil 'quiet)))))
+
 (defun cc-butler-governance--normalize-index-format ()
   "Rewrite every OLD-format generated `MEMORY.md' line (see
 `cc-butler-governance--legacy-index-line-regexp') to the CURRENT format,
@@ -757,21 +866,34 @@ appended as a second, brand-new line).  Returns a plist :removed
 (defun cc-butler-governance-regenerate ()
   "Regenerate the Claude Code memory cache from the neutral store — the store is
 the source of truth; the memory is derived.  Also syncs `MEMORY.md's index
-against it in five ways: rewrites any OLD-format generated line to the
+against it in six ways: rewrites any OLD-format generated line to the
 current, shorter format (see `cc-butler-governance--normalize-index-format'
-— run FIRST, so `--sync-index' below never mistakes a not-yet-normalized
-legacy line for a genuinely missing one), removes/rewrites any even-OLDER
+— run FIRST, so nothing below ever mistakes a not-yet-normalized legacy
+line for a genuinely missing one), removes/rewrites any even-OLDER
 bare-target-link duplicate (see
 `cc-butler-governance--dedupe-bare-target-lines' — run SECOND, same
 reason), shrinks any CURRENT-format line still over the byte cap (see
 `cc-butler-governance--shrink-oversized-index-lines' — run THIRD, after
-both format-migration passes so it only ever sees current-shape lines),
-merges in any note still missing an index line afterward
-(add-only — see `cc-butler-governance--sync-index'), and prunes any index
-line whose principle no longer exists in the store (see
-`cc-butler-governance--prune-dead-entries').  Finally refreshes the
-banner (see `cc-butler-governance--refresh-banner') with the real, current
-entries-in-budget figures.  Returns the count of principles written."
+both format-migration passes so it only ever sees current-shape lines and
+BEFORE the sort below, which reuses on-disk line text verbatim and would
+otherwise reposition a still-oversized line instead of a fixed one), then
+either re-sorts the store-owned entries by each principle's latest git
+commit time, descending — so a note that keeps getting revised surfaces
+near the top instead of wherever it happened to land historically (see
+`cc-butler-governance--rewrite-sorted-index') — or, when the store is not
+a git repo (or git itself is unavailable), falls back to the previous
+add-only, insertion-order merge (`cc-butler-governance--sync-index');
+either way `cc-butler-governance--last-sort-unavailable-reason' records
+which happened, non-nil only on the fallback, for a caller to report
+loudly rather than let a silent fallback pass as a normal run.  Finally
+prunes any index line whose principle no longer exists in the store (see
+`cc-butler-governance--prune-dead-entries' — the sort's own reinsertion
+already drops a now-dead slug as a side effect, but this stays in place
+as belt-and-suspenders, and is the ONLY cleanup on the fallback path,
+since `--sync-index' never prunes) and refreshes the banner (see
+`cc-butler-governance--refresh-banner') with the real, current
+entries-in-budget figures computed against the final, post-sort content.
+Returns the count of principles written."
   (interactive)
   (let ((memory-dir (cc-butler-governance-memory-store)))
     (make-directory memory-dir t)
@@ -782,14 +904,23 @@ entries-in-budget figures.  Returns the count of principles written."
                    t)
         (push (file-name-sans-extension (file-name-nondirectory f)) slugs)
         (setq n (1+ n)))
+      (setq slugs (nreverse slugs))
       (cc-butler-governance--normalize-index-format)
       (cc-butler-governance--dedupe-bare-target-lines)
       (cc-butler-governance--shrink-oversized-index-lines)
-      (cc-butler-governance--sync-index (nreverse slugs))
+      (let ((recency (cc-butler-governance--commit-recency-map)))
+        (setq cc-butler-governance--last-sort-unavailable-reason (cdr recency))
+        (if (car recency)
+            (cc-butler-governance--rewrite-sorted-index slugs (car recency))
+          (cc-butler-governance--sync-index slugs)))
       (cc-butler-governance--prune-dead-entries)
       (cc-butler-governance--refresh-banner)
       (when (called-interactively-p 'interactive)
-        (message "cc-butler: regenerated %d principle(s) from the store" n))
+        (message "cc-butler: regenerated %d principle(s) from the store%s" n
+                  (if cc-butler-governance--last-sort-unavailable-reason
+                      (format " (git-based sort unavailable (%s): falling back to insertion order)"
+                              cc-butler-governance--last-sort-unavailable-reason)
+                    " (index sorted by git commit-recency)")))
       n)))
 
 (defconst cc-butler-governance--index-line-regexp
@@ -1702,6 +1833,10 @@ duplicate slugs."
     (concat
      (cc-butler-governance--cap-report-line)
      (format "Regenerated %d principle(s) from the store.\n" n)
+     (if cc-butler-governance--last-sort-unavailable-reason
+         (format "Index sort: git-based sort unavailable (%s): falling back to insertion order.\n"
+                 cc-butler-governance--last-sort-unavailable-reason)
+       "Index sort: entries ordered by git commit-recency, most recently committed first.\n")
      "Checked: store->index (notes missing an index line), index->store (index lines whose principle no longer exists), description drift (index text vs each note's current frontmatter), and duplicate slugs (any slug indexed more than once).\n"
      (if before
          (format "Merged %d previously un-indexed note(s) into MEMORY.md: %s\n"
