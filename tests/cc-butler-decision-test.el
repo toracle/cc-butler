@@ -11,6 +11,7 @@
 ;;     -f ert-run-tests-batch-and-exit
 
 (require 'ert)
+(require 'cl-lib)
 (require 'cc-butler-decision)
 (require 'cc-butler-mail-test)   ; mock channel + inboxes/pokes vars
 
@@ -1124,6 +1125,112 @@ and auto-restores every setting (nothing leaks)."
       (setq cc-butler-mail-dir orig-mail
             cc-butler-decision-dir orig-dec
             cc-butler-human-agent orig-human))))
+
+;;;; ---- close-with-reason: reuse without fabricating an answer -------
+;;
+;; `cc-butler-decision-close-with-reason' closes a Kind=decision item through a
+;; channel OTHER than a real `C-c C-c' answer, for one of four reasons (①-④,
+;; see its docstring), without ever fabricating a "정수님 answered: ..."
+;; message under his identity.  No mock channel is needed here — unlike
+;; `cc-butler-decision-submit', this function never delivers anything; it only
+;; annotates the file and (for three of the four reasons) archives it.
+
+(defmacro cc-butler-decision-test--with-file (msg &rest body)
+  "Render MSG to open/ under a fresh, throwaway `cc-butler-decision-dir'; run
+BODY with `file' bound to its path and as the current buffer (`buf'
+visiting it), then clean up."
+  (declare (indent 1))
+  `(let* ((cc-butler-decision-dir (make-temp-file "cc-butler-dec-test" t))
+          (file (cc-butler--decision-render ,msg))
+          (buf (find-file-noselect file)))
+     (unwind-protect
+         (with-current-buffer buf ,@body)
+       (when (buffer-live-p buf) (kill-buffer buf))
+       (delete-directory cc-butler-decision-dir t))))
+
+(ert-deftest cc-butler-decision/close-with-reason-archiving-reasons-archive-and-exclude ()
+  "Each of the three archiving reasons (`answered', `not-a-question',
+`our-side') actually archives open/ → done/, and the backlog counter
+\(`cc-butler--decision-open-files-and-oldest') excludes the result -- the
+SAME way an answered decision or a read note already disappears from the
+backlog today -- with no fabricated answer sent anywhere."
+  (dolist (reason '(answered not-a-question our-side))
+    (cc-butler-decision-test--with-file cc-butler-decision-test--msg
+      (cl-letf (((symbol-function 'cc-butler--log) #'ignore))
+        (cc-butler-decision-close-with-reason reason (format "evidence for %s" reason)))
+      (should (null (car (cc-butler--decision-open-files-and-oldest))))
+      (should (= 1 (length (directory-files (cc-butler--decision-done-dir)
+                                            nil "\\`[^.].*\\.org\\'")))))))
+
+(ert-deftest cc-butler-decision/close-with-reason-pending-evidence-stays-open-and-counted ()
+  "REASON `pending-evidence' must NOT look closed: this is the trap the steward
+explicitly flagged.  The file stays in open/, still `decision'-kind by
+filename, and `cc-butler--decision-open-files-and-oldest' STILL counts it --
+hiding \"we don't know\" as \"done\" would recreate the exact fake-backlog
+bug this function exists to close, in a worse form."
+  (cc-butler-decision-test--with-file cc-butler-decision-test--msg
+    (cl-letf (((symbol-function 'cc-butler--log) #'ignore))
+      (cc-butler-decision-close-with-reason
+       'pending-evidence "answer may be in an untranscribed voice message"))
+    (let ((files (car (cc-butler--decision-open-files-and-oldest))))
+      (should (= 1 (length files)))
+      (should (equal (file-name-nondirectory file) (car files))))
+    (should (= 1 (length (directory-files (cc-butler--decision-open-dir)
+                                          nil "\\`[^.].*\\.org\\'"))))
+    (should (null (directory-files (cc-butler--decision-done-dir)
+                                   nil "\\`[^.].*\\.org\\'")))))
+
+(ert-deftest cc-butler-decision/close-with-reason-note-text-survives-archived ()
+  "The reason+note are actually readable in the archived file's content, in
+the `stale/INDEX.md' reconciliation-comment shape -- not thrown away."
+  (cc-butler-decision-test--with-file cc-butler-decision-test--msg
+    (cl-letf (((symbol-function 'cc-butler--log) #'ignore))
+      (cc-butler-decision-close-with-reason 'our-side "item 2907 replaced this one"))
+    (let* ((done-file (car (directory-files (cc-butler--decision-done-dir) t
+                                            "\\`[^.].*\\.org\\'")))
+           (content (with-temp-buffer (insert-file-contents done-file) (buffer-string))))
+      (should (string-match-p "item 2907 replaced this one" content))
+      (should (string-match-p "our-side" content))
+      (should (string-match-p "# --- reconciled:" content))
+      (should (string-match-p "# done —" content)))))
+
+(ert-deftest cc-butler-decision/close-with-reason-note-text-survives-pending ()
+  "Same for `pending-evidence' -- the note is written even though nothing
+archives, and it is marked distinctly (no `# done —' line: it isn't done)."
+  (cc-butler-decision-test--with-file cc-butler-decision-test--msg
+    (cl-letf (((symbol-function 'cc-butler--log) #'ignore))
+      (cc-butler-decision-close-with-reason 'pending-evidence "voice message untranscribed"))
+    (let ((content (buffer-string)))
+      (should (string-match-p "voice message untranscribed" content))
+      (should (string-match-p "# --- pending-evidence:" content))
+      (should-not (string-match-p "# done —" content)))))
+
+(ert-deftest cc-butler-decision/close-with-reason-refuses-bad-reason ()
+  "An invalid REASON symbol is refused before any mutation -- no comment
+inserted, nothing archived."
+  (cc-butler-decision-test--with-file cc-butler-decision-test--msg
+    (should-error (cc-butler-decision-close-with-reason 'maybe "some note"))
+    (should (= 1 (length (directory-files (cc-butler--decision-open-dir)
+                                          nil "\\`[^.].*\\.org\\'"))))
+    (should (null (directory-files (cc-butler--decision-done-dir)
+                                   nil "\\`[^.].*\\.org\\'")))
+    (should-not (string-match-p "reconciled\\|pending-evidence" (buffer-string)))))
+
+(ert-deftest cc-butler-decision/close-with-reason-refuses-empty-note ()
+  "An empty/blank NOTE is refused -- closing needs evidence, not a bare reason
+-- and nothing is mutated."
+  (cc-butler-decision-test--with-file cc-butler-decision-test--msg
+    (should-error (cc-butler-decision-close-with-reason 'answered "   "))
+    (should (= 1 (length (directory-files (cc-butler--decision-open-dir)
+                                          nil "\\`[^.].*\\.org\\'"))))
+    (should (null (directory-files (cc-butler--decision-done-dir)
+                                   nil "\\`[^.].*\\.org\\'")))))
+
+(ert-deftest cc-butler-decision/close-with-reason-refuses-missing-file ()
+  "Refuses cleanly when the buffer isn't visiting an existing decision-queue
+file."
+  (with-temp-buffer
+    (should-error (cc-butler-decision-close-with-reason 'answered "evidence"))))
 
 (provide 'cc-butler-decision-test)
 ;;; cc-butler-decision-test.el ends here
