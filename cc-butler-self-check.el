@@ -278,9 +278,19 @@ UNLESS its live value already equals the current code-default, in which
 case a restart gives back that exact same value anyway and there is
 nothing to lose (2026-09-10: steward set `cc-butler-launch-ready-timeout'
 live to 8 with `saved-value' nil, deliberately -- that must read as OK,
-not bad).  Only flag a symbol whose state is unsaved AND whose value also
-appears in `cc-butler--defcustom-drift-all' (i.e. genuinely differs from
-the code-default) -- a real risk of reverting to something wrong.
+not bad).
+
+A symbol whose state is unsaved AND whose value also appears in
+`cc-butler--defcustom-drift-all' (i.e. genuinely differs from the
+code-default) is only flagged if that drift's label -- via the same
+`cc-butler--defcustom-file-for-symbol' + `cc-butler--defcustom-drift-label'
+mechanism check 7 already uses -- comes back \"(likely stuck reload)\".
+REGRESSION FIX (2026-09-10, live): before this, any unsaved+differing
+symbol was flagged regardless of label, and once the population widened
+(PR #225) that hit 8 symbols, 7 of which were legitimate live
+customizations -- pure noise. A \"(likely deliberate customization)\"
+label, or unlabelable drift, must not flag here any more than it fails
+check 7.
 
 Distinct from check 7 (`cc-butler-self-check--code-vs-live-defcustom'):
 that one asks whether the value running RIGHT NOW already matches what
@@ -290,15 +300,21 @@ SURVIVE a restart.
 Population is the automatic scan (`cc-butler--defcustom-symbols-all')
 plus `cc-butler-self-check-tracked-variables' (now an EXTRA list -- see
 its docstring)."
-  (let ((drifted (mapcar #'car (cc-butler--defcustom-drift-all)))
-        bad)
+  (let* ((dir (cc-butler-source-dir))
+         (drift (cc-butler--defcustom-drift-all dir))
+         bad)
     (dolist (sym (delete-dups (append (cc-butler--defcustom-symbols-all)
                                        cc-butler-self-check-tracked-variables)))
       (when (boundp sym)
         (let ((state (custom-variable-state sym (symbol-value sym))))
-          (when (and (not (memq state '(saved standard)))
-                     (memq sym drifted))
-            (push (cons sym state) bad)))))
+          (when (not (memq state '(saved standard)))
+            (let ((triple (assq sym drift)))
+              (when triple
+                (let* ((live (nth 1 triple)) (code-default (nth 2 triple))
+                       (file (cc-butler--defcustom-file-for-symbol dir sym))
+                       (label (and file (cc-butler--defcustom-drift-label file sym live code-default))))
+                  (when (and label (string-match-p "\\`(likely stuck reload)" label))
+                    (push (cons sym state) bad)))))))))
     (setq bad (nreverse bad))
     (if bad
         (list :ok nil
@@ -307,7 +323,7 @@ its docstring)."
                                (lambda (b) (format "%s is `%s' (not saved/standard)" (car b) (cdr b)))
                                bad "; ")))
       (list :ok t
-            :detail "persisted vs live: no tracked variable is both unsaved and differing from its code-default"))))
+            :detail "persisted vs live: no tracked variable is both unsaved and labeled a likely stuck reload"))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Check 6: vault path -- WARMBLE_JUMBLE_PATH vs. the governance store

@@ -221,12 +221,19 @@ so `fboundp' is normally true here."
 
 (ert-deftest cc-butler-self-check/persisted-vs-live-fails-on-live-patch ()
   "A tracked variable that was `setq''d/`let'-bound live (not through
-Customize) reads as `changed', not `saved'/`standard' -- must fail."
+Customize), reads as `changed', genuinely differs from its code-default,
+AND is labeled a likely stuck reload must fail."
   (let ((cc-butler-self-check-tracked-variables '(cc-butler-north-star-file))
         (cc-butler-north-star-file "/tmp/live-patched-value.org"))
-    (let ((r (cc-butler-self-check--persisted-vs-live)))
-      (should-not (plist-get r :ok))
-      (should (string-match-p "cc-butler-north-star-file" (plist-get r :detail))))))
+    (cl-letf (((symbol-function 'cc-butler--defcustom-drift-all)
+               (lambda (&optional _dir)
+                 (list (list 'cc-butler-north-star-file "/tmp/live-patched-value.org" "/tmp/code-default.org"))))
+              ((symbol-function 'cc-butler--defcustom-file-for-symbol) (lambda (&rest _) "/fake/file.el"))
+              ((symbol-function 'cc-butler--defcustom-drift-label)
+               (lambda (&rest _) "(likely stuck reload) this value matches a past shipped default")))
+      (let ((r (cc-butler-self-check--persisted-vs-live)))
+        (should-not (plist-get r :ok))
+        (should (string-match-p "cc-butler-north-star-file" (plist-get r :detail)))))))
 
 (ert-deftest cc-butler-self-check/persisted-vs-live-passes-when-saved ()
   "A tracked variable whose Customize state is `saved' (or `standard') must
@@ -255,9 +262,10 @@ must NOT be flagged."
       (makunbound 'cc-butler-test-check5-matching))))
 
 (ert-deftest cc-butler-self-check/persisted-vs-live-still-flags-unsaved-when-differing-from-code-default ()
-  "The real-risk case must still fail: unsaved AND the live value differs
-from the code-default (present in `cc-butler--defcustom-drift-all') -- a
-restart would silently revert this to something wrong."
+  "The real-risk case must still fail: unsaved, the live value differs from
+the code-default (present in `cc-butler--defcustom-drift-all'), AND the
+drift is labeled a likely stuck reload -- a restart would silently revert
+this to something wrong."
   (let ((cc-butler-self-check-tracked-variables '(cc-butler-test-check5-differing)))
     (defvar cc-butler-test-check5-differing)
     (setq cc-butler-test-check5-differing 5)
@@ -265,11 +273,39 @@ restart would silently revert this to something wrong."
         (cl-letf (((symbol-function 'custom-variable-state) (lambda (&rest _) 'changed))
                   ((symbol-function 'cc-butler--defcustom-drift-all)
                    (lambda (&optional _dir) (list (list 'cc-butler-test-check5-differing 5 8))))
-                  ((symbol-function 'cc-butler--defcustom-symbols-all) (lambda (&optional _dir) nil)))
+                  ((symbol-function 'cc-butler--defcustom-symbols-all) (lambda (&optional _dir) nil))
+                  ((symbol-function 'cc-butler--defcustom-file-for-symbol) (lambda (&rest _) "/fake/file.el"))
+                  ((symbol-function 'cc-butler--defcustom-drift-label)
+                   (lambda (&rest _) "(likely stuck reload) this value matches a past shipped default")))
           (let ((r (cc-butler-self-check--persisted-vs-live)))
             (should-not (plist-get r :ok))
             (should (string-match-p "cc-butler-test-check5-differing" (plist-get r :detail)))))
       (makunbound 'cc-butler-test-check5-differing))))
+
+(ert-deftest cc-butler-self-check/persisted-vs-live-does-not-flag-deliberate-customization ()
+  "REGRESSION GUARD (2026-09-10, live): after check 5's population widened
+(PR #225), it flagged 8 symbols, 7 of which were legitimate live
+customizations -- never saved to custom.el, but deliberately differing
+from the code-default -- pure noise. A symbol that is unsaved AND
+genuinely differs from its code-default (present in
+`cc-butler--defcustom-drift-all') but whose
+`cc-butler--defcustom-drift-label' comes back \"(likely deliberate
+customization)\", not \"(likely stuck reload)\", must NOT be flagged --
+exactly the case that was wrongly flagging 7 of 8 symbols live."
+  (let ((cc-butler-self-check-tracked-variables '(cc-butler-test-check5-deliberate)))
+    (defvar cc-butler-test-check5-deliberate)
+    (setq cc-butler-test-check5-deliberate 999)
+    (unwind-protect
+        (cl-letf (((symbol-function 'custom-variable-state) (lambda (&rest _) 'changed))
+                  ((symbol-function 'cc-butler--defcustom-drift-all)
+                   (lambda (&optional _dir) (list (list 'cc-butler-test-check5-deliberate 999 8))))
+                  ((symbol-function 'cc-butler--defcustom-symbols-all) (lambda (&optional _dir) nil))
+                  ((symbol-function 'cc-butler--defcustom-file-for-symbol) (lambda (&rest _) "/fake/file.el"))
+                  ((symbol-function 'cc-butler--defcustom-drift-label)
+                   (lambda (&rest _) "(likely deliberate customization) this value never appears in this line's git history")))
+          (let ((r (cc-butler-self-check--persisted-vs-live)))
+            (should (plist-get r :ok))))
+      (makunbound 'cc-butler-test-check5-deliberate))))
 
 (ert-deftest cc-butler-self-check/persisted-vs-live-population-includes-auto-scanned-symbol ()
   "The auto-scanned population must genuinely widen coverage beyond
