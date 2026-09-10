@@ -389,16 +389,41 @@ so a cut can never land mid-character."
         (setq out (substring out 0 (1- (length out)))))
       (concat out "…"))))
 
+(defun cc-butler-governance--description-budget-bytes (slug)
+  "Bytes available for SLUG's index-line description before the line
+itself would exceed `cc-butler-governance-max-index-line-bytes' -- the
+slug and its fixed boilerplate (`- butler-', `.md — ', trailing
+newline) are subtracted from the line cap first, then clamped to never
+exceed `cc-butler-governance--generated-description-max-bytes' (so a
+short slug does not grow into a summary just because it has room --
+the index line is a hook, not a summary).
+
+A slug whose own boilerplate already meets or exceeds the line cap
+gets a budget of 0 -- the rendered line still exceeds the cap in that
+case (the slug itself is the overflow, not the description), and no
+description length can fix that without renaming the note, which is
+out of scope here: note bodies (including their `name:' frontmatter,
+the slug's source) are never touched by this file's index-rendering
+code."
+  (let ((boilerplate-bytes (string-bytes (format "- butler-%s.md — \n" slug))))
+    (max 0 (min cc-butler-governance--generated-description-max-bytes
+                (- cc-butler-governance-max-index-line-bytes boilerplate-bytes)))))
+
 (defun cc-butler-governance--index-line (slug)
   "Render the `MEMORY.md' line for SLUG, using the note's own description,
-truncated to `cc-butler-governance--generated-description-max-bytes'."
+truncated to fit `cc-butler-governance-max-index-line-bytes' once SLUG's
+own boilerplate is accounted for (see
+`cc-butler-governance--description-budget-bytes') -- NOT a flat
+`cc-butler-governance--generated-description-max-bytes' regardless of
+slug length, which is what let real lines run 108-124 bytes against an
+80-byte cap despite each description alone fitting its own sub-limit."
   (let* ((note (expand-file-name (concat "butler-" slug ".md")
                                  (cc-butler-governance-memory-store)))
          (desc (or (cc-butler-governance--frontmatter-description note)
                    "(no description in store)")))
     (cc-butler-governance--render-index-line
      slug (cc-butler-governance--truncate-bytes
-           desc cc-butler-governance--generated-description-max-bytes))))
+           desc (cc-butler-governance--description-budget-bytes slug)))))
 
 (defun cc-butler-governance--index-has-slug-p (index slug)
   "Non-nil when INDEX (a file that may not exist yet) already links SLUG's
@@ -498,6 +523,100 @@ the same slug, never removed outright.  Returns the slugs rewritten."
         (write-region (point-min) (point-max) index nil 'quiet)))
     (nreverse rewritten)))
 
+(defun cc-butler-governance--shrink-oversized-index-lines ()
+  "Re-render every CURRENT-format `MEMORY.md' line whose byte length still
+exceeds `cc-butler-governance-max-index-line-bytes' -- the case
+`cc-butler-governance--normalize-index-format' does not cover, since that
+function only matches the OLD double-slug shape and treats any line
+already in the current shape as done regardless of length.
+
+This exists because the description budget used to be a flat
+`cc-butler-governance--generated-description-max-bytes' (48) with no
+regard for how many of the 80 bytes the slug itself already spent --
+most real slugs run 40-75 bytes, so nearly every generated line
+exceeded the cap despite each description alone being within its own
+limit (measured 2026-09-10: 587 real lines averaged 113 bytes against
+an 80-byte cap). Re-renders via `cc-butler-governance--index-line' (now
+slug-aware, see `cc-butler-governance--description-budget-bytes'), the
+SAME formatter every other pass uses, so this can never diverge from
+what a fresh line for that slug would look like.
+
+Only ever rewrites a line it can PROVE is stale mechanical output, never
+one that shows any sign of independent hand-authored wording -- the same
+caution `--sync-index' and `--normalize-index-format' already take about
+never clobbering a human's own text.  \"Provably mechanical\" here means:
+the on-disk description, re-truncated to the OLD flat
+`cc-butler-governance--generated-description-max-bytes' (48) budget,
+byte-for-byte matches what `cc-butler-governance--truncate-bytes' would
+produce from the note's CURRENT frontmatter description at that SAME old
+48-byte budget -- the identical comparison
+`cc-butler-governance--stale-index-entries' already uses to tell drifted
+or curated text apart from text that is still exactly what the old
+generator would write.  A match means nothing about this line has
+diverged from mechanical generation since the old flat-budget formatter
+last wrote it, so it is safe to re-render at the correct slug-aware
+budget.  A mismatch -- on-disk text the old generator would not have
+produced from the current description -- is left COMPLETELY untouched,
+oversized or not: it may be a line a human curated with different
+wording on purpose (see
+`cc-butler-governance/regenerate-does-not-duplicate-an-already-curated-entry'),
+and this function has no way to tell that apart from real drift, so
+neither is safe to overwrite here.  A note whose current description is
+itself short enough to need no truncation at either budget trivially
+matches and \"shrinks\" as a no-op -- expected, not a false positive,
+since old-render and new-render are then identical anyway.
+
+A slug whose boilerplate alone already meets or exceeds the cap will
+still render over-length after this -- expected, not a bug (see
+`cc-butler-governance--description-budget-bytes'); this function's job
+is only to remove the WASTED bytes the old flat 48-byte budget left in
+the description, not to guarantee every single line fits.
+
+Idempotent: once a line is re-rendered at its minimum length for that
+slug, a second call finds the same rendering and makes no further
+change. Safe on lines this store did not generate:
+`cc-butler-governance--index-line-regexp' only matches the current
+generated shape, and any slug no longer present in the store (checked
+against `cc-butler-governance-names') is skipped, matching the same
+dead-link caution `--normalize-index-format' documents. Returns the
+slugs rewritten."
+  (let ((index (cc-butler-governance--memory-index-file))
+        (live (cc-butler-governance-names))
+        (rewritten nil))
+    (when (file-readable-p index)
+      (with-temp-buffer
+        (insert-file-contents index)
+        (goto-char (point-min))
+        (while (re-search-forward
+                (concat cc-butler-governance--index-line-regexp "\\(.*\\)$") nil t)
+          (let* ((slug (match-string 1))
+                 (indexed-desc (match-string 2))
+                 (beg (match-beginning 0))
+                 (end (min (point-max) (1+ (line-end-position)))))
+            (if (and (member slug live)
+                     (> (string-bytes (buffer-substring-no-properties beg end))
+                        cc-butler-governance-max-index-line-bytes)
+                     ;; Same comparison `--stale-index-entries' uses (just
+                     ;; the positive sense of it): on-disk text must equal
+                     ;; the OLD 48-byte-budget rendering of the note's
+                     ;; CURRENT description, or this is curated/drifted
+                     ;; text, not mechanical output, and must be left alone.
+                     (let* ((note (expand-file-name (concat "butler-" slug ".md")
+                                                    (cc-butler-governance-memory-store)))
+                            (current (or (cc-butler-governance--frontmatter-description note)
+                                         "(no description in store)")))
+                       (equal (cc-butler-governance--truncate-bytes
+                               current cc-butler-governance--generated-description-max-bytes)
+                              indexed-desc)))
+                (let ((new-line (cc-butler-governance--index-line slug)))
+                  (goto-char beg)
+                  (delete-region beg end)
+                  (insert new-line)
+                  (push slug rewritten))
+              (goto-char end))))
+        (write-region (point-min) (point-max) index nil 'quiet)))
+    (nreverse rewritten)))
+
 (defun cc-butler-governance--dedupe-bare-target-lines ()
   "Resolve every THIRD, even OLDER `MEMORY.md' line shape (see
 `cc-butler-governance--bare-legacy-index-line-regexp') -- a bracket link
@@ -571,13 +690,16 @@ appended as a second, brand-new line).  Returns a plist :removed
 (defun cc-butler-governance-regenerate ()
   "Regenerate the Claude Code memory cache from the neutral store — the store is
 the source of truth; the memory is derived.  Also syncs `MEMORY.md's index
-against it in four ways: rewrites any OLD-format generated line to the
+against it in five ways: rewrites any OLD-format generated line to the
 current, shorter format (see `cc-butler-governance--normalize-index-format'
 — run FIRST, so `--sync-index' below never mistakes a not-yet-normalized
 legacy line for a genuinely missing one), removes/rewrites any even-OLDER
 bare-target-link duplicate (see
 `cc-butler-governance--dedupe-bare-target-lines' — run SECOND, same
-reason), merges in any note still missing an index line afterward
+reason), shrinks any CURRENT-format line still over the byte cap (see
+`cc-butler-governance--shrink-oversized-index-lines' — run THIRD, after
+both format-migration passes so it only ever sees current-shape lines),
+merges in any note still missing an index line afterward
 (add-only — see `cc-butler-governance--sync-index'), and prunes any index
 line whose principle no longer exists in the store (see
 `cc-butler-governance--prune-dead-entries').  Finally refreshes the
@@ -595,6 +717,7 @@ entries-in-budget figures.  Returns the count of principles written."
         (setq n (1+ n)))
       (cc-butler-governance--normalize-index-format)
       (cc-butler-governance--dedupe-bare-target-lines)
+      (cc-butler-governance--shrink-oversized-index-lines)
       (cc-butler-governance--sync-index (nreverse slugs))
       (cc-butler-governance--prune-dead-entries)
       (cc-butler-governance--refresh-banner)

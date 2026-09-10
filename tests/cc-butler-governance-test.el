@@ -870,6 +870,84 @@ AS-IS -- not silently shortened -- proving the two code paths
           (should (string-match-p (regexp-quote desc) text)))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; The slug-aware description budget (2026-09-10) -- CONFIRMED BUG: the
+;;;; description was truncated to a FIXED 48 bytes regardless of how many
+;;;; of the 80-byte line cap the slug's own boilerplate already spent.
+;;;; Real slugs run 40-75 bytes, so lines routinely rendered 108-124 bytes
+;;;; against the 80-byte `cc-butler-governance-max-index-line-bytes' cap
+;;;; even though each description alone fit its own 48-byte sub-limit
+;;;; (measured 2026-09-10: 587 real lines averaged 113 bytes). Fix:
+;;;; `--index-line' now sizes the description to what is actually left
+;;;; after the slug (`--description-budget-bytes'), and
+;;;; `--shrink-oversized-index-lines' (wired into `regenerate') re-renders
+;;;; any CURRENT-format line still over the cap from before the fix.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/regenerate-shrinks-oversized-current-format-index-line ()
+  "RED for the real-world bug state: an already-CURRENT-format line
+\(`- butler-SLUG.md — DESC') for a long slug, rendered under the OLD flat
+48-byte description truncation, is over `max-index-line-bytes' even
+though `--normalize-index-format' does not touch it (that pass only
+matches the OLD double-slug bracket shape). GREEN after
+`cc-butler-governance-regenerate' runs `--shrink-oversized-index-lines':
+the line for this slug is re-rendered to fit the cap, and the old
+oversized text is gone."
+  (cc-butler-governance-test--with-store
+    (let* ((slug "an-extremely-long-slug-name-that-mostly-fills-the-budget")
+           (desc "This is a genuinely long description text used to verify the old flat truncation overflowed the eighty byte line cap in the legacy rendering path.")
+           (index (expand-file-name "MEMORY.md" mem))
+           (old-truncated (cc-butler-governance--truncate-bytes
+                           desc cc-butler-governance--generated-description-max-bytes))
+           (old-line (cc-butler-governance--render-index-line slug old-truncated)))
+      ;; Guard the premise: the OLD-scheme line really is over the cap, and
+      ;; this slug's own boilerplate alone is NOT (so a fix is possible).
+      (should (> (string-bytes old-line) cc-butler-governance-max-index-line-bytes))
+      (should (< (cc-butler-governance--description-budget-bytes slug) 48))
+      (should (> (cc-butler-governance--description-budget-bytes slug) 0))
+      (with-temp-file (expand-file-name (concat slug ".md") store)
+        (insert (cc-butler-governance--render slug desc "body" "feedback")))
+      ;; Pre-seed MEMORY.md with the already-current-format, already-oversized
+      ;; line -- the real bug state `--normalize-index-format' cannot see.
+      (with-temp-file index (insert old-line))
+      (cc-butler-governance-regenerate)
+      (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
+        (should-not (string-search old-line text))
+        (with-temp-buffer
+          (insert text)
+          (goto-char (point-min))
+          (should (re-search-forward cc-butler-governance--index-line-regexp nil t))
+          (let* ((beg (match-beginning 0))
+                 (end (min (point-max) (1+ (line-end-position))))
+                 (full-line (buffer-substring-no-properties beg end)))
+            (should (<= (string-bytes full-line) cc-butler-governance-max-index-line-bytes))))))))
+
+(ert-deftest cc-butler-governance/description-budget-is-zero-when-slug-boilerplate-alone-exceeds-the-cap ()
+  "EDGE CASE: a slug long enough that `- butler-SLUG.md — ' plus its
+trailing newline alone already meets or exceeds
+`cc-butler-governance-max-index-line-bytes' gets a description budget of
+0 -- the slug itself is the overflow, not the description, and no
+description length can fix that without renaming the note (out of
+scope; see `cc-butler-governance--description-budget-bytes'). Must not
+error, and `--index-line' must still return normally rather than hang."
+  (cc-butler-governance-test--with-store
+    (let ((slug "a-fabricated-slug-name-deliberately-long-enough-to-exceed-the-cap-alone"))
+      ;; Guard the premise: this slug's boilerplate alone is already over.
+      (should (> (string-bytes (format "- butler-%s.md — \n" slug))
+                 cc-butler-governance-max-index-line-bytes))
+      (should (= 0 (cc-butler-governance--description-budget-bytes slug)))
+      ;; `--index-line' reads the note off the MEMORY-DIR copy (the shape
+      ;; `cc-butler-governance-regenerate' produces via its `butler-' prefix
+      ;; copy step), not the raw store -- write it there directly.
+      (with-temp-file (expand-file-name (concat "butler-" slug ".md") mem)
+        (insert (cc-butler-governance--render
+                 slug "a perfectly ordinary description, irrelevant here" "body" "feedback")))
+      ;; No error, no hang -- and the description portion is minimal (the
+      ;; ellipsis alone), never the untruncated description.
+      (let ((line (cc-butler-governance--index-line slug)))
+        (should (stringp line))
+        (should-not (string-match-p "perfectly ordinary description" line))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Normalizing already-generated legacy (OLD-format) index lines
 ;;;; (2026-09-09) -- the missing piece: changing the writer alone only
 ;;;; affects brand-new lines; `--sync-index' is add-only and never
