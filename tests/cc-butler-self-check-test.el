@@ -341,6 +341,33 @@ default-value test (tests/cc-butler-session-test.el)."
   (should (equal (eval (car (get 'cc-butler-self-check-tracked-variables 'standard-value)) t)
                  '(claude-code-ide-mcp-server-port))))
 
+(ert-deftest cc-butler-self-check/persisted-vs-live-flags-extra-list-symbol-not-found-by-scanner ()
+  "THE BUG (2026-09-10): a symbol reaching check 5 ONLY via the EXTRA list
+`cc-butler-self-check-tracked-variables' -- not found by
+`cc-butler--defcustom-symbols-all', matching the real shape of
+`claude-code-ide-mcp-server-port', which belongs to a third-party package
+and so is structurally invisible to the in-repo scan -- is ALSO invisible
+to `cc-butler--defcustom-drift-all': that function only walks
+`cc-butler--modules', cc-butler's own source.  So `(assq sym drift)' is
+always nil for such a symbol, the `(when triple ...)' body guarding the
+label check never runs, and the symbol can NEVER be flagged no matter how
+far its live value has drifted from its own default.  This must fail
+against the CURRENT (unfixed) code -- the EXTRA list is currently useless
+for the exact case it exists to catch."
+  (let ((cc-butler-self-check-tracked-variables '(cc-butler-test-check5-external)))
+    (defvar cc-butler-test-check5-external)
+    (put 'cc-butler-test-check5-external 'standard-value '(1))
+    (setq cc-butler-test-check5-external 2)
+    (unwind-protect
+        (cl-letf (((symbol-function 'custom-variable-state) (lambda (&rest _) 'set))
+                  ((symbol-function 'cc-butler--defcustom-symbols-all) (lambda (&optional _dir) nil))
+                  ((symbol-function 'cc-butler--defcustom-drift-all) (lambda (&optional _dir) nil)))
+          (let ((r (cc-butler-self-check--persisted-vs-live)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "cc-butler-test-check5-external" (plist-get r :detail)))))
+      (makunbound 'cc-butler-test-check5-external)
+      (put 'cc-butler-test-check5-external 'standard-value nil))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; Check 6: vault path
 ;;;; ------------------------------------------------------------------

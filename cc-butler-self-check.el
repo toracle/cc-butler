@@ -276,7 +276,13 @@ this list at the same time as genuinely redundant with the scan, which
 was correct -- but `claude-code-ide-mcp-server-port' was dropped alongside
 it, which was not, and is the textbook case this EXTRA list exists for).
 Also useful for a symbol defined inside a macro the read-don't-eval reader
-does not expand."
+does not expand.
+
+An EXTRA-list-only symbol -- one the automatic scan cannot see -- is
+flagged by check 5 whenever unsaved and differing from its own
+`standard-value', with no stuck-vs-deliberate label applied: that
+classification depends on this repo's own git history, which does not
+exist for a symbol belonging to another package."
   :type '(repeat symbol)
   :group 'cc-butler)
 
@@ -301,6 +307,23 @@ customizations -- pure noise. A \"(likely deliberate customization)\"
 label, or unlabelable drift, must not flag here any more than it fails
 check 7.
 
+`cc-butler--defcustom-drift-all' only walks `cc-butler--modules' (this
+repo's own source), so a symbol reaching this check ONLY via the EXTRA
+list `cc-butler-self-check-tracked-variables' -- never found by
+`cc-butler--defcustom-symbols-all' either, the exact shape of
+`claude-code-ide-mcp-server-port', a third-party package's defcustom --
+never appears in `drift' at all. For that case there is no git history to
+walk and no stuck-vs-deliberate label to ask for, so this compares the
+live value directly against the symbol's own `standard-value' (the
+built-in, package-agnostic default Emacs already tracks) and flags it
+whenever unsaved AND differing -- no attempt at a stuck/deliberate
+distinction, unlike the in-repo path above. The EXTRA list is small and
+opt-in: each symbol on it was deliberately chosen because its
+restart-survival matters enough to watch, so failing open here (flag
+first, let a human judge) is the right default -- unlike the broad
+auto-scanned population, where doing the same produced the 7-of-8 noise
+regression this docstring already describes.
+
 Distinct from check 7 (`cc-butler-self-check--code-vs-live-defcustom'):
 that one asks whether the value running RIGHT NOW already matches what
 the code says, restart or not; this one asks only whether it would
@@ -318,12 +341,20 @@ its docstring)."
         (let ((state (custom-variable-state sym (symbol-value sym))))
           (when (not (memq state '(saved standard)))
             (let ((triple (assq sym drift)))
-              (when triple
-                (let* ((live (nth 1 triple)) (code-default (nth 2 triple))
-                       (file (cc-butler--defcustom-file-for-symbol dir sym))
-                       (label (and file (cc-butler--defcustom-drift-label file sym live code-default))))
-                  (when (and label (string-match-p "\\`(likely stuck reload)" label))
-                    (push (cons sym state) bad)))))))))
+              (if triple
+                  (let* ((live (nth 1 triple)) (code-default (nth 2 triple))
+                         (file (cc-butler--defcustom-file-for-symbol dir sym))
+                         (label (and file (cc-butler--defcustom-drift-label file sym live code-default))))
+                    (when (and label (string-match-p "\\`(likely stuck reload)" label))
+                      (push (cons sym state) bad)))
+                ;; Not found by the in-repo scan -- an EXTRA-list-only symbol.
+                ;; No git history to classify stuck-vs-deliberate; compare
+                ;; directly against its own `standard-value' and flag on any
+                ;; genuine difference.
+                (when (get sym 'standard-value)
+                  (let ((standard (eval (car (get sym 'standard-value)) t)))
+                    (when (not (equal (symbol-value sym) standard))
+                      (push (cons sym state) bad))))))))))
     (setq bad (nreverse bad))
     (if bad
         (list :ok nil
@@ -332,7 +363,7 @@ its docstring)."
                                (lambda (b) (format "%s is `%s' (not saved/standard)" (car b) (cdr b)))
                                bad "; ")))
       (list :ok t
-            :detail "persisted vs live: no tracked variable is both unsaved and labeled a likely stuck reload"))))
+            :detail "persisted vs live: no tracked variable is both unsaved and labeled a likely stuck reload (in-repo), or unsaved and differing from its own standard-value (EXTRA-list-only)"))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Check 6: vault path -- WARMBLE_JUMBLE_PATH vs. the governance store
