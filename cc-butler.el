@@ -713,6 +713,15 @@ dashboard).  Nil if the running commit is not determinable at all."
               ('unmerged "⚠ UNMERGED")
               (_ "ancestry unknown")))))
 
+(defun cc-butler--checkout-dirty-p (dir)
+  "Porcelain `git status' output for DIR, or nil if clean/not-a-checkout/unknown.
+The one detector for \"does this checkout have uncommitted changes\",
+shared by `cc-butler-tool-runtime-source' (reports it as a warning) and
+`cc-butler-tool-reload-code' (refuses on it by default) — see cc-butler
+CLAUDE.md's note on PR #136/#146 for why this must not become two
+independent implementations that only one of them keeps updated."
+  (and dir (cc-butler--git dir "status" "--porcelain")))
+
 (defun cc-butler-tool-runtime-source ()
   "MCP tool: report the exact commit the LIVE daemon is running cc-butler
 from right now, and whether that commit is merged into `origin/main'.
@@ -752,7 +761,7 @@ fake drift."
          (loaded-line cc-butler--runtime-commit-line)
          (checkout-sha (and dir (cc-butler--git-head-sha dir)))
          (checkout-line (and dir (cc-butler--source-revision dir)))
-         (dirty (and dir (cc-butler--git dir "status" "--porcelain"))))
+         (dirty (cc-butler--checkout-dirty-p dir)))
     (if (not loaded-sha)
         (format "Cannot determine the running commit: %s is not a readable git checkout, or `git' failed there."
                 (or dir "<unknown directory>"))
@@ -800,14 +809,51 @@ variable NAME and a rough shape, not to reproduce the value in full."
         (concat (substring s 0 limit) "…")
       s)))
 
-(defun cc-butler-tool-reload-code ()
+(defun cc-butler-tool-reload-code (&optional allow-dirty)
   "MCP tool: reload cc-butler from disk, and report what was actually loaded.
 
 Reloading swaps CODE in a live Emacs.  It does not touch any session's
 conversation, and a 514k-token session is still 514k afterwards — that is
 the whole point of preserving sessions.  Reload and compaction are
 orthogonal: `cc-butler-compact-session' is the only thing here that reduces
-a context, and nothing in this path is a substitute for it."
+a context, and nothing in this path is a substitute for it.
+
+Refuses, and does NOT call `cc-butler-reload' at all, when the source
+checkout has uncommitted changes — unless ALLOW-DIRTY is non-nil.  This is
+the rule \"reviewed code only reaches the live daemon\" stated precisely: a
+dirty checkout is evidence that MIGHT be unreviewed work-in-progress
+sitting where a subagent left it, not proof either way, so it needs an
+explicit, logged override rather than silent pass-through.  Reuses
+`cc-butler--checkout-dirty-p' — the same detector `runtime_source' already
+reports this with — rather than a second, independent check.  An
+ALLOW-DIRTY override is logged via `cc-butler--log', porcelain status
+included, so the override itself leaves evidence.
+
+Deliberately guards only THIS MCP surface, not `cc-butler-reload' itself:
+that function is also called by `M-x cc-butler-reload' and by
+`cc-butler-use-checkout'/`cc-butler-use-installed' — a human already at the
+keyboard, routinely testing their own uncommitted local changes on
+purpose.  Blocking that legitimate interactive workflow the same way as an
+agent-driven MCP call would be the wrong call; the risk this guards
+against — an agent silently hot-loading unreviewed code with no human in
+the loop — exists only at the MCP boundary."
+  (let* ((dir (cc-butler-source-dir))
+         (dirty (cc-butler--checkout-dirty-p dir)))
+    (if (and dirty (not allow-dirty))
+        (format "Refused: %s has uncommitted changes — NOT reloaded.  \
+reload_butler_code does not hot-load an unreviewed checkout into the live \
+daemon by default:\n%s\n\nReview and commit (or stash) first, or call again \
+with allow_dirty=true to deliberately override (the override is logged)."
+                dir dirty)
+      (when dirty
+        (cc-butler--log "reload_butler_code: allow_dirty override — reloading a dirty checkout at %s:\n%s"
+                         dir dirty))
+      (cc-butler--tool-reload-code-1))))
+
+(defun cc-butler--tool-reload-code-1 ()
+  "The actual reload-and-report body of `cc-butler-tool-reload-code',
+factored out so the dirty-checkout guard above can refuse before this ever
+runs."
   (let* ((res (cc-butler-reload))
          (dir (plist-get res :dir))
          (stale (plist-get res :stale))
@@ -879,8 +925,11 @@ a context, and nothing in this path is a substitute for it."
   (claude-code-ide-make-tool
    :function #'cc-butler-tool-reload-code
    :name "reload_butler_code"
-   :description "Hot-reload the cc-butler control plane from disk after its SOURCE CODE changed — new tools, fixes, new modules — without restarting Emacs and without losing any session. Reloads every module in dependency order, including this file first so a newly added module is not skipped. It loads what is on disk and does NOT git pull, so pull first if you want newer code; it reports the source directory and its git HEAD so you can tell what you actually got. Also reports any defcustom/defvar whose live value now differs from its code default — `defcustom'/`defvar' never overwrite an already-bound symbol, so a changed default in source can silently fail to take effect live even though the reload itself reports success; no test suite can catch this (a test always loads into an unbound symbol), so this report is the only detector. This changes CODE ONLY and has no effect whatsoever on any session's context size — it is not a way to shrink a large session and is unrelated to compaction; use compact_session for that."
-   :args nil))
+   :description "Hot-reload the cc-butler control plane from disk after its SOURCE CODE changed — new tools, fixes, new modules — without restarting Emacs and without losing any session. Reloads every module in dependency order, including this file first so a newly added module is not skipped. It loads what is on disk and does NOT git pull, so pull first if you want newer code; it reports the source directory and its git HEAD so you can tell what you actually got. Also reports any defcustom/defvar whose live value now differs from its code default — `defcustom'/`defvar' never overwrite an already-bound symbol, so a changed default in source can silently fail to take effect live even though the reload itself reports success; no test suite can catch this (a test always loads into an unbound symbol), so this report is the only detector. This changes CODE ONLY and has no effect whatsoever on any session's context size — it is not a way to shrink a large session and is unrelated to compaction; use compact_session for that. REFUSES by default, without reloading anything, when the source checkout has uncommitted changes — reviewed code only reaches the live daemon; pass allow_dirty=true to deliberately override (logged)."
+   :args '((:name "allow_dirty"
+                  :type boolean
+                  :description "Override the default refusal to reload a checkout that has uncommitted changes. Only for a deliberate, already-reviewed exception — the override is logged with the checkout's dirty status. Omit for the normal case: the tool refuses on its own, before reloading anything, when the checkout is dirty."
+                  :optional t))))
 
 (provide 'cc-butler)
 ;;; cc-butler.el ends here
