@@ -104,8 +104,25 @@
     cc-butler-doc-panel cc-butler-docs cc-butler-persist
     cc-butler-mail cc-butler-decision cc-butler-inbox cc-butler-governance
     cc-butler-provenance cc-butler-cleanup cc-butler-compact
-    cc-butler-north-star cc-butler-self-check)
+    cc-butler-north-star matrix-bridge cc-butler-self-check)
   "cc-butler modules, in dependency order.")
+
+(defconst cc-butler--modules-directory-exceptions
+  '()
+  "Root `.el' files deliberately excluded from `cc-butler--modules'.
+
+Empty on purpose.  Every `.el' file at the repo root is expected to be a
+real module: `cc-butler-reload' loads exactly `cc-butler--modules' (plus
+`cc-butler' itself), and self-checks 5/7 walk the same list for
+defcustom drift -- a file outside it is invisible to both, and both keep
+reporting success regardless (`matrix-bridge.el' sat in exactly this gap
+for weeks; see the \"an upstream list walk is blind to what is not on the
+list\" governance note, 2026-09-10).
+
+Adding a symbol here is a DELIBERATE act, not a convenience: it turns off
+the parity test in `cc-butler-reload-test.el' for that one file.  State
+the reason on the line you add, e.g. why the file must never be `load'ed
+as a module (a build script, a one-off migration, ...).")
 
 (defconst cc-butler--dir
   (file-name-directory (or load-file-name buffer-file-name default-directory))

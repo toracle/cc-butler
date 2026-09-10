@@ -55,10 +55,12 @@
 ;; `subr-x', none of which requires this file back — safe to reuse its
 ;; `cc-butler--decision-format-age' below instead of writing a duplicate.
 (require 'cc-butler-decision)
-;; `matrix-bridge' is a standalone, co-located file (not one of
-;; `cc-butler--modules') that already owns all Matrix connection config
-;; (homeserver, token, self-identity) — check 9 below reuses that config and
-;; its synchronous thread-fetch function rather than duplicating either.
+;; `matrix-bridge' is a co-located file, now tracked in `cc-butler--modules'
+;; (2026-09-10 — it sat outside the list for weeks, invisible to
+;; `cc-butler-reload' and to self-checks 5/7) that already owns all Matrix
+;; connection config (homeserver, token, self-identity) — check 9 below
+;; reuses that config and its synchronous thread-fetch function rather than
+;; duplicating either.
 (require 'matrix-bridge)
 
 ;; `cc-butler-source-dir' lives in cc-butler.el, which requires THIS file --

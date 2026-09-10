@@ -865,7 +865,7 @@ succeeded.  Lands in the open bucket, not unverifiable, not an error."
   "A real, confirmed-live gap: `:Delivered-to-matrix:' present but no
 `:Room:' at all -- structurally unverifiable, must not be guessed at with
 any default room.  Stays `:ok t' (unverifiable alone never fails the
-check) and is named separately, not folded into `open' or `stale'."
+check) and is named separately, not folded into `open'."
   (cc-butler-self-check-test--with-decision-dir
     (cc-butler-self-check-test--with-matrix-configured
       (cc-butler-self-check-test--seed-open-decision "noroom" "$fake-event-4" nil)
