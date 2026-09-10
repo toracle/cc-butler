@@ -574,12 +574,19 @@ messages from a peer's and will mis-filter them"))
                     "[첨부 m.audio · voice.ogg]") t)
 
   ;; the whole line, and the two events we must drop
-  ;; The human's own messages carry the reminder ...
-  (cl-assert (equal (matrix-bridge-event-line
-                     `((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
-                       (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                    (concat "[matrix · 정수님 · id:$abc] hi"
-                            matrix-bridge-human-reminder)) t)
+  ;; The human's own messages carry the reminder ... Bound explicitly, same
+  ;; reason as the self-user-id case below: with the defvar now nil, reading
+  ;; the global here would make this assertion pass for the wrong reason
+  ;; (nil sender never equals nil id, so it would silently take the "not the
+  ;; human" branch and the missing reminder would read as a genuine failure
+  ;; of a DIFFERENT kind -- or, worse, as a pass if the branches ever changed
+  ;; shape).
+  (let ((matrix-bridge-human-user-id "@jeongsoo:warmblood-lounge"))
+    (cl-assert (equal (matrix-bridge-event-line
+                       `((type . "m.room.message") (sender . ,matrix-bridge-human-user-id)
+                         (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
+                      (concat "[matrix · 정수님 · id:$abc] hi"
+                              matrix-bridge-human-reminder)) t))
   ;; ... and nobody else's do.  Without this negative case the assertion above
   ;; would still pass if the reminder were appended unconditionally.
   (cl-assert (equal (matrix-bridge-event-line
