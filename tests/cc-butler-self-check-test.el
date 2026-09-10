@@ -11,6 +11,10 @@
 ;; `cc-butler-test--make-multi-commit-git-repo',
 ;; `cc-butler-test--write-fixture-module') — never a parallel copy.
 (require 'cc-butler-reload-test)
+;; Reuses `cc-butler-mail-test--with-file' — a throwaway `cc-butler-mail-dir'
+;; over the real file adapter — rather than inventing a second temp-maildir
+;; fixture for check 8's tests below.
+(require 'cc-butler-mail-test)
 
 ;;;; ------------------------------------------------------------------
 ;;;; Registry reload mechanism (defvar vs defconst)
@@ -529,6 +533,108 @@ that found drift but no stuck-reload label among it."
     (let ((r (cc-butler-self-check--code-vs-live-defcustom)))
       (should (plist-get r :ok))
       (should (string-match-p "0 drifted" (plist-get r :detail))))))
+
+;;;; ------------------------------------------------------------------
+;;;; Check 8: orphaned inboxes -- unread mail nobody will ever read
+;;;; ------------------------------------------------------------------
+;;
+;; All fixture slugs below are synthetic ("old-session", "worker-a",
+;; "restarted-worker", "test-agent") -- never a real person or session id.
+
+(defun cc-butler-self-check-test--drop-message (slug filename age-seconds)
+  "Create <`cc-butler-mail-dir'>/SLUG/new/FILENAME with mtime AGE-SECONDS
+in the past.  Uses the real maildir plumbing (`cc-butler--mail-ensure'/
+`cc-butler--mail-inbox') so the fixture matches real delivery layout."
+  (cc-butler--mail-ensure slug)
+  (let ((f (expand-file-name (concat "new/" filename) (cc-butler--mail-inbox slug))))
+    (with-temp-file f (insert "(:kind note :from \"x\" :body \"hi\")\n"))
+    (set-file-times f (time-subtract (current-time) age-seconds))
+    f))
+
+(defmacro cc-butler-self-check-test--with-live-slugs (slugs &rest body)
+  "Run BODY with `cc-butler-self-check--live-inbox-slugs' stubbed to
+return exactly SLUGS (a list of strings) as the live set."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'cc-butler-self-check--live-inbox-slugs)
+              (lambda ()
+                (let ((h (make-hash-table :test 'equal)))
+                  (dolist (s ,slugs) (puthash s t h))
+                  h))))
+     ,@body))
+
+(ert-deftest cc-butler-self-check/orphaned-inboxes-flags-not-live-old-inbox ()
+  "(a) A not-live slug's inbox holding a message at/over the age threshold
+must be flagged, with the slug, pending count, and age all visible in
+:detail."
+  (cc-butler-mail-test--with-file
+    (cc-butler-self-check-test--drop-message "old-session" "1.eld" (* 8 24 60 60))
+    (cc-butler-self-check-test--with-live-slugs nil
+      (let ((r (cc-butler-self-check--orphaned-inboxes)))
+        (should-not (plist-get r :ok))
+        (should (string-match-p "old-session" (plist-get r :detail)))
+        (should (string-match-p "1 pending" (plist-get r :detail)))
+        (should (string-match-p "8d" (plist-get r :detail)))))))
+
+(ert-deftest cc-butler-self-check/orphaned-inboxes-never-flags-live-session ()
+  "(b) A currently live agent's own unread backlog must never be flagged,
+no matter how old the messages are -- an active worker with unread mail
+is busy, not orphaned. Liveness gates the whole check."
+  (cc-butler-mail-test--with-file
+    (cc-butler-self-check-test--drop-message "worker-a" "1.eld" (* 30 24 60 60))
+    (cc-butler-self-check-test--with-live-slugs '("worker-a")
+      (let ((r (cc-butler-self-check--orphaned-inboxes)))
+        (should (plist-get r :ok))
+        (should-not (string-match-p "worker-a" (plist-get r :detail)))))))
+
+(ert-deftest cc-butler-self-check/orphaned-inboxes-does-not-flag-recent-mail ()
+  "(c) A not-live slug whose only unread mail is recent (under the
+threshold) must NOT be flagged -- guards against flagging a worker that
+merely restarted minutes/hours ago."
+  (cc-butler-mail-test--with-file
+    (cc-butler-self-check-test--drop-message "restarted-worker" "1.eld" 300)
+    (cc-butler-self-check-test--with-live-slugs nil
+      (let ((r (cc-butler-self-check--orphaned-inboxes)))
+        (should (plist-get r :ok))
+        (should-not (string-match-p "restarted-worker" (plist-get r :detail)))))))
+
+(ert-deftest cc-butler-self-check/orphaned-inboxes-does-not-flag-empty-new ()
+  "(d) An inbox that exists but has nothing under new/ at all is not
+orphaned -- an inbox with nothing pending is not orphaned."
+  (cc-butler-mail-test--with-file
+    (cc-butler--mail-ensure "test-agent")
+    (cc-butler-self-check-test--with-live-slugs nil
+      (let ((r (cc-butler-self-check--orphaned-inboxes)))
+        (should (plist-get r :ok))
+        (should-not (string-match-p "test-agent" (plist-get r :detail)))))))
+
+(ert-deftest cc-butler-self-check/inbox-dirs-excludes-log-dir ()
+  "(e), mechanism-level: `cc-butler-self-check--inbox-dirs' must never
+return the channel journal directory (`cc-butler--mail-log-dir') as a
+candidate inbox, even though it sits alongside real per-agent inboxes
+under the same `cc-butler-mail-dir' root."
+  (cc-butler-mail-test--with-file
+    (cc-butler--mail-ensure "old-session")
+    (make-directory (cc-butler--mail-log-dir) t)
+    (let ((dirs (cc-butler-self-check--inbox-dirs)))
+      (should (member "old-session" dirs))
+      (should-not (member "log" dirs)))))
+
+(ert-deftest cc-butler-self-check/orphaned-inboxes-never-flags-log-dir-even-with-new-subdir ()
+  "(e), end-to-end: even in the adversarial case where the channel journal
+directory happens to hold a `new/' subdirectory with an old file inside
+it, the orphaned-inboxes check must never treat `log' itself as a
+candidate inbox slug."
+  (cc-butler-mail-test--with-file
+    (let* ((log-dir (cc-butler--mail-log-dir))
+           (new-dir (expand-file-name "new/" log-dir))
+           (bogus (expand-file-name "bogus.eld" new-dir)))
+      (make-directory new-dir t)
+      (with-temp-file bogus (insert "()\n"))
+      (set-file-times bogus (time-subtract (current-time) (* 30 24 60 60))))
+    (cc-butler-self-check-test--with-live-slugs nil
+      (let ((r (cc-butler-self-check--orphaned-inboxes)))
+        (should (plist-get r :ok))
+        (should-not (string-match-p "log" (plist-get r :detail)))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Transition detection: escalate only on ok<->fail flips, both ways
