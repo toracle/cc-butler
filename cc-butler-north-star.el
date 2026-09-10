@@ -144,7 +144,7 @@ north-star-macbook-m1-max.org처럼 서로 다른 fleet의 목표 파일이 나�
 
 각 활성 목표에 대해:
 1. 그 목표의 DoD가 실제로 충족되었는가? (\"어려움이 있었다\"는 완료의 증거가 아니다 — governance store의 dod-vs-ultimate-goal 기준 적용.)
-2. 아직이라면 막힌 지점이 있는가? manager/enabler로서 시도할 수 있는 안전한 조치를 먼저 강구할 것.
+2. 아직이라면 막힌 지점이 있는가? \"막혀 있음\"·park으로 적힌 항목이면 그 판단을 그대로 믿지 말고 지금 «다시» 재라 — 재기 전에 governance store를 먼저 grep해 같은 모양의 기존 원칙(예: a-blocking-premise-is-never-re-examined-while-it-blocks, a-blocked-screen-is-not-evidence-that-unblocking-has-value)이 있는지 확인할 것. 산출물은 선언(\"재검토함\")이 아니라 실제로 실행한 명령과 그 출력이어야 한다. manager/enabler로서 시도할 수 있는 안전한 조치를 먼저 강구할 것.
 3. 판단이 불명확하면 escalate_to_butler로 정수님께 질문할 것 — 짐작으로 채우지 말 것.
 4. DoD가 충족된 목표는 이 파일에서 제거하고 완료 서사를 wb-para 프로젝트 노트로 아카이브할 것 — 진행 기록은 이 파일이 아니라 프로젝트 노트에 (governance: north-star-file-holds-intent-not-progress).
 원래 목표와 무관한 부수 작업(yak-shaving)에 머물러 있지는 않은지도 함께 점검할 것."
