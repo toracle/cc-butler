@@ -249,17 +249,21 @@ live to 8 with `saved-value' nil, deliberately -- a restart gives back that
 exact same value anyway, so there is nothing to lose and this must read as
 OK, not bad.  An unsaved variable whose live value already equals the
 current code-default (i.e. absent from `cc-butler--defcustom-drift-all')
-must NOT be flagged."
+must NOT be flagged.  (`standard-value' is set explicitly here to match
+the live value, so this exercises the real \"matches\" comparison rather
+than the separate no-`standard-value' failure case.)"
   (let ((cc-butler-self-check-tracked-variables '(cc-butler-test-check5-matching)))
     (defvar cc-butler-test-check5-matching)
     (setq cc-butler-test-check5-matching 8)
+    (put 'cc-butler-test-check5-matching 'standard-value '(8))
     (unwind-protect
         (cl-letf (((symbol-function 'custom-variable-state) (lambda (&rest _) 'changed))
                   ((symbol-function 'cc-butler--defcustom-drift-all) (lambda (&optional _dir) nil))
                   ((symbol-function 'cc-butler--defcustom-symbols-all) (lambda (&optional _dir) nil)))
           (let ((r (cc-butler-self-check--persisted-vs-live)))
             (should (plist-get r :ok))))
-      (makunbound 'cc-butler-test-check5-matching))))
+      (makunbound 'cc-butler-test-check5-matching)
+      (put 'cc-butler-test-check5-matching 'standard-value nil))))
 
 (ert-deftest cc-butler-self-check/persisted-vs-live-still-flags-unsaved-when-differing-from-code-default ()
   "The real-risk case must still fail: unsaved, the live value differs from
@@ -367,6 +371,31 @@ for the exact case it exists to catch."
             (should (string-match-p "cc-butler-test-check5-external" (plist-get r :detail)))))
       (makunbound 'cc-butler-test-check5-external)
       (put 'cc-butler-test-check5-external 'standard-value nil))))
+
+(ert-deftest cc-butler-self-check/persisted-vs-live-flags-extra-list-symbol-without-standard-value ()
+  "THE BUG (2026-09-10): `cc-butler-self-check-tracked-variables' has no
+entry requirement beyond \"the automatic scan can't see it\" -- nothing
+stops a plain `defvar' (not a `defcustom') from being added to it.  Such a
+symbol has no `standard-value' property at all (only `defcustom'/
+`custom-declare-variable' populate that), so the EXTRA-list-only branch's
+`(when (get sym \\='standard-value) ...)' guard is simply falsy: no flag,
+no note, no error -- the symbol was accepted onto the list but check 5
+silently cannot monitor it, and nothing in the report says so.  Against
+CURRENT (unfixed) code this reads as plain :ok t with no mention of the
+symbol anywhere -- indistinguishable from \"all clear\".  Must instead
+surface as a distinctly-worded check failure naming the symbol."
+  (let ((cc-butler-self-check-tracked-variables '(cc-butler-test-check5-no-standard-value)))
+    (defvar cc-butler-test-check5-no-standard-value)
+    (setq cc-butler-test-check5-no-standard-value 42)
+    (unwind-protect
+        (cl-letf (((symbol-function 'custom-variable-state) (lambda (&rest _) 'set))
+                  ((symbol-function 'cc-butler--defcustom-symbols-all) (lambda (&optional _dir) nil))
+                  ((symbol-function 'cc-butler--defcustom-drift-all) (lambda (&optional _dir) nil)))
+          (let ((r (cc-butler-self-check--persisted-vs-live)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "cc-butler-test-check5-no-standard-value" (plist-get r :detail)))
+            (should (string-match-p "no standard-value\\|not a defcustom" (plist-get r :detail)))))
+      (makunbound 'cc-butler-test-check5-no-standard-value))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Check 6: vault path

@@ -282,7 +282,15 @@ An EXTRA-list-only symbol -- one the automatic scan cannot see -- is
 flagged by check 5 whenever unsaved and differing from its own
 `standard-value', with no stuck-vs-deliberate label applied: that
 classification depends on this repo's own git history, which does not
-exist for a symbol belonging to another package."
+exist for a symbol belonging to another package.
+
+An entry here is only actually MONITORABLE by check 5 if it is a
+`defcustom' (i.e. has a `standard-value' symbol property -- only
+`defcustom'/`custom-declare-variable' ever set one). A plain `defvar' has
+no `standard-value' and so cannot be compared against \"what it would
+revert to on restart\" at all; check 5 flags that case as its own distinct
+failure (\"... has no standard-value ... cannot be monitored\") rather than
+silently passing it through."
   :type '(repeat symbol)
   :group 'cc-butler)
 
@@ -331,7 +339,14 @@ SURVIVE a restart.
 
 Population is the automatic scan (`cc-butler--defcustom-symbols-all')
 plus `cc-butler-self-check-tracked-variables' (now an EXTRA list -- see
-its docstring)."
+its docstring).
+
+An EXTRA-list entry only counts as monitorable if it is a `defcustom'
+(has a `standard-value' property). A plain `defvar' added to the EXTRA
+list has none, so this check cannot tell what it would revert to on
+restart; rather than silently doing nothing (indistinguishable from \"all
+clear\"), that case is flagged as its own distinct failure naming the
+symbol and stating it has no `standard-value'."
   (let* ((dir (cc-butler-source-dir))
          (drift (cc-butler--defcustom-drift-all dir))
          bad)
@@ -347,20 +362,35 @@ its docstring)."
                          (label (and file (cc-butler--defcustom-drift-label file sym live code-default))))
                     (when (and label (string-match-p "\\`(likely stuck reload)" label))
                       (push (cons sym state) bad)))
-                ;; Not found by the in-repo scan -- an EXTRA-list-only symbol.
-                ;; No git history to classify stuck-vs-deliberate; compare
-                ;; directly against its own `standard-value' and flag on any
+                ;; Not present in `drift' -- either an EXTRA-list-only symbol
+                ;; the in-repo scanner can't see, or an in-repo symbol that
+                ;; simply isn't drifted right now (`cc-butler--defcustom-drift'
+                ;; only pushes a symbol onto `drift' when its live value
+                ;; already differs from the freshly-recomputed code-default).
+                ;; No git history to classify stuck-vs-deliberate either way;
+                ;; compare directly against `standard-value' and flag on any
                 ;; genuine difference.
-                (when (get sym 'standard-value)
-                  (let ((standard (eval (car (get sym 'standard-value)) t)))
-                    (when (not (equal (symbol-value sym) standard))
-                      (push (cons sym state) bad))))))))))
+                (if (get sym 'standard-value)
+                    (let ((standard (eval (car (get sym 'standard-value)) t)))
+                      (when (not (equal (symbol-value sym) standard))
+                        (push (cons sym state) bad)))
+                  ;; No `standard-value' at all -- only `defcustom'/
+                  ;; `custom-declare-variable' populate that property, so this
+                  ;; is a plain `defvar' someone added to the EXTRA list
+                  ;; `cc-butler-self-check-tracked-variables'.  This check has
+                  ;; no way to know what it would revert to on restart; doing
+                  ;; nothing here would silently report :ok with no mention of
+                  ;; the gap, so flag it as its own distinct failure instead.
+                  (push (cons sym :no-standard-value) bad))))))))
     (setq bad (nreverse bad))
     (if bad
         (list :ok nil
               :detail (format "persisted vs live: %s"
                               (mapconcat
-                               (lambda (b) (format "%s is `%s' (not saved/standard)" (car b) (cdr b)))
+                               (lambda (b)
+                                 (if (eq (cdr b) :no-standard-value)
+                                     (format "%s is in `cc-butler-self-check-tracked-variables' but has no standard-value -- not a defcustom, cannot be monitored for persisted-vs-live drift" (car b))
+                                   (format "%s is `%s' (not saved/standard)" (car b) (cdr b))))
                                bad "; ")))
       (list :ok t
             :detail "persisted vs live: no tracked variable is both unsaved and labeled a likely stuck reload (in-repo), or unsaved and differing from its own standard-value (EXTRA-list-only)"))))
