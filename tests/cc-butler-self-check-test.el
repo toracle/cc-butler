@@ -643,10 +643,11 @@ candidate inbox slug."
 
 (defun cc-butler-self-check-test--touch-ack (slug age-seconds)
   "Create/touch SLUG's `.orphan-ack' marker via the real acknowledge
-function, then pin its mtime to AGE-SECONDS in the past with
+function (with a harmless synthetic reason -- never a real one, this
+repo is public), then pin its mtime to AGE-SECONDS in the past with
 `set-file-times' -- avoids relying on wall-clock ordering between
 fixture steps that run faster than clock resolution."
-  (cc-butler-self-check-acknowledge-orphan-inbox slug)
+  (cc-butler-self-check-acknowledge-orphan-inbox slug "kept pending separate disposal")
   (set-file-times (cc-butler-self-check--orphan-ack-file slug)
                    (time-subtract (current-time) age-seconds)))
 
@@ -691,7 +692,8 @@ would also satisfy a bare `should-error' here without the explicit
 guard actually having run, which would make this test pass whether or
 not the guard exists."
   (cc-butler-mail-test--with-file
-    (let ((err (should-error (cc-butler-self-check-acknowledge-orphan-inbox "no-such-inbox"))))
+    (let ((err (should-error (cc-butler-self-check-acknowledge-orphan-inbox
+                               "no-such-inbox" "kept pending separate disposal"))))
       (should (string-match-p "not a known mail inbox" (error-message-string err))))
     (should-not (file-directory-p (cc-butler--mail-inbox "no-such-inbox")))))
 
@@ -704,11 +706,67 @@ acknowledgment and asserts both are byte-identical."
     (let* ((f (cc-butler-self-check-test--drop-message "old-session" "1.eld" (* 8 24 60 60)))
            (before-mtime (file-attribute-modification-time (file-attributes f)))
            (before-content (with-temp-buffer (insert-file-contents f) (buffer-string))))
-      (cc-butler-self-check-acknowledge-orphan-inbox "old-session")
+      (cc-butler-self-check-acknowledge-orphan-inbox "old-session" "kept pending separate disposal")
       (should (file-exists-p f))
       (should (equal (file-attribute-modification-time (file-attributes f)) before-mtime))
       (should (equal (with-temp-buffer (insert-file-contents f) (buffer-string))
                       before-content)))))
+
+(ert-deftest cc-butler-self-check/acknowledge-orphan-inbox-records-reason-in-marker ()
+  "Acknowledging with a non-blank REASON must persist that reason text in
+the marker file's own content -- not just bump its mtime.  A marker
+with only a timestamp erases who judged an inbox fine and why, exactly
+the erasure this check exists to catch."
+  (cc-butler-mail-test--with-file
+    (cc-butler-self-check-test--drop-message "old-session" "1.eld" (* 8 24 60 60))
+    (cc-butler-self-check-acknowledge-orphan-inbox "old-session" "kept pending separate disposal")
+    (let ((content (with-temp-buffer
+                      (insert-file-contents (cc-butler-self-check--orphan-ack-file "old-session"))
+                      (buffer-string))))
+      (should (string-match-p "kept pending separate disposal" content)))))
+
+(ert-deftest cc-butler-self-check/acknowledge-orphan-inbox-rejects-blank-reason-no-prior-marker ()
+  "An empty or whitespace-only REASON must signal an error and create NO
+marker file at all -- never a timestamp-only marker, which would repeat
+the exact erasure (who judged this fine, and why) this check exists to
+catch.  Asserts on the error's message text, not a bare `should-error'
+-- same discipline as `acknowledge-orphan-inbox-rejects-unknown-slug',
+so a downstream failure (e.g. `write-region' erroring some other way)
+can never masquerade as this guard having run."
+  (cc-butler-mail-test--with-file
+    (cc-butler--mail-ensure "old-session")
+    (let ((err (should-error (cc-butler-self-check-acknowledge-orphan-inbox "old-session" "   "))))
+      (should (string-match-p "non-blank reason" (error-message-string err))))
+    (should-not (file-exists-p (cc-butler-self-check--orphan-ack-file "old-session")))))
+
+(ert-deftest cc-butler-self-check/acknowledge-orphan-inbox-rejects-blank-reason-with-existing-marker ()
+  "A blank-REASON call on an ALREADY-acknowledged inbox must not touch --
+let alone blank out -- the pre-existing marker's content or mtime at
+all; a blank reason must never corrupt a prior good acknowledgment."
+  (cc-butler-mail-test--with-file
+    (cc-butler--mail-ensure "old-session")
+    (cc-butler-self-check-acknowledge-orphan-inbox "old-session" "kept pending separate disposal")
+    (let* ((ack-file (cc-butler-self-check--orphan-ack-file "old-session"))
+           (before-content (with-temp-buffer (insert-file-contents ack-file) (buffer-string)))
+           (before-mtime (file-attribute-modification-time (file-attributes ack-file))))
+      (let ((err (should-error (cc-butler-self-check-acknowledge-orphan-inbox "old-session" ""))))
+        (should (string-match-p "non-blank reason" (error-message-string err))))
+      (should (equal (with-temp-buffer (insert-file-contents ack-file) (buffer-string))
+                      before-content))
+      (should (equal (file-attribute-modification-time (file-attributes ack-file))
+                      before-mtime)))))
+
+(ert-deftest cc-butler-self-check/orphaned-inboxes-acknowledged-detail-includes-reason ()
+  "An acknowledged-but-still-listed candidate's `:detail' entry must
+include the reason it was acknowledged for, not just its slug/count/age
+-- otherwise \"someone said this was fine\" with no recorded reason is
+exactly the failure check 8 exists to prevent."
+  (cc-butler-mail-test--with-file
+    (cc-butler-self-check-test--drop-message "old-session" "1.eld" (* 8 24 60 60))
+    (cc-butler-self-check-test--touch-ack "old-session" (* 1 24 60 60))
+    (cc-butler-self-check-test--with-live-slugs nil
+      (let ((r (cc-butler-self-check--orphaned-inboxes)))
+        (should (string-match-p "kept pending separate disposal" (plist-get r :detail)))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Transition detection: escalate only on ok<->fail flips, both ways
