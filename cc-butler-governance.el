@@ -551,9 +551,23 @@ revised (still alive, still load-bearing) surfaces near the top of
 `MEMORY.md' instead of wherever it happened to land historically.
 
 Every line NOT in this store's own generated shape — hand-authored content
-the store does not own — is left byte-for-byte untouched at its original
-position, the same guarantee `cc-butler-governance--sync-index' gives (see
-`cc-butler-governance/regenerate-index-merge-preserves-hand-written-lines').
+the store does not own — is left byte-for-byte untouched, and ALL such
+lines are hoisted ABOVE the entire sorted block as a group, preserving
+their original relative order among each other (2026-09-10, PR #216
+fix): reinserting the block at the position of the FIRST store-owned
+line instead left any non-store line that originally sat AFTER that
+point stranded past the WHOLE block, however large — a real visibility
+regression (a legacy/hand-authored line pointing at content that exists
+ONLY via that one `MEMORY.md' line, well within the read budget before
+the sort, pushed tens of KB past it after — see
+`cc-butler-governance/regenerate-orphan-legacy-line-can-fall-out-of-budget-after-sort').
+Mechanically this falls out of the existing delete-in-place loop below
+for free: it already leaves every non-matching line (banner included)
+untouched, in original relative order, as matched lines are deleted out
+from around it — the only change needed is inserting the sorted block at
+the END of what remains (`point-max') instead of at the first match's
+original position.
+
 An already-indexed slug's EXISTING line text is reused verbatim — curated
 wording is never overwritten (see
 `cc-butler-governance/regenerate-does-not-duplicate-an-already-curated-entry');
@@ -578,20 +592,21 @@ stale, still-oversized text to a new spot."
   (let ((index (cc-butler-governance--memory-index-file)))
     (with-temp-buffer
       (when (file-readable-p index) (insert-file-contents index))
-      (let ((existing (make-hash-table :test 'equal))
-            (insert-pos nil))
+      (let ((existing (make-hash-table :test 'equal)))
         (goto-char (point-min))
         (while (re-search-forward
                 (concat cc-butler-governance--index-line-regexp ".*\n?") nil t)
-          (unless insert-pos (setq insert-pos (match-beginning 0)))
           (puthash (match-string 1) (match-string 0) existing)
           (delete-region (match-beginning 0) (match-end 0))
           (goto-char (match-beginning 0)))
-        (unless insert-pos
-          (goto-char (point-max))
-          (unless (or (bobp) (bolp)) (insert "\n"))
-          (setq insert-pos (point)))
-        (let* ((ordered
+        ;; Every store-owned line is now gone; whatever remains (banner plus
+        ;; any non-store lines, in original relative order) is exactly what
+        ;; the sorted block must be hoisted ABOVE -- so it always goes at
+        ;; the end of what's left, never at the first match's old spot.
+        (goto-char (point-max))
+        (unless (or (bobp) (bolp)) (insert "\n"))
+        (let* ((insert-pos (point))
+               (ordered
                 (sort (copy-sequence slugs)
                       (lambda (a b)
                         (> (or (gethash (concat a ".md") recency-map) -1)
