@@ -71,26 +71,36 @@ if a file listed here ever goes genuinely clean, that test fails and NAMES
 it, so an exception cannot quietly outlive the reason it was added for.
 
 `matrix-bridge-test.el', `bridge.py', `config.sh', `test_bridge.py': the
-SAME already-known, already out-of-scope issue -- the Matrix bridge's own
+SAME already-known issue, tracked in #239 -- the Matrix bridge's own
 human/fleet identifiers (`warmblood-lounge'-homeserver mxids) are
 deliberately hardcoded in the bridge's protocol-level tests, because those
 tests exist to prove the bridge correctly identifies \"the human\" and
 \"itself\" on Matrix, which cannot be done with a fake id. This file's job
-is to catch a NEW leak riding along with something else, not to re-flag a
-known, tracked one every time the suite runs.
+is to catch a NEW leak riding along with something else, not to re-flag one
+already tracked there every time the suite runs.
 
-`matrix-bridge.el': narrower than the above, and changed by this same
-commit (2026-09-10) -- `matrix-bridge-human-user-id' and
+`matrix-bridge.el': narrower than the above, and partly closed by an
+earlier commit (2026-09-10) -- `matrix-bridge-human-user-id' and
 `matrix-bridge-self-user-id' no longer default to a real id (both are nil,
 guarded at `matrix-bridge-start'; see those defvars' own docstrings), so
-this file is no longer exempt for its PRODUCTION DEFAULTS. It stays
-exempt only because it carries its own in-file protocol-test self-check,
-`matrix-bridge-self-test' -- the OTHER test surface named in this repo's
-CLAUDE.md (\"there are two test surfaces here\") -- which hardcodes the
-same real mxids as `matrix-bridge-test.el' above, for the identical
-protocol-testing reason. Redacting THAT self-test is the same
-already-scoped, already-coordinated-with-the-butler change referenced
-above, not a side effect of this fix.")
+this file is no longer exempt for its PRODUCTION DEFAULTS. Two real
+literals still keep the exception justified, not one:
+
+  1. its own in-file protocol-test self-check, `matrix-bridge-self-test'
+     -- the OTHER test surface named in this repo's CLAUDE.md (\"there are
+     two test surfaces here\") -- which hardcodes the same real mxids as
+     `matrix-bridge-test.el' above, for the identical protocol-testing
+     reason (same #239, not a separate issue);
+  2. `matrix-bridge-self-user-id''s own docstring `e.g.' example, a real
+     mxid with no protocol constraint on it at all -- unlike (1), nothing
+     stops this one being replaced with a synthetic example today. It has
+     not been, simply because nobody has done it yet; its presence here is
+     not evidence that it NEEDS to stay real.
+
+Either alone would keep this file exempt -- removing (1) without (2), or
+(2) without (1), still leaves a real violation for
+`every-exception-still-contains-a-violation' to find. Only once BOTH are
+gone does that test start naming this file as stale.")
 
 (defconst cc-butler-fixture-hygiene-test--shape-res
   (list (concat "![A-Za-z0-9_-]\\{10,\\}:"

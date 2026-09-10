@@ -131,6 +131,73 @@ for `matrix-bridge-self-user-id'."
         (matrix-bridge-human-user-id nil))
     (should-error (matrix-bridge-start))))
 
+;;;; --- matrix-bridge--deliver: never inject with a nil identity var ---------
+;; `matrix-bridge-start' only guards its OWN call site. Two other paths reach
+;; live (non-shadow) delivery without ever calling it: a hot-reload of an
+;; already-running daemon (`emacs-startup-hook' does not fire again, and
+;; `defvar' does not touch an already-bound variable, so a var that was never
+;; bound before the reload stays nil straight through it), and
+;; `matrix-bridge-shadow' being flipped to nil directly (documented at the top
+;; of matrix-bridge.el as the way to "go live" -- it does not route through
+;; `matrix-bridge-start' either). `matrix-bridge--deliver' is the one function
+;; every real delivery must pass through regardless of which path reached it,
+;; so that is where this guards -- not by refusing to run (this is deep in an
+;; async poll loop; throwing here risks taking the whole loop down over one
+;; bad message), but by falling back to the existing shadow path, the same
+;; graceful degradation already used two clauses below for "injection isn't
+;; available at all".
+
+(defmacro matrix-bridge-test--with-fake-injector (injected-var &rest body)
+  "Run BODY with `cc-butler--send-input'/`cc-butler--dir-by-name' stubbed so
+`matrix-bridge--deliver' believes real injection is available, setting
+INJECTED-VAR (a symbol, already `let'-bound by the caller) to t if the stub
+is actually called. Restores whatever these two symbols were bound to
+before (fboundp or not) -- they are real `cc-butler.el' functions that may
+already be loaded by the rest of the suite, so this must not leave them
+permanently unbound or permanently stubbed for later tests."
+  (declare (indent 1))
+  `(let* ((send-was-bound (fboundp 'cc-butler--send-input))
+          (send-orig (and send-was-bound (symbol-function 'cc-butler--send-input)))
+          (dir-was-bound (fboundp 'cc-butler--dir-by-name))
+          (dir-orig (and dir-was-bound (symbol-function 'cc-butler--dir-by-name))))
+     (fset 'cc-butler--send-input (lambda (&rest _) (setq ,injected-var t)))
+     (fset 'cc-butler--dir-by-name (lambda (&rest _) "fake-dir"))
+     (unwind-protect
+         (progn ,@body)
+       (if send-was-bound (fset 'cc-butler--send-input send-orig)
+         (fmakunbound 'cc-butler--send-input))
+       (if dir-was-bound (fset 'cc-butler--dir-by-name dir-orig)
+         (fmakunbound 'cc-butler--dir-by-name)))))
+
+(ert-deftest matrix-bridge/deliver-shadows-instead-of-injecting-when-self-id-nil ()
+  (let ((matrix-bridge-shadow nil)
+        (matrix-bridge-self-user-id nil)
+        (matrix-bridge-human-user-id "@fake-human:example.org")
+        (injected nil))
+    (matrix-bridge-test--with-fake-injector injected
+      (matrix-bridge--deliver "some text")
+      (should-not injected))))
+
+(ert-deftest matrix-bridge/deliver-shadows-instead-of-injecting-when-human-id-nil ()
+  (let ((matrix-bridge-shadow nil)
+        (matrix-bridge-self-user-id "@fake-self:example.org")
+        (matrix-bridge-human-user-id nil)
+        (injected nil))
+    (matrix-bridge-test--with-fake-injector injected
+      (matrix-bridge--deliver "some text")
+      (should-not injected))))
+
+(ert-deftest matrix-bridge/deliver-injects-normally-when-both-ids-set ()
+  "The guard above must not block ordinary non-shadow delivery -- only a nil
+identity var should divert to shadow, not the presence of the guard itself."
+  (let ((matrix-bridge-shadow nil)
+        (matrix-bridge-self-user-id "@fake-self:example.org")
+        (matrix-bridge-human-user-id "@fake-human:example.org")
+        (injected nil))
+    (matrix-bridge-test--with-fake-injector injected
+      (matrix-bridge--deliver "some text")
+      (should injected))))
+
 ;;;; --- JSON false is not Lisp nil (regression, 2026-09-05) ------------------
 ;; Found by replaying 248 real room events through both bridges: the Python
 ;; and Elisp outputs diverged on 4 events, all genuine replies inside a thread.
