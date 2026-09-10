@@ -498,7 +498,21 @@ source text (default `cc-butler-source-dir'), regardless of whether it
 currently drifts.  The population check 5 (persisted-vs-live) auto-scans
 instead of a hand-maintained list, so it cannot silently narrow as the
 codebase grows (2026-09-10: the hand list tracked 2 of ~8 variables that
-actually mattered)."
+actually mattered).
+
+This only inspects top-level `defcustom'/`defvar' forms (see
+`cc-butler--defcustom-forms-in-string') and skips private accumulators
+by name (`cc-butler--defcustom-drift-internal-p' — a deliberate exclusion,
+not scanner blindness: it protects sensitive accumulator content from
+leaking into drift reports, see that function's docstring). A symbol that
+must always resync with source on every reload — a static dispatch or
+registry table, not a genuine customization point — belongs to neither
+category: it should be declared with `defconst', not `defvar'. `defconst'
+is structurally outside what this scanner (and check 5/7, which call it)
+even looks at, so a `defconst' registry cannot go stale in the first
+place, unlike a `defvar' registry — see `cc-butler-self-check--checks' in
+cc-butler-self-check.el, fixed from `defvar' to `defconst' for exactly
+this reason on 2026-09-10."
   (let ((dir (or dir (cc-butler-source-dir))))
     (cl-loop for m in (cons 'cc-butler cc-butler--modules)
              append (cl-loop for pair in (cc-butler--defcustom-forms-in-file

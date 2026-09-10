@@ -256,7 +256,7 @@ tonight's exact mistake one level up."
 ;;;; Check 5: persisted vs. live -- would this survive a restart?
 ;;;; ------------------------------------------------------------------
 
-(defcustom cc-butler-self-check-tracked-variables nil
+(defcustom cc-butler-self-check-tracked-variables '(claude-code-ide-mcp-server-port)
   "EXTRA variables checked for persisted-vs-live drift by check 5
 \(`cc-butler-self-check--persisted-vs-live'), beyond the automatic scan
 \(`cc-butler--defcustom-symbols-all').  The automatic scan is now the
@@ -266,8 +266,17 @@ the codebase grows the way a hand-maintained list did: on 2026-09-10 this
 list tracked 2 of ~8 variables that actually mattered that day, the exact
 \"hand-maintained population silently narrows\" failure this closes.
 
-Only useful now for a symbol the scan genuinely cannot see -- e.g. one
-defined inside a macro the read-don't-eval reader does not expand."
+Only useful now for a symbol the scan genuinely cannot see -- the
+canonical case is `claude-code-ide-mcp-server-port' itself: it belongs to
+the third-party `claude-code-ide' package, not to cc-butler.el or any
+module in `cc-butler--modules', so `cc-butler--defcustom-symbols-all'
+structurally cannot ever see it no matter how thorough the scan gets
+\(confirmed live, 2026-09-10: `cc-butler-north-star-file' was dropped from
+this list at the same time as genuinely redundant with the scan, which
+was correct -- but `claude-code-ide-mcp-server-port' was dropped alongside
+it, which was not, and is the textbook case this EXTRA list exists for).
+Also useful for a symbol defined inside a macro the read-don't-eval reader
+does not expand."
   :type '(repeat symbol)
   :group 'cc-butler)
 
@@ -278,9 +287,19 @@ UNLESS its live value already equals the current code-default, in which
 case a restart gives back that exact same value anyway and there is
 nothing to lose (2026-09-10: steward set `cc-butler-launch-ready-timeout'
 live to 8 with `saved-value' nil, deliberately -- that must read as OK,
-not bad).  Only flag a symbol whose state is unsaved AND whose value also
-appears in `cc-butler--defcustom-drift-all' (i.e. genuinely differs from
-the code-default) -- a real risk of reverting to something wrong.
+not bad).
+
+A symbol whose state is unsaved AND whose value also appears in
+`cc-butler--defcustom-drift-all' (i.e. genuinely differs from the
+code-default) is only flagged if that drift's label -- via the same
+`cc-butler--defcustom-file-for-symbol' + `cc-butler--defcustom-drift-label'
+mechanism check 7 already uses -- comes back \"(likely stuck reload)\".
+REGRESSION FIX (2026-09-10, live): before this, any unsaved+differing
+symbol was flagged regardless of label, and once the population widened
+(PR #225) that hit 8 symbols, 7 of which were legitimate live
+customizations -- pure noise. A \"(likely deliberate customization)\"
+label, or unlabelable drift, must not flag here any more than it fails
+check 7.
 
 Distinct from check 7 (`cc-butler-self-check--code-vs-live-defcustom'):
 that one asks whether the value running RIGHT NOW already matches what
@@ -290,15 +309,21 @@ SURVIVE a restart.
 Population is the automatic scan (`cc-butler--defcustom-symbols-all')
 plus `cc-butler-self-check-tracked-variables' (now an EXTRA list -- see
 its docstring)."
-  (let ((drifted (mapcar #'car (cc-butler--defcustom-drift-all)))
-        bad)
+  (let* ((dir (cc-butler-source-dir))
+         (drift (cc-butler--defcustom-drift-all dir))
+         bad)
     (dolist (sym (delete-dups (append (cc-butler--defcustom-symbols-all)
                                        cc-butler-self-check-tracked-variables)))
       (when (boundp sym)
         (let ((state (custom-variable-state sym (symbol-value sym))))
-          (when (and (not (memq state '(saved standard)))
-                     (memq sym drifted))
-            (push (cons sym state) bad)))))
+          (when (not (memq state '(saved standard)))
+            (let ((triple (assq sym drift)))
+              (when triple
+                (let* ((live (nth 1 triple)) (code-default (nth 2 triple))
+                       (file (cc-butler--defcustom-file-for-symbol dir sym))
+                       (label (and file (cc-butler--defcustom-drift-label file sym live code-default))))
+                  (when (and label (string-match-p "\\`(likely stuck reload)" label))
+                    (push (cons sym state) bad)))))))))
     (setq bad (nreverse bad))
     (if bad
         (list :ok nil
@@ -307,7 +332,7 @@ its docstring)."
                                (lambda (b) (format "%s is `%s' (not saved/standard)" (car b) (cdr b)))
                                bad "; ")))
       (list :ok t
-            :detail "persisted vs live: no tracked variable is both unsaved and differing from its code-default"))))
+            :detail "persisted vs live: no tracked variable is both unsaved and labeled a likely stuck reload"))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Check 6: vault path -- WARMBLE_JUMBLE_PATH vs. the governance store
@@ -386,7 +411,7 @@ must not page anyone."
 ;;;; Registry
 ;;;; ------------------------------------------------------------------
 
-(defvar cc-butler-self-check--checks
+(defconst cc-butler-self-check--checks
   '(("mcp-port" . cc-butler-self-check--mcp-port)
     ("governance-memory-dir" . cc-butler-self-check--governance-memory-dir)
     ("north-star-file" . cc-butler-self-check--north-star-file)
@@ -396,7 +421,18 @@ must not page anyone."
     ("code-vs-live-defcustom" . cc-butler-self-check--code-vs-live-defcustom))
   "Alist of (NAME . FUNCTION).  FUNCTION takes no args, returns a plist
 \(:ok BOOL :detail STRING).  Extensible -- new checks are just new entries,
-so this does not stay a fixed list of six forever.")
+so this does not stay a fixed list of six forever.
+
+A `defconst' on purpose, not a `defvar' (2026-09-10 live: it was a `defvar'
+when PR #225 added the 7th entry, and `cc-butler-reload' left an
+already-running daemon stuck on the OLD 6-entry alist -- `defvar' with a
+value only sets the symbol IF IT IS CURRENTLY UNBOUND, it never overwrites
+an already-bound one, so check 7's function was defined but never actually
+dispatched). This is a pure code-owned dispatch table, not a genuine
+customization point nobody is meant to `setq' or Customize away from
+source, so `defconst''s unconditional reassignment on every reload is
+exactly right here, with nothing to lose -- same precedent as
+`cc-butler--modules' in cc-butler.el.")
 
 (defun cc-butler-self-check-run ()
   "Run every registered check.  Return an alist of (NAME . PLIST)."

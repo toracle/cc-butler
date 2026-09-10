@@ -13,6 +13,62 @@
 (require 'cc-butler-reload-test)
 
 ;;;; ------------------------------------------------------------------
+;;;; Registry reload mechanism (defvar vs defconst)
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-self-check/registry-defvar-does-not-resync-on-reload ()
+  "SYNTHETIC, mechanism-only -- not tied to the real
+`cc-butler-self-check--checks' symbol.  `defvar' with a value only sets the
+symbol IF IT IS CURRENTLY UNBOUND, so reloading the SAME file path with a
+changed value leaves an already-bound `defvar' stuck at the OLD value.
+This is the general Elisp gap that let check 7 (added by PR #225) exist in
+source but never actually run on a fleet that had already loaded the older
+6-entry `cc-butler-self-check--checks' alist before #225 merged."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-check-registry-reload" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defvar cc-butler-test-registry-reload '((\"a\" . 1)))\n")))
+    (unwind-protect
+        (progn
+          (load file nil t)
+          (write-region "(defvar cc-butler-test-registry-reload '((\"a\" . 1) (\"b\" . 2)))\n"
+                        nil file)
+          (load file nil t)
+          (should (equal (mapcar #'car cc-butler-test-registry-reload) '("a"))))
+      (makunbound 'cc-butler-test-registry-reload)
+      (delete-directory dir t))))
+
+(ert-deftest cc-butler-self-check/registry-defconst-resyncs-on-reload ()
+  "Mirror image, `defconst': unconditionally reassigns on every top-level
+evaluation regardless of prior binding, so the same overwrite-and-reload
+DOES pick up the new entry.  No code change is under test here -- this
+just documents/locks in the mechanism the `defconst' fix to
+`cc-butler-self-check--checks' (below) relies on."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-check-registry-reload" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defconst cc-butler-test-registry-reload-const '((\"a\" . 1)))\n")))
+    (unwind-protect
+        (progn
+          (load file nil t)
+          (write-region "(defconst cc-butler-test-registry-reload-const '((\"a\" . 1) (\"b\" . 2)))\n"
+                        nil file)
+          (load file nil t)
+          (should (equal (mapcar #'car cc-butler-test-registry-reload-const) '("a" "b"))))
+      (makunbound 'cc-butler-test-registry-reload-const)
+      (delete-directory dir t))))
+
+(ert-deftest cc-butler-self-check/run-covers-every-registered-check ()
+  "Every name in the registry must actually appear in `cc-butler-self-check-run's
+result -- a check function can exist and be correct in isolation while never
+being reachable through the dispatcher if it was never added to the alist (or,
+2026-09-10 live: was added to the alist in SOURCE but the reload never applied
+it to the already-bound symbol -- see the defconst fix above). The existing
+per-check tests only ever call each check FUNCTION directly and would not have
+caught either failure mode."
+  (let ((names (mapcar #'car (cc-butler-self-check-run))))
+    (dolist (c cc-butler-self-check--checks)
+      (should (member (car c) names)))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Check 1: MCP port
 ;;;; ------------------------------------------------------------------
 
@@ -165,12 +221,19 @@ so `fboundp' is normally true here."
 
 (ert-deftest cc-butler-self-check/persisted-vs-live-fails-on-live-patch ()
   "A tracked variable that was `setq''d/`let'-bound live (not through
-Customize) reads as `changed', not `saved'/`standard' -- must fail."
+Customize), reads as `changed', genuinely differs from its code-default,
+AND is labeled a likely stuck reload must fail."
   (let ((cc-butler-self-check-tracked-variables '(cc-butler-north-star-file))
         (cc-butler-north-star-file "/tmp/live-patched-value.org"))
-    (let ((r (cc-butler-self-check--persisted-vs-live)))
-      (should-not (plist-get r :ok))
-      (should (string-match-p "cc-butler-north-star-file" (plist-get r :detail))))))
+    (cl-letf (((symbol-function 'cc-butler--defcustom-drift-all)
+               (lambda (&optional _dir)
+                 (list (list 'cc-butler-north-star-file "/tmp/live-patched-value.org" "/tmp/code-default.org"))))
+              ((symbol-function 'cc-butler--defcustom-file-for-symbol) (lambda (&rest _) "/fake/file.el"))
+              ((symbol-function 'cc-butler--defcustom-drift-label)
+               (lambda (&rest _) "(likely stuck reload) this value matches a past shipped default")))
+      (let ((r (cc-butler-self-check--persisted-vs-live)))
+        (should-not (plist-get r :ok))
+        (should (string-match-p "cc-butler-north-star-file" (plist-get r :detail)))))))
 
 (ert-deftest cc-butler-self-check/persisted-vs-live-passes-when-saved ()
   "A tracked variable whose Customize state is `saved' (or `standard') must
@@ -199,9 +262,10 @@ must NOT be flagged."
       (makunbound 'cc-butler-test-check5-matching))))
 
 (ert-deftest cc-butler-self-check/persisted-vs-live-still-flags-unsaved-when-differing-from-code-default ()
-  "The real-risk case must still fail: unsaved AND the live value differs
-from the code-default (present in `cc-butler--defcustom-drift-all') -- a
-restart would silently revert this to something wrong."
+  "The real-risk case must still fail: unsaved, the live value differs from
+the code-default (present in `cc-butler--defcustom-drift-all'), AND the
+drift is labeled a likely stuck reload -- a restart would silently revert
+this to something wrong."
   (let ((cc-butler-self-check-tracked-variables '(cc-butler-test-check5-differing)))
     (defvar cc-butler-test-check5-differing)
     (setq cc-butler-test-check5-differing 5)
@@ -209,11 +273,39 @@ restart would silently revert this to something wrong."
         (cl-letf (((symbol-function 'custom-variable-state) (lambda (&rest _) 'changed))
                   ((symbol-function 'cc-butler--defcustom-drift-all)
                    (lambda (&optional _dir) (list (list 'cc-butler-test-check5-differing 5 8))))
-                  ((symbol-function 'cc-butler--defcustom-symbols-all) (lambda (&optional _dir) nil)))
+                  ((symbol-function 'cc-butler--defcustom-symbols-all) (lambda (&optional _dir) nil))
+                  ((symbol-function 'cc-butler--defcustom-file-for-symbol) (lambda (&rest _) "/fake/file.el"))
+                  ((symbol-function 'cc-butler--defcustom-drift-label)
+                   (lambda (&rest _) "(likely stuck reload) this value matches a past shipped default")))
           (let ((r (cc-butler-self-check--persisted-vs-live)))
             (should-not (plist-get r :ok))
             (should (string-match-p "cc-butler-test-check5-differing" (plist-get r :detail)))))
       (makunbound 'cc-butler-test-check5-differing))))
+
+(ert-deftest cc-butler-self-check/persisted-vs-live-does-not-flag-deliberate-customization ()
+  "REGRESSION GUARD (2026-09-10, live): after check 5's population widened
+(PR #225), it flagged 8 symbols, 7 of which were legitimate live
+customizations -- never saved to custom.el, but deliberately differing
+from the code-default -- pure noise. A symbol that is unsaved AND
+genuinely differs from its code-default (present in
+`cc-butler--defcustom-drift-all') but whose
+`cc-butler--defcustom-drift-label' comes back \"(likely deliberate
+customization)\", not \"(likely stuck reload)\", must NOT be flagged --
+exactly the case that was wrongly flagging 7 of 8 symbols live."
+  (let ((cc-butler-self-check-tracked-variables '(cc-butler-test-check5-deliberate)))
+    (defvar cc-butler-test-check5-deliberate)
+    (setq cc-butler-test-check5-deliberate 999)
+    (unwind-protect
+        (cl-letf (((symbol-function 'custom-variable-state) (lambda (&rest _) 'changed))
+                  ((symbol-function 'cc-butler--defcustom-drift-all)
+                   (lambda (&optional _dir) (list (list 'cc-butler-test-check5-deliberate 999 8))))
+                  ((symbol-function 'cc-butler--defcustom-symbols-all) (lambda (&optional _dir) nil))
+                  ((symbol-function 'cc-butler--defcustom-file-for-symbol) (lambda (&rest _) "/fake/file.el"))
+                  ((symbol-function 'cc-butler--defcustom-drift-label)
+                   (lambda (&rest _) "(likely deliberate customization) this value never appears in this line's git history")))
+          (let ((r (cc-butler-self-check--persisted-vs-live)))
+            (should (plist-get r :ok))))
+      (makunbound 'cc-butler-test-check5-deliberate))))
 
 (ert-deftest cc-butler-self-check/persisted-vs-live-population-includes-auto-scanned-symbol ()
   "The auto-scanned population must genuinely widen coverage beyond
@@ -234,6 +326,20 @@ returned only by `cc-butler--defcustom-symbols-all', absent from the
           (cc-butler-self-check--persisted-vs-live)
           (should (memq 'cc-butler-test-check5-autoscanned checked)))
       (makunbound 'cc-butler-test-check5-autoscanned))))
+
+(ert-deftest cc-butler-self-check/tracked-variables-default-includes-external-mcp-port ()
+  "REGRESSION GUARD (2026-09-10, live): PR #225 dropped the default to nil,
+reasoning `cc-butler-north-star-file' was redundant with the auto-scan
+\(`cc-butler--defcustom-symbols-all') -- true for that symbol, but wrong to
+also drop `claude-code-ide-mcp-server-port': it belongs to a third-party
+package, not to cc-butler.el or any module in `cc-butler--modules', so the
+auto-scan structurally cannot ever see it (confirmed live:
+`(memq 'claude-code-ide-mcp-server-port (cc-butler--defcustom-symbols-all))'
+is nil). Compares against the defcustom's own `standard-value' rather than
+hardcoding a literal default, matching `cc-butler-ops-log-dir's own
+default-value test (tests/cc-butler-session-test.el)."
+  (should (equal (eval (car (get 'cc-butler-self-check-tracked-variables 'standard-value)) t)
+                 '(claude-code-ide-mcp-server-port))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Check 6: vault path
