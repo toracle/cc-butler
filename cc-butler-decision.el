@@ -900,12 +900,16 @@ delivery) -- the regex below matches either indentation.
 This function must be accurate in BOTH directions -- it is not
 acceptable to lean either way. A false \"not sent\" (미발신) does not
 harmlessly prompt a resend-and-check: a genuinely-delivered file
-carries the line \"⚠ 이제 «답 대기»다. 재게시 금지 -- 다시 올리면 그분은
-같은 것을 두 번 읽으신다.\" (now awaiting reply; do NOT re-post -- reposting
-means he reads the same thing twice), so misreading it as 미발신 invites
-exactly the forbidden re-send. And a false \"awaiting reply\" (답변대기)
-is just as bad in the other direction: a real not-sent item hides
-silently in a bucket nobody re-checks.
+carries a line shaped like \"⚠ 이제 «답 대기»다. 재게시 금지 -- EXAMPLE
+합성 사유, 실물 아님.\" (a real do-not-repost warning; the specific
+reasoning clause is kept synthetic on purpose -- 2026-09-10 fix, see
+`cc-butler-fixture-hygiene-test.el': it is a standing procedural line
+about how a delivered decision must be handled, not tied to any one
+incident, but still not this public repo's content to publish), so
+misreading it as 미발신 invites exactly the forbidden re-send. And a
+false \"awaiting reply\" (답변대기) is just as bad in the other
+direction: a real not-sent item hides silently in a bucket nobody
+re-checks.
 
 Over-counting into 미발신 is NOT harmless -- it triggers a re-send, and
 the human pays the cost (reading the same thing twice). So this
