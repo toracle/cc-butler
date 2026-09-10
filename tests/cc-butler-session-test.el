@@ -2450,5 +2450,45 @@ deleted to compensate, silently working around the epoch guarantee."
     (should (file-exists-p a))
     (should (file-exists-p b))))
 
+;;;; ---- set_session_info fleet_status (design-fleet-utilization-2026-09-08 §2/§9) ----
+
+(ert-deftest cc-butler-session/set-session-info-accepts-valid-fleet-status ()
+  "Each of the 6 vocabulary values is accepted and stored under its own
+:fleet-status key, separate from the free-text :status (design §2 -- the
+same \"different facts, different columns\" principle already applied to
+:status vs :osc)."
+  (dolist (v cc-butler-fleet-status-values)
+    (let ((cc-butler--meta (make-hash-table :test 'equal)))
+      (cl-letf (((symbol-function 'claude-code-ide-mcp-server-get-session-context)
+                 (lambda () (list :project-dir "/fake/dir/")))
+                ((symbol-function 'cc-butler--maybe-refresh) (lambda ())))
+        (cc-butler-tool-set-session-info nil nil v)
+        (should (equal v (plist-get (cc-butler--meta-get "/fake/dir/") :fleet-status)))
+        ;; storing fleet_status must not clobber the existing free-text :status
+        (should (null (plist-get (cc-butler--meta-get "/fake/dir/") :status)))))))
+
+(ert-deftest cc-butler-session/set-session-info-rejects-invalid-fleet-status ()
+  "An unvalidated free-text value must not be silently accepted into the
+validated :fleet-status column -- it belongs in the existing free-text
+:status field instead."
+  (let ((cc-butler--meta (make-hash-table :test 'equal)))
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-server-get-session-context)
+               (lambda () (list :project-dir "/fake/dir/")))
+              ((symbol-function 'cc-butler--maybe-refresh) (lambda ())))
+      (should-error (cc-butler-tool-set-session-info nil nil "낮잠 자는 중") :type 'user-error)
+      (should (null (cc-butler--meta-get "/fake/dir/"))))))
+
+(ert-deftest cc-butler-session/set-session-info-fleet-status-optional ()
+  "Omitting fleet_status must leave any previously-set value unchanged --
+same \"omit to leave unchanged\" contract as title/status."
+  (let ((cc-butler--meta (make-hash-table :test 'equal)))
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-server-get-session-context)
+               (lambda () (list :project-dir "/fake/dir/")))
+              ((symbol-function 'cc-butler--maybe-refresh) (lambda ())))
+      (cc-butler-tool-set-session-info nil nil "배차 대기")
+      (cc-butler-tool-set-session-info "new title" nil nil)
+      (should (equal "배차 대기" (plist-get (cc-butler--meta-get "/fake/dir/") :fleet-status)))
+      (should (equal "new title" (plist-get (cc-butler--meta-get "/fake/dir/") :title))))))
+
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here

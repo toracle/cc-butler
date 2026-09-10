@@ -53,6 +53,7 @@
 (require 'cc-butler-cleanup)
 (require 'cc-butler-compact)
 (require 'cc-butler-north-star)
+(require 'cc-butler-fleet-report)
 (require 'cc-butler-self-check)
 
 (require 'hydra)

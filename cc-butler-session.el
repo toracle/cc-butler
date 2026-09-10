@@ -2446,8 +2446,25 @@ Emacs' default click behavior in this buffer, and was the whole problem."
 ;;;; MCP tool: let Claude set its own title / status
 ;;;; ------------------------------------------------------------------
 
-(defun cc-butler-tool-set-session-info (&optional title status)
-  "MCP tool: let the calling Claude session set its own TITLE/STATUS."
+(defconst cc-butler-fleet-status-values
+  '("도는 중" "사람 대기" "사건 대기" "배차 대기" "목표 소진" "오프라인")
+  "Valid values for a session's self-reported fleet-status (the
+`fleet_status' arg of `set_session_info'; design-fleet-utilization-2026-09-08
+§2). Kept as a THIRD, separately-validated column in `cc-butler--meta',
+distinct from the free-text `:status' and the harness-pushed `:osc' --
+`cc-butler-tool-list-sessions' already documents why those two must stay
+separate facts; this is the same principle extended to a validated
+enum. \"목표 소진\" in particular is a self-report-only value (§0-5/§2 of
+the design, added after a real mis-inference cost three false end-of-work
+reports) -- nothing here infers it from other fields, so that constraint
+holds by construction, not by a check.")
+
+(defun cc-butler-tool-set-session-info (&optional title status fleet-status)
+  "MCP tool: let the calling Claude session set its own TITLE/STATUS/FLEET-STATUS."
+  (when (and fleet-status (stringp fleet-status)
+             (not (member fleet-status cc-butler-fleet-status-values)))
+    (user-error "cc-butler: fleet_status must be one of: %s"
+                (string-join cc-butler-fleet-status-values ", ")))
   (let* ((ctx (claude-code-ide-mcp-server-get-session-context))
          (dir (plist-get ctx :project-dir)))
     (unless dir
@@ -2456,12 +2473,15 @@ Emacs' default click behavior in this buffer, and was the whole problem."
            (append (when (and title (stringp title) (not (string-empty-p title)))
                      (list :title title))
                    (when (and status (stringp status))
-                     (list :status status))))
+                     (list :status status))
+                   (when (and fleet-status (stringp fleet-status))
+                     (list :fleet-status fleet-status))))
     (cc-butler--maybe-refresh)
-    (format "Updated session '%s': title=%s status=%s"
+    (format "Updated session '%s': title=%s status=%s fleet_status=%s"
             (cc-butler--display-name dir)
             (or title "(unchanged)")
-            (or status "(unchanged)"))))
+            (or status "(unchanged)")
+            (or fleet-status "(unchanged)"))))
 
 ;; Make (re)loading idempotent: drop any previously-registered tool of the
 ;; same name before registering, so reloads don't accumulate duplicates.
@@ -2483,6 +2503,10 @@ Emacs' default click behavior in this buffer, and was the whole problem."
          (:name "status"
                 :type string
                 :description "Concise current status / subtitle. Optional; omit to leave unchanged."
+                :optional t)
+         (:name "fleet_status"
+                :type string
+                :description "Self-reported fleet-status for the daily fleet-utilization report -- one of: 도는 중, 사람 대기, 사건 대기, 배차 대기, 목표 소진, 오프라인. Optional; omit to leave unchanged. 목표 소진 is self-report-only: only set it when YOU are explicitly declaring your assigned work exhausted with no next instruction -- never infer it for yourself from being parked with an unclear resume condition."
                 :optional t)))
 
 (provide 'cc-butler-session)
