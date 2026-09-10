@@ -50,6 +50,11 @@
 (require 'cc-butler-governance)
 (require 'cc-butler-docs)
 (require 'cc-butler-north-star)
+(require 'cc-butler-mail)
+;; No cycle: `cc-butler-decision' requires only `cc-butler-mail' / `org' /
+;; `subr-x', none of which requires this file back — safe to reuse its
+;; `cc-butler--decision-format-age' below instead of writing a duplicate.
+(require 'cc-butler-decision)
 
 ;; `cc-butler-source-dir' lives in cc-butler.el, which requires THIS file --
 ;; the reference is forward at compile time and resolved at run time, the
@@ -484,6 +489,122 @@ must not page anyone."
                             (length drift))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; Check 8: orphaned inboxes -- unread mail nobody will ever read
+;;;; ------------------------------------------------------------------
+;;
+;; Found live: a directory named `___' held unread mail, an artifact of a
+;; display-name regex bug (fixed in PR #183, commits 9d3a79a/7884dbe) that
+;; collapsed any non-ASCII display name to that literal placeholder.
+;; Current code can never regenerate that slug again, so that inbox is now
+;; structurally unreachable forever -- and separately, a currently-not-live
+;; agent's inbox can also hold undelivered mail.  Nothing before this check
+;; ever enumerated inbox directories against the live-session set, so both
+;; cases were silent.
+
+(defcustom cc-butler-self-check-orphan-inbox-age-threshold (* 7 24 60 60)
+  "Seconds an inbox's oldest unread message must sit before check 8
+\(`cc-butler-self-check--orphaned-inboxes') flags its directory as an
+orphan candidate.  Only applies to a slug with NO currently live
+session -- liveness gates the whole check first, so a busy worker's
+backlog is never touched here regardless of this value.
+
+Deliberately generous (7 days), not a tight window: a worker that
+merely restarted minutes or hours ago is not evidence of anything
+wrong, and a short threshold would flag that routine gap the same as
+genuinely orphaned mail -- e.g. the `___' inbox this check exists to
+catch, unreachable since PR #183's display-name regex fix."
+  :type 'integer
+  :group 'cc-butler)
+
+(defun cc-butler-self-check--live-inbox-slugs ()
+  "Return the set of maildir slugs every currently live session maps to
+\(a hash-table, for O(1) membership tests), via `cc-butler--sessions' --
+the fleet's existing liveness roster -- and the same
+`cc-butler--mail-slug' + `cc-butler--display-name' derivation the mail
+delivery path itself uses for a session's `:dir'."
+  (let ((table (make-hash-table :test 'equal)))
+    (dolist (s (cc-butler--sessions))
+      (puthash (cc-butler--mail-slug (cc-butler--display-name (plist-get s :dir)))
+                t table))
+    table))
+
+(defun cc-butler-self-check--inbox-dirs ()
+  "Return the basenames of every immediate subdirectory of
+`cc-butler-mail-dir' that could be a per-agent inbox -- i.e. every
+subdirectory except the channel journal directory (`cc-butler--mail-log-dir',
+never a guessed literal).  Nil when `cc-butler-mail-dir' does not exist."
+  (let ((root (file-name-as-directory (expand-file-name cc-butler-mail-dir))))
+    (when (file-directory-p root)
+      (let ((log-name (file-name-nondirectory
+                        (directory-file-name (cc-butler--mail-log-dir)))))
+        (seq-filter
+         (lambda (name)
+           (and (not (equal name log-name))
+                (file-directory-p (expand-file-name name root))))
+         (ignore-errors (directory-files root nil "\\`[^.]")))))))
+
+(defun cc-butler-self-check--inbox-new-files (slug)
+  "Return the list of message files directly under
+<`cc-butler-mail-dir'>/SLUG/new/, or nil when that directory does not
+exist or holds none."
+  (let ((newdir (expand-file-name (concat slug "/new/")
+                                  (file-name-as-directory
+                                   (expand-file-name cc-butler-mail-dir)))))
+    (and (file-directory-p newdir)
+         (seq-filter #'file-regular-p
+                     (ignore-errors (directory-files newdir t "\\`[^.]"))))))
+
+(defun cc-butler-self-check--inbox-oldest-age (files)
+  "Return the age in seconds of the oldest of FILES (by modification
+time), or nil for empty FILES.  Reads only file metadata -- never
+message content (sender/body) -- matching this codebase's convention
+that check/report output must never surface private runtime content
+\(same reasoning as the `--'-prefixed-symbol exclusion in
+`cc-butler--defcustom-drift-internal-p')."
+  (when files
+    (let (oldest)
+      (dolist (f files)
+        (let ((mtime (file-attribute-modification-time (file-attributes f))))
+          (when (or (null oldest) (time-less-p mtime oldest))
+            (setq oldest mtime))))
+      (float-time (time-subtract (current-time) oldest)))))
+
+(defun cc-butler-self-check--orphaned-inboxes ()
+  "Check 8: an inbox directory under `cc-butler-mail-dir' whose slug maps
+to no currently live session, AND whose oldest unread message in new/
+has sat for at least `cc-butler-self-check-orphan-inbox-age-threshold'
+seconds, is orphaned -- unread mail nobody will ever read.  Read-only:
+never deletes, moves, or marks a message read.
+
+Two false-positive guards, both load-bearing (see this check's own
+design brief):
+ - liveness gates the WHOLE check -- a currently live agent's own
+   unread backlog is never flagged, no matter how old (busy, not
+   orphaned);
+ - a not-live slug whose oldest unread message is still under the
+   threshold is not flagged either (a worker that merely restarted
+   minutes/hours ago is not evidence of anything wrong)."
+  (let ((live (cc-butler-self-check--live-inbox-slugs))
+        candidates)
+    (dolist (slug (cc-butler-self-check--inbox-dirs))
+      (unless (gethash slug live)
+        (let* ((files (cc-butler-self-check--inbox-new-files slug))
+               (age (cc-butler-self-check--inbox-oldest-age files)))
+          (when (and age (>= age cc-butler-self-check-orphan-inbox-age-threshold))
+            (push (list slug (length files) age) candidates)))))
+    (setq candidates (nreverse candidates))
+    (if candidates
+        (list :ok nil
+              :detail (format "orphaned inboxes: %s"
+                              (mapconcat
+                               (lambda (c)
+                                 (format "%s (%d pending, oldest %s)"
+                                         (nth 0 c) (nth 1 c)
+                                         (cc-butler--decision-format-age (nth 2 c))))
+                               candidates "; ")))
+      (list :ok t :detail "orphaned inboxes: none"))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Registry
 ;;;; ------------------------------------------------------------------
 
@@ -494,7 +615,8 @@ must not page anyone."
     ("module-load-path" . cc-butler-self-check--module-load-path)
     ("persisted-vs-live" . cc-butler-self-check--persisted-vs-live)
     ("vault-path" . cc-butler-self-check--vault-path)
-    ("code-vs-live-defcustom" . cc-butler-self-check--code-vs-live-defcustom))
+    ("code-vs-live-defcustom" . cc-butler-self-check--code-vs-live-defcustom)
+    ("orphaned-inboxes" . cc-butler-self-check--orphaned-inboxes))
   "Alist of (NAME . FUNCTION).  FUNCTION takes no args, returns a plist
 \(:ok BOOL :detail STRING).  Extensible -- new checks are just new entries,
 so this does not stay a fixed list of six forever.
@@ -631,7 +753,7 @@ just silent."
   (claude-code-ide-make-tool
    :function #'cc-butler-tool-self-check
    :name "self_check"
-   :description "Pull the full state of cc-butler's periodic consistency self-check (existence -> consistency), on demand, from any fleet session. Seven checks: MCP bound port vs. each live session's actual connection port; governance memory write-path vs. read-path; the North Star file's existence + location inside the current governance store; the running module code's ancestry vs. origin/main (deliberately partial -- pending a separate stable-install-path decision); tracked customizable variables' persisted-vs-live state (would this survive a restart); WARMBLE_JUMBLE_PATH vs. the governance store (a cross-tool vault-drift canary); and code-vs-live defcustom drift (is a live value already stuck on a superseded code default RIGHT NOW, restart or not). Returns EVERY check's state, ok and failing both -- a clean run is positively confirmable, not just silent."
+   :description "Pull the full state of cc-butler's periodic consistency self-check (existence -> consistency), on demand, from any fleet session. Eight checks: MCP bound port vs. each live session's actual connection port; governance memory write-path vs. read-path; the North Star file's existence + location inside the current governance store; the running module code's ancestry vs. origin/main (deliberately partial -- pending a separate stable-install-path decision); tracked customizable variables' persisted-vs-live state (would this survive a restart); WARMBLE_JUMBLE_PATH vs. the governance store (a cross-tool vault-drift canary); code-vs-live defcustom drift (is a live value already stuck on a superseded code default RIGHT NOW, restart or not); and orphaned mail inboxes (a not-live agent's inbox with old unread mail nobody will ever read). Returns EVERY check's state, ok and failing both -- a clean run is positively confirmable, not just silent."
    :args nil))
 
 (provide 'cc-butler-self-check)
