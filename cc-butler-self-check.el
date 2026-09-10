@@ -56,6 +56,10 @@
 ;; same pattern `cc-butler-session.el' already uses for
 ;; `cc-butler--source-diagnostics'.
 (declare-function cc-butler-source-dir "cc-butler" ())
+(declare-function cc-butler--defcustom-drift-all "cc-butler" (&optional dir))
+(declare-function cc-butler--defcustom-symbols-all "cc-butler" (&optional dir))
+(declare-function cc-butler--defcustom-file-for-symbol "cc-butler" (dir symbol))
+(declare-function cc-butler--defcustom-drift-label "cc-butler" (file symbol live-value code-default))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Check 1: MCP port -- bound port == every live session's actual port
@@ -252,29 +256,48 @@ tonight's exact mistake one level up."
 ;;;; Check 5: persisted vs. live -- would this survive a restart?
 ;;;; ------------------------------------------------------------------
 
-(defcustom cc-butler-self-check-tracked-variables
-  '(cc-butler-north-star-file claude-code-ide-mcp-server-port)
-  "Customizable variables periodically checked for persisted-vs-live drift
-by check 5 (`cc-butler-self-check--persisted-vs-live').  A value only
-`setq''d live (not through `customize-set-variable'/`customize-save-variable')
-survives until the next restart and then reverts silently -- exactly what
-bit three variables at once on 2026-08-14.  Extensible the same way the
-check registry is."
+(defcustom cc-butler-self-check-tracked-variables nil
+  "EXTRA variables checked for persisted-vs-live drift by check 5
+\(`cc-butler-self-check--persisted-vs-live'), beyond the automatic scan
+\(`cc-butler--defcustom-symbols-all').  The automatic scan is now the
+PRIMARY population -- it reads every defcustom/defvar across cc-butler.el
+and `cc-butler--modules' from source text, so it cannot silently narrow as
+the codebase grows the way a hand-maintained list did: on 2026-09-10 this
+list tracked 2 of ~8 variables that actually mattered that day, the exact
+\"hand-maintained population silently narrows\" failure this closes.
+
+Only useful now for a symbol the scan genuinely cannot see -- e.g. one
+defined inside a macro the read-don't-eval reader does not expand."
   :type '(repeat symbol)
   :group 'cc-butler)
 
 (defun cc-butler-self-check--persisted-vs-live ()
   "Check 5: every tracked variable's `custom-variable-state' is `saved' or
-`standard' -- i.e. would still hold this value after an Emacs restart.
-`set'/`changed'/`themed'/`rogue' all mean a live-patched value a restart
-silently discards -- per 2026-08-14 framing, the more load-bearing question
-(\"is this correct AFTER a restart\"), distinct from \"is this correct
-right now\"."
-  (let (bad)
-    (dolist (sym cc-butler-self-check-tracked-variables)
+`standard' -- i.e. would still hold this value after an Emacs restart --
+UNLESS its live value already equals the current code-default, in which
+case a restart gives back that exact same value anyway and there is
+nothing to lose (2026-09-10: steward set `cc-butler-launch-ready-timeout'
+live to 8 with `saved-value' nil, deliberately -- that must read as OK,
+not bad).  Only flag a symbol whose state is unsaved AND whose value also
+appears in `cc-butler--defcustom-drift-all' (i.e. genuinely differs from
+the code-default) -- a real risk of reverting to something wrong.
+
+Distinct from check 7 (`cc-butler-self-check--code-vs-live-defcustom'):
+that one asks whether the value running RIGHT NOW already matches what
+the code says, restart or not; this one asks only whether it would
+SURVIVE a restart.
+
+Population is the automatic scan (`cc-butler--defcustom-symbols-all')
+plus `cc-butler-self-check-tracked-variables' (now an EXTRA list -- see
+its docstring)."
+  (let ((drifted (mapcar #'car (cc-butler--defcustom-drift-all)))
+        bad)
+    (dolist (sym (delete-dups (append (cc-butler--defcustom-symbols-all)
+                                       cc-butler-self-check-tracked-variables)))
       (when (boundp sym)
         (let ((state (custom-variable-state sym (symbol-value sym))))
-          (unless (memq state '(saved standard))
+          (when (and (not (memq state '(saved standard)))
+                     (memq sym drifted))
             (push (cons sym state) bad)))))
     (setq bad (nreverse bad))
     (if bad
@@ -284,8 +307,7 @@ right now\"."
                                (lambda (b) (format "%s is `%s' (not saved/standard)" (car b) (cdr b)))
                                bad "; ")))
       (list :ok t
-            :detail (format "persisted vs live: all %d tracked variable(s) are saved/standard"
-                            (length cc-butler-self-check-tracked-variables))))))
+            :detail "persisted vs live: no tracked variable is both unsaved and differing from its code-default"))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Check 6: vault path -- WARMBLE_JUMBLE_PATH vs. the governance store
@@ -316,6 +338,51 @@ Reports only -- never edits `~/.zshrc' or any other shell config."
                             env-abs store))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; Check 7: code vs. live defcustom -- is this already wrong RIGHT NOW?
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-self-check--code-vs-live-defcustom ()
+  "Check 7: any defcustom/defvar whose LIVE value matches a value the code
+used to ship as its default, before a later commit changed the default --
+the \"stuck reload\" shape (2026-09-05: `cc-butler-launch-ready-timeout'
+raised 5->8 in source, stayed live at 5 through a reload, and sat that
+way for 5 days because nothing periodic ever asked).  Distinct from check
+5 (persisted-vs-live): that one asks whether a live value SURVIVES a
+restart; this one asks whether the value running RIGHT NOW already
+matches what the code currently says it should be, restart or not.
+
+Reuses `cc-butler--defcustom-drift-all' (the exact enumeration
+`cc-butler-reload' itself reports) and `cc-butler--defcustom-drift-label'
+(the exact stuck-vs-deliberate classifier) rather than reimplementing
+either.
+
+Only a \"(likely stuck reload)\" label fails this check -- a \"(likely
+deliberate customization)\" label, or unlabelable drift (no git history
+to match against -- e.g. a default that has never changed, like
+`cc-butler-decision-workflow', 2026-09-10), is ordinary customization and
+must not page anyone."
+  (let* ((dir (cc-butler-source-dir))
+         (drift (cc-butler--defcustom-drift-all dir))
+         stuck)
+    (dolist (triple drift)
+      (let* ((sym (nth 0 triple)) (live (nth 1 triple)) (code-default (nth 2 triple))
+             (file (cc-butler--defcustom-file-for-symbol dir sym))
+             (label (and file (cc-butler--defcustom-drift-label file sym live code-default))))
+        (when (and label (string-match-p "\\`(likely stuck reload)" label))
+          (push (list sym live code-default label) stuck))))
+    (setq stuck (nreverse stuck))
+    (if stuck
+        (list :ok nil
+              :detail (format "code-vs-live defcustom: %s"
+                              (mapconcat
+                               (lambda (s) (format "%s live=%S code-default=%S %s"
+                                                    (nth 0 s) (nth 1 s) (nth 2 s) (nth 3 s)))
+                               stuck "; ")))
+      (list :ok t
+            :detail (format "code-vs-live defcustom: %d drifted symbol(s) checked, none labeled stuck reload"
+                            (length drift))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Registry
 ;;;; ------------------------------------------------------------------
 
@@ -325,7 +392,8 @@ Reports only -- never edits `~/.zshrc' or any other shell config."
     ("north-star-file" . cc-butler-self-check--north-star-file)
     ("module-load-path" . cc-butler-self-check--module-load-path)
     ("persisted-vs-live" . cc-butler-self-check--persisted-vs-live)
-    ("vault-path" . cc-butler-self-check--vault-path))
+    ("vault-path" . cc-butler-self-check--vault-path)
+    ("code-vs-live-defcustom" . cc-butler-self-check--code-vs-live-defcustom))
   "Alist of (NAME . FUNCTION).  FUNCTION takes no args, returns a plist
 \(:ok BOOL :detail STRING).  Extensible -- new checks are just new entries,
 so this does not stay a fixed list of six forever.")
@@ -451,7 +519,7 @@ just silent."
   (claude-code-ide-make-tool
    :function #'cc-butler-tool-self-check
    :name "self_check"
-   :description "Pull the full state of cc-butler's periodic consistency self-check (existence -> consistency), on demand, from any fleet session. Six checks: MCP bound port vs. each live session's actual connection port; governance memory write-path vs. read-path; the North Star file's existence + location inside the current governance store; the running module code's ancestry vs. origin/main (deliberately partial -- pending a separate stable-install-path decision); tracked customizable variables' persisted-vs-live state (would this survive a restart); and WARMBLE_JUMBLE_PATH vs. the governance store (a cross-tool vault-drift canary). Returns EVERY check's state, ok and failing both -- a clean run is positively confirmable, not just silent."
+   :description "Pull the full state of cc-butler's periodic consistency self-check (existence -> consistency), on demand, from any fleet session. Seven checks: MCP bound port vs. each live session's actual connection port; governance memory write-path vs. read-path; the North Star file's existence + location inside the current governance store; the running module code's ancestry vs. origin/main (deliberately partial -- pending a separate stable-install-path decision); tracked customizable variables' persisted-vs-live state (would this survive a restart); WARMBLE_JUMBLE_PATH vs. the governance store (a cross-tool vault-drift canary); and code-vs-live defcustom drift (is a live value already stuck on a superseded code default RIGHT NOW, restart or not). Returns EVERY check's state, ok and failing both -- a clean run is positively confirmable, not just silent."
    :args nil))
 
 (provide 'cc-butler-self-check)
