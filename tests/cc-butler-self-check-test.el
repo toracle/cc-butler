@@ -13,6 +13,62 @@
 (require 'cc-butler-reload-test)
 
 ;;;; ------------------------------------------------------------------
+;;;; Registry reload mechanism (defvar vs defconst)
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-self-check/registry-defvar-does-not-resync-on-reload ()
+  "SYNTHETIC, mechanism-only -- not tied to the real
+`cc-butler-self-check--checks' symbol.  `defvar' with a value only sets the
+symbol IF IT IS CURRENTLY UNBOUND, so reloading the SAME file path with a
+changed value leaves an already-bound `defvar' stuck at the OLD value.
+This is the general Elisp gap that let check 7 (added by PR #225) exist in
+source but never actually run on a fleet that had already loaded the older
+6-entry `cc-butler-self-check--checks' alist before #225 merged."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-check-registry-reload" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defvar cc-butler-test-registry-reload '((\"a\" . 1)))\n")))
+    (unwind-protect
+        (progn
+          (load file nil t)
+          (write-region "(defvar cc-butler-test-registry-reload '((\"a\" . 1) (\"b\" . 2)))\n"
+                        nil file)
+          (load file nil t)
+          (should (equal (mapcar #'car cc-butler-test-registry-reload) '("a"))))
+      (makunbound 'cc-butler-test-registry-reload)
+      (delete-directory dir t))))
+
+(ert-deftest cc-butler-self-check/registry-defconst-resyncs-on-reload ()
+  "Mirror image, `defconst': unconditionally reassigns on every top-level
+evaluation regardless of prior binding, so the same overwrite-and-reload
+DOES pick up the new entry.  No code change is under test here -- this
+just documents/locks in the mechanism the `defconst' fix to
+`cc-butler-self-check--checks' (below) relies on."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-check-registry-reload" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defconst cc-butler-test-registry-reload-const '((\"a\" . 1)))\n")))
+    (unwind-protect
+        (progn
+          (load file nil t)
+          (write-region "(defconst cc-butler-test-registry-reload-const '((\"a\" . 1) (\"b\" . 2)))\n"
+                        nil file)
+          (load file nil t)
+          (should (equal (mapcar #'car cc-butler-test-registry-reload-const) '("a" "b"))))
+      (makunbound 'cc-butler-test-registry-reload-const)
+      (delete-directory dir t))))
+
+(ert-deftest cc-butler-self-check/run-covers-every-registered-check ()
+  "Every name in the registry must actually appear in `cc-butler-self-check-run's
+result -- a check function can exist and be correct in isolation while never
+being reachable through the dispatcher if it was never added to the alist (or,
+2026-09-10 live: was added to the alist in SOURCE but the reload never applied
+it to the already-bound symbol -- see the defconst fix above). The existing
+per-check tests only ever call each check FUNCTION directly and would not have
+caught either failure mode."
+  (let ((names (mapcar #'car (cc-butler-self-check-run))))
+    (dolist (c cc-butler-self-check--checks)
+      (should (member (car c) names)))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Check 1: MCP port
 ;;;; ------------------------------------------------------------------
 

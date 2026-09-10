@@ -386,7 +386,7 @@ must not page anyone."
 ;;;; Registry
 ;;;; ------------------------------------------------------------------
 
-(defvar cc-butler-self-check--checks
+(defconst cc-butler-self-check--checks
   '(("mcp-port" . cc-butler-self-check--mcp-port)
     ("governance-memory-dir" . cc-butler-self-check--governance-memory-dir)
     ("north-star-file" . cc-butler-self-check--north-star-file)
@@ -396,7 +396,18 @@ must not page anyone."
     ("code-vs-live-defcustom" . cc-butler-self-check--code-vs-live-defcustom))
   "Alist of (NAME . FUNCTION).  FUNCTION takes no args, returns a plist
 \(:ok BOOL :detail STRING).  Extensible -- new checks are just new entries,
-so this does not stay a fixed list of six forever.")
+so this does not stay a fixed list of six forever.
+
+A `defconst' on purpose, not a `defvar' (2026-09-10 live: it was a `defvar'
+when PR #225 added the 7th entry, and `cc-butler-reload' left an
+already-running daemon stuck on the OLD 6-entry alist -- `defvar' with a
+value only sets the symbol IF IT IS CURRENTLY UNBOUND, it never overwrites
+an already-bound one, so check 7's function was defined but never actually
+dispatched). This is a pure code-owned dispatch table, not a genuine
+customization point nobody is meant to `setq' or Customize away from
+source, so `defconst''s unconditional reassignment on every reload is
+exactly right here, with nothing to lose -- same precedent as
+`cc-butler--modules' in cc-butler.el.")
 
 (defun cc-butler-self-check-run ()
   "Run every registered check.  Return an alist of (NAME . PLIST)."
