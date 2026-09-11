@@ -789,15 +789,17 @@ cross-test-file `require' for one macro)."
        (delete-directory cc-butler-decision-dir t))))
 
 (defun cc-butler-self-check-test--seed-open-decision
-    (id-suffix &optional event-id room delivered-room delivered-thread)
+    (id-suffix &optional event-id room delivered-room delivered-thread held-until)
   "Write a `Kind: decision' open/ file, optionally with
-`:Delivered-to-matrix:'/`:Room:'/`:Delivered-room:'/`:Delivered-thread:'
-properties."
+`:Delivered-to-matrix:'/`:Room:'/`:Delivered-room:'/`:Delivered-thread:'/
+`:Delivery-held-until:' properties.  HELD-UNTIL is inserted verbatim
+\(raw property value\), so a caller can pass a malformed one on purpose."
   (with-temp-file (expand-file-name
                     (format "%s-991-%s.org" (format-time-string "%Y%m%dT%H%M%S") id-suffix)
                     (cc-butler--decision-open-dir))
     (insert ":PROPERTIES:\n:Kind: decision\n"
             (if event-id (format ":Delivered-to-matrix: %s\n" event-id) "")
+            (if held-until (format ":Delivery-held-until: %s\n" held-until) "")
             (if room (format ":Room: %s\n" room) "")
             (if delivered-room (format ":Delivered-room: %s\n" delivered-room) "")
             (if delivered-thread (format ":Delivered-thread: %s\n" delivered-thread) "")
@@ -825,6 +827,17 @@ the number of calls made, visible to BODY."
                         (1+ cc-butler-self-check-test--thread-replies-calls))
                   (funcall ,fn room event-id))))
        ,@body)))
+
+(defmacro cc-butler-self-check-test--with-file-age (age &rest body)
+  "Run BODY with `cc-butler--decision-file-time' stubbed so every candidate
+file is AGE seconds old, regardless of its real filename -- the seed
+helper always timestamps a file as \"now\", so this is how these tests
+control a no-delivery item's age without needing an artificially old
+filename."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'cc-butler--decision-file-time)
+              (lambda (_filename) (- (float-time) ,age))))
+     ,@body))
 
 (ert-deftest cc-butler-self-check/queue-room-not-configured-self-user-id-nil ()
   "No Matrix identity set on this fleet at all -- a normal, valid state, not
@@ -955,7 +968,7 @@ the delivery."
              ((equal event-id "$fake-event-leafwrong") (list :status 'not-in-room))
              (t (error "root must not be queried once the leaf already failed"))))
         (let ((r (cc-butler-self-check--queue-room-thread-activity)))
-          (should (plist-get r :ok))
+          (should-not (plist-get r :ok))
           (should (string-match-p "unverifiable 1" (plist-get r :detail)))
           (should (string-match-p "M_NOT_FOUND\\|does not contain" (plist-get r :detail)))
           (should (= 1 cc-butler-self-check-test--thread-replies-calls)))))))
@@ -987,7 +1000,9 @@ already-confirmed delivery as a wrong-room one."
 
 (ert-deftest cc-butler-self-check/queue-room-unverifiable-not-in-room ()
   "The recorded room turns out wrong (M_NOT_FOUND) -- a data problem, kept
-distinct in `:detail' from \"never delivered\" or \"fetch failed\"."
+distinct in `:detail' from \"never delivered\" or \"fetch failed\", and (as
+of the level PR) a genuine FAIL: this fleet failed to get the decision in
+front of him, once, at all."
   (cc-butler-self-check-test--with-decision-dir
     (cc-butler-self-check-test--with-matrix-configured
       (cc-butler-self-check-test--seed-open-decision
@@ -995,7 +1010,7 @@ distinct in `:detail' from \"never delivered\" or \"fetch failed\"."
       (cc-butler-self-check-test--with-thread-replies-stub
           (lambda (_room _event-id) (list :status 'not-in-room))
         (let ((r (cc-butler-self-check--queue-room-thread-activity)))
-          (should (plist-get r :ok))
+          (should-not (plist-get r :ok))
           (should (string-match-p "unverifiable 1" (plist-get r :detail)))
           (should (string-match-p "M_NOT_FOUND\\|does not contain" (plist-get r :detail))))))))
 
@@ -1053,6 +1068,143 @@ formatted distinctly per sender."
           (should (string-match-p "@fleet-a:example.org x3" (plist-get r :detail)))
           (should (string-match-p "@fleet-b:example.org x4" (plist-get r :detail)))
           (should (string-match-p "scanned 7" (plist-get r :detail))))))))
+
+;;;; ---- 2026-09-11: check 9 levels -- no-delivery age FAIL, with a
+;;;; `:Delivery-held-until:' escape hatch for a deliberate hold ---------
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-within-grace-stays-ok ()
+  "A no-delivery item younger than the threshold is normal, expected async
+delay -- acknowledged tier, not FAIL."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision "grace")
+      (cc-butler-self-check-test--with-file-age
+          (- cc-butler-self-check-no-delivery-age-threshold 60)
+        (cc-butler-self-check-test--with-thread-replies-stub
+            (lambda (_room _event-id) (error "must not be called -- never delivered"))
+          (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+            (should (plist-get r :ok))
+            (should (string-match-p "grace 1" (plist-get r :detail)))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-aged-past-threshold-fails ()
+  "A no-delivery item aged past the threshold, with no hold, is exactly the
+2026-09-11 defect this check exists to catch -- FAIL."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision "aged")
+      (cc-butler-self-check-test--with-file-age
+          (+ cc-butler-self-check-no-delivery-age-threshold 60)
+        (cc-butler-self-check-test--with-thread-replies-stub
+            (lambda (_room _event-id) (error "must not be called -- never delivered"))
+          (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "FAIL 1" (plist-get r :detail)))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-held-future-stays-ok-and-named ()
+  "A no-delivery item aged past the threshold BUT covered by a still-active
+`:Delivery-held-until:' hold must stay `:ok t' -- and its until-time and
+reason must be named in :detail, so a human sees a deliberate wait, not
+silence."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (let ((until (format-time-string "%Y-%m-%d %H:%M" (time-add (current-time) (seconds-to-time 3600)))))
+        (cc-butler-self-check-test--seed-open-decision
+         "heldfuture" nil nil nil nil (concat until " synthetic daylight hold"))
+        (cc-butler-self-check-test--with-file-age
+            (+ cc-butler-self-check-no-delivery-age-threshold 60)
+          (cc-butler-self-check-test--with-thread-replies-stub
+              (lambda (_room _event-id) (error "must not be called -- never delivered"))
+            (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+              (should (plist-get r :ok))
+              (should (string-match-p "held 1" (plist-get r :detail)))
+              (should (string-match-p (regexp-quote until) (plist-get r :detail)))
+              (should (string-match-p "synthetic daylight hold" (plist-get r :detail))))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-held-expired-fails ()
+  "A hold whose until-time has already passed must FAIL, same as unheld --
+the escape hatch stops covering it once it expires."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (let ((until (format-time-string "%Y-%m-%d %H:%M" (time-subtract (current-time) (seconds-to-time 3600)))))
+        (cc-butler-self-check-test--seed-open-decision
+         "heldexpired" nil nil nil nil (concat until " expired synthetic hold"))
+        (cc-butler-self-check-test--with-file-age
+            (+ cc-butler-self-check-no-delivery-age-threshold 60)
+          (cc-butler-self-check-test--with-thread-replies-stub
+              (lambda (_room _event-id) (error "must not be called -- never delivered"))
+            (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+              (should-not (plist-get r :ok))
+              (should (string-match-p "FAIL 1" (plist-get r :detail))))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-malformed-hold-fails ()
+  "A garbled `:Delivery-held-until:' must not suppress a FAIL -- malformed
+is treated exactly like absent: forgetting or garbling this marker has to
+err toward a push to the steward, never toward silence."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "heldmalformed" nil nil nil nil "not-a-real-timestamp synthetic reason")
+      (cc-butler-self-check-test--with-file-age
+          (+ cc-butler-self-check-no-delivery-age-threshold 60)
+        (cc-butler-self-check-test--with-thread-replies-stub
+            (lambda (_room _event-id) (error "must not be called -- never delivered"))
+          (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "FAIL 1" (plist-get r :detail)))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-hold-beyond-horizon-fails ()
+  "A hold more than `cc-butler-self-check-max-delivery-hold' seconds out
+(e.g. a mistyped year) is INVALID, not active -- evaluated as unheld, so
+an aged item still FAILs rather than being silenced for a year with only
+:detail as the record."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (let ((until (format-time-string "%Y-%m-%d %H:%M"
+                                        (time-add (current-time) (seconds-to-time (* 73 60 60))))))
+        (cc-butler-self-check-test--seed-open-decision
+         "heldbeyondhorizon" nil nil nil nil (concat until " too far out")))
+      (cc-butler-self-check-test--with-file-age
+          (+ cc-butler-self-check-no-delivery-age-threshold 60)
+        (cc-butler-self-check-test--with-thread-replies-stub
+            (lambda (_room _event-id) (error "must not be called -- never delivered"))
+          (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "FAIL 1" (plist-get r :detail)))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-hold-within-horizon-stays-ok ()
+  "Positive control for the horizon test above: a hold well within
+`cc-butler-self-check-max-delivery-hold' (here 12h, under the 72h
+default) still stays `:ok t' and named -- the horizon caps unreasonably
+far holds, it does not disable the escape hatch."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (let ((until (format-time-string "%Y-%m-%d %H:%M"
+                                        (time-add (current-time) (seconds-to-time (* 12 60 60))))))
+        (cc-butler-self-check-test--seed-open-decision
+         "heldwithinhorizon" nil nil nil nil (concat until " within horizon"))
+        (cc-butler-self-check-test--with-file-age
+            (+ cc-butler-self-check-no-delivery-age-threshold 60)
+          (cc-butler-self-check-test--with-thread-replies-stub
+              (lambda (_room _event-id) (error "must not be called -- never delivered"))
+            (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+              (should (plist-get r :ok))
+              (should (string-match-p "held 1" (plist-get r :detail)))
+              (should (string-match-p (regexp-quote until) (plist-get r :detail))))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-unparseable-filename-fails ()
+  "A no-delivery item whose filename does not parse into an age (should
+never happen -- filenames are code-generated) must FAIL, not sit in
+`grace' forever uncounted: nil age means silence otherwise, which is
+exactly the wrong default for something that should never occur."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision "unparseable")
+      (cl-letf (((symbol-function 'cc-butler--decision-file-time) (lambda (_filename) nil)))
+        (cc-butler-self-check-test--with-thread-replies-stub
+            (lambda (_room _event-id) (error "must not be called -- never delivered"))
+          (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "FAIL 1" (plist-get r :detail)))))))))
 
 ;;;; ---- the four PERMANENT negative controls -----------------------
 
@@ -1159,14 +1311,18 @@ any sender -- pinned here as a permanent test rather than left implicit."
 
 (defmacro cc-butler-self-check-test--with-stubs (&rest body)
   "Run BODY with `cc-butler-tool-escalate-to-butler' / `cc-butler-tool-log'
-stubbed to record calls instead of touching any real butler state, and
-`cc-butler-self-check--previous' reset -- matching this repo's existing
-`cl-letf'-on-`symbol-function' stubbing style (see
-`cc-butler-north-star-test.el')."
+stubbed to record calls instead of touching any real butler state,
+`cc-butler-self-check--previous' reset, and `cc-butler--inbox' let-bound
+to nil (NOT stubbed -- the real `cc-butler--inbox-push' runs, the same
+convention already used elsewhere in this suite for testing that
+function's call sites directly, e.g. `cc-butler-session-test.el') --
+matching this repo's existing `cl-letf'-on-`symbol-function' stubbing
+style (see `cc-butler-north-star-test.el')."
   (declare (indent 0))
   `(let ((cc-butler-self-check-test--escalations nil)
          (cc-butler-self-check-test--logs nil)
-         (cc-butler-self-check--previous nil))
+         (cc-butler-self-check--previous nil)
+         (cc-butler--inbox nil))
      (cl-letf (((symbol-function 'cc-butler-tool-escalate-to-butler)
                 (lambda (summary &optional needs options kind sender-label)
                   (push (list :summary summary :needs needs :options options :kind kind
@@ -1242,6 +1398,44 @@ notification forever once the check actually recovers."
     (should (= 2 (length cc-butler-self-check-test--escalations)))
     (should (equal "notification" (plist-get (car cc-butler-self-check-test--escalations) :kind)))
     (should (string-match-p "RECOVERED" (plist-get (car cc-butler-self-check-test--escalations) :summary)))))
+
+;;;; ---- coordinator push: `cc-butler--inbox' / `pending_events', not
+;;;; the desktop/messenger/Matrix-adjacent escalate-to-butler path -------
+
+(ert-deftest cc-butler-self-check/report-transition-pushes-exactly-one-inbox-event ()
+  "An OK->FAIL transition must land exactly one event in `cc-butler--inbox'
+-- the same store `report_to_steward' writes to and `pending_events'
+drains -- so whichever session is currently steward sees it on its next
+`pending_events' call."
+  (cc-butler-self-check-test--with-stubs
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results t))
+    (should (= 0 (length cc-butler--inbox)))
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results nil))
+    (should (= 1 (length cc-butler--inbox)))
+    (should (string-match-p "started FAILING" (plist-get (car cc-butler--inbox) :body)))
+    (should (equal "cc-butler (self-check)" (plist-get (car cc-butler--inbox) :name)))
+    (should (null (plist-get (car cc-butler--inbox) :id)))))
+
+(ert-deftest cc-butler-self-check/report-steady-fail-pushes-no-inbox-event ()
+  "A steady FAIL between ticks (no flip) must push ZERO further inbox
+events -- only the actual transition does, never every tick."
+  (cc-butler-self-check-test--with-stubs
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results t))
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results nil))
+    (should (= 1 (length cc-butler--inbox)))
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results nil))
+    (should (= 1 (length cc-butler--inbox)))))
+
+(ert-deftest cc-butler-self-check/report-recovery-pushes-a-second-inbox-event ()
+  "FAIL -> RECOVERED is its own transition and must push its own event,
+distinct from the FAIL one already pushed."
+  (cc-butler-self-check-test--with-stubs
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results t))
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results nil))
+    (should (= 1 (length cc-butler--inbox)))
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results t))
+    (should (= 2 (length cc-butler--inbox)))
+    (should (string-match-p "RECOVERED" (plist-get (car cc-butler--inbox) :body)))))
 
 (provide 'cc-butler-self-check-test)
 ;;; cc-butler-self-check-test.el ends here

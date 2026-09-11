@@ -2110,6 +2110,35 @@ body anywhere."
       (should (= 1 (length calls)))
       (should (equal (nth 0 (car calls)) "report")))))
 
+;;;; ---- 2026-09-11: `:dir' nil + NAME-OVERRIDE, for a non-interactive
+;;;; Lisp caller with no real session (`cc-butler-self-check--report') --
+
+(ert-deftest cc-butler-session/inbox-push-nil-dir-with-name-override-does-not-error ()
+  "DIR nil used to error inside `cc-butler--display-name'
+\(`expand-file-name' requires a string\) -- NAME-OVERRIDE must bypass that
+entirely, not merely catch the error."
+  (cc-butler-session-test--with-ops-log
+    (let ((cc-butler--inbox nil))
+      (cc-butler--inbox-push nil "self-check transition" "cc-butler (self-check)")
+      (should (= 1 (length cc-butler--inbox)))
+      (should (equal "cc-butler (self-check)" (plist-get (car cc-butler--inbox) :name)))
+      (should (null (plist-get (car cc-butler--inbox) :id)))
+      (should (null (plist-get (car cc-butler--inbox) :dir)))
+      (should (equal "self-check transition" (plist-get (car cc-butler--inbox) :body))))))
+
+(ert-deftest cc-butler-session/inbox-push-two-arg-callers-unchanged ()
+  "The existing 2-arg call shape (report_to_steward, the notification hook)
+must produce an entry identical to before this change -- NAME-OVERRIDE
+absent, `:name'/`:id' still derived from DIR the same way."
+  (cc-butler-session-test--with-ops-log
+    (let ((cc-butler--inbox nil))
+      (cc-butler--inbox-push "/worker-two-arg/" "unchanged body")
+      (let ((entry (car cc-butler--inbox)))
+        (should (equal "/worker-two-arg/" (plist-get entry :dir)))
+        (should (equal (cc-butler--display-name "/worker-two-arg/") (plist-get entry :name)))
+        (should (equal (cc-butler--session-id "/worker-two-arg/") (plist-get entry :id)))
+        (should (equal "unchanged body" (plist-get entry :body)))))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; ghostel event-pipe deadlock workaround (cc-butler#104)
 ;;;; ------------------------------------------------------------------

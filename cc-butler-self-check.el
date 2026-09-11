@@ -523,6 +523,41 @@ catch, unreachable since PR #183's display-name regex fix."
   :type 'integer
   :group 'cc-butler)
 
+(defcustom cc-butler-self-check-no-delivery-age-threshold 3600
+  "Seconds an open decision may go with no `:Delivered-to-matrix:' recorded
+at all before check 9 (`cc-butler-self-check--queue-room-thread-activity')
+FAILs it as `no-delivery' -- unless a still-active `:Delivery-held-until:'
+hold covers it (see `cc-butler--decision-delivery-held-until'), in which
+case it stays acknowledged (`:ok t', named in :detail) until the hold
+expires, regardless of age.
+
+Measured against the live queue's own delivered-item records (filename
+time -> recorded delivery time), 2026-09-11: typical 7-16 min; deliberate
+overnight holds exist (a delivery intentionally waiting for daylight
+hours) and must not be counted against this threshold, which is why the
+hold escape hatch exists at all -- 1 hour would otherwise FAIL every one
+of those overnight, and noise like that trains people to stop looking.
+1 hour (this default) is well past typical delivery latency while still
+catching a genuine stall (the 2026-09-11 defect this whole check exists
+for went undetected for 5 hours) within about 4 self-check ticks."
+  :type 'integer
+  :group 'cc-butler)
+
+(defcustom cc-butler-self-check-max-delivery-hold (* 72 60 60)
+  "Seconds beyond `now' that a `:Delivery-held-until:' hold may extend into
+before check 9 treats it as INVALID rather than active -- an
+unboundedly-far hold would silence a `no-delivery' FAIL for however long
+the timestamp says, visible only in :detail, which nobody reads by
+construction (that invisibility is the exact failure class this PR
+exists to close).  A hold further out than this horizon is evaluated as
+unheld, under the normal age rule -- so a mistyped year (`2027-...') FAILs
+loudly instead of silencing that item for a year.
+
+72 hours (this default) covers a weekend hold; the one measured
+overnight hold in the live queue was roughly 6.5 hours."
+  :type 'integer
+  :group 'cc-butler)
+
 (defun cc-butler-self-check--live-inbox-slugs ()
   "Return the set of maildir slugs every currently live session maps to
 \(a hash-table, for O(1) membership tests), via `cc-butler--sessions' --
@@ -849,9 +884,20 @@ Returns a plist:
                                                 that finds nothing is a
                                                 meaningful \"checked, no
                                                 thread activity at all\".
-  (:bucket unverifiable :reason R)          -- R one of `no-delivery' `no-room'
+  (:bucket unverifiable :reason R ...)      -- R one of `no-delivery' `no-room'
                                                 `room-conflict' `not-in-room'
                                                 `root-fetch-error' `fetch-error'.
+                                                `no-delivery' additionally
+                                                carries `:age' (seconds, or
+                                                nil if unparseable) and, when
+                                                a `:Delivery-held-until:'
+                                                property is present and
+                                                parses, `:held-until'
+                                                (float-time) and
+                                                `:held-reason' -- see
+                                                `cc-butler-self-check--queue-room-thread-activity''s
+                                                docstring for how these turn
+                                                into a FAIL/held/grace split.
 Either property missing (`no-delivery'/`no-room') is checked BEFORE ever
 calling out to Matrix at all -- an unverifiable decision must never guess
 at a room to fetch from.  Likewise `room-conflict' (`:Room:' and
@@ -885,7 +931,11 @@ controls pinning this down."
   (let ((event-id (cc-butler--decision-delivered-to-matrix-event-id path))
         (room (cc-butler--decision-delivery-room path)))
     (cond
-     ((not event-id) (list :bucket 'unverifiable :reason 'no-delivery))
+     ((not event-id)
+      (let ((held (cc-butler--decision-delivery-held-until path)))
+        (list :bucket 'unverifiable :reason 'no-delivery
+              :age (cc-butler-self-check--queue-room-no-delivery-age path)
+              :held-until (car held) :held-reason (cdr held))))
      ((not room) (list :bucket 'unverifiable :reason 'no-room))
      ((eq room 'conflict) (list :bucket 'unverifiable :reason 'room-conflict))
      (t
@@ -931,6 +981,73 @@ already-confirmed delivery as a wrong-room one."
              (cc-butler-self-check--queue-room-open-result root-resp)
            (list :bucket 'unverifiable :reason 'root-fetch-error)))))))
 
+(defun cc-butler-self-check--queue-room-no-delivery-age (path)
+  "Age in seconds of PATH's own filename timestamp, or nil when the
+filename does not parse as one (see `cc-butler--decision-file-time',
+which takes a bare filename, not a full path)."
+  (let ((time (cc-butler--decision-file-time (file-name-nondirectory path))))
+    (and time (- (float-time) time))))
+
+(defun cc-butler-self-check--queue-room-hold-active-p (entry now)
+  "Non-nil when no-delivery ENTRY's `:held-until' is a currently active,
+IN-HORIZON hold as of NOW (a float-time): present, still in the future,
+and no more than `cc-butler-self-check-max-delivery-hold' seconds out.  A
+hold further out than that horizon is treated as INVALID -- evaluated as
+unheld under the normal age rule, same as missing or unparseable -- so a
+mistyped year does not silence a FAIL for a year with only :detail
+\(which nobody reads\) as the record."
+  (let ((held-until (plist-get entry :held-until)))
+    (and held-until
+         (< now held-until)
+         (<= held-until (+ now cc-butler-self-check-max-delivery-hold)))))
+
+(defun cc-butler-self-check--queue-room-no-delivery-failing-p (entry now)
+  "Non-nil when a no-delivery ENTRY (a plist with `:age'/`:held-until', as
+built by `cc-butler-self-check--queue-room-thread-activity-one') should
+FAIL check 9 as of NOW (a float-time): aged at or past
+`cc-butler-self-check-no-delivery-age-threshold' -- OR its age is nil
+(the filename did not parse; code generates these filenames, so this
+should never happen, which is exactly why it must fail loud rather than
+count as grace forever) -- AND not covered by a still-active,
+in-horizon `:Delivery-held-until:' hold
+\(`cc-butler-self-check--queue-room-hold-active-p'\).  A missing,
+unparseable, or too-far-out `:Delivery-held-until:' is indistinguishable
+here from no hold at all -- all three fall through to this same age
+check, per that property's own docstring."
+  (let ((age (plist-get entry :age)))
+    (and (or (null age) (>= age cc-butler-self-check-no-delivery-age-threshold))
+         (not (cc-butler-self-check--queue-room-hold-active-p entry now)))))
+
+(defun cc-butler-self-check--queue-room-no-delivery-detail (entries now)
+  "Format a `[FAIL N; held N (until ...); grace N]' breakdown of no-delivery
+ENTRIES for `:detail' -- empty string when ENTRIES is nil.  A held item's
+until-time (and reason, when recorded) is always named, so a human can
+tell a deliberate wait from a stall without opening the file.  Uses the
+same `cc-butler-self-check--queue-room-hold-active-p' the FAIL decision
+does, so \"shown as held\" and \"actually suppresses the FAIL\" can never
+disagree."
+  (if (null entries)
+      ""
+    (let ((failing (seq-filter (lambda (e) (cc-butler-self-check--queue-room-no-delivery-failing-p e now))
+                                entries))
+          (held (seq-filter (lambda (e) (cc-butler-self-check--queue-room-hold-active-p e now))
+                             entries)))
+      (format " [FAIL %d; held %d%s; grace %d]"
+              (length failing)
+              (length held)
+              (if held
+                  (format " (%s)"
+                          (mapconcat
+                           (lambda (e)
+                             (format "until %s%s"
+                                     (format-time-string "%Y-%m-%d %H:%M" (plist-get e :held-until))
+                                     (if (plist-get e :held-reason)
+                                         (format " — %s" (plist-get e :held-reason))
+                                       "")))
+                           held "; "))
+                "")
+              (- (length entries) (length failing) (length held))))))
+
 (defun cc-butler-self-check--queue-room-thread-activity ()
   "Check 9: surfaces Matrix thread activity for each open/ decision queue
 file that recorded delivery into a room -- see the section commentary
@@ -955,14 +1072,24 @@ either bucket counts toward
 the same \"still awaiting answer\" total -- nothing here ever removes a
 decision from that count.
 
-`:ok' is unconditionally t whenever Matrix is configured -- this check has
-NO closure verdict to fail on (see `cc-butler-self-check--queue-room-thread-activity-one''s
-docstring for why: thread activity, even from this fleet's own identity,
-is not evidence of an answer). Its entire value is surfacing raw
-per-candidate thread material in `:detail' for a human to read and judge
--- not judging on their behalf. `:detail' always names: total candidates,
-the open count (with each file's scanned-reply count and sender
-breakdown), the unverifiable count (broken down by reason), and the
+`:ok' is nil only when at least one candidate is a `no-delivery' FAILing
+at or past `cc-butler-self-check-no-delivery-age-threshold' (and not
+covered by a still-active `:Delivery-held-until:' hold -- see
+`cc-butler-self-check--queue-room-no-delivery-failing-p') or a
+`not-in-room' -- these two are the only reasons that mean this fleet
+genuinely failed to get the decision in front of him, once, at all.
+Every other unverifiable reason (`no-room' `room-conflict'
+`root-fetch-error' `fetch-error', and a `no-delivery' still within grace
+or actively held) stays `:ok t', always named in `:detail' -- known,
+visible, non-blocking, same tier check 8 uses for an acknowledged orphan
+candidate. This NEVER judges closure, FAIL or not: a FAIL here means
+delivery is broken or stale, never \"unanswered\" -- see
+`cc-butler-self-check--queue-room-thread-activity-one''s docstring for
+why thread activity, even this fleet's own, is not evidence of an
+answer. `:detail' always names: total candidates, the open count (with
+each file's scanned-reply count and sender breakdown), the unverifiable
+count (broken down by reason, with no-delivery further split into
+FAIL/held/grace and every held item's until-time and reason), and the
 aggregate scanned-message total paired with how many decisions were
 actually checked -- so a reader can tell \"the check ran and found
 nothing\" apart from \"the check silently didn't run\"."
@@ -976,6 +1103,7 @@ nothing\" apart from \"the check silently didn't run\"."
                                n)))
     (let* ((dir (cc-butler--decision-open-dir))
            (files (car (cc-butler--decision-open-files-and-oldest)))
+           (now (float-time))
            open unverifiable (scanned-total 0) (checked 0))
       (dolist (f files)
         (let ((r (cc-butler-self-check--queue-room-thread-activity-one (expand-file-name f dir))))
@@ -984,14 +1112,23 @@ nothing\" apart from \"the check silently didn't run\"."
              (setq checked (1+ checked) scanned-total (+ scanned-total (plist-get r :scanned)))
              (push (list f (plist-get r :scanned) (plist-get r :senders)) open))
             ('unverifiable
-             (push (cons f (plist-get r :reason)) unverifiable)))))
+             (push (list :file f :reason (plist-get r :reason)
+                         :age (plist-get r :age)
+                         :held-until (plist-get r :held-until)
+                         :held-reason (plist-get r :held-reason))
+                   unverifiable)))))
       (setq open (nreverse open) unverifiable (nreverse unverifiable))
-      (let* ((reason-counts
+      (let* ((no-delivery-entries (seq-filter (lambda (u) (eq (plist-get u :reason) 'no-delivery)) unverifiable))
+             (not-in-room-count (length (seq-filter (lambda (u) (eq (plist-get u :reason) 'not-in-room)) unverifiable)))
+             (no-delivery-failing (seq-filter (lambda (u) (cc-butler-self-check--queue-room-no-delivery-failing-p u now))
+                                               no-delivery-entries))
+             (ok (and (null no-delivery-failing) (= 0 not-in-room-count)))
+             (reason-counts
               (mapcar (lambda (reason)
-                        (cons reason (length (seq-filter (lambda (u) (eq (cdr u) reason)) unverifiable))))
+                        (cons reason (length (seq-filter (lambda (u) (eq (plist-get u :reason) reason)) unverifiable))))
                       '(no-delivery no-room room-conflict not-in-room root-fetch-error fetch-error)))
              (detail
-              (format "queue-room thread activity: %d candidate(s) — open %d%s · unverifiable %d (%s) — %d decision(s) checked, %d total thread message(s) scanned — this check never judges closure; read each before treating any as answered"
+              (format "queue-room thread activity: %d candidate(s) — open %d%s · unverifiable %d (%s%s) — %d decision(s) checked, %d total thread message(s) scanned — this check never judges closure; read each before treating any as answered"
                       (length files)
                       (length open)
                       (if open
@@ -1008,8 +1145,9 @@ nothing\" apart from \"the check silently didn't run\"."
                                                        (cc-butler-self-check--queue-room-reason-label (car rc))
                                                        (cdr rc)))
                                  reason-counts "; ")
+                      (cc-butler-self-check--queue-room-no-delivery-detail no-delivery-entries now)
                       checked scanned-total)))
-        (list :ok t :detail detail)))))
+        (list :ok ok :detail detail)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Registry
@@ -1062,10 +1200,23 @@ future ticks compare against.")
 
 (defun cc-butler-self-check--report (results)
   "Report RESULTS: a quiet per-tick summary no matter what, plus a loud
-`display-warning' when anything is failing, plus a notification-kind
-escalation for each check whose :ok flipped since the last tick (either
-direction -- a fix must be announced as loudly as a break, or a human
-carries a stale failure notification forever)."
+`display-warning' when anything is failing, plus TWO escalations for each
+check whose :ok flipped since the last tick (either direction -- a fix
+must be announced as loudly as a break, or a human carries a stale
+failure notification forever):
+ - a notification-kind escalation to the butler (unchanged, pre-existing
+   -- renders read-only in 정수님's queue, though nothing currently
+   surfaces it to any session either; see this function's own commentary
+   history for that finding);
+ - one event pushed into `cc-butler--inbox' via `cc-butler--inbox-push',
+   the SAME store `report_to_steward' writes to and `pending_events'
+   drains -- so whichever session is currently steward sees it on its
+   very next `pending_events' call, without anyone opening this Emacs
+   frame or running self_check by hand.  At most one event per check per
+   flip: a steady FAIL between ticks produces nothing further here (the
+   `(not (eq (cdr cell) ok))' guard below fires only on an actual
+   change), and neither push touches the desktop, a messenger, or
+   Matrix -- `cc-butler-notify-decision' is not called from here."
   (let ((failing (seq-filter (lambda (r) (not (plist-get (cdr r) :ok))) results)))
     (when failing
       (display-warning
@@ -1083,12 +1234,14 @@ carries a stale failure notification forever)."
         (if cell
             (progn
               (when (not (eq (cdr cell) ok))
-                (ignore-errors
-                  (cc-butler-tool-escalate-to-butler
-                   (format "cc-butler self-check: `%s' %s — %s"
-                           name (if ok "RECOVERED" "started FAILING")
-                           (plist-get (cdr r) :detail))
-                   nil nil "notification" "cc-butler (self-check)")))
+                (let ((msg (format "cc-butler self-check: `%s' %s — %s"
+                                    name (if ok "RECOVERED" "started FAILING")
+                                    (plist-get (cdr r) :detail))))
+                  (ignore-errors
+                    (cc-butler-tool-escalate-to-butler
+                     msg nil nil "notification" "cc-butler (self-check)"))
+                  (ignore-errors
+                    (cc-butler--inbox-push nil msg "cc-butler (self-check)"))))
               (setcdr cell ok))
           (push (cons name ok) cc-butler-self-check--previous)))))
   results)

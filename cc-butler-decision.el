@@ -1065,6 +1065,46 @@ fallback to `:Delivered-to-matrix:' covers both."
   (or (cc-butler--decision-delivered-thread-id file)
       (cc-butler--decision-delivered-to-matrix-event-id file)))
 
+(defconst cc-butler--decision-delivery-held-until-re
+  "^[ \t]*:Delivery-held-until: \\(.*\\)$"
+  "Regex matching a `:Delivery-held-until:' property line: a deliberate
+delivery hold, e.g. \"2026-09-11 09:00 daylight hours\" -- an expiry
+timestamp (`YYYY-MM-DD HH:MM') followed by an optional free-text reason.
+Captures the whole raw value as group 1; see
+`cc-butler--decision-delivery-held-until-timestamp-re' for the stricter
+match that actually parses it.")
+
+(defconst cc-butler--decision-delivery-held-until-timestamp-re
+  "\\`\\([0-9]\\{4\\}\\)-\\([0-9]\\{2\\}\\)-\\([0-9]\\{2\\}\\) \\([0-9]\\{2\\}\\):\\([0-9]\\{2\\}\\)\\(?:[ \t]+\\(.*\\)\\)?\\'"
+  "Matches a `:Delivery-held-until:' raw value's leading `YYYY-MM-DD HH:MM'
+timestamp, groups 1-5, with an optional trailing free-text reason as
+group 6.  Deliberately strict (manual digit groups, not a lenient
+date-parser) -- same style as `cc-butler--decision-file-time' -- so a
+garbled value fails to match rather than being guessed at.")
+
+(defun cc-butler--decision-delivery-held-until (file)
+  "Return FILE's `:Delivery-held-until:' as (TIME-FLOAT . REASON-OR-NIL), or
+nil when the property is absent OR its leading timestamp does not match
+`cc-butler--decision-delivery-held-until-timestamp-re'.
+
+Malformed and absent are deliberately INDISTINGUISHABLE to callers:
+forgetting or garbling this marker must fail toward a push to the
+steward (evaluated as an ordinary, unheld no-delivery candidate), never
+toward silently swallowing what would otherwise be a FAIL."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (when (re-search-forward cc-butler--decision-delivery-held-until-re nil t)
+      (let ((raw (string-trim (match-string 1))))
+        (when (string-match cc-butler--decision-delivery-held-until-timestamp-re raw)
+          (cons (float-time (encode-time 0
+                                          (string-to-number (match-string 5 raw))
+                                          (string-to-number (match-string 4 raw))
+                                          (string-to-number (match-string 3 raw))
+                                          (string-to-number (match-string 2 raw))
+                                          (string-to-number (match-string 1 raw))))
+                (match-string 6 raw)))))))
+
 (defun cc-butler--decision-file-mentions-delivery-p (file)
   "Non-nil when the bare string \"Delivered-to-matrix\" appears ANYWHERE in
 FILE -- no `^' anchor, no colon, no indentation requirement. Deliberately
