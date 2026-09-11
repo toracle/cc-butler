@@ -1437,5 +1437,214 @@ distinct from the FAIL one already pushed."
     (should (= 2 (length cc-butler--inbox)))
     (should (string-match-p "RECOVERED" (plist-get (car cc-butler--inbox) :body)))))
 
+;;;; ------------------------------------------------------------------
+;;;; Check 10: code staleness numbers -- synthetic git repos
+;;;; ------------------------------------------------------------------
+;;;; Reuses `cc-butler-test--git' / `cc-butler-test--make-git-repo'
+;;;; (tests/cc-butler-reload-test.el) for fixture setup -- real `git'
+;;;; subprocess calls, batch tests only, never the daemon. No real remote
+;;;; is needed anywhere below: `git rev-list'/`merge-base' only read refs,
+;;;; and a remote-tracking ref is just a ref `git update-ref' can set
+;;;; directly (same trick the existing `cc-butler-runtime-source' fixture
+;;;; already relies on).
+
+(defun cc-butler-self-check-test--commit (dir msg)
+  "Create an empty commit MSG in DIR; return its full SHA."
+  (cc-butler-test--git dir "commit" "-q" "--allow-empty" "-m" msg)
+  (cc-butler--git dir "rev-parse" "HEAD"))
+
+(ert-deftest cc-butler-self-check/code-staleness-counts-behind-only ()
+  "Checkout HEAD is an ancestor of `origin/main': N behind, 0 ahead."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (a (cdr fix))
+         (b (cc-butler-self-check-test--commit dir "second"))
+         (c (cc-butler-self-check-test--commit dir "third")))
+    (cc-butler-test--git dir "update-ref" "refs/remotes/origin/main" c)
+    (cc-butler-test--git dir "reset" "-q" "--hard" a)
+    (let ((counts (cc-butler-self-check--code-staleness-counts dir a)))
+      (should (equal counts '(0 . 2)))
+      (ignore b))))
+
+(ert-deftest cc-butler-self-check/code-staleness-counts-ahead-only ()
+  "Checkout HEAD has commits `origin/main' does not: N ahead, 0 behind."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (a (cdr fix)))
+    (cc-butler-test--git dir "update-ref" "refs/remotes/origin/main" a)
+    (let ((b (cc-butler-self-check-test--commit dir "second")))
+      (let ((counts (cc-butler-self-check--code-staleness-counts dir b)))
+        (should (equal counts '(1 . 0)))))))
+
+(ert-deftest cc-butler-self-check/code-staleness-counts-diverged ()
+  "Checkout HEAD and `origin/main' both have commits the other lacks --
+neither is an ancestor of the other."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (a (cdr fix)))
+    (cc-butler-test--git dir "checkout" "-qb" "side")
+    (let ((b (cc-butler-self-check-test--commit dir "on side")))
+      (cc-butler-test--git dir "update-ref" "refs/remotes/origin/main" b)
+      (cc-butler-test--git dir "checkout" "-q" "main")
+      (let* ((c (cc-butler-self-check-test--commit dir "on main"))
+             (counts (cc-butler-self-check--code-staleness-counts dir c)))
+        (should (equal counts '(1 . 1)))
+        (should (> (car counts) 0))
+        (should (> (cdr counts) 0))
+        (ignore a)))))
+
+(ert-deftest cc-butler-self-check/code-staleness-counts-nil-when-sha-or-dir-missing ()
+  (should-not (cc-butler-self-check--code-staleness-counts nil "deadbeef"))
+  (should-not (cc-butler-self-check--code-staleness-counts "/some/dir/" nil)))
+
+(ert-deftest cc-butler-self-check/code-staleness-fetch-age-uses-fetch-head-mtime ()
+  "Prefers FETCH_HEAD's mtime when present."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix))
+         (fetch-head (expand-file-name ".git/FETCH_HEAD" dir))
+         (stamp (time-subtract (current-time) (seconds-to-time 500))))
+    (write-region "deadbeef\t\tbranch 'main' of somewhere\n" nil fetch-head)
+    (set-file-times fetch-head stamp)
+    (let ((age (cc-butler-self-check--code-staleness-fetch-age dir)))
+      (should age)
+      (should (< (abs (- age 500)) 30)))))
+
+(ert-deftest cc-butler-self-check/code-staleness-fetch-age-falls-back-to-reflog ()
+  "Falls back to the `origin/main' reflog's mtime when FETCH_HEAD is
+absent (e.g. a linked worktree)."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix))
+         (reflog (expand-file-name ".git/logs/refs/remotes/origin/main" dir))
+         (stamp (time-subtract (current-time) (seconds-to-time 900))))
+    (make-directory (file-name-directory reflog) t)
+    (write-region "0000000000000000000000000000000000000000 deadbeef test <test> 0 +0000\tfetch\n"
+                  nil reflog)
+    (set-file-times reflog stamp)
+    (let ((age (cc-butler-self-check--code-staleness-fetch-age dir)))
+      (should age)
+      (should (< (abs (- age 900)) 30)))))
+
+(ert-deftest cc-butler-self-check/code-staleness-fetch-age-nil-when-neither-exists ()
+  "No FETCH_HEAD and no reflog: nil, not a guess -- the \"unknown fetch
+time\" case."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)))
+    (should-not (cc-butler-self-check--code-staleness-fetch-age dir))))
+
+(ert-deftest cc-butler-self-check/code-staleness-fetch-age-detail-never-blank-on-nil ()
+  "A missing fetch age must read as a literal explanation, never a blank
+or a silent \"0 behind\" look-alike."
+  (should (equal (cc-butler-self-check--code-staleness-fetch-age-detail nil)
+                 "unknown (no FETCH_HEAD and no origin/main reflog found)")))
+
+(ert-deftest cc-butler-self-check/code-staleness-integration-reports-diverged-with-numbers ()
+  "Full check, end to end, against a real diverged synthetic repo: :ok nil
+\(divergence is one of the flag-worthy conditions), and :detail still names
+the ref, the fetch age, and both ahead/behind pairs with a DIVERGED marker
+-- the verdict and the numbers are never in tension.
+
+`git update-ref' itself writes a reflog entry for the ref it touches
+(core.logAllRefUpdates defaults on for a non-bare repo), so this fixture's
+own `update-ref refs/remotes/origin/main' call means a fetch age IS
+determinable here -- a fresh one, from that reflog. The \"nil / unknown\"
+case is covered on its own, without that side effect, by
+`cc-butler-self-check/code-staleness-fetch-age-nil-when-neither-exists'."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (a (cdr fix)))
+    (cc-butler-test--git dir "checkout" "-qb" "side")
+    (let ((b (cc-butler-self-check-test--commit dir "on side")))
+      (cc-butler-test--git dir "update-ref" "refs/remotes/origin/main" b)
+      (cc-butler-test--git dir "checkout" "-q" "main")
+      (let ((c (cc-butler-self-check-test--commit dir "on main")))
+        (let ((cc-butler--runtime-source-dir dir)
+              (cc-butler--runtime-commit-sha c)
+              (cc-butler--runtime-commit-line (format "%s on main" (substring c 0 7))))
+          (let* ((r (cc-butler-self-check--code-staleness))
+                 (detail (plist-get r :detail)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "refs/remotes/origin/main" detail))
+            (should (string-match-p "1 ahead / 1 behind \\[DIVERGED\\]" detail))
+            (should (string-match-p "last fetched .* ago" detail))
+            (should (string-match-p (regexp-quote dir) detail))
+            (ignore a)))))))
+
+(ert-deftest cc-butler-self-check/code-staleness-integration-behind-only-stays-ok ()
+  "Plain lag with no divergence and no loaded/checkout mismatch must NOT
+flip :ok -- being N behind origin/main, alone, is normal and expected
+\(see the check's own docstring on why there is no single N that alone
+makes this a problem\); only the number belongs in :detail."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (a (cdr fix))
+         (b (cc-butler-self-check-test--commit dir "second"))
+         (c (cc-butler-self-check-test--commit dir "third")))
+    (cc-butler-test--git dir "update-ref" "refs/remotes/origin/main" c)
+    ;; Reset the checkout (and thus the "loaded" commit, set to match it
+    ;; below) BACK to the first commit -- behind origin/main by 2, ahead
+    ;; by 0, and loaded == checkout HEAD, so neither flag condition fires.
+    (cc-butler-test--git dir "reset" "-q" "--hard" a)
+    (let ((cc-butler--runtime-source-dir dir)
+          (cc-butler--runtime-commit-sha a)
+          (cc-butler--runtime-commit-line (format "%s first" (substring a 0 7))))
+      (let* ((r (cc-butler-self-check--code-staleness))
+             (detail (plist-get r :detail)))
+        (should (plist-get r :ok))
+        (should (string-match-p "0 ahead / 2 behind" detail))
+        (should-not (string-match-p "DIVERGED" detail))
+        (should-not (string-match-p "LOADED CODE DIFFERS" detail))
+        (ignore b)))))
+
+(ert-deftest cc-butler-self-check/code-staleness-integration-flags-loaded-differs-from-checkout ()
+  "REGRESSION scenario this check exists for: a hot-reload half-failed (or
+was simply never called after a `git pull'), so the LOADED commit and the
+on-disk checkout HEAD are two different commits. This must be :ok nil and
+must say so in :detail, in words, not just as two SHAs a reader has to
+diff by eye."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (a (cdr fix))
+         (b (cc-butler-self-check-test--commit dir "second")))
+    (cc-butler-test--git dir "update-ref" "refs/remotes/origin/main" b)
+    ;; checkout HEAD is at b (the latest commit); the LOADED commit is
+    ;; still a -- exactly what a stale daemon that hasn't reloaded looks
+    ;; like.
+    (let ((cc-butler--runtime-source-dir dir)
+          (cc-butler--runtime-commit-sha a)
+          (cc-butler--runtime-commit-line (format "%s first" (substring a 0 7))))
+      (let* ((r (cc-butler-self-check--code-staleness))
+             (detail (plist-get r :detail)))
+        (should-not (plist-get r :ok))
+        (should (string-match-p "LOADED CODE DIFFERS FROM CHECKOUT HEAD" detail))))))
+
+(ert-deftest cc-butler-self-check/code-staleness-nil-ok-when-no-loaded-commit-at-all ()
+  "No loaded commit determinable at all (never a readable checkout): the
+one genuine FAIL this check has -- the check itself could not run, not a
+staleness judgment."
+  (let ((cc-butler--runtime-source-dir "/nonexistent/nowhere/")
+        (cc-butler--runtime-commit-sha nil)
+        (cc-butler--runtime-commit-line nil))
+    (let ((r (cc-butler-self-check--code-staleness)))
+      (should-not (plist-get r :ok))
+      (should (string-match-p "could not determine" (plist-get r :detail))))))
+
+(ert-deftest cc-butler-self-check/code-staleness-not-checked-when-runtime-source-vars-unbound ()
+  "Some fleets run self-check.el without PR #74's runtime-source vars
+loaded (older cc-butler.el) -- must report :ok t with an explicit \"not
+checked\" reason, never crash and never read as a real pass. Forces the
+unbound state directly (`makunbound', restored after)."
+  (let ((was-bound (boundp 'cc-butler--runtime-source-dir))
+        (orig (and (boundp 'cc-butler--runtime-source-dir) cc-butler--runtime-source-dir)))
+    (unwind-protect
+        (progn
+          (makunbound 'cc-butler--runtime-source-dir)
+          (let ((r (cc-butler-self-check--code-staleness)))
+            (should (plist-get r :ok))
+            (should (string-match-p "not checked" (plist-get r :detail)))))
+      (when was-bound (setq cc-butler--runtime-source-dir orig)))))
+
 (provide 'cc-butler-self-check-test)
 ;;; cc-butler-self-check-test.el ends here
