@@ -1966,7 +1966,7 @@ and this reuses its narrowing rather than inventing a second kind
 (cc-butler#8 PR #151 review).
 
 Second bug, same window, opposite edge (2026-09-11,
-`monocle-monocle-kap-system-diagram' `new_topic' launch): counting back
+`example-topic' `new_topic' launch): counting back
 from the LITERAL `point-max' broke on a freshly-rendered ghostel screen
 that pads with blank rows below the dialog to fill the full terminal
 height. Measured live: 39 total lines,
