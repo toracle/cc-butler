@@ -323,7 +323,7 @@ The Sessions table is always regenerated from live cc-butler state."
                  '("butler_log" "butler_dashboard")))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-log
  :name "butler_log"
  :description "Append a timestamped entry to the butler's append-only daily log (docs/log/YYYY-MM-DD.org under the butler home). Use it to record decisions you made, progress worth remembering, or notes — the durable timeline that survives the chat scrolling away. Worker reports/notifications are logged automatically; use this for the curated, higher-signal entries. Call it when something happens that future-you (or a fresh context) should be able to reconstruct."
@@ -335,7 +335,7 @@ The Sessions table is always regenerated from live cc-butler state."
                 :description "Entry kind: 'decision', 'progress', 'event', or 'note' (default 'note'). Optional."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-dashboard
  :name "butler_dashboard"
  :description "Update the butler's at-a-glance dashboard (docs/dashboard.org under the butler home). The per-session status table (running/waiting, branch, PR, model, live activity, and any status note left via set_session_info) is regenerated automatically from live session state — you do NOT supply it. You supply the human judgment: a short OVERVIEW of the current situation and the list of OPEN DECISIONS awaiting input. Call it whenever the big picture changes so the snapshot stays current. Omitting an argument keeps its previous text."

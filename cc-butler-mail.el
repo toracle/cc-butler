@@ -459,7 +459,7 @@ Reports how many were dismissed and how many coordinators were skipped."
                  '("ask_worker" "check_inbox" "reply_message" "rearm_session")))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-ask-worker
  :name "ask_worker"
  :description "Ask another session (a worker) a question over the cc-butler channel so the answer RETURNS TO YOUR INBOX automatically (unlike send_to_session, whose reply you would have to poll for). The worker is poked to read its inbox; when it answers with reply_message the reply lands in your inbox — call check_inbox to read it."
@@ -468,13 +468,13 @@ Reports how many were dismissed and how many coordinators were skipped."
          (:name "question" :type string
                 :description "What you are asking the worker.")))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-check-inbox
  :name "check_inbox"
  :description "Drain YOUR cc-butler inbox: messages other sessions sent you — questions (each with a reply_handle to answer via reply_message), replies to questions you asked, and notes. Call it at the start of a turn and whenever you are poked. Returns and clears them (archived for the audit trail)."
  :args nil)
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-reply-message
  :name "reply_message"
  :description "Answer a question from your inbox. Pass the reply_handle exactly as check_inbox gave it, and your answer as body; it is delivered to the asker's inbox (the query's return path)."
@@ -483,7 +483,7 @@ Reports how many were dismissed and how many coordinators were skipped."
          (:name "body" :type string
                 :description "Your answer.")))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-rearm-session
  :name "rearm_session"
  :description "Re-arm a running session so it picks up MCP tools registered after it connected (the custom-tools server can't push tool-list changes). It reconnects its MCP client without restarting — no work lost. Newly spawned sessions get the tools automatically and don't need this."

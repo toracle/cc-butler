@@ -618,7 +618,7 @@ state is out of scope."
            (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                    '("new_topic")))
          claude-code-ide-mcp-server-tools))
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-new-topic
    :name "new_topic"
    :description "Create a new topic workspace from a template and launch a Claude session in it — the way you grow the fleet. The workspace is scaffolded (.projectile, CLAUDE.md, and the statusLine that makes its context size readable) and the session is launched through the shared path every role uses. Pass template=\"arbitrary\" to start a session in an existing directory instead, giving that directory's absolute path as topic."

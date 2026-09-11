@@ -10,6 +10,12 @@
 ;; adapter updates.  See docs/cc-butler-governance-store-sdd.md.
 
 (require 'subr-x)
+;; Needed only for `cc-butler--make-guarded-tool' (cc-butler-session.el),
+;; the shared MCP tool error-boundary wrapper every registration below
+;; must go through. No cycle: cc-butler-session.el requires only
+;; claude-code-ide / claude-code-ide-mcp-server / subr-x / seq / json,
+;; none of which requires this file back.
+(require 'cc-butler-session)
 
 (defconst cc-butler-governance--load-dir
   (file-name-directory (or load-file-name buffer-file-name default-directory))
@@ -1915,7 +1921,7 @@ duplicate slugs."
            (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                    '("record_principle" "regenerate_governance")))
          claude-code-ide-mcp-server-tools))
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-record-principle
    :name "record_principle"
    :description "Record a butler/steward operating principle into the governance store and regenerate the Claude Code memory from it. Writes the frontmatter for you (name/description/metadata) so the schema cannot be got wrong, and takes NO path argument — it writes to exactly the store the regenerator reads, which is the whole point. A genuinely NEW name is first checked against the store for a possible existing duplicate (shared-keyword search over every principle's description) — if one looks similar enough, this refuses and names the candidate(s) instead of creating a near-duplicate; pass skip_duplicate_check if you've checked and it's a false positive. Calling it with the name of an EXISTING principle REPLACES that principle's entire file with whatever you pass as body — this OVERWRITES, it never merges or appends. To revise one: read its current content first, fold your change into the complete text by hand, then pass that whole result as body; passing only your new material deletes the rest. A body far smaller than the note's current size is refused unless confirm_shrink is also passed as true, so an accidental partial-overwrite cannot silently destroy most of a note. Returns the absolute file written, the note count before and after, and whether the generated note was read back off disk and confirmed to name this principle — if that verification fails it reports failure, because a regeneration reporting success while landing nothing is a real thing that has happened here."
@@ -1931,7 +1937,7 @@ duplicate slugs."
             :description "Required (true) when revising an existing principle to less than half its current body size — otherwise refused, to catch an accidental partial-overwrite that would delete most of the note. Pass true only when the shrink is deliberate (e.g. you already folded the note down under the body-length cap).")
            (:name "skip_duplicate_check" :type "boolean" :required nil
             :description "Required (true) to create a NEW principle that the store's duplicate search flagged as similar to an existing one. Pass true only after checking the named candidate(s) and confirming this is genuinely a different lesson, not the same one under a new name.")))
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-regenerate-governance
    :name "regenerate_governance"
    :description "Bare-trigger governance cache/index regeneration, no arguments. Call this once after writing directly to a governance/*.md store file with Write/Edit (i.e. NOT through record_principle) — that direct write is never followed by a regenerate on its own, so the note can sit in the store and never reach the cache or the MEMORY.md index until this is called. Safe to call any time with nothing new, too: it reports exactly how many store notes are currently un-indexed (0 means fully synced), so it also works as a standalone check for a forgotten sync."

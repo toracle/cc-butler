@@ -9,6 +9,122 @@
 (require 'ert)
 (require 'cc-butler)
 
+;;;; ------------------------------------------------------------------
+;;;; MCP tool error guard: every registration goes through one wrapper
+;;;; ------------------------------------------------------------------
+;;;; claude-code-ide's own generic dispatcher (external, pinned package)
+;;;; returns an escaping error's FULL, UNBOUNDED message verbatim to the
+;;;; calling session's transcript. `cc-butler--mcp-tool-guard' /
+;;;; `cc-butler--make-guarded-tool' close that: every cc-butler tool
+;;;; registration must route :function through the guard.
+
+(ert-deftest cc-butler-mcp-tool-guard/user-error-passes-through-unchanged ()
+  "A `user-error' is text authored for the human/caller (e.g.
+`record_principle''s duplicate-candidate guidance) -- returned verbatim,
+never truncated or re-wrapped."
+  (let* ((fn (lambda () (user-error "Duplicate candidate: pick one of foo, bar")))
+         (guarded (cc-butler--mcp-tool-guard "some_tool" fn)))
+    (should (equal (funcall guarded)
+                   "Duplicate candidate: pick one of foo, bar"))))
+
+(ert-deftest cc-butler-mcp-tool-guard/ordinary-error-is-bounded-name-symbol-first-line-only ()
+  "A plain `error' returns only the tool NAME, the error SYMBOL, and the
+FIRST LINE of the message, truncated to ~200 chars -- never later lines,
+never the whole thing."
+  (let* ((fn (lambda () (error "first line only\nsecond line must never appear\nthird line either")))
+         (guarded (cc-butler--mcp-tool-guard "some_tool" fn))
+         (out (funcall guarded)))
+    (should (string-match-p "some_tool" out))
+    (should (string-match-p "error" out))
+    (should (string-match-p "first line only" out))
+    (should-not (string-match-p "second line" out))
+    (should-not (string-match-p "third line" out))))
+
+(ert-deftest cc-butler-mcp-tool-guard/sentinel-on-a-later-line-never-escapes-the-return-value ()
+  "SENTINEL test: a fixture error whose SECOND line carries a unique marker
+\(simulating the real leak class -- a terminal-buffer dump appended after
+a safe first line, e.g. `cc-butler--accept-trust-dialog-new-shape''s
+settle-timeout error). The sentinel must be absent from the guarded
+return; the first line must be present. The FULL error (sentinel
+included) still reaches *Messages* via `message' -- logged locally only."
+  (let* ((sentinel "SENTINEL-DO-NOT-LEAK-9c1e")
+         (fn (lambda ()
+               (error "settle timeout: highlight did not move\nScreen:\n%s and more terminal text"
+                      sentinel)))
+         (guarded (cc-butler--mcp-tool-guard "new_topic" fn))
+         (messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+      (let ((out (funcall guarded)))
+        (should-not (string-match-p sentinel out))
+        (should (string-match-p "settle timeout: highlight did not move" out))
+        (should (string-match-p "new_topic" out))
+        ;; The full error, sentinel included, DOES reach *Messages* (local only).
+        (should (seq-some (lambda (m) (string-match-p sentinel m)) messages))))))
+
+(ert-deftest cc-butler-mcp-tool-guard/first-line-truncated-to-roughly-200-chars ()
+  (let* ((long-first-line (make-string 400 ?x))
+         (fn (lambda () (error "%s" long-first-line)))
+         (guarded (cc-butler--mcp-tool-guard "some_tool" fn))
+         (out (funcall guarded)))
+    (should (< (length out) 250))
+    (should-not (string-match-p (regexp-quote long-first-line) out))))
+
+(ert-deftest cc-butler-mcp-tool-guard/quit-still-propagates-uncaught ()
+  "`quit' (C-g) is not an `error' -- claude-code-ide's own generic handler
+already turns it into \"Operation cancelled by user\"; the guard must not
+intercept it or that behavior silently changes."
+  (let* ((fn (lambda () (signal 'quit nil)))
+         (guarded (cc-butler--mcp-tool-guard "some_tool" fn)))
+    (should-error (funcall guarded) :type 'quit)))
+
+(ert-deftest cc-butler-mcp-tool-guard/success-path-is-untouched ()
+  (let* ((fn (lambda (a b) (+ a b)))
+         (guarded (cc-butler--mcp-tool-guard "some_tool" fn)))
+    (should (= 5 (funcall guarded 2 3)))))
+
+(ert-deftest cc-butler-mcp-tool-guard/new-topic-registration-is-wrapped-and-sentinel-safe ()
+  "The REAL, production `new_topic' registration -- not a generic
+mechanism test. Stubs `cc-butler-create-topic' (the one thing
+`cc-butler-tool-new-topic' itself calls) to raise the exact shape of
+error the real launch chain can produce: a safe first line, then a
+terminal-buffer dump on later lines carrying a sentinel. Looks the tool
+up from the LIVE registry (`claude-code-ide-mcp-server-tools') and calls
+its actual registered :function, proving the production registration --
+not just the mechanism in isolation -- is guarded."
+  (let* ((spec (seq-find (lambda (s)
+                           (equal (plist-get (claude-code-ide--normalize-tool-spec s) :name)
+                                  "new_topic"))
+                         (bound-and-true-p claude-code-ide-mcp-server-tools)))
+         (sentinel "SENTINEL-DO-NOT-LEAK-9c1e"))
+    (should spec)
+    (let* ((norm (claude-code-ide--normalize-tool-spec spec))
+           (fn (plist-get norm :function)))
+      (should-not (eq fn #'cc-butler-tool-new-topic))
+      (cl-letf (((symbol-function 'cc-butler-create-topic)
+                 (lambda (&rest _)
+                   (error "sent Down but highlight did not move within 3.0s -- Return NOT sent. Screen:\n%s and more terminal text"
+                          sentinel))))
+        (let ((out (funcall fn "template" "topic")))
+          (should-not (string-match-p sentinel out))
+          (should (string-match-p "sent Down but highlight did not move" out))
+          (should (string-match-p "new_topic" out)))))))
+
+(ert-deftest cc-butler-mcp-tool-guard/every-registration-in-the-repo-goes-through-the-wrapper ()
+  "REGRESSION GUARD: every `claude-code-ide-make-tool' CALL in this repo's
+root .el files must be `cc-butler--make-guarded-tool' instead --
+literally zero direct calls anywhere. A new tool registration that skips
+the wrapper (copy-pasted from claude-code-ide's own docs, say) fails
+here, not silently in production."
+  (let (hits)
+    (dolist (f (directory-files cc-butler--dir t "\\`[^.].*\\.el\\'"))
+      (with-temp-buffer
+        (insert-file-contents f)
+        (goto-char (point-min))
+        (while (search-forward "(claude-code-ide-make-tool" nil t)
+          (push (format "%s:%d" (file-name-nondirectory f) (line-number-at-pos)) hits))))
+    (should (equal hits nil))))
+
 (ert-deftest cc-butler-session/configure-installs-refit-hook ()
   "The single session-config path installs a BUFFER-LOCAL window-refit hook, so
 any layout change (windmove / C-x o) re-fits the PTY to the largest window (no

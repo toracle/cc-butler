@@ -25,6 +25,83 @@
 (require 'json)
 
 ;;;; ------------------------------------------------------------------
+;;;; MCP tool registration: every tool goes through one error guard
+;;;; ------------------------------------------------------------------
+;;;; claude-code-ide's own generic dispatcher (an external, pinned package
+;;;; -- see this repo's CLAUDE.md; claude-code-ide-mcp-http-server.el's
+;;;; `tools/call' handler) catches any error escaping a tool's :function
+;;;; and returns `(format "Error: %s" (error-message-string err))' VERBATIM
+;;;; to the CALLING session's own transcript on disk. A census (2026-09-11,
+;;;; main 7f25a0e) found 27 of 30 cc-butler tools with no error guard at
+;;;; all and 3 partial -- and at least one real leak: `new_topic''s launch
+;;;; chain (create-topic -> finish-topic -> start-session-in ->
+;;;; launch-session -> wait-for-session-ready) can embed a WHOLE terminal
+;;;; buffer in its error text (the trust-dialog settle-poll errors -- see
+;;;; `cc-butler--accept-trust-dialog-new-shape'). Whatever that buffer held
+;;;; -- credentials, client names, paths -- would travel with it.
+;;;;
+;;;; Placed here, near the top of this file, rather than in cc-butler.el:
+;;;; cc-butler.el REQUIRES every module (including this one) at ITS OWN
+;;;; top level, so a module cannot `require' cc-butler back without a
+;;;; cycle. This file is the one every module with a tool registration
+;;;; already reaches (directly or transitively) except
+;;;; `cc-butler-governance.el', which gained an explicit
+;;;; `(require (quote cc-butler-session))' for exactly this.
+;;;;
+;;;; Every `claude-code-ide-make-tool' registration in this codebase must
+;;;; go through `cc-butler--make-guarded-tool' instead -- never call
+;;;; `claude-code-ide-make-tool' directly. See
+;;;; tests/cc-butler-session-test.el's registration-coverage test, which
+;;;; fails CI the moment a new tool registration skips this.
+
+(defun cc-butler--mcp-tool-guard (name fn)
+  "Return a function that calls FN with its args, converting any escaping
+non-`user-error' into a bounded, safe return string instead of letting the
+FULL, UNBOUNDED error message reach the calling session's transcript.
+
+A `user-error' passes through UNCHANGED -- Emacs's own convention for text
+authored for the human/caller (e.g. `record_principle''s duplicate-
+candidate guidance, cc-butler-governance.el:1670), never truncated or
+re-wrapped.
+
+Any other error: the FULL error (every line) is logged locally only, via
+`message' into *Messages* -- never returned. The return value carries only
+NAME, the error SYMBOL, and the FIRST LINE of the message, truncated to
+~200 characters. Never a later line, never the whole thing.
+
+RULE FOR AUTHORS: truncating to the first line bounds the VOLUME of what
+escapes an error, not its KIND. An error message authored anywhere in
+cc-butler must not BEGIN with a file path, buffer text, or any content
+read from disk or a terminal -- put that detail after the first line,
+where this guard keeps it local. The first line is returned to the
+calling session on TRUST that it is safe; a future author who needs to
+lead with disk/terminal content should put a safe summary first and the
+detail after, not break that trust by accident."
+  (lambda (&rest args)
+    (condition-case err
+        (apply fn args)
+      (user-error (error-message-string err))
+      (error
+       (let ((full (error-message-string err)))
+         (message "cc-butler tool %s error (%S): %s" name (car err) full)
+         (format "cc-butler tool %s failed -- %S: %s"
+                 name (car err)
+                 (let ((first-line (car (split-string full "\n"))))
+                   (if (> (length first-line) 200)
+                       (concat (substring first-line 0 200) "…")
+                     first-line))))))))
+
+(defun cc-butler--make-guarded-tool (&rest slots)
+  "Like `claude-code-ide-make-tool', but wraps SLOTS' :function through
+`cc-butler--mcp-tool-guard' first. Every cc-butler MCP tool registration
+must go through this -- never `claude-code-ide-make-tool' directly."
+  (let* ((name (plist-get slots :name))
+         (fn (plist-get slots :function)))
+    (apply #'claude-code-ide-make-tool
+           (plist-put (copy-sequence slots) :function
+                      (cc-butler--mcp-tool-guard name fn)))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Channel launch flag (shared by the topic/session launchers)
 ;;;; ------------------------------------------------------------------
 
@@ -2561,7 +2638,7 @@ Emacs' default click behavior in this buffer, and was the whole problem."
                 (plist-get (claude-code-ide--normalize-tool-spec spec) :name)))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-set-session-info
  :name "set_session_info"
  :description "Set THIS Claude session's display title and/or status line in the Emacs session manager so the human can track multiple sessions at a glance. Use a short title naming the task/topic (e.g. 'billing: invoice PDF') and a concise status describing what you are doing right now (e.g. 'writing tests', 'waiting on review'). Call it whenever your focus changes."

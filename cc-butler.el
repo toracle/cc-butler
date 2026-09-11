@@ -892,7 +892,7 @@ fake drift."
            (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                    '("runtime_source")))
          claude-code-ide-mcp-server-tools))
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-runtime-source
    :name "runtime_source"
    :description "Report the exact git commit the LIVE daemon is running cc-butler from right now (the LOADED commit), separately from the checkout's current HEAD on disk, and warn loudly if they differ — reading a checkout's files never tells you what is actually running unless the two match, since :vc-installed cc-butler's checkout advances independently of the loaded image until an explicit reload. Also flags uncommitted changes in the checkout, and whether the loaded commit is merged into origin/main (checked against locally-known state — no network fetch, so it is fast and never blocks). Answers a question nothing else answers except transiently: `reload_butler_code' only reports this in its own return value at the moment it is explicitly called, and a daemon restart (crash, OOM, systemd) silently reloads cc-butler from whatever a mutable dev checkout happens to be sitting on, with no error surfaced anywhere. Call this any time you need to verify what code is actually live — especially after suspecting a restart happened, before trusting behavior inferred from reading the checkout's source files, or before trusting behavior that depends on recently-merged or recently-hot-loaded code."
@@ -1037,7 +1037,7 @@ runs."
            (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                    '("reload_butler_code")))
          claude-code-ide-mcp-server-tools))
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-reload-code
    :name "reload_butler_code"
    :description "Hot-reload the cc-butler control plane from disk after its SOURCE CODE changed — new tools, fixes, new modules — without restarting Emacs and without losing any session. Reloads every module in dependency order, including this file first so a newly added module is not skipped. It loads what is on disk and does NOT git pull, so pull first if you want newer code; it reports the source directory and its git HEAD so you can tell what you actually got. Also reports any defcustom/defvar whose live value now differs from its code default — `defcustom'/`defvar' never overwrite an already-bound symbol, so a changed default in source can silently fail to take effect live even though the reload itself reports success; no test suite can catch this (a test always loads into an unbound symbol), so this report is the only detector. This changes CODE ONLY and has no effect whatsoever on any session's context size — it is not a way to shrink a large session and is unrelated to compaction; use compact_session for that. REFUSES by default, without reloading anything, when the source checkout has uncommitted changes — reviewed code only reaches the live daemon; pass allow_dirty=true to deliberately override (logged)."

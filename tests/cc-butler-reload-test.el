@@ -1038,7 +1038,17 @@ one thing that is actually running."
                         (bound-and-true-p claude-code-ide-mcp-server-tools))))
     (when spec   ; only when claude-code-ide is present to register against
       (let ((norm (claude-code-ide--normalize-tool-spec spec)))
-        (should (eq (plist-get norm :function) #'cc-butler-tool-runtime-source))
+        ;; :function is `cc-butler--mcp-tool-guard''s wrapper closure now,
+        ;; not `cc-butler-tool-runtime-source' itself directly -- every
+        ;; registration goes through the shared MCP error guard (2026-09-11,
+        ;; the leaked-buffer-text incident). `eq' no longer holds; prove
+        ;; delegation instead by calling it and checking the real function
+        ;; actually ran.
+        (let (called)
+          (cl-letf (((symbol-function 'cc-butler-tool-runtime-source)
+                     (lambda () (setq called t) "ok")))
+            (funcall (plist-get norm :function))
+            (should called)))
         (should-not (plist-get norm :args))))))
 
 (ert-deftest cc-butler-modules/matches-every-el-file-in-the-directory ()

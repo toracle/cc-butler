@@ -1806,7 +1806,7 @@ only says how many and how stale the oldest is."
                  '("escalate_to_butler" "pending_decisions")))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-escalate-to-butler
  :name "escalate_to_butler"
  :description "Steward only: raise a DECISION or send a NOTIFICATION to the user-facing butler's quiet queue. A decision needs a human answer (a choice, an approval, missing info) — use it for that, not routine progress. A notification (kind='notification') is for status that only needs to be READ — a correction, a completion, a 'you should know this' — and renders read-only, same as a decision, in the same open/ location; it is never answerable, and it does not count toward the ⚖ answer-required backlog (indicator or pending_decisions), but a human still closes it with one keypress (r) rather than it disappearing on its own. Ask yourself first: would anything the human could say change what happens next? If not, send it as a notification. Getting this wrong (sending status as a decision) silently accumulates as a backlog that looks like neglect but is really miscategorized FYIs. The butler drains decisions via pending_decisions and relays the answer back to you with send_to_session; a notification has nothing to relay back."
@@ -1826,7 +1826,7 @@ only says how many and how stale the oldest is."
                 :description "'decision' (default) if this needs a pick-one/approve answer; 'notification' if it's status only and should be READ, not answered. Anything other than exactly 'notification' is treated as a decision — when unsure, the default is the safe choice."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-pending-decisions
  :name "pending_decisions"
  :description "Butler only: drain your quiet decision queue — the decisions the steward has escalated for the human to decide. Call it at the start of a turn (and when nudged) to see what needs the boss's attention, without the worker firehose. Returns the decisions and clears them; present them cleanly to the human, then relay each answer down to the steward with send_to_session."
@@ -2158,13 +2158,13 @@ durable log; only delivery to the steward is suppressed."
                    "accept_trust_dialog")))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-inbox
  :name "pending_events"
  :description "Steward only: drain your inbox of pending events from worker sessions that need attention (a worker asked a question, finished, reported via report_to_steward, or hit a prompt), newest last. Each line is a timestamped worker name (with its session id) and message. Call this at the start of each turn (and whenever you are nudged) to learn what changed without anything being typed into your input box. Returns the events and clears them."
  :args nil)
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-report-to-steward
  :name "report_to_steward"
  :description "Report up to the steward with real content — not just 'I need attention'. State WHAT happened / what you did, the current STATE, and exactly what you NEED (a decision, input, or nothing). Your session name and id are attached automatically; the steward drains this via pending_events and tracks/dispatches you from there. This does NOT reach the human/butler directly — the steward escalates to the butler only when something genuinely needs a human decision. Call it when you finish, get blocked, or have a status update."
@@ -2180,7 +2180,7 @@ durable log; only delivery to the steward is suppressed."
                 :description "What you need to proceed, e.g. 'review this PR' or 'which auth method to use'. Omit (or 'nothing') if you are only informing. Optional."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-report-to-butler
  :name "report_to_butler"
  :description "DEPRECATED — renamed to `report_to_steward' on 2026-07-09 (this tool never actually reached the butler; it always landed with the steward). Kept only so already-connected sessions don't hit a tool-not-found error. Use report_to_steward instead."
@@ -2196,13 +2196,13 @@ durable log; only delivery to the steward is suppressed."
                 :description "What you need to proceed. Omit (or 'nothing') if you are only informing. Optional."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-list-sessions
  :name "list_claude_sessions"
  :description "List the other live Claude Code sessions running in this Emacs (the workers you orchestrate): their stable name, whether each is WAITING-FOR-INPUT (idle at its prompt, dispatchable) or BLOCKED-ON-DIALOG (stuck inside an open dialog/confirmation menu it never resolved -- NOT dispatchable, and NOT answerable remotely either: sending it anything lands as prompt text and the trailing Enter falls on whatever the dialog's default happens to be, silently \"answering\" it wrong; this needs a human at the keyboard), its git branch, its live activity title (what it's doing right now), any status note it deliberately left via set_session_info (e.g. parked with a reason), and (when known) the model it's running. Call this first to learn the names used by read_session_output and send_to_session."
  :args nil)
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-read-session
  :name "read_session_output"
  :description "Read the recent terminal screen of another Claude session by name, to see what it is doing or asking. The text is that session's live TUI screen (may include UI chrome). The input row is returned only when the session's terminal cursor shows a human really typed into it; a ghost/autocomplete suggestion painted into an empty box is replaced with a plain marker, and a row whose state cannot be determined is replaced with an UNVERIFIED marker rather than shown as if it were real input."
@@ -2214,7 +2214,7 @@ durable log; only delivery to the steward is suppressed."
                 :description "How many trailing lines to return (default 40)."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-send-session
  :name "send_to_session"
  :description "Type a prompt/answer into another Claude session by name and submit it (press Enter), to direct that worker. Use to answer a worker's question, give it a task, or unblock it. You cannot send to yourself. Multi-line is supported: include newlines in text — they are delivered as a paste and stay literal, and Enter is pressed only once, at the end, to submit. CAUTION when sending free-form text (not answering a question you just asked): if the target has an open interactive prompt or menu (e.g. from AskUserQuestion), your one submit-Enter lands on whatever is highlighted there, not on your text — it is silently swallowed on both ends. Check with read_session_output first when unsure, and tell dispatched workers to prefer report_to_steward/escalate_to_butler over AskUserQuestion so this cannot happen."
@@ -2225,7 +2225,7 @@ durable log; only delivery to the steward is suppressed."
                 :type string
                 :description "The text to type into that session before submitting. May contain newlines for a multi-line prompt; only the final submit presses Enter.")))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-accept-trust-dialog
  :name "accept_trust_dialog"
  :description "Press \"Yes, I trust this folder\" on session NAME's one-time folder-trust dialog — the safety handle for the case where the automatic launch-time gate missed it and the session is sitting stuck on \"No, exit\". Acts ONLY if a trust dialog is actually showing on that session's live screen right now; if not (an ordinary prompt, an unrelated menu, or nothing at all), it refuses explicitly and sends zero keys rather than guessing. Never use this speculatively — check read_session_output first if unsure what is actually on screen."
