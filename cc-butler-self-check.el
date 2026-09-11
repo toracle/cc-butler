@@ -1150,6 +1150,165 @@ nothing\" apart from \"the check silently didn't run\"."
         (list :ok ok :detail detail)))))
 
 ;;;; ------------------------------------------------------------------
+;;;; Check 10: how stale is the running code, as NUMBERS
+;;;; ------------------------------------------------------------------
+;;;; Two fleets were found running stale daemons the same day, and nothing
+;;;; here or anywhere else showed it: this fleet's loaded commit was 14
+;;;; behind origin/main, another's was 92 behind AND diverged (its own
+;;;; unpushed commits sitting on top). A boolean "up to date" would have
+;;;; read green through both -- there is no single threshold at which
+;;;; N-behind becomes "a problem" in the abstract, only a number a human
+;;;; needs to be ABLE to see. This check does not introduce a second
+;;;; staleness FAIL -- `cc-butler-self-check--module-load-path' (check 4)
+;;;; already fails when the running code is unmerged/unreachable from
+;;;; origin/main at all, via `cc-butler--commit-merged-p'. This check's
+;;;; job is purely instrumentation: put the ahead/behind counts, for both
+;;;; the LOADED commit and the on-disk checkout HEAD, in the output every
+;;;; tick, alongside the exact ref compared against and how stale that
+;;;; ref's own local knowledge is -- so "0 behind" next to a week-old
+;;;; fetch can never look identical to "0 behind" next to a fresh one.
+
+(defun cc-butler-self-check--code-staleness-common-gitdir (gitdir)
+  "The COMMON git dir serving GITDIR -- itself, unless GITDIR belongs to a
+linked worktree, in which case its `commondir' file names the real one
+\(refs, FETCH_HEAD and reflogs all live there, not in the worktree's own
+private gitdir). Same one-hop resolution `cc-butler--git-ref-hash' already
+does inline for a single ref; factored out here so the fetch-age reader
+below does not duplicate it a second time."
+  (let ((commondir (expand-file-name "commondir" gitdir)))
+    (or (and (file-regular-p commondir)
+             (let ((rel (cc-butler--file-head-line commondir 4096)))
+               (and rel (expand-file-name rel gitdir))))
+        gitdir)))
+
+(defun cc-butler-self-check--code-staleness-fetch-age (dir)
+  "Seconds since DIR's local `refs/remotes/origin/main' was last updated by
+a real `git fetch'/`pull', or nil if not determinable. Prefers
+`FETCH_HEAD's mtime (touched by every fetch regardless of which refs it
+moved); falls back to the ref's own reflog mtime when FETCH_HEAD is
+absent (e.g. a linked worktree that has never fetched through itself).
+File-mtime and file-read only -- no subprocess, the same discipline
+`cc-butler--git-head' uses and explains: a periodic timer must not risk
+blocking on a stalled filesystem the way an unbounded subprocess call
+can."
+  (let ((gitdir (cc-butler--git-dir dir)))
+    (when gitdir
+      (let* ((common (cc-butler-self-check--code-staleness-common-gitdir gitdir))
+             (fetch-head (expand-file-name "FETCH_HEAD" common))
+             (reflog (expand-file-name "logs/refs/remotes/origin/main" common))
+             (stamp-file (cond ((file-exists-p fetch-head) fetch-head)
+                                ((file-exists-p reflog) reflog))))
+        (when stamp-file
+          (- (float-time)
+             (float-time (file-attribute-modification-time
+                          (file-attributes stamp-file)))))))))
+
+(defun cc-butler-self-check--code-staleness-counts (dir sha)
+  "(AHEAD . BEHIND) commit counts between SHA and DIR's locally known
+`origin/main' -- either side nil if not determinable. AHEAD counts
+commits reachable from SHA but not from `origin/main'; BEHIND is the
+reverse. Reads only the already-fetched local `origin/main' -- never
+fetches, so this is safe to call from a periodic timer, same tradeoff
+`cc-butler--source-behind' already accepts: a stale local `origin/main'
+can only UNDER-report drift, never invent it."
+  (when (and dir sha)
+    (cons
+     (let ((n (cc-butler--git dir "rev-list" "--count" (format "origin/main..%s" sha))))
+       (and n (string-match-p "\\`[0-9]+\\'" n) (string-to-number n)))
+     (let ((n (cc-butler--git dir "rev-list" "--count" (format "%s..origin/main" sha))))
+       (and n (string-match-p "\\`[0-9]+\\'" n) (string-to-number n))))))
+
+(defun cc-butler-self-check--code-staleness-number (n)
+  "N as a string, or the literal \"unknown\" -- never blank, so a reader can
+tell a real zero apart from \"could not determine\" at a glance."
+  (if n (number-to-string n) "unknown"))
+
+(defun cc-butler-self-check--code-staleness-fetch-age-detail (seconds)
+  "\"Nm/Nh/Nd ago\", or a literal explanation when SECONDS is nil -- never
+blank. A \"0 behind\" printed next to a silently-missing fetch age is
+exactly the false reassurance this check exists to prevent."
+  (if seconds
+      (format "%s ago" (cc-butler--decision-format-age seconds))
+    "unknown (no FETCH_HEAD and no origin/main reflog found)"))
+
+(defun cc-butler-self-check--code-staleness-diverged-p (counts)
+  "Non-nil when COUNTS (an (AHEAD . BEHIND) pair, see
+`cc-butler-self-check--code-staleness-counts') shows genuine divergence --
+both sides known AND non-zero. Nil/undeterminable counts are never treated
+as diverged; a one-sided count (plain ahead, or plain behind) is normal
+drift, not divergence."
+  (and counts (car counts) (cdr counts) (> (car counts) 0) (> (cdr counts) 0)))
+
+(defun cc-butler-self-check--code-staleness-side (label sha line ahead behind)
+  "One \"LABEL vs origin/main: ...\" clause for LABEL's SHA/LINE against
+AHEAD/BEHIND counts (see `cc-butler-self-check--code-staleness-counts')."
+  (format "%s %s vs origin/main: %s ahead / %s behind%s"
+          label (or line sha "could not determine")
+          (cc-butler-self-check--code-staleness-number ahead)
+          (cc-butler-self-check--code-staleness-number behind)
+          (if (cc-butler-self-check--code-staleness-diverged-p (cons ahead behind)) " [DIVERGED]" "")))
+
+(defun cc-butler-self-check--code-staleness ()
+  "Check 10: NUMBERS for how stale the running code is, never just ok/fail.
+
+Reports the LOADED commit (`cc-butler--runtime-commit-sha', the snapshot
+`cc-butler--capture-runtime-source' took at the last load/reload -- what
+is actually executing) and the on-disk checkout HEAD
+(`cc-butler--git-head-sha', re-read fresh every tick) separately, since a
+restart or hot-load can leave them apart. The checkout location is
+whatever `cc-butler--runtime-source-dir' resolved to at load time --
+wherever THIS fleet's library actually loaded from, never a hardcoded
+path, so the same check serves every fleet regardless of layout.
+
+`:ok' is nil when there is something a human is actually worth flagging
+for: the LOADED commit differs from the on-disk checkout HEAD (a hot-reload
+or restart would pick up code already sitting on disk and hasn't), or
+either the loaded commit or the checkout HEAD has diverged from
+`origin/main' (commits on both sides -- unpushed local work sitting under
+code nobody has merged). Being merely N commits BEHIND `origin/main', with
+neither of those, stays `:ok' t: that is normal lag, not a problem in
+itself -- there is no single N at which it becomes one in the abstract
+\(see the section commentary above), so the NUMBER is what is surfaced,
+always in `:detail', never collapsed into a verdict on its own. `:ok' is
+also nil when this check itself could not determine anything at all (no
+readable loaded-source git checkout) -- a meta-failure, not a staleness
+judgment."
+  (if (not (boundp 'cc-butler--runtime-source-dir))
+      (list :ok t
+            :detail "code staleness: not checked -- PR #74's runtime-source vars (cc-butler.el) are not loaded in this fleet")
+    (let ((dir cc-butler--runtime-source-dir)
+          (loaded-sha cc-butler--runtime-commit-sha)
+          (loaded-line cc-butler--runtime-commit-line))
+      (if (not (and dir loaded-sha))
+          (list :ok nil
+                :detail "code staleness: could not determine at all -- no readable loaded-source git checkout (cc-butler--runtime-source-dir/-commit-sha unset)")
+        (let* ((gitdir (cc-butler--git-dir dir))
+               (origin-sha (and gitdir (cc-butler--git-ref-hash gitdir "refs/remotes/origin/main")))
+               (checkout-sha (cc-butler--git-head-sha dir))
+               (checkout-line (and checkout-sha (cc-butler--source-revision dir)))
+               (fetch-age (cc-butler-self-check--code-staleness-fetch-age dir))
+               (loaded-counts (cc-butler-self-check--code-staleness-counts dir loaded-sha))
+               (checkout-counts (cc-butler-self-check--code-staleness-counts dir checkout-sha))
+               (mismatch (and checkout-sha (not (string= loaded-sha checkout-sha))))
+               (flagged (or mismatch
+                            (cc-butler-self-check--code-staleness-diverged-p loaded-counts)
+                            (cc-butler-self-check--code-staleness-diverged-p checkout-counts))))
+          (list :ok (not flagged)
+                :detail
+                (format "code staleness: source %s -- loaded %s, origin/main tip %s (compared against refs/remotes/origin/main, last fetched %s) -- %s; %s%s"
+                        dir
+                        (or loaded-line loaded-sha)
+                        (or origin-sha "could not determine (no locally known origin/main ref)")
+                        (cc-butler-self-check--code-staleness-fetch-age-detail fetch-age)
+                        (cc-butler-self-check--code-staleness-side "loaded" loaded-sha loaded-line
+                                                                    (car loaded-counts) (cdr loaded-counts))
+                        (cc-butler-self-check--code-staleness-side "checkout HEAD" checkout-sha checkout-line
+                                                                    (car checkout-counts) (cdr checkout-counts))
+                        (if mismatch
+                            " -- ⚠ LOADED CODE DIFFERS FROM CHECKOUT HEAD: reload or restart to pick up what is already on disk"
+                          ""))))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Registry
 ;;;; ------------------------------------------------------------------
 
@@ -1162,7 +1321,8 @@ nothing\" apart from \"the check silently didn't run\"."
     ("vault-path" . cc-butler-self-check--vault-path)
     ("code-vs-live-defcustom" . cc-butler-self-check--code-vs-live-defcustom)
     ("orphaned-inboxes" . cc-butler-self-check--orphaned-inboxes)
-    ("queue-room-thread-activity" . cc-butler-self-check--queue-room-thread-activity))
+    ("queue-room-thread-activity" . cc-butler-self-check--queue-room-thread-activity)
+    ("code-staleness" . cc-butler-self-check--code-staleness))
   "Alist of (NAME . FUNCTION).  FUNCTION takes no args, returns a plist
 \(:ok BOOL :detail STRING).  Extensible -- new checks are just new entries,
 so this does not stay a fixed list of six forever.
