@@ -371,6 +371,95 @@ folder-trust screen in its as-rendered (\"No, exit\" highlighted) state."
           (should-not (cc-butler--trust-dialog-new-shape-yes-selected-p buf)))
       (kill-buffer buf))))
 
+(defun cc-butler-session-test--insert-trust-dialog-new-shape-full-height ()
+  "Insert the v2.1.260+ folder-trust screen exactly as it renders on a
+FRESH ghostel session with nothing else on screen yet — verbatim capture
+(`get_buffer_content', 2026-09-11, `example-topic'
+after `new_topic'): 39 total lines, dialog content in lines 1-19, then 20
+blank lines padding down to the full terminal height. Regression fixture
+for the bug this padding caused: the trust marker (line 8) sat above the
+naive last-`cc-butler--live-screen-tail-lines'-lines window, which counted
+back from the literal end of this blank padding rather than from the
+dialog content — `cc-butler--wait-for-session-ready' /
+`cc-butler--accept-trust-dialog-new-shape' silently never fired and the
+launch sat stuck on \"No, exit\" forever."
+  (insert (make-string 24 cc-butler--border-rule-char) "\n")
+  (insert " Accessing workspace:\n\n")
+  (insert " /home/user/projects/example-project\n\n")
+  (insert " Quick safety check: Is this a project you created or one you trust? (Like your\n")
+  (insert " own code, a well-known open source project, or work from your team). If not,\n")
+  (insert " take a moment to review what's in this folder first.\n\n")
+  (insert " Claude Code'll be able to read, edit, and execute files here.\n\n")
+  (insert " Security guide\n\n")
+  (insert "❯ No, exit\n")
+  (insert "  Yes, I trust this folder\n\n")
+  (insert " Enter to confirm · Esc to cancel\n")
+  (dotimes (_ 20) (insert "\n")))
+
+(ert-deftest cc-butler-session/trust-dialog-new-shape-p-detects-real-screen-with-blank-padding-below ()
+  "Regression for the 2026-09-11 `new_topic' launch hang: the real screen
+pads with blank rows below the dialog to fill the terminal height, and
+detection must still fire — not just on the unpadded fixture above."
+  (let ((buf (get-buffer-create " *cc-butler-test-trust-new-padded*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (cc-butler-session-test--insert-trust-dialog-new-shape-full-height))
+          (should (cc-butler--trust-dialog-marker-present-p buf))
+          (should (cc-butler--trust-dialog-new-shape-p buf))
+          (should-not (cc-butler--trust-dialog-new-shape-yes-selected-p buf)))
+      (kill-buffer buf))))
+
+(defun cc-butler-session-test--insert-quoted-dialog-then-live-bottom-with-blank-padding ()
+  "Insert a screen combining both known scrollback shapes at once: the
+trust dialog QUOTED earlier in conversation (as in
+`cc-butler-session-test--insert-quoted-dialog-in-conversation'), then a
+REAL non-blank live bottom — ordinary prompt/status rows, the way a
+session actually looks mid-turn — and only THEN trailing blank padding
+underneath that, the way a freshly-rendered terminal pads down to its
+full height. The existing quoted-dialog fixture never has blank padding
+below its live bottom, and the padded-fixture above never has a quoted
+dialog above its live bottom — this combines both, since the fix skips
+trailing blank/whitespace before counting the tail window back, and must
+land on the real prompt/status rows, not skip far enough to expose the
+quoted dialog above them."
+  (insert " [스튜어드] 🔴 정정 — 내 배차문에 결함이 있었다.\n\n")
+  (insert "**실측 원문** (2026-09-05, `example-topic` 세션):\n")
+  (insert "```\n")
+  (insert " Quick safety check: Is this a project you created or one you trust? (Like your own code, a\n")
+  (insert " well-known open source project, or work from your team). If not, take a moment to review what's in\n")
+  (insert " this folder first.\n\n")
+  (insert " Claude Code'll be able to read, edit, and execute files here.\n\n")
+  (insert " Security guide\n\n")
+  (insert " ❯ No, exit\n")
+  (insert "   Yes, I trust this folder\n\n")
+  (insert " Enter to confirm · Esc to cancel\n")
+  (insert "```\n")
+  (insert "이대로 두면 세션을 죽인다.\n\n")
+  ;; Real, non-blank live bottom — status/prompt rows, not filler dots.
+  (dotimes (_ (cc-butler--live-screen-tail-lines))
+    (insert "cc-butler> ready\n"))
+  (insert (make-string 24 cc-butler--border-rule-char) "\n")
+  (insert "❯ \n")
+  (insert (make-string 24 cc-butler--border-rule-char) "\n")
+  ;; Then blank padding under that real bottom, filling out the terminal
+  ;; height the way a fresh render does.
+  (dotimes (_ 10) (insert "\n")))
+
+(ert-deftest cc-butler-session/trust-dialog-showing-p-nil-on-quoted-dialog-with-real-bottom-and-blank-padding-below ()
+  "Regression for the tail-window fix: a quoted dialog in scrollback, a
+real non-blank live bottom below it, and trailing blank padding below
+THAT must still resolve to the real bottom, not skip past it back into
+the quote. All three detectors must stay nil."
+  (let ((buf (get-buffer-create " *cc-butler-test-trust-quoted-then-blank-padding*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (cc-butler-session-test--insert-quoted-dialog-then-live-bottom-with-blank-padding))
+          (should-not (cc-butler--trust-dialog-marker-present-p buf))
+          (should-not (cc-butler--trust-dialog-new-shape-p buf))
+          (should-not (cc-butler--trust-dialog-showing-p buf)))
+      (kill-buffer buf))))
+
 (ert-deftest cc-butler-session/trust-dialog-new-shape-p-nil-on-mcp-classifier-lookalike ()
   "The Auto Mode classifier confirmation shares `❯' + Yes/No wording but
 has no `Quick safety check:' marker — must not be mistaken for the trust

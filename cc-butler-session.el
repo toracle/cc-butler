@@ -1951,8 +1951,8 @@ See `cc-butler--live-screen-tail-start'."
 
 (defun cc-butler--live-screen-tail-start (buf)
   "Return the position in BUF that starts the last
-`cc-butler--live-screen-tail-lines' lines — the live bottom of the screen,
-as opposed to scrollback.
+`cc-butler--live-screen-tail-lines' lines of actual content — the live
+bottom of the screen, as opposed to scrollback.
 
 A first cut at this (2026-09-05) anchored on a real box border found
 within a lookback window above the marker instead of on position, and
@@ -1963,11 +1963,26 @@ the border check. Position is the fix, not another content heuristic —
 cc-butler-compact--menu-p already solved exactly this class of problem
 (a structurally-real-looking match sitting in scrollback) the same way,
 and this reuses its narrowing rather than inventing a second kind
-(cc-butler#8 PR #151 review)."
+(cc-butler#8 PR #151 review).
+
+Second bug, same window, opposite edge (2026-09-11,
+`example-topic' `new_topic' launch): counting back
+from the LITERAL `point-max' broke on a freshly-rendered ghostel screen
+that pads with blank rows below the dialog to fill the full terminal
+height. Measured live: 39 total lines,
+dialog content in lines 4-19, all of lines 20-39 blank — the trust marker
+at line 8 sat above the naive tail window (lines ~15-39), so the whole
+launch-accept chain silently never fired and the session sat stuck on
+its \"No, exit\" default forever. Skipping trailing blank/whitespace
+lines before counting back fixes this without weakening the anti-quoting
+guarantee above: the scrollback-quote case pads its live bottom with real
+filler text (`cc-butler-session-test--insert-quoted-dialog-in-conversation'),
+never blank lines, so this skip never fires there."
   (with-current-buffer buf
     (save-excursion
       (goto-char (point-max))
-      (forward-line (- (cc-butler--live-screen-tail-lines)))
+      (skip-chars-backward " \t\n")
+      (forward-line (- (1- (cc-butler--live-screen-tail-lines))))
       (point))))
 
 (defun cc-butler--trust-dialog-marker-present-p (buf)
