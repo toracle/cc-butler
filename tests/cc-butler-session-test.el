@@ -371,6 +371,44 @@ folder-trust screen in its as-rendered (\"No, exit\" highlighted) state."
           (should-not (cc-butler--trust-dialog-new-shape-yes-selected-p buf)))
       (kill-buffer buf))))
 
+(defun cc-butler-session-test--insert-trust-dialog-new-shape-full-height ()
+  "Insert the v2.1.260+ folder-trust screen exactly as it renders on a
+FRESH ghostel session with nothing else on screen yet — verbatim capture
+(`get_buffer_content', 2026-09-11, `monocle-monocle-kap-system-diagram'
+after `new_topic'): 39 total lines, dialog content in lines 1-19, then 20
+blank lines padding down to the full terminal height. Regression fixture
+for the bug this padding caused: the trust marker (line 8) sat above the
+naive last-`cc-butler--live-screen-tail-lines'-lines window, which counted
+back from the literal end of this blank padding rather than from the
+dialog content — `cc-butler--wait-for-session-ready' /
+`cc-butler--accept-trust-dialog-new-shape' silently never fired and the
+launch sat stuck on \"No, exit\" forever."
+  (insert (make-string 24 cc-butler--border-rule-char) "\n")
+  (insert " Accessing workspace:\n\n")
+  (insert " /Users/jeongsoopark/projects/monocle-monocle-kap-system-diagram\n\n")
+  (insert " Quick safety check: Is this a project you created or one you trust? (Like your\n")
+  (insert " own code, a well-known open source project, or work from your team). If not,\n")
+  (insert " take a moment to review what's in this folder first.\n\n")
+  (insert " Claude Code'll be able to read, edit, and execute files here.\n\n")
+  (insert " Security guide\n\n")
+  (insert "❯ No, exit\n")
+  (insert "  Yes, I trust this folder\n\n")
+  (insert " Enter to confirm · Esc to cancel\n")
+  (dotimes (_ 20) (insert "\n")))
+
+(ert-deftest cc-butler-session/trust-dialog-new-shape-p-detects-real-screen-with-blank-padding-below ()
+  "Regression for the 2026-09-11 `new_topic' launch hang: the real screen
+pads with blank rows below the dialog to fill the terminal height, and
+detection must still fire — not just on the unpadded fixture above."
+  (let ((buf (get-buffer-create " *cc-butler-test-trust-new-padded*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (cc-butler-session-test--insert-trust-dialog-new-shape-full-height))
+          (should (cc-butler--trust-dialog-marker-present-p buf))
+          (should (cc-butler--trust-dialog-new-shape-p buf))
+          (should-not (cc-butler--trust-dialog-new-shape-yes-selected-p buf)))
+      (kill-buffer buf))))
+
 (ert-deftest cc-butler-session/trust-dialog-new-shape-p-nil-on-mcp-classifier-lookalike ()
   "The Auto Mode classifier confirmation shares `❯' + Yes/No wording but
 has no `Quick safety check:' marker — must not be mistaken for the trust
