@@ -809,7 +809,8 @@ points at a different, useful diagnostic (never delivered vs. delivered but
 un-recorded room vs. a wrong recorded room vs. a fetch failure)."
   (pcase reason
     ('no-delivery "no :Delivered-to-matrix: recorded")
-    ('no-room "no :Room: recorded")
+    ('no-room "no :Room:/:Delivered-room: recorded")
+    ('room-conflict ":Room: and :Delivered-room: disagree")
     ('not-in-room "recorded room does not contain the event (M_NOT_FOUND)")
     ('fetch-error "fetch failed")
     (_ (symbol-name reason))))
@@ -848,10 +849,14 @@ Returns a plist:
                                                 meaningful \"checked, no
                                                 thread activity at all\".
   (:bucket unverifiable :reason R)          -- R one of `no-delivery' `no-room'
-                                                `not-in-room' `fetch-error'.
+                                                `room-conflict' `not-in-room'
+                                                `fetch-error'.
 Either property missing (`no-delivery'/`no-room') is checked BEFORE ever
 calling out to Matrix at all -- an unverifiable decision must never guess
-at a room to fetch from.
+at a room to fetch from.  Likewise `room-conflict' (`:Room:' and
+`:Delivered-room:' both present and naming different rooms): which one is
+right is not decidable from the file alone, so this never silently picks
+either side.
 
 This check has NO closure bucket.  A thread reply -- even one from this
 fleet's own identity -- is not evidence of an answer: this fleet's own
@@ -864,12 +869,14 @@ them production state-change questions that would have silently vanished
 from the queue.  See this check's own test file for the permanent negative
 controls pinning this down."
   (let ((event-id (cc-butler--decision-delivered-to-matrix-event-id path))
-        (room (cc-butler--decision-room-id path)))
+        (room (cc-butler--decision-delivery-room path)))
     (cond
      ((not event-id) (list :bucket 'unverifiable :reason 'no-delivery))
      ((not room) (list :bucket 'unverifiable :reason 'no-room))
+     ((eq room 'conflict) (list :bucket 'unverifiable :reason 'room-conflict))
      (t
-      (let ((resp (matrix-bridge-thread-replies room event-id)))
+      (let ((resp (matrix-bridge-thread-replies
+                    room (cc-butler--decision-thread-root-event-id path))))
         (pcase (plist-get resp :status)
           ('not-in-room (list :bucket 'unverifiable :reason 'not-in-room))
           ('error (list :bucket 'unverifiable :reason 'fetch-error))
@@ -895,8 +902,9 @@ Otherwise, each candidate lands in one of two buckets
 (`cc-butler-self-check--queue-room-thread-activity-one'): OPEN (the thread was
 fetched -- `:detail' carries its scanned-message count and a raw
 sender/count breakdown, for a human to read) or UNVERIFIABLE (missing
-`:Delivered-to-matrix:'/`:Room:', the recorded room turned out wrong, or
-the fetch itself failed).  Every candidate in either bucket counts toward
+`:Delivered-to-matrix:'/room property, `:Room:' and `:Delivered-room:'
+disagreeing, the recorded room turned out wrong, or the fetch itself
+failed).  Every candidate in either bucket counts toward
 the same \"still awaiting answer\" total -- nothing here ever removes a
 decision from that count.
 
@@ -934,7 +942,7 @@ nothing\" apart from \"the check silently didn't run\"."
       (let* ((reason-counts
               (mapcar (lambda (reason)
                         (cons reason (length (seq-filter (lambda (u) (eq (cdr u) reason)) unverifiable))))
-                      '(no-delivery no-room not-in-room fetch-error)))
+                      '(no-delivery no-room room-conflict not-in-room fetch-error)))
              (detail
               (format "queue-room thread activity: %d candidate(s) — open %d%s · unverifiable %d (%s) — %d decision(s) checked, %d total thread message(s) scanned — this check never judges closure; read each before treating any as answered"
                       (length files)

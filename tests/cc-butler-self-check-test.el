@@ -788,15 +788,19 @@ cross-test-file `require' for one macro)."
        (delete-directory cc-butler-mail-dir t)
        (delete-directory cc-butler-decision-dir t))))
 
-(defun cc-butler-self-check-test--seed-open-decision (id-suffix &optional event-id room)
+(defun cc-butler-self-check-test--seed-open-decision
+    (id-suffix &optional event-id room delivered-room delivered-thread)
   "Write a `Kind: decision' open/ file, optionally with
-`:Delivered-to-matrix:'/`:Room:' properties."
+`:Delivered-to-matrix:'/`:Room:'/`:Delivered-room:'/`:Delivered-thread:'
+properties."
   (with-temp-file (expand-file-name
                     (format "%s-991-%s.org" (format-time-string "%Y%m%dT%H%M%S") id-suffix)
                     (cc-butler--decision-open-dir))
     (insert ":PROPERTIES:\n:Kind: decision\n"
             (if event-id (format ":Delivered-to-matrix: %s\n" event-id) "")
             (if room (format ":Room: %s\n" room) "")
+            (if delivered-room (format ":Delivered-room: %s\n" delivered-room) "")
+            (if delivered-thread (format ":Delivered-thread: %s\n" delivered-thread) "")
             ":END:\n#+TITLE: synthetic\n\n* Decision\nplaceholder\n")))
 
 (defmacro cc-butler-self-check-test--with-matrix-configured (&rest body)
@@ -876,6 +880,58 @@ check) and is named separately, not folded into `open'."
           (should (string-match-p "unverifiable 1" (plist-get r :detail)))
           (should (string-match-p "no :Room:" (plist-get r :detail)))
           (should (= 0 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-only-delivered-room-property-resolves ()
+  "The fix must not depend on the `:Room:' backfill -- a file carrying ONLY
+`:Delivered-room:' (the newer-convention shape the 4 newest live
+escalations actually use) must still resolve to a room and get fetched,
+not land in `no-room'."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "delroom" "$fake-event-delroom" nil "!fake-room:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (room _event-id)
+            (should (equal room "!fake-room:example.org"))
+            (list :status 'ok :events nil :scanned 0 :truncated nil))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+          (should (plist-get r :ok))
+          (should (string-match-p "open 1" (plist-get r :detail)))
+          (should (= 1 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-conflict-between-room-and-delivered-room ()
+  "`:Room:' and `:Delivered-room:' present and naming DIFFERENT rooms is its
+own unverifiable reason -- must not silently pick either value, and must
+never call out to Matrix with a guessed room."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "conflict" "$fake-event-conflict" "!fake-room-a:example.org" "!fake-room-b:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room _event-id) (error "must not be called -- room conflict is unverifiable"))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+          (should (plist-get r :ok))
+          (should (string-match-p "unverifiable 1" (plist-get r :detail)))
+          (should (string-match-p "disagree" (plist-get r :detail)))
+          (should (= 0 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-fetches-from-thread-root-not-leaf ()
+  "The leaf/root hypothesis, confirmed live 2026-09-11: when
+`:Delivered-to-matrix:' names a LEAF reply and `:Delivered-thread:' names
+the actual root, the fetch must go to the ROOT -- a human answer attaches
+there, not to the leaf."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "leafroot" "$fake-event-leaf" "!fake-room:example.org" nil "$fake-event-root")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room event-id)
+            (should (equal event-id "$fake-event-root"))
+            (list :status 'ok :events nil :scanned 5 :truncated nil))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+          (should (plist-get r :ok))
+          (should (string-match-p "5 total thread message" (plist-get r :detail)))
+          (should (= 1 cc-butler-self-check-test--thread-replies-calls)))))))
 
 (ert-deftest cc-butler-self-check/queue-room-unverifiable-not-in-room ()
   "The recorded room turns out wrong (M_NOT_FOUND) -- a data problem, kept

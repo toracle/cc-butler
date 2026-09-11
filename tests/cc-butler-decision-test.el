@@ -753,6 +753,153 @@ default to any room."
           (should (null (cc-butler--decision-room-id f))))
       (delete-file f))))
 
+;;;; ---- 2026-09-11 fix: event-id first-token parity + `:Delivered-room:'/
+;;;; `:Delivered-thread:' (queue-room-thread-activity check 9 hardening) ----
+;;;; Every id below is synthetic.
+
+(ert-deftest cc-butler-decision/delivered-to-matrix-event-id-strips-trailing-annotation ()
+  "A real `:Delivered-to-matrix:' value can carry a trailing human-readable
+annotation in parens, same shape `:Room:' already handles -- before this
+fix, the event-id reader alone took the WHOLE trimmed value, so the
+annotation rode along as part of the id fed to Matrix.  Live 2026-09-11
+this produced a false M_NOT_FOUND (`not-in-room') for a delivery that was
+actually in the right room -- the id just never matched."
+  (let ((f (make-temp-file "cc-butler-dtm-id")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Delivered-to-matrix: $fake-event-5  (요약, 최상위)\n:END:\n"))
+          (should (equal "$fake-event-5"
+                         (cc-butler--decision-delivered-to-matrix-event-id f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivered-room-id-flat-shape ()
+  (let ((f (make-temp-file "cc-butler-delivered-room")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Delivered-room: !fake-room-2:example.org\n:END:\n"))
+          (should (equal "!fake-room-2:example.org"
+                         (cc-butler--decision-delivered-room-id f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivered-room-id-indented-shape-strips-trailing-label ()
+  (let ((f (make-temp-file "cc-butler-delivered-room")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert "* 발신됨 — butler, synthetic\n"
+                    "  :Delivered-to-matrix: $fake-event-6\n"
+                    "  :Delivered-room: !fake-room-3:example.org (butlers)\n"))
+          (should (equal "!fake-room-3:example.org"
+                         (cc-butler--decision-delivered-room-id f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivery-room-only-room-property ()
+  (let ((f (make-temp-file "cc-butler-delivery-room")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Room: !fake-room-4:example.org\n:END:\n"))
+          (should (equal "!fake-room-4:example.org"
+                         (cc-butler--decision-delivery-room f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivery-room-only-delivered-room-property ()
+  "The fix must not depend on any backfill of `:Room:' -- a file carrying
+ONLY `:Delivered-room:' (the newer-convention shape) must resolve on its
+own."
+  (let ((f (make-temp-file "cc-butler-delivery-room")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Delivered-room: !fake-room-5:example.org\n:END:\n"))
+          (should (equal "!fake-room-5:example.org"
+                         (cc-butler--decision-delivery-room f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivery-room-both-properties-agree ()
+  (let ((f (make-temp-file "cc-butler-delivery-room")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Room: !fake-room-6:example.org\n"
+                    ":Delivered-room: !fake-room-6:example.org\n:END:\n"))
+          (should (equal "!fake-room-6:example.org"
+                         (cc-butler--decision-delivery-room f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivery-room-both-properties-disagree-is-conflict ()
+  "Both properties present and naming DIFFERENT rooms is not decidable from
+the file alone -- must return the `conflict' sentinel, never silently pick
+either value."
+  (let ((f (make-temp-file "cc-butler-delivery-room")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Room: !fake-room-7:example.org\n"
+                    ":Delivered-room: !fake-room-8:example.org\n:END:\n"))
+          (should (eq 'conflict (cc-butler--decision-delivery-room f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivery-room-nil-when-neither-present ()
+  (let ((f (make-temp-file "cc-butler-delivery-room")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Delivered-to-matrix: $fake-event-7\n:END:\n"))
+          (should (null (cc-butler--decision-delivery-room f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivered-thread-id-strips-trailing-detail ()
+  (let ((f (make-temp-file "cc-butler-delivered-thread")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert "* 발신됨 — butler, synthetic\n"
+                    "  :Delivered-to-matrix: $fake-event-root\n"
+                    "  :Delivered-thread: $fake-event-root (요약=루트, 상세는 $fake-event-detail)\n"))
+          (should (equal "$fake-event-root"
+                         (cc-butler--decision-delivered-thread-id f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivered-thread-id-nil-when-absent ()
+  (let ((f (make-temp-file "cc-butler-delivered-thread")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Delivered-to-matrix: $fake-event-8\n:END:\n"))
+          (should (null (cc-butler--decision-delivered-thread-id f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/thread-root-event-id-prefers-delivered-thread ()
+  "The whole point: when `:Delivered-to-matrix:' records a LEAF reply and
+`:Delivered-thread:' records the actual root, thread-activity fetches must
+use the root, not the leaf -- `/relations' only returns replies attached
+to the event it is called on, and a human reply attaches to the root."
+  (let ((f (make-temp-file "cc-butler-thread-root")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert "* 발신됨 — butler, synthetic\n"
+                    "  :Delivered-to-matrix: $fake-event-leaf\n"
+                    "  :Delivered-thread: $fake-event-root\n"))
+          (should (equal "$fake-event-root"
+                         (cc-butler--decision-thread-root-event-id f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/thread-root-event-id-falls-back-to-delivered-to-matrix ()
+  "Shape B has no `:Delivered-thread:' at all, and a delivery whose own
+event IS the thread root has no need of one -- both fall back cleanly."
+  (let ((f (make-temp-file "cc-butler-thread-root")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Delivered-to-matrix: $fake-event-9\n:END:\n"))
+          (should (equal "$fake-event-9"
+                         (cc-butler--decision-thread-root-event-id f))))
+      (delete-file f))))
+
 ;;;; ---- create-path (escalate :options) + full flow -----------------
 
 (ert-deftest cc-butler-decision/parse-options ()
