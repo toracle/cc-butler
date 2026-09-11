@@ -938,12 +938,22 @@ someone happened to look at the empty field."
 `$abc...'), or nil when the property is absent.  Reads the same
 `cc-butler--decision-delivered-to-matrix-re' `cc-butler--decision-delivered-to-matrix-p'
 uses -- extended with a capturing group, not a second, parallel regex --
-so the two can never disagree about what counts as \"present\"."
+so the two can never disagree about what counts as \"present\".
+
+Returns only the leading whitespace-delimited token, same as
+`cc-butler--decision-room-id' -- a real `:Delivered-to-matrix:' value can
+carry a trailing human-readable annotation in parens (e.g. \"$abc...  (요약,
+최상위)\"), and a caller that fed the whole trimmed line to Matrix as an
+event id would query a string that can never match, coming back
+M_NOT_FOUND -- indistinguishable from a genuinely wrong room.  Before this
+fix, this reader alone diverged from the room reader by taking the whole
+trimmed value instead of just the first token; that asymmetry is what
+produced exactly this false not-in-room result live (2026-09-11)."
   (with-temp-buffer
     (insert-file-contents file)
     (goto-char (point-min))
     (and (re-search-forward cc-butler--decision-delivered-to-matrix-re nil t)
-         (string-trim (match-string 1)))))
+         (car (split-string (string-trim (match-string 1)) "[ \t]+" t)))))
 
 (defconst cc-butler--decision-room-re
   "^[ \t]*:Room: \\(.*\\)$"
@@ -973,6 +983,87 @@ rather than guessing."
     (goto-char (point-min))
     (and (re-search-forward cc-butler--decision-room-re nil t)
          (car (split-string (string-trim (match-string 1)) "[ \t]+" t)))))
+
+(defconst cc-butler--decision-delivered-room-re
+  "^[ \t]*:Delivered-room: \\(.*\\)$"
+  "Regex matching a `:Delivered-room:' property line, the newer-convention
+sibling of `:Room:' (`cc-butler--decision-room-re') -- same dual-shape
+capture, same trailing-label risk, read by
+`cc-butler--decision-delivered-room-id'.")
+
+(defun cc-butler--decision-delivered-room-id (file)
+  "Return FILE's `:Delivered-room:' property value, or nil when absent.  Same
+first-token-only extraction as `cc-butler--decision-room-id' -- see that
+function's docstring for why."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (and (re-search-forward cc-butler--decision-delivered-room-re nil t)
+         (car (split-string (string-trim (match-string 1)) "[ \t]+" t)))))
+
+(defun cc-butler--decision-delivery-room (file)
+  "Resolve FILE's recorded delivery room from whichever of `:Room:' and
+`:Delivered-room:' it carries.  Two live property names exist for the same
+fact (an in-tree convention drift -- neither is written by any code in
+this repo; see this codebase's own commentary on that gap), so a reader
+that only checked one would silently miss files using the other.
+
+Returns:
+  a room id string  -- exactly one of the two is present, or both are
+                        present and agree.
+  nil                -- neither property is present.
+  `conflict'          -- both are present and name DIFFERENT rooms.  Which
+                        one is correct is not decidable from the file
+                        alone; callers must treat this as its own
+                        unverifiable reason, never silently pick either
+                        value."
+  (let ((room (cc-butler--decision-room-id file))
+        (delivered-room (cc-butler--decision-delivered-room-id file)))
+    (cond
+     ((and room delivered-room)
+      (if (equal room delivered-room) room 'conflict))
+     (room room)
+     (delivered-room delivered-room)
+     (t nil))))
+
+(defconst cc-butler--decision-delivered-thread-re
+  "^[ \t]*:Delivered-thread: \\(.*\\)$"
+  "Regex matching a `:Delivered-thread:' property line: the Matrix event id
+of the THREAD ROOT a delivery was posted into (distinct from
+`:Delivered-to-matrix:', which can name either the root itself or a leaf
+reply within it -- see `cc-butler--decision-thread-root-event-id').")
+
+(defun cc-butler--decision-delivered-thread-id (file)
+  "Return FILE's `:Delivered-thread:' property value (the thread ROOT event
+id), or nil when absent.  Same first-token-only extraction as the other
+event/room readers here."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (and (re-search-forward cc-butler--decision-delivered-thread-re nil t)
+         (car (split-string (string-trim (match-string 1)) "[ \t]+" t)))))
+
+(defun cc-butler--decision-thread-root-event-id (file)
+  "Return the event id thread-activity checks should fetch `/relations' FROM
+for FILE: `:Delivered-thread:' when present, else `:Delivered-to-matrix:'
+itself.
+
+This distinction is load-bearing, not cosmetic: `/relations/{event}/m.thread'
+only returns replies attached to the event it is called on.  A human
+reply attaches to the THREAD ROOT, not to whichever leaf event happened to
+be recorded as `:Delivered-to-matrix:' -- when that property names a leaf
+(this fleet's delivery convention posts a short header, then the decision
+body as a threaded reply to it; 3 of 4 live 2026-09-11 escalations record
+that reply, not the header), fetching from the leaf returns an empty
+thread even when the human genuinely answered on the root.  Confirmed live
+2026-09-11: the same event/room pair returned 0 relations queried from the
+leaf and 30 queried from its `:Delivered-thread:' root.
+
+`:Delivered-thread:' does not exist on older (Shape B) files, and a
+delivery whose own event IS the thread root has no need of it -- the
+fallback to `:Delivered-to-matrix:' covers both."
+  (or (cc-butler--decision-delivered-thread-id file)
+      (cc-butler--decision-delivered-to-matrix-event-id file)))
 
 (defun cc-butler--decision-file-mentions-delivery-p (file)
   "Non-nil when the bare string \"Delivered-to-matrix\" appears ANYWHERE in

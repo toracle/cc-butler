@@ -788,15 +788,19 @@ cross-test-file `require' for one macro)."
        (delete-directory cc-butler-mail-dir t)
        (delete-directory cc-butler-decision-dir t))))
 
-(defun cc-butler-self-check-test--seed-open-decision (id-suffix &optional event-id room)
+(defun cc-butler-self-check-test--seed-open-decision
+    (id-suffix &optional event-id room delivered-room delivered-thread)
   "Write a `Kind: decision' open/ file, optionally with
-`:Delivered-to-matrix:'/`:Room:' properties."
+`:Delivered-to-matrix:'/`:Room:'/`:Delivered-room:'/`:Delivered-thread:'
+properties."
   (with-temp-file (expand-file-name
                     (format "%s-991-%s.org" (format-time-string "%Y%m%dT%H%M%S") id-suffix)
                     (cc-butler--decision-open-dir))
     (insert ":PROPERTIES:\n:Kind: decision\n"
             (if event-id (format ":Delivered-to-matrix: %s\n" event-id) "")
             (if room (format ":Room: %s\n" room) "")
+            (if delivered-room (format ":Delivered-room: %s\n" delivered-room) "")
+            (if delivered-thread (format ":Delivered-thread: %s\n" delivered-thread) "")
             ":END:\n#+TITLE: synthetic\n\n* Decision\nplaceholder\n")))
 
 (defmacro cc-butler-self-check-test--with-matrix-configured (&rest body)
@@ -876,6 +880,110 @@ check) and is named separately, not folded into `open'."
           (should (string-match-p "unverifiable 1" (plist-get r :detail)))
           (should (string-match-p "no :Room:" (plist-get r :detail)))
           (should (= 0 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-only-delivered-room-property-resolves ()
+  "The fix must not depend on the `:Room:' backfill -- a file carrying ONLY
+`:Delivered-room:' (the newer-convention shape the 4 newest live
+escalations actually use) must still resolve to a room and get fetched,
+not land in `no-room'."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "delroom" "$fake-event-delroom" nil "!fake-room:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (room _event-id)
+            (should (equal room "!fake-room:example.org"))
+            (list :status 'ok :events nil :scanned 0 :truncated nil))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+          (should (plist-get r :ok))
+          (should (string-match-p "open 1" (plist-get r :detail)))
+          (should (= 1 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-conflict-between-room-and-delivered-room ()
+  "`:Room:' and `:Delivered-room:' present and naming DIFFERENT rooms is its
+own unverifiable reason -- must not silently pick either value, and must
+never call out to Matrix with a guessed room."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "conflict" "$fake-event-conflict" "!fake-room-a:example.org" "!fake-room-b:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room _event-id) (error "must not be called -- room conflict is unverifiable"))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+          (should (plist-get r :ok))
+          (should (string-match-p "unverifiable 1" (plist-get r :detail)))
+          (should (string-match-p "disagree" (plist-get r :detail)))
+          (should (= 0 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-fetches-from-thread-root-not-leaf ()
+  "The leaf/root hypothesis, confirmed live 2026-09-11: when
+`:Delivered-to-matrix:' names a LEAF reply and `:Delivered-thread:' names
+the actual root, activity comes from the ROOT -- a human answer attaches
+there, not to the leaf.  Room membership is still verified on the LEAF
+first (the delivered event, the one this check exists to verify), so both
+calls happen: leaf then root."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "leafroot" "$fake-event-leaf" "!fake-room:example.org" nil "$fake-event-root")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room event-id)
+            (cond
+             ((equal event-id "$fake-event-leaf")
+              (list :status 'ok :events nil :scanned 0 :truncated nil))
+             ((equal event-id "$fake-event-root")
+              (list :status 'ok :events nil :scanned 5 :truncated nil))
+             (t (error "unexpected event-id %s" event-id))))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+          (should (plist-get r :ok))
+          (should (string-match-p "5 total thread message" (plist-get r :detail)))
+          (should (= 2 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-leaf-not-in-room-decides-before-root-is-touched ()
+  "The delivered event (leaf) is what this check verifies -- when leaf and
+root differ, the leaf is queried FIRST and decides room membership; the
+root must never be touched once the leaf has already failed.
+`:Delivered-thread:' is itself a hand-written record and cannot vouch for
+the delivery."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "leafwrong" "$fake-event-leafwrong" "!fake-room:example.org" nil "$fake-event-rootwrong")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room event-id)
+            (cond
+             ((equal event-id "$fake-event-leafwrong") (list :status 'not-in-room))
+             (t (error "root must not be queried once the leaf already failed"))))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+          (should (plist-get r :ok))
+          (should (string-match-p "unverifiable 1" (plist-get r :detail)))
+          (should (string-match-p "M_NOT_FOUND\\|does not contain" (plist-get r :detail)))
+          (should (= 1 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-root-only-failure-not-mislabeled-not-in-room ()
+  "A root-only fetch failure, AFTER the leaf already verified room
+membership, must never read as `not-in-room' -- that would misreport an
+already-confirmed delivery as a wrong-room one."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "rootfail" "$fake-event-rootfail-leaf" "!fake-room:example.org" nil "$fake-event-rootfail-root")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room event-id)
+            (cond
+             ((equal event-id "$fake-event-rootfail-leaf")
+              (list :status 'ok :events nil :scanned 0 :truncated nil))
+             ((equal event-id "$fake-event-rootfail-root")
+              (list :status 'not-in-room))
+             (t (error "unexpected event-id %s" event-id))))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+          (should (plist-get r :ok))
+          (should (string-match-p "unverifiable 1" (plist-get r :detail)))
+          ;; Every reason's label is always listed with its count (even 0) --
+          ;; so the assertion is on the COUNTS, not on label text presence.
+          (should (string-match-p "M_NOT_FOUND) 0" (plist-get r :detail)))
+          (should (string-match-p "thread root fetch failed 1" (plist-get r :detail)))
+          (should (= 2 cc-butler-self-check-test--thread-replies-calls)))))))
 
 (ert-deftest cc-butler-self-check/queue-room-unverifiable-not-in-room ()
   "The recorded room turns out wrong (M_NOT_FOUND) -- a data problem, kept
