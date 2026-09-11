@@ -281,7 +281,7 @@ onto \"Yes, I trust this folder\" (the post-Down state, also captured
 live); otherwise the as-rendered default (\"No, exit\" highlighted)."
   (insert (make-string 24 cc-butler--border-rule-char) "\n")
   (insert " Accessing workspace:\n\n")
-  (insert " /Users/jeongsoopark/projects/monocle-wiki-engine-sdd\n\n")
+  (insert " /home/user/projects/example-project\n\n")
   (insert " Quick safety check: Is this a project you created or one you trust? (Like your own code, a\n")
   (insert " well-known open source project, or work from your team). If not, take a moment to review what's in\n")
   (insert " this folder first.\n\n")
@@ -753,6 +753,225 @@ than erroring."
             (should-not (cc-butler--accept-trust-dialog-new-shape "/worker/"))))
       (kill-buffer buf))))
 
+;;;; ---- accept-trust-dialog handle (safe, checked-live-screen) ---------
+;;;; The callable "press the trust dialog" handle: `cc-butler--accept-trust-dialog'.
+;;;; Unlike `cc-butler--accept-trust-dialog-new-shape' above (new shape only,
+;;;; called from the automatic launch-time gate), this handles BOTH known
+;;;; shapes and is meant for a remote caller (the `accept_trust_dialog' MCP
+;;;; tool) to unstick a session the automatic gate missed. The whole point is
+;;;; safety: it must act only when a dialog is actually showing, and refuse
+;;;; otherwise -- these tests prove the refusal path sends zero keys, not just
+;;;; that the accept path works.
+
+(ert-deftest cc-butler-session/accept-trust-dialog-old-shape-accepts-with-one-return ()
+  "Old-shape dialog (`❯ 1. Yes, I trust this folder' pre-highlighted):
+a single Return accepts it, and the result is `accepted' once a fresh
+re-read confirms the marker is gone."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-old*"))
+        (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (cc-butler-session-test--insert-trust-dialog))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda ()
+                       (cl-incf return-count)
+                       (with-current-buffer term-buf (erase-buffer) (insert "❯ \n")))))
+            (should (eq 'accepted (cc-butler--accept-trust-dialog "/worker/")))
+            (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-new-shape-accepts-and-confirms-gone ()
+  "New-shape dialog: delegates to `cc-butler--accept-trust-dialog-new-shape'
+for the Down + confirm-landing + Return sequence, then re-reads once more
+and reports `accepted' once the marker is confirmed gone."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-new*"))
+        (down-count 0) (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (cc-butler-session-test--insert-trust-dialog-new-shape))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down)
+                     (lambda (&optional _buf)
+                       (cl-incf down-count)
+                       (with-current-buffer term-buf
+                         (erase-buffer)
+                         (cc-butler-session-test--insert-trust-dialog-new-shape t))))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda ()
+                       (cl-incf return-count)
+                       (with-current-buffer term-buf (erase-buffer) (insert "❯ \n")))))
+            (should (eq 'accepted (cc-butler--accept-trust-dialog "/worker/")))
+            (should (= 1 down-count))
+            (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-new-shape-with-blank-padding-accepts ()
+  "Regression for the tail-window fix (#245): a freshly-rendered ghostel
+screen pads with blank rows below the dialog to fill the terminal
+height. `cc-butler--accept-trust-dialog' must still detect and accept it
+— proving this handle rides on the FIXED `cc-butler--live-screen-tail-start',
+not a stale assumption about where the live bottom sits."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-new-padded*"))
+        (down-count 0) (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (cc-butler-session-test--insert-trust-dialog-new-shape-full-height))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down)
+                     (lambda (&optional _buf)
+                       (cl-incf down-count)
+                       (with-current-buffer term-buf
+                         (erase-buffer)
+                         (cc-butler-session-test--insert-trust-dialog-new-shape t)
+                         (dotimes (_ 20) (insert "\n")))))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda ()
+                       (cl-incf return-count)
+                       (with-current-buffer term-buf (erase-buffer) (insert "❯ \n")))))
+            (should (eq 'accepted (cc-butler--accept-trust-dialog "/worker/")))
+            (should (= 1 down-count))
+            (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-refuses-on-unrelated-menu ()
+  "A screen showing an unrelated ❯/Yes-No menu (no trust marker) must be
+refused as `no-dialog', with ZERO keys sent — blindly sending Down+Return
+into whatever menu happens to be open would silently answer a different
+prompt, worse than doing nothing."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-unrelated*"))
+        (down-count 0) (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (cc-butler-session-test--insert-mcp-classifier-prompt))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down) (lambda (&optional _buf) (cl-incf down-count)))
+                    ((symbol-function 'claude-code-ide--terminal-send-return) (lambda () (cl-incf return-count))))
+            (should (eq 'no-dialog (cc-butler--accept-trust-dialog "/worker/")))
+            (should (= 0 down-count))
+            (should (= 0 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-refuses-on-plain-prompt ()
+  "An ordinary idle prompt with no dialog at all must be refused as
+`no-dialog', with zero keys sent."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-plain*"))
+        (down-count 0) (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (insert (make-string 24 cc-butler--border-rule-char) "\n")
+            (insert "❯ \n")
+            (insert (make-string 24 cc-butler--border-rule-char) "\n"))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down) (lambda (&optional _buf) (cl-incf down-count)))
+                    ((symbol-function 'claude-code-ide--terminal-send-return) (lambda () (cl-incf return-count))))
+            (should (eq 'no-dialog (cc-butler--accept-trust-dialog "/worker/")))
+            (should (= 0 down-count))
+            (should (= 0 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-still-showing-after-press-when-return-does-not-land ()
+  "If a key is sent but the marker is STILL present on a fresh re-read
+afterward (the terminal did not process it, or the same dialog
+re-rendered), the result must be `still-showing', not `accepted' — a
+caller must not assume success just because a key was sent."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-stuck*"))
+        (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (cc-butler-session-test--insert-trust-dialog))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda () (cl-incf return-count))))
+            ;; Buffer content is deliberately left unchanged by the Return
+            ;; mock -- the dialog is still showing on the re-read.
+            (should (eq 'still-showing (cc-butler--accept-trust-dialog "/worker/")))
+            (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-errors-on-no-live-buffer ()
+  "No live terminal buffer for the session at all: errors loudly rather
+than silently doing nothing or acting on a stale/absent buffer."
+  (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+             (lambda (_d) " *cc-butler-test-accept-nonexistent-buf*")))
+    (should
+     (string-match-p
+      "no live terminal buffer for /some/unlaunched/dir/"
+      (condition-case e
+          (progn (cc-butler--accept-trust-dialog "/some/unlaunched/dir/") "")
+        (error (error-message-string e)))))))
+
+(defun cc-butler-session-test--insert-new-shape-yes-quoted-then-live-no-exit ()
+  "Insert a screen where \"❯ Yes, I trust this folder\" appears QUOTED in
+scrollback (as if relayed while discussing this very bug), followed by
+enough live-screen filler to push that quote well out of the tail window,
+and only THEN the REAL v2.1.260+ trust dialog live at the bottom of the
+screen — still in its default, as-rendered state (`❯ No, exit'
+highlighted; Down has not landed). Regression fixture for the 2026-09-11
+steward review of #248: `cc-butler--trust-dialog-new-shape-yes-selected-p'
+searched from `point-min' rather than the live tail, so the quoted line
+alone made it read \"landed\" while the real dialog below still selected
+\"No, exit\" — the Return that gate exists to gate would then be sent
+onto that live selection and exit the session."
+  (insert "이전에 이 문제를 논의하며 실제 화면을 인용한다:\n\n")
+  (insert "```\n")
+  (insert "❯ Yes, I trust this folder\n")
+  (insert "```\n\n")
+  (dotimes (_ (cc-butler--live-screen-tail-lines))
+    (insert "…\n"))
+  (cc-butler-session-test--insert-trust-dialog-new-shape))
+
+(ert-deftest cc-butler-session/new-shape-yes-selected-p-nil-when-yes-only-quoted-in-scrollback ()
+  "`cc-butler--trust-dialog-new-shape-yes-selected-p' must not read a
+quoted \"❯ Yes, I trust this folder\" in scrollback as the highlight
+having landed — the live dialog below it still selects \"No, exit\"."
+  (let ((buf (get-buffer-create " *cc-butler-test-yes-selected-scrollback*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (cc-butler-session-test--insert-new-shape-yes-quoted-then-live-no-exit))
+          (should-not (cc-butler--trust-dialog-new-shape-yes-selected-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-new-shape-never-sends-return-when-yes-only-quoted-in-scrollback ()
+  "Full accept flow, same fixture: since the highlight never actually
+lands on the live dialog (Down is a no-op here — the real terminal simply
+never registers it, standing in for the worst case), the settle poll must
+time out and error WITHOUT ever sending Return. Before the
+`--live-screen-tail-start' scoping fix, the first poll read would have
+seen the quoted \"❯ Yes, I trust this folder\" as landed and sent Return
+immediately, exiting the session onto its live \"No, exit\" selection."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-yes-quoted*"))
+        (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (cc-butler-session-test--insert-new-shape-yes-quoted-then-live-no-exit))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down) (lambda (&optional _buf) nil))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda () (cl-incf return-count)))
+                    (cc-butler-trust-dialog-settle-timeout 0.2))
+            (should-error (cc-butler--accept-trust-dialog-new-shape "/worker/"))
+            (should (= 0 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
 ;;;; ---- resume gate (cc-butler#4, 2026-09-03) --------------------------
 ;;;; Claude Code's own `--continue' startup chooser, distinct from the
 ;;;; folder-trust screen above. Unlike the trust dialog, the highlighted
@@ -789,6 +1008,28 @@ regardless of which option is highlighted."
             (insert (make-string 24 cc-butler--border-rule-char))
             (insert "\n❯ \n")
             (insert (make-string 24 cc-butler--border-rule-char)))
+          (should-not (cc-butler--resume-gate-showing-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/resume-gate-showing-p-nil-when-quoted-in-scrollback-above-a-normal-live-prompt ()
+  "Both resume-gate phrases quoted in scrollback (e.g. relayed while
+discussing this gate), with enough live-screen filler to push them out of
+the tail window, and an ORDINARY idle prompt live at the bottom — must not
+read as the gate showing. Unscoped, this would mark an otherwise-idle
+session as stuck on the gate and block dispatch to it (2026-09-11 steward
+class sweep, same bug class as
+`cc-butler--trust-dialog-new-shape-yes-selected-p')."
+  (let ((buf (get-buffer-create " *cc-butler-test-gate-quoted*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert "이전에 이 게이트를 논의하며 화면을 인용한다:\n\n```\n")
+            (insert "❯ 1. Resume from summary (recommended)\n  2. Resume full session as-is\n  3. Don't ask me again\n")
+            (insert "```\n\n")
+            (dotimes (_ (cc-butler--live-screen-tail-lines)) (insert "…\n"))
+            (insert (make-string 24 cc-butler--border-rule-char) "\n")
+            (insert "❯ \n")
+            (insert (make-string 24 cc-butler--border-rule-char) "\n"))
           (should-not (cc-butler--resume-gate-showing-p buf)))
       (kill-buffer buf))))
 
