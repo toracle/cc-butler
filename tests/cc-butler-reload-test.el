@@ -11,22 +11,182 @@
 (require 'cl-lib)
 (require 'cc-butler)
 
-(ert-deftest cc-butler-reload/reloads-this-file-before-using-its-module-list ()
-  "REGRESSION (2026-07-23): `cc-butler--modules' is defined in cc-butler.el,
-so a reload driven by the OLD in-memory list silently skips a module added
-since Emacs started — and still reports success.  cc-butler.el must be
-re-read FIRST so the list is current before it is used."
+(ert-deftest cc-butler-reload/loads-every-module-before-loading-itself-last ()
+  "REGRESSION (2026-09-11): the reload used to load cc-butler.el FIRST, before
+any dependency module — see `cc-butler-reload/self-load-order-bug-void-
+function-shape' below for the real failure that caused.  Every module must
+load BEFORE cc-butler.el's own top-level forms run, not after."
   (let ((loaded nil))
     (cl-letf (((symbol-function 'load)
                (lambda (f &rest _) (push (file-name-nondirectory f) loaded) t))
               ((symbol-function 'cc-butler--stale-elc) (lambda () nil)))
       (cc-butler-reload))
     (setq loaded (nreverse loaded))
-    (should (equal (car loaded) "cc-butler.el"))
-    ;; and every module still follows, in order
-    (should (equal (cdr loaded)
-                   (mapcar (lambda (m) (concat (symbol-name m) ".el"))
-                           cc-butler--modules)))))
+    ;; every module, in order, all before cc-butler.el itself (loaded last)
+    (should (equal loaded
+                   (append (mapcar (lambda (m) (concat (symbol-name m) ".el"))
+                                    cc-butler--modules)
+                           '("cc-butler.el"))))))
+
+(ert-deftest cc-butler-reload/still-picks-up-a-module-added-since-emacs-started ()
+  "The old \"load cc-butler.el first\" order existed only to keep a newly
+added module (one not yet in the in-memory `cc-butler--modules') from being
+silently skipped (2026-07-23, `cc-butler-compact'). Loading modules before
+cc-butler.el must not lose that guarantee: the module list to load is read
+straight off cc-butler.el's OWN CURRENT TEXT ON DISK
+\(`cc-butler--modules-from-file'), not the in-memory list, so a module added
+to that file since this Emacs started is still picked up."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-newmod" t)))
+         (self-file (expand-file-name "cc-butler.el" dir)))
+    (write-region "(defconst cc-butler--modules '(cc-butler-brand-new))\n"
+                  nil self-file)
+    (write-region "" nil (expand-file-name "cc-butler-brand-new.el" dir))
+    (let (loaded)
+      (cl-letf (((symbol-function 'load)
+                 (lambda (f &rest _) (push (file-name-nondirectory f) loaded) t))
+                ((symbol-function 'cc-butler-source-dir) (lambda () dir))
+                ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil))
+                ((symbol-function 'cc-butler--stale-elc) (lambda () nil))
+                ((symbol-function 'cc-butler--defcustom-drift-all) (lambda (_) nil))
+                ;; the in-memory list deliberately does NOT know about the
+                ;; brand-new module yet -- that is the whole scenario
+                (cc-butler--modules '(cc-butler-some-old-module)))
+        (cc-butler-reload))
+      (should (member "cc-butler-brand-new.el" loaded)))))
+
+(defun cc-butler-test--write-reload-order-fixture (dir)
+  "Write the two-file fixture DIR needs for the reload load-order tests:
+a dependency module and a self file (named cc-butler.el, matching what
+`cc-butler-reload' always loads as self regardless of source tree) whose
+top-level form calls a function only the dependency's NEW on-disk version
+defines.  Also pre-loads an OLDER, already-`provide'd, function-less
+version of the dependency into THIS Emacs, matching the real state a
+long-running daemon is in right before a hot-reload: the module is already
+resident in memory, just not yet carrying the function the reload is about
+to add to it."
+  (let ((dep-file (expand-file-name "cc-butler-reload-fixture-dep.el" dir))
+        (self-file (expand-file-name "cc-butler.el" dir)))
+    (fmakunbound 'cc-butler-reload-fixture-fn)
+    (provide 'cc-butler-reload-fixture-dep)
+    (write-region "(defun cc-butler-reload-fixture-fn () :new)\n(provide 'cc-butler-reload-fixture-dep)\n"
+                  nil dep-file)
+    (write-region "(require 'cc-butler-reload-fixture-dep)\n(setq cc-butler-reload-fixture-result (cc-butler-reload-fixture-fn))\n"
+                  nil self-file)))
+
+(defvar cc-butler-reload-fixture-result nil
+  "Set by the fixture self file `cc-butler-test--write-reload-order-fixture'
+writes, if (and only if) its top-level call to the fixture dependency
+function actually ran without erroring.")
+
+(ert-deftest cc-butler-reload/self-load-order-bug-void-function-shape ()
+  "REGRESSION (2026-09-11, real production failure): after PR #249 merged
+and the live daemon reloaded, it failed with \"Symbol's function definition
+is void: cc-butler--make-guarded-tool\" and left `runtime_source' and
+`reload_butler_code' as \"Unknown tool\" — a silent half-reload, not a
+crash anyone saw.  Cause: `cc-butler-reload' loaded cc-butler.el FIRST.
+cc-butler.el's own top-level `(require 'cc-butler-session)' was a no-op
+\(the feature was already `provide'd by the OLD, still-resident module\),
+so cc-butler.el's later top-level tool-registration calls — which call a
+function PR #249 had just ADDED to cc-butler-session.el — ran against the
+stale module still in memory and hit void-function, aborting the reload
+before it ever reached the dolist that would have reloaded that module
+fresh.
+
+This fixture reproduces that exact shape without depending on the real
+cc-butler-session.el: a fixture \"dependency\" module is pre-loaded here in
+its OLDER, function-less form (mirroring the stale resident module); its
+NEWER on-disk form defines the function; a fixture \"self\" file (literally
+named cc-butler.el, since `cc-butler-reload' always loads self by that
+fixed name) requires the dependency (a no-op against the stale in-memory
+copy, exactly like the real `(require \\='cc-butler-session)') and then
+calls the function at its own top level, exactly like cc-butler.el's real
+MCP tool registrations calling `cc-butler--make-guarded-tool'.
+
+CONFIRMED to fail this way against the OLD (pre-2026-09-11) load order
+before this fix: shadowing `cc-butler-reload' with that order's defun body
+against this same fixture signals `(void-function
+cc-butler-reload-fixture-fn)' and leaves
+`cc-butler-reload-fixture-result' nil."
+  (let ((dir (file-name-as-directory (make-temp-file "cc-reload-order-bug" t)))
+        (cc-butler-reload-fixture-result nil))
+    (cc-butler-test--write-reload-order-fixture dir)
+    (cl-letf (((symbol-function 'cc-butler-source-dir) (lambda () dir))
+              ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil))
+              ((symbol-function 'cc-butler--stale-elc) (lambda () nil))
+              ((symbol-function 'cc-butler--defcustom-drift-all) (lambda (_) nil))
+              (cc-butler--modules '(cc-butler-reload-fixture-dep)))
+      (let ((res (cc-butler-reload)))
+        (should (eq cc-butler-reload-fixture-result :new))
+        (should-not (plist-get res :self-error))
+        (should-not (plist-get res :failed-modules))))))
+
+(ert-deftest cc-butler-reload/a-broken-module-is-named-not-swallowed ()
+  "A partial reload must never read as a silent half-state (steward
+requirement, 2026-09-11): a module that fails to load is named in the
+return value, and every OTHER module still loads — one broken file does
+not abort the whole reload the way a bare, uncaught `load' error used to."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-partial" t)))
+         (good-file (expand-file-name "cc-butler-good.el" dir))
+         (bad-file (expand-file-name "cc-butler-bad.el" dir))
+         (self-file (expand-file-name "cc-butler.el" dir)))
+    (write-region "(defvar cc-butler-reload-good-loaded t)\n" nil good-file)
+    (write-region "(this-function-does-not-exist)\n" nil bad-file)
+    (write-region "" nil self-file)
+    (cl-letf (((symbol-function 'cc-butler-source-dir) (lambda () dir))
+              ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil))
+              ((symbol-function 'cc-butler--stale-elc) (lambda () nil))
+              ((symbol-function 'cc-butler--defcustom-drift-all) (lambda (_) nil))
+              (cc-butler--modules '(cc-butler-good cc-butler-bad)))
+      (let ((res (cc-butler-reload)))
+        (should (equal (plist-get res :failed-modules) '(cc-butler-bad)))
+        (should-not (plist-get res :self-error))
+        (should (boundp 'cc-butler-reload-good-loaded))))))
+
+(ert-deftest cc-butler-reload/a-broken-module-failure-is-logged-loudly ()
+  "The partial failure must leave a trace, not just a quiet plist a caller
+might not inspect."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-partial-log" t)))
+         (bad-file (expand-file-name "cc-butler-bad.el" dir))
+         (self-file (expand-file-name "cc-butler.el" dir))
+         logged)
+    (write-region "(this-function-does-not-exist)\n" nil bad-file)
+    (write-region "" nil self-file)
+    (cl-letf (((symbol-function 'cc-butler-source-dir) (lambda () dir))
+              ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil))
+              ((symbol-function 'cc-butler--stale-elc) (lambda () nil))
+              ((symbol-function 'cc-butler--defcustom-drift-all) (lambda (_) nil))
+              ((symbol-function 'cc-butler--log)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) logged)))
+              (cc-butler--modules '(cc-butler-bad)))
+      (cc-butler-reload))
+    (should logged)
+    (should (string-match-p "PARTIAL" (car logged)))
+    (should (string-match-p "cc-butler-bad" (car logged)))))
+
+(ert-deftest cc-butler-reload/tool-output-names-a-partial-reload-loudly ()
+  "The MCP caller only ever sees `cc-butler-tool-reload-code's return text —
+a partial reload has to be spelled out there, the same way stale .elc and
+defcustom drift already are, or a half-reloaded daemon reads as a clean
+success to whoever asked."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 2 :dir "/x/" :stale nil :defcustom-drift nil
+                               :self-error nil :failed-modules '(cc-butler-bad))))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+            ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil)))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should (string-match-p "PARTIAL" out))
+      (should (string-match-p "cc-butler-bad" out)))))
+
+(ert-deftest cc-butler-reload/tool-output-quiet-when-reload-is-clean ()
+  "Protects against an overly broad partial-reload message: the ordinary
+clean case must not claim a partial failure."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 2 :dir "/x/" :stale nil :defcustom-drift nil
+                               :self-error nil :failed-modules nil)))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+            ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil)))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should-not (string-match-p "PARTIAL" out)))))
 
 (ert-deftest cc-butler-reload/reports-count-and-directory ()
   "The return value names what was loaded and from where — the directory is
