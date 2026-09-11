@@ -810,7 +810,7 @@ outlives the process)."
   (interactive)
   (pop-to-buffer (get-buffer-create cc-butler-log-buffer-name)))
 
-(defun cc-butler--inbox-push (dir body)
+(defun cc-butler--inbox-push (dir body &optional name-override)
   "Record a worker event from session DIR with BODY into the butler inbox.
 The worker's name and session id are attached, and the event is teed to
 the cc-butler log -- a short gist to the ops log (events only, kept
@@ -818,16 +818,26 @@ grep-safe and single-line), the full BODY to the message log
 (`cc-butler--log-message'), never both -- an arbitrary, possibly
 multi-line worker report body must not land verbatim in the ops event
 stream (2026-08-27: a log line quoted back into a relay message got
-re-logged as if the event it described had happened a second time)."
-  (push (list :time (current-time)
-              :dir dir
-              :name (cc-butler--display-name dir)
-              :id (cc-butler--session-id dir)
-              :body (or body ""))
-        cc-butler--inbox)
-  (cc-butler--log "%s → butler │ report (%d chars, see msg log)"
-                  (cc-butler--who-dir dir) (length (or body "")))
-  (cc-butler--log-message "report" (cc-butler--who-dir dir) "butler" body))
+re-logged as if the event it described had happened a second time).
+
+NAME-OVERRIDE is for a non-interactive Lisp caller with no real session
+DIR to derive a name from at all (DIR nil) -- same problem, same fix
+`cc-butler-tool-escalate-to-butler''s SENDER-LABEL already solves on that
+path (`cc-butler-self-check--report' is exactly such a caller): DIR nil
+would otherwise error inside `cc-butler--display-name'
+\(`expand-file-name' requires a string, not nil\).  When given,
+NAME-OVERRIDE wins outright and `:id' is left nil, since there is no real
+session to look one up for."
+  (let ((who (or name-override (cc-butler--who-dir dir))))
+    (push (list :time (current-time)
+                :dir dir
+                :name (or name-override (cc-butler--display-name dir))
+                :id (and dir (cc-butler--session-id dir))
+                :body (or body ""))
+          cc-butler--inbox)
+    (cc-butler--log "%s → butler │ report (%d chars, see msg log)"
+                    who (length (or body "")))
+    (cc-butler--log-message "report" who "butler" body)))
 
 ;; The steward is designated in `cc-butler-orchestrator' (loaded after this
 ;; file); forward-declare it so the list UI can pin/label it.

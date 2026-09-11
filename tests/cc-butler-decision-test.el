@@ -900,6 +900,74 @@ event IS the thread root has no need of one -- both fall back cleanly."
                          (cc-butler--decision-thread-root-event-id f))))
       (delete-file f))))
 
+;;;; ---- 2026-09-11 fix: `:Delivery-held-until:' -- deliberate delivery
+;;;; holds escape check 9's no-delivery age FAIL -----------------------
+
+(ert-deftest cc-butler-decision/delivery-held-until-with-reason ()
+  (let ((f (make-temp-file "cc-butler-held")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Delivery-held-until: 2026-09-11 09:00 daylight hours\n:END:\n"))
+          (let ((held (cc-butler--decision-delivery-held-until f)))
+            (should held)
+            (should (equal "daylight hours" (cdr held)))
+            (should (= (float-time (encode-time 0 0 9 11 9 2026)) (car held)))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivery-held-until-no-reason ()
+  (let ((f (make-temp-file "cc-butler-held")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Delivery-held-until: 2026-09-11 09:00\n:END:\n"))
+          (let ((held (cc-butler--decision-delivery-held-until f)))
+            (should held)
+            (should (null (cdr held)))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivery-held-until-indented-shape ()
+  (let ((f (make-temp-file "cc-butler-held")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert "* 발신됨 — butler, synthetic\n"
+                    "  :Delivered-to-matrix: $fake-event-10\n"
+                    "  :Delivery-held-until: 2026-09-11 09:00 synthetic reason\n"))
+          (should (cc-butler--decision-delivery-held-until f)))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivery-held-until-nil-when-absent ()
+  (let ((f (make-temp-file "cc-butler-held")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Delivered-to-matrix: $fake-event-11\n:END:\n"))
+          (should (null (cc-butler--decision-delivery-held-until f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivery-held-until-nil-when-malformed-date ()
+  "Garbled digits (not a real calendar date) must fail to parse, not be
+guessed at -- malformed and absent are deliberately indistinguishable to
+callers."
+  (let ((f (make-temp-file "cc-butler-held")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Delivery-held-until: not-a-date reason\n:END:\n"))
+          (should (null (cc-butler--decision-delivery-held-until f))))
+      (delete-file f))))
+
+(ert-deftest cc-butler-decision/delivery-held-until-nil-when-missing-time-part ()
+  "Date only, no `HH:MM' -- also malformed, must not parse."
+  (let ((f (make-temp-file "cc-butler-held")))
+    (unwind-protect
+        (progn
+          (with-temp-file f
+            (insert ":PROPERTIES:\n:Delivery-held-until: 2026-09-11 daylight hours\n:END:\n"))
+          (should (null (cc-butler--decision-delivery-held-until f))))
+      (delete-file f))))
+
 ;;;; ---- create-path (escalate :options) + full flow -----------------
 
 (ert-deftest cc-butler-decision/parse-options ()

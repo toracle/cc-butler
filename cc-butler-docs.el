@@ -247,12 +247,18 @@ consulting it)."
 ;;;; Automatic capture: worker events -> daily log
 ;;;; ------------------------------------------------------------------
 
-(defun cc-butler-docs--auto-log (dir body)
-  "Advice on `cc-butler--inbox-push': mirror a worker event into the daily log."
+(defun cc-butler-docs--auto-log (dir body &optional name-override)
+  "Advice on `cc-butler--inbox-push': mirror a worker event into the daily
+log.  NAME-OVERRIDE mirrors that function's own optional third arg (DIR
+nil, e.g. a self-check transition) -- `:after' advice is called with
+every argument the advised function received, so this must accept it too
+or a 3-arg call errors here with wrong-number-of-arguments; and
+`cc-butler--who-dir' itself errors on a nil DIR, the same reason
+`cc-butler--inbox-push' needed the override in the first place."
   (when (and cc-butler-docs-auto-log (cc-butler-docs--home))
     (ignore-errors
       (cc-butler-docs--append-log
-       "event" (format "%s — %s" (cc-butler--who-dir dir) (or body ""))))))
+       "event" (format "%s — %s" (or name-override (cc-butler--who-dir dir)) (or body ""))))))
 
 (advice-add 'cc-butler--inbox-push :after #'cc-butler-docs--auto-log)
 
