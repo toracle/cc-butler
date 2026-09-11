@@ -661,6 +661,66 @@ walk ITS git history for a label) re-derives it here instead."
            when (assq symbol (cc-butler--defcustom-forms-in-file file))
            return file))
 
+(defun cc-butler--modules-from-file (file)
+  "The literal list value of FILE's top-level `(defconst cc-butler--modules
+...)' form, read directly out of its text, or nil.
+
+Deliberately does NOT `load' FILE to get this: `load' would also execute
+every OTHER top-level form in FILE — including, in cc-butler.el, the MCP
+tool registrations that call into other modules (see `cc-butler-reload').
+Those calls must not run until this function's answer has been used to
+reload those modules first; reading just this one form, without evaluating
+anything else in the file, is what makes that possible.
+
+Nil on any trouble (unreadable file, form not found, malformed) — callers
+must fall back to the in-memory `cc-butler--modules' rather than treat nil
+as \"no modules\"."
+  (when (file-readable-p file)
+    (ignore-errors
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-min))
+        (catch 'cc-butler--modules-from-file
+          (while t
+            (let ((form (condition-case nil
+                            (read (current-buffer))
+                          (end-of-file (throw 'cc-butler--modules-from-file nil)))))
+              (when (and (consp form)
+                         (eq (car form) 'defconst)
+                         (eq (cadr form) 'cc-butler--modules))
+                (throw 'cc-butler--modules-from-file (eval (nth 2 form) t))))))))))
+
+(defun cc-butler--reload-modules-and-self (dir modules self)
+  "Load MODULES (a list of symbols, dependency order) then SELF (a symbol)
+from DIR, in that order — modules first, self last.
+
+This order is the fix for a real hot-reload failure (2026-09-11): when
+cc-butler.el reloaded FIRST, its own top-level tool registrations ran
+against whatever OLD, still-resident version of a dependency module
+happened to be in memory, because a plain `(require ...)' of an
+already-`provide'd feature is a no-op and does not re-run that module's
+defuns.  A registration calling a function the reload was meant to ADD to
+that module (`cc-butler--make-guarded-tool', PR #249) hit
+\"Symbol's function definition is void\" and aborted the reload partway,
+leaving the daemon in the half-reloaded state that produced it.  Loading
+every dependency module fresh BEFORE self means self's top-level forms
+always run against current code, never stale code.
+
+Returns a plist `(:loaded (SYMBOL ...) :failed ((SYMBOL . ERROR-STRING) ...))'
+— SYMBOL for either a module or SELF — so a caller can tell a full reload
+from a partial one instead of only ever seeing an unqualified success or a
+mid-load exception.  A file that does not exist under DIR is treated as
+nothing to load (not a failure), matching this function's previous
+`file-exists-p' guard."
+  (let (loaded failed)
+    (dolist (m (append modules (list self)))
+      (let ((f (expand-file-name (concat (symbol-name m) ".el") dir)))
+        (when (file-exists-p f)
+          (condition-case err
+              (progn (load f nil t) (push m loaded))
+            (error (push (cons m (error-message-string err)) failed))))))
+    (list :loaded (nreverse loaded) :failed (nreverse failed))))
+
 ;;;###autoload
 (defun cc-butler-reload ()
   "Cleanly reload all cc-butler modules in dependency order — the hot-load
@@ -669,18 +729,26 @@ cleanly), not stray defuns that can leave old keymaps/hooks/modes layered
 underneath.  Loads by absolute path (not the load-path).  Never restarts Emacs
 \(the worker sessions are preserved).
 
-Reloads THIS file first.  `cc-butler--modules' and `cc-butler--dir' are
-defined here, so a reload driven by the old values cannot pick up a module
-that was added since this Emacs started — it would silently skip the new
-file and report success.  That happened on 2026-07-23 with
-`cc-butler-compact'.  Re-reading this file first makes the module list
-current before it is used.
+Reloads every dependency module BEFORE this file itself — see
+`cc-butler--reload-modules-and-self' for why that order, not the reverse, is
+what makes a top-level form in THIS file (e.g. an MCP tool registration) safe
+to call a function a module reload just added.  Which modules to load is
+still decided from THIS FILE'S OWN CURRENT TEXT ON DISK, not the in-memory
+`cc-butler--modules' — read via `cc-butler--modules-from-file', which parses
+just that one form without executing anything else in the file — so a module
+added since this Emacs started is still picked up, the same guarantee the
+old \"reload this file first\" order used to provide (2026-07-23,
+`cc-butler-compact').
 
 Loads from `cc-butler-source-dir' — where this file came from, unless
 `cc-butler-use-checkout' / `cc-butler-use-installed' deliberately pointed it
 elsewhere.
 
 Returns a plist describing what happened, for `cc-butler-tool-reload-code'.
+`:failed-modules' names any module (or `cc-butler' itself, as `:self-error')
+that raised while loading — a non-nil value here means a PARTIAL reload:
+say so loudly, don't just report the modules that DID make it as if nothing
+went wrong.
 
 NOTE on this function's own drift detector (`cc-butler--defcustom-drift',
 called below): a fix that changes what THIS function does — including the
@@ -711,21 +779,27 @@ how this particular call arrived, for a human to weigh later)."
     (when dirty
       (cc-butler--log "cc-butler-reload: reloading a dirty checkout at %s — called-interactively-p: %s (breadcrumb only, not a gate):\n%s"
                        dir (called-interactively-p 'interactive) dirty)))
-  (let ((self (expand-file-name "cc-butler.el" (cc-butler-source-dir))))
-    (when (file-exists-p self) (load self nil t)))
-  ;; Re-read the source directory AFTER the self-load: that load is what makes
-  ;; `cc-butler--modules' and `cc-butler--dir' current, and an override set by
-  ;; `cc-butler--switch-source' has to be the thing the modules follow.
-  (dolist (m cc-butler--modules)
-    (load (expand-file-name (concat (symbol-name m) ".el") (cc-butler-source-dir)) nil t))
-  (let* ((stale (cc-butler--stale-elc))
-         (dir (cc-butler-source-dir))
-         (drift (cc-butler--defcustom-drift-all dir)))
-    (when (called-interactively-p 'interactive)
-      (message "cc-butler: reloaded %d modules from %s%s"
-               (length cc-butler--modules) dir
-               (if stale (format " — WARNING: %d stale .elc" (length stale)) "")))
-    (list :count (length cc-butler--modules) :dir dir :stale stale :defcustom-drift drift)))
+  (let* ((dir (cc-butler-source-dir))
+         (self-file (expand-file-name "cc-butler.el" dir))
+         (modules (or (cc-butler--modules-from-file self-file) cc-butler--modules))
+         (result (cc-butler--reload-modules-and-self dir modules 'cc-butler))
+         (failed (plist-get result :failed))
+         (self-error (cdr (assq 'cc-butler failed)))
+         (failed-modules (assq-delete-all 'cc-butler (copy-alist failed))))
+    (when failed
+      (let ((summary (mapconcat (lambda (f) (format "%s: %s" (car f) (cdr f))) failed "; ")))
+        (cc-butler--log "cc-butler-reload: PARTIAL RELOAD — %d of %d file(s) failed: %s"
+                         (length failed) (1+ (length modules)) summary)))
+    (let* ((stale (cc-butler--stale-elc))
+           (drift (cc-butler--defcustom-drift-all dir)))
+      (when (called-interactively-p 'interactive)
+        (message "cc-butler: reloaded %d modules from %s%s%s"
+                 (length modules) dir
+                 (if stale (format " — WARNING: %d stale .elc" (length stale)) "")
+                 (if failed (format " — PARTIAL RELOAD: %d file(s) failed, see *Messages*" (length failed)) "")))
+      (list :count (length modules) :dir dir :stale stale :defcustom-drift drift
+            :self-error self-error
+            :failed-modules (mapcar #'car failed-modules)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; What commit is the live daemon actually running, right now?
@@ -973,6 +1047,8 @@ runs."
          (dir (plist-get res :dir))
          (stale (plist-get res :stale))
          (drift (plist-get res :defcustom-drift))
+         (self-error (plist-get res :self-error))
+         (failed-modules (plist-get res :failed-modules))
          ;; File reads only — `shell-command-to-string' here once put the
          ;; whole daemon one wedged .git/index.lock away from a total freeze
          ;; (single Lisp thread, no timeout, `with-timeout' can't interrupt
@@ -981,7 +1057,21 @@ runs."
     (concat
      (format "Reloaded %d cc-butler modules from %s" (plist-get res :count) dir)
      (if head (format "\nSource is at: %s" head) "")
-     "\n\nThis loads whatever is ON DISK in that directory — it does not fetch. If you expected newer code, `git pull` there first and call this again. Note that directory is the one this Emacs actually loads from, which is not necessarily the checkout you have been editing."
+     "\n\nThis loads whatever is ON DISK in that directory — it does not fetch. If you expected newer code, `git pull' there first and call this again. Note that directory is the one this Emacs actually loads from, which is not necessarily the checkout you have been editing."
+     ;; A half-reloaded daemon must never read as a clean success: name
+     ;; exactly what failed rather than silently reporting only the modules
+     ;; that DID load, the way this used to abort partway with no trace
+     ;; beyond an uncaught error (2026-09-11).
+     (if (or self-error failed-modules)
+         (format "\n\n⚠ PARTIAL RELOAD — %s did NOT reload cleanly and %s still running its PREVIOUS in-memory code. Fix the error and reload again; see *Messages* for the full error text.%s"
+                 (mapconcat #'identity
+                             (delq nil (list (and failed-modules
+                                                   (mapconcat #'symbol-name failed-modules ", "))
+                                              (and self-error "cc-butler.el itself")))
+                             ", ")
+                 (if (and failed-modules self-error) "are" "is")
+                 (if self-error (format "\n  cc-butler.el: %s" self-error) ""))
+       "")
      (if stale
          (format "\n\n⚠ STALE BYTE-CODE: %s are older than their .el source. Emacs prefers .elc on startup, so these will silently undo this reload the next time Emacs restarts. Delete them (or byte-recompile) in %s."
                  (string-join stale ", ") dir)
