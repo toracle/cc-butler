@@ -281,7 +281,7 @@ onto \"Yes, I trust this folder\" (the post-Down state, also captured
 live); otherwise the as-rendered default (\"No, exit\" highlighted)."
   (insert (make-string 24 cc-butler--border-rule-char) "\n")
   (insert " Accessing workspace:\n\n")
-  (insert " /Users/jeongsoopark/projects/monocle-wiki-engine-sdd\n\n")
+  (insert " /home/user/projects/example-project\n\n")
   (insert " Quick safety check: Is this a project you created or one you trust? (Like your own code, a\n")
   (insert " well-known open source project, or work from your team). If not, take a moment to review what's in\n")
   (insert " this folder first.\n\n")
@@ -915,6 +915,63 @@ than silently doing nothing or acting on a stale/absent buffer."
           (progn (cc-butler--accept-trust-dialog "/some/unlaunched/dir/") "")
         (error (error-message-string e)))))))
 
+(defun cc-butler-session-test--insert-new-shape-yes-quoted-then-live-no-exit ()
+  "Insert a screen where \"❯ Yes, I trust this folder\" appears QUOTED in
+scrollback (as if relayed while discussing this very bug), followed by
+enough live-screen filler to push that quote well out of the tail window,
+and only THEN the REAL v2.1.260+ trust dialog live at the bottom of the
+screen — still in its default, as-rendered state (`❯ No, exit'
+highlighted; Down has not landed). Regression fixture for the 2026-09-11
+steward review of #248: `cc-butler--trust-dialog-new-shape-yes-selected-p'
+searched from `point-min' rather than the live tail, so the quoted line
+alone made it read \"landed\" while the real dialog below still selected
+\"No, exit\" — the Return that gate exists to gate would then be sent
+onto that live selection and exit the session."
+  (insert "이전에 이 문제를 논의하며 실제 화면을 인용한다:\n\n")
+  (insert "```\n")
+  (insert "❯ Yes, I trust this folder\n")
+  (insert "```\n\n")
+  (dotimes (_ (cc-butler--live-screen-tail-lines))
+    (insert "…\n"))
+  (cc-butler-session-test--insert-trust-dialog-new-shape))
+
+(ert-deftest cc-butler-session/new-shape-yes-selected-p-nil-when-yes-only-quoted-in-scrollback ()
+  "`cc-butler--trust-dialog-new-shape-yes-selected-p' must not read a
+quoted \"❯ Yes, I trust this folder\" in scrollback as the highlight
+having landed — the live dialog below it still selects \"No, exit\"."
+  (let ((buf (get-buffer-create " *cc-butler-test-yes-selected-scrollback*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (cc-butler-session-test--insert-new-shape-yes-quoted-then-live-no-exit))
+          (should-not (cc-butler--trust-dialog-new-shape-yes-selected-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-new-shape-never-sends-return-when-yes-only-quoted-in-scrollback ()
+  "Full accept flow, same fixture: since the highlight never actually
+lands on the live dialog (Down is a no-op here — the real terminal simply
+never registers it, standing in for the worst case), the settle poll must
+time out and error WITHOUT ever sending Return. Before the
+`--live-screen-tail-start' scoping fix, the first poll read would have
+seen the quoted \"❯ Yes, I trust this folder\" as landed and sent Return
+immediately, exiting the session onto its live \"No, exit\" selection."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-yes-quoted*"))
+        (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (cc-butler-session-test--insert-new-shape-yes-quoted-then-live-no-exit))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down) (lambda (&optional _buf) nil))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda () (cl-incf return-count)))
+                    (cc-butler-trust-dialog-settle-timeout 0.2))
+            (should-error (cc-butler--accept-trust-dialog-new-shape "/worker/"))
+            (should (= 0 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
 ;;;; ---- resume gate (cc-butler#4, 2026-09-03) --------------------------
 ;;;; Claude Code's own `--continue' startup chooser, distinct from the
 ;;;; folder-trust screen above. Unlike the trust dialog, the highlighted
@@ -951,6 +1008,28 @@ regardless of which option is highlighted."
             (insert (make-string 24 cc-butler--border-rule-char))
             (insert "\n❯ \n")
             (insert (make-string 24 cc-butler--border-rule-char)))
+          (should-not (cc-butler--resume-gate-showing-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/resume-gate-showing-p-nil-when-quoted-in-scrollback-above-a-normal-live-prompt ()
+  "Both resume-gate phrases quoted in scrollback (e.g. relayed while
+discussing this gate), with enough live-screen filler to push them out of
+the tail window, and an ORDINARY idle prompt live at the bottom — must not
+read as the gate showing. Unscoped, this would mark an otherwise-idle
+session as stuck on the gate and block dispatch to it (2026-09-11 steward
+class sweep, same bug class as
+`cc-butler--trust-dialog-new-shape-yes-selected-p')."
+  (let ((buf (get-buffer-create " *cc-butler-test-gate-quoted*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert "이전에 이 게이트를 논의하며 화면을 인용한다:\n\n```\n")
+            (insert "❯ 1. Resume from summary (recommended)\n  2. Resume full session as-is\n  3. Don't ask me again\n")
+            (insert "```\n\n")
+            (dotimes (_ (cc-butler--live-screen-tail-lines)) (insert "…\n"))
+            (insert (make-string 24 cc-butler--border-rule-char) "\n")
+            (insert "❯ \n")
+            (insert (make-string 24 cc-butler--border-rule-char) "\n"))
           (should-not (cc-butler--resume-gate-showing-p buf)))
       (kill-buffer buf))))
 

@@ -1895,13 +1895,55 @@ screen is worse than seeing none.  Check the cc-butler log for the refresh error
          ((string-empty-p out) "(no output)")
          (t out))))))
 
+(defun cc-butler--accept-trust-dialog-error-facts (name dir err)
+  "Build a FACT-ONLY summary of ERR — a caught error from
+`cc-butler--accept-trust-dialog' for session NAME at DIR — for an MCP
+tool's return text: session name, which step failed, and (when the
+buffer is still readable) whether the trust marker/shape predicates hold
+and how many lines the live tail window covers.
+
+Deliberately never includes any buffer TEXT. An MCP tool's return value
+lands in the CALLING session's own transcript on disk — the two error
+paths inside `cc-butler--accept-trust-dialog-new-shape' embed the whole
+terminal buffer in their (LOCAL-only) error message precisely so a human
+debugging live can see the screen; repeating that into an MCP return
+would ship whatever that buffer held (credentials, client names, paths)
+to a different session's transcript. The step is classified by matching
+fixed substrings of THIS codebase's own error strings — never anything
+read from the buffer — and the caller is expected to also log the full
+error (buffer text included) locally via `message' before calling this
+(2026-09-11 steward review of #248)."
+  (let* ((msg (error-message-string err))
+         (step (cond
+                ((string-match-p "no live terminal buffer\\|no terminal buffer for" msg)
+                 "no live terminal buffer for the session")
+                ((string-match-p "did not move" msg)
+                 "settle timeout: highlight never landed on \"Yes, I trust this folder\"")
+                ((string-match-p "shape unrecognized" msg)
+                 "trust marker present but shape unrecognized (neither old nor new v2.1.260+ shape)")
+                (t "other (see this session's own *Messages* log for the full error)")))
+         (buf (ignore-errors (get-buffer (claude-code-ide--get-buffer-name dir)))))
+    (if (and buf (buffer-live-p buf))
+        (format "accept_trust_dialog on %s failed — %s.  marker present: %s, new-shape: %s, old-shape showing: %s, live tail window: %s lines."
+                name step
+                (if (cc-butler--trust-dialog-marker-present-p buf) "yes" "no")
+                (if (cc-butler--trust-dialog-new-shape-p buf) "yes" "no")
+                (if (cc-butler--trust-dialog-showing-p buf) "yes" "no")
+                (cc-butler--live-screen-tail-lines))
+      (format "accept_trust_dialog on %s failed — %s.  (no live terminal buffer left to inspect for further facts.)"
+              name step))))
+
 (defun cc-butler-tool-accept-trust-dialog (name)
   "MCP tool: press \"Yes, I trust this folder\" on session NAME's trust
 dialog — ONLY if one is actually showing on its live screen right now.
 Refuses explicitly, with zero keys sent, when no trust dialog is showing.
 See `cc-butler--accept-trust-dialog' for the safety discipline (screen
 re-checked immediately before every key, both known dialog shapes
-recognized by their exact predicates, never a blind keypress)."
+recognized by their exact predicates, never a blind keypress).
+
+On error, the returned text carries FACTS about the screen, never the
+screen itself — see `cc-butler--accept-trust-dialog-error-facts'. The
+full error, buffer dump included, is logged locally only, via `message'."
   (let ((dir (cc-butler--dir-by-name name)))
     (if (not dir)
         (format "No session named %S.  Call list_claude_sessions for names." name)
@@ -1914,7 +1956,8 @@ recognized by their exact predicates, never a blind keypress)."
             ('still-showing
              (format "Sent a key to %s's trust dialog, but it is still on screen afterward — needs a human look, do not retry blindly." name)))
         (error
-         (format "cc-butler: accept_trust_dialog on %s failed: %s" name (error-message-string err)))))))
+         (message "cc-butler: accept_trust_dialog on %s failed: %s" name (error-message-string err))
+         (cc-butler--accept-trust-dialog-error-facts name dir err))))))
 
 (defun cc-butler--relay-command-p (text)
   "Non-nil when TEXT is a bare slash command rather than a message.

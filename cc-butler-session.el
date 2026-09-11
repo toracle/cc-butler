@@ -1977,7 +1977,13 @@ its \"No, exit\" default forever. Skipping trailing blank/whitespace
 lines before counting back fixes this without weakening the anti-quoting
 guarantee above: the scrollback-quote case pads its live bottom with real
 filler text (`cc-butler-session-test--insert-quoted-dialog-in-conversation'),
-never blank lines, so this skip never fires there."
+never blank lines, so this skip never fires there.
+
+A terminal buffer is a scroll pane. Any predicate about what is currently
+on screen must say which window it reads: use this function's start,
+never `point-min' — two separate live-screen predicates in this file
+shipped with a bare `point-min' scan and both were confirmed to misread
+scrollback as the live screen (2026-09-11 steward class sweep)."
   (with-current-buffer buf
     (save-excursion
       (goto-char (point-max))
@@ -2050,10 +2056,20 @@ Down keypress is CONFIRMED to have taken effect, not merely sent. This is
 the gate `cc-butler--accept-trust-dialog-new-shape' checks before sending
 Return: a Return sent on an unconfirmed Down can land on \"No, exit\"
 instead and exit the session outright (2026-09-05 steward correction —
-send confirmation is not landing confirmation)."
+send confirmation is not landing confirmation).
+
+Scoped to the live screen tail (`cc-butler--live-screen-tail-start'), not
+`point-min' — the same scrollback-exclusion every other trust-dialog
+detector in this file uses. Unscoped, a quoted \"❯ Yes, I trust this
+folder\" sitting anywhere earlier in the buffer (e.g. relayed while
+discussing this very bug) would read as landed while the live dialog below
+it still highlights \"No, exit\", and the Return this gate exists to guard
+would then be sent onto that — the exact failure this function was written
+to prevent, reintroduced via the read instead of the write (2026-09-11
+steward review of #248)."
   (with-current-buffer buf
     (save-excursion
-      (goto-char (point-min))
+      (goto-char (cc-butler--live-screen-tail-start buf))
       (search-forward "❯ Yes, I trust this folder" nil t))))
 
 (defun cc-butler--terminal-send-down (&optional buffer)
@@ -2313,12 +2329,18 @@ also require a specific option to be highlighted: confirmed live
 2026-09-03 across a 5-session sample that the pre-highlighted default
 varies per session (4 defaulted to \"Resume from summary\", 1 to \"Resume
 full session as-is\") -- so no caller may assume which numbered option is
-selected, or blindly send a fixed keystroke to answer this gate."
+selected, or blindly send a fixed keystroke to answer this gate.
+
+Scoped to the live screen tail (`cc-butler--live-screen-tail-start'), not
+`point-min' -- both phrases quoted anywhere earlier in scrollback (e.g. a
+relayed message discussing this very gate) must not mark an otherwise-idle
+session as stuck on it and block dispatch to it (2026-09-11 steward class
+sweep, same bug class as `cc-butler--trust-dialog-new-shape-yes-selected-p')."
   (with-current-buffer buf
     (save-excursion
-      (goto-char (point-min))
+      (goto-char (cc-butler--live-screen-tail-start buf))
       (and (search-forward "1. Resume from summary" nil t)
-           (progn (goto-char (point-min))
+           (progn (goto-char (cc-butler--live-screen-tail-start buf))
                   (search-forward "2. Resume full session as-is" nil t))))))
 
 (defun cc-butler--wait-for-session-ready (dir)

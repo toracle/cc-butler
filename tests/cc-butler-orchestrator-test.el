@@ -911,11 +911,83 @@ calls `cc-butler--accept-trust-dialog'."
     (should (string-match-p "still on screen" (cc-butler-tool-accept-trust-dialog "s")))))
 
 (ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-surfaces-errors ()
-  "An error from the core function (no live buffer, settle timeout, ...)
-must reach the caller as a readable message, not an uncaught elisp error."
+  "An error from the core function must reach the caller as a readable,
+fact-based message — not an uncaught elisp error, and not the raw error
+text verbatim (that text can embed a whole terminal buffer for other
+error paths; see the sentinel tests below). An unclassified error still
+names the session and says \"other\"."
   (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+            ((symbol-function 'claude-code-ide--get-buffer-name) (lambda (_d) " *cc-butler-orch-test-boom-nonexistent*"))
             ((symbol-function 'cc-butler--accept-trust-dialog) (lambda (_d) (error "boom"))))
-    (should (string-match-p "boom" (cc-butler-tool-accept-trust-dialog "s")))))
+    (let ((out (cc-butler-tool-accept-trust-dialog "s")))
+      (should-not (string-match-p "boom" out))
+      (should (string-match-p "\\bs\\b" out))
+      (should (string-match-p "other" out)))))
+
+;; The MCP tool's return value lands in the CALLING session's own transcript
+;; on disk — the two error paths inside `cc-butler--accept-trust-dialog-new-shape'
+;; embed the WHOLE terminal buffer in their (LOCAL-only) error message, so the
+;; tool's returned text must carry facts about that buffer, never the buffer
+;; itself. Each fixture below plants a sentinel string nowhere but in the raw
+;; buffer text, drives a real (unmocked) error path through the actual
+;; predicates, and asserts the sentinel never reaches the tool's return value
+;; while the facts (session name, which step failed) do.
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-never-leaks-buffer-text-on-settle-timeout ()
+  (let ((term-buf (get-buffer-create " *cc-butler-orch-test-sentinel-timeout*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (insert "SENTINEL-DO-NOT-LEAK-7f3a\n")
+            (cc-butler-session-test--insert-trust-dialog-new-shape))
+          (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+                    ((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down) (lambda (&optional _buf) nil))
+                    ((symbol-function 'claude-code-ide--terminal-send-return) (lambda () nil))
+                    (cc-butler-trust-dialog-settle-timeout 0.2))
+            (let ((out (cc-butler-tool-accept-trust-dialog "acceptor-session")))
+              (should-not (string-match-p "SENTINEL-DO-NOT-LEAK" out))
+              (should (string-match-p "acceptor-session" out))
+              (should (string-match-p "settle timeout" out)))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-never-leaks-buffer-text-on-unrecognized-shape ()
+  "The marker-present-but-unrecognized-shape branch is unreachable through
+this handle's own outer gating in ordinary operation (it only delegates to
+the new-shape acceptor once the exact new shape is already confirmed) —
+but the screen can still change between that outer check and the
+acceptor's own re-check, so this models exactly that race: the outer
+check sees the new shape, the acceptor's re-check does not."
+  (let ((term-buf (get-buffer-create " *cc-butler-orch-test-sentinel-unrecognized*"))
+        (calls 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (insert (make-string 24 cc-butler--border-rule-char) "\n")
+            (insert " SENTINEL-DO-NOT-LEAK-7f3a\n")
+            (insert " Quick safety check: some future, unrecognized shape\n\n")
+            (insert "❯ Something else entirely\n   Yes, I trust this folder\n"))
+          (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+                    ((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--trust-dialog-new-shape-p)
+                     (lambda (_buf) (cl-incf calls) (= calls 1))))
+            (let ((out (cc-butler-tool-accept-trust-dialog "acceptor-session")))
+              (should-not (string-match-p "SENTINEL-DO-NOT-LEAK" out))
+              (should (string-match-p "acceptor-session" out))
+              (should (string-match-p "shape unrecognized" out)))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-facts-on-no-live-buffer ()
+  (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+            ((symbol-function 'claude-code-ide--get-buffer-name)
+             (lambda (_d) " *cc-butler-orch-test-sentinel-nonexistent*")))
+    (let ((out (cc-butler-tool-accept-trust-dialog "acceptor-session")))
+      (should (string-match-p "acceptor-session" out))
+      (should (string-match-p "no live terminal buffer" out)))))
 
 ;;;; Attribution: the code says who is speaking, not the model
 ;;;; ------------------------------------------------------------------
