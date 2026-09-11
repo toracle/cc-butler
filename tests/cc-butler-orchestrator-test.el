@@ -881,6 +881,42 @@ do not know what the screen says."
       (let ((out (cc-butler-tool-read-session "s")))
         (should-not (equal out "(no output)"))
         (should (string-match-p "refresh\\|stale\\|could not" out))))))
+;;;; accept_trust_dialog tool: dispatch on the core function's result, never
+;;;; the screen itself -- these stub `cc-butler--accept-trust-dialog' directly
+;;;; since its own screen-reading logic already has dedicated coverage above.
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-no-session-named ()
+  "Unknown session name: refuses with a specific message, and never even
+calls `cc-butler--accept-trust-dialog'."
+  (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) nil))
+            ((symbol-function 'cc-butler--accept-trust-dialog)
+             (lambda (_d) (error "must not be called"))))
+    (should (string-match-p "No session named" (cc-butler-tool-accept-trust-dialog "ghost")))))
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-reports-accepted ()
+  (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+            ((symbol-function 'cc-butler--accept-trust-dialog) (lambda (_d) 'accepted)))
+    (should (string-match-p "accepted" (cc-butler-tool-accept-trust-dialog "s")))))
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-reports-no-dialog-refused ()
+  (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+            ((symbol-function 'cc-butler--accept-trust-dialog) (lambda (_d) 'no-dialog)))
+    (let ((out (cc-butler-tool-accept-trust-dialog "s")))
+      (should (string-match-p "No trust dialog" out))
+      (should (string-match-p "refused" out)))))
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-reports-still-showing ()
+  (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+            ((symbol-function 'cc-butler--accept-trust-dialog) (lambda (_d) 'still-showing)))
+    (should (string-match-p "still on screen" (cc-butler-tool-accept-trust-dialog "s")))))
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-surfaces-errors ()
+  "An error from the core function (no live buffer, settle timeout, ...)
+must reach the caller as a readable message, not an uncaught elisp error."
+  (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+            ((symbol-function 'cc-butler--accept-trust-dialog) (lambda (_d) (error "boom"))))
+    (should (string-match-p "boom" (cc-butler-tool-accept-trust-dialog "s")))))
+
 ;;;; Attribution: the code says who is speaking, not the model
 ;;;; ------------------------------------------------------------------
 

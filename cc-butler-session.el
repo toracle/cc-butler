@@ -2184,6 +2184,48 @@ territory, not this function's."
              dir (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max)))))
      (t nil))))
 
+(defun cc-butler--accept-trust-dialog (dir)
+  "Press \"Yes, I trust this folder\" on DIR's live session — the callable
+handle a remote caller (the fleet, via the `accept_trust_dialog' MCP tool)
+uses to unstick a session the automatic gate in
+`cc-butler--wait-for-session-ready' missed. Acts ONLY if a trust dialog is
+actually showing on DIR's screen right NOW; refuses and sends zero keys
+otherwise — never sends a key into whatever happens to be on screen.
+
+Re-checks the screen immediately before acting, via the same pinned-key
+discipline as `cc-butler--accept-trust-dialog-new-shape' for the new
+shape (send Down, poll for the highlight to actually land on \"Yes\",
+only then send Return); the old shape needs a single Return, since \"Yes,
+I trust this folder\" is already its pre-highlighted default. Both shapes
+are recognized by their exact predicates
+(`cc-butler--trust-dialog-new-shape-p' / `cc-butler--trust-dialog-showing-p'),
+never by a fixed keypress count or an assumed highlight position. A marker
+present in some other, unrecognized shape falls through to the refusal
+branch rather than guessing.
+
+Returns one of three symbols:
+- `accepted'      — a dialog was showing; the marker is now confirmed gone
+                    from a fresh re-read of the screen.
+- `no-dialog'      — no (recognized) trust dialog was showing; zero keys
+                    were sent.
+- `still-showing'  — a key was sent, but the marker is still present on a
+                    fresh re-read afterward; needs a human look, not a
+                    blind retry."
+  (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
+    (unless (buffer-live-p buf)
+      (error "cc-butler: no live terminal buffer for %s" dir))
+    (cc-butler--refresh-terminal-text buf)
+    (cond
+     ((cc-butler--trust-dialog-new-shape-p buf)
+      (cc-butler--accept-trust-dialog-new-shape dir)
+      (cc-butler--refresh-terminal-text buf)
+      (if (cc-butler--trust-dialog-marker-present-p buf) 'still-showing 'accepted))
+     ((cc-butler--trust-dialog-showing-p buf)
+      (with-current-buffer buf (claude-code-ide--terminal-send-return))
+      (cc-butler--refresh-terminal-text buf)
+      (if (cc-butler--trust-dialog-marker-present-p buf) 'still-showing 'accepted))
+     (t 'no-dialog))))
+
 ;;;; ---- BLOCKED-ON-DIALOG (2026-09-08) --------------------------------
 ;;;; `list_claude_sessions' reported the single status WAITING-FOR-INPUT
 ;;;; for both a genuinely idle prompt and a session stuck inside an open

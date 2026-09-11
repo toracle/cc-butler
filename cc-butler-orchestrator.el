@@ -1895,6 +1895,27 @@ screen is worse than seeing none.  Check the cc-butler log for the refresh error
          ((string-empty-p out) "(no output)")
          (t out))))))
 
+(defun cc-butler-tool-accept-trust-dialog (name)
+  "MCP tool: press \"Yes, I trust this folder\" on session NAME's trust
+dialog — ONLY if one is actually showing on its live screen right now.
+Refuses explicitly, with zero keys sent, when no trust dialog is showing.
+See `cc-butler--accept-trust-dialog' for the safety discipline (screen
+re-checked immediately before every key, both known dialog shapes
+recognized by their exact predicates, never a blind keypress)."
+  (let ((dir (cc-butler--dir-by-name name)))
+    (if (not dir)
+        (format "No session named %S.  Call list_claude_sessions for names." name)
+      (condition-case err
+          (pcase (cc-butler--accept-trust-dialog dir)
+            ('accepted
+             (format "Trust dialog on %s accepted — confirmed gone from the screen." name))
+            ('no-dialog
+             (format "No trust dialog is showing on %s right now — refused, zero keys sent." name))
+            ('still-showing
+             (format "Sent a key to %s's trust dialog, but it is still on screen afterward — needs a human look, do not retry blindly." name)))
+        (error
+         (format "cc-butler: accept_trust_dialog on %s failed: %s" name (error-message-string err)))))))
+
 (defun cc-butler--relay-command-p (text)
   "Non-nil when TEXT is a bare slash command rather than a message.
 A command is an OPERATION on the session, not prose for anyone to read, and
@@ -2090,7 +2111,8 @@ durable log; only delivery to the steward is suppressed."
          (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                  '("list_claude_sessions" "read_session_output"
                    "send_to_session" "pending_events"
-                   "report_to_steward" "report_to_butler")))
+                   "report_to_steward" "report_to_butler"
+                   "accept_trust_dialog")))
        claude-code-ide-mcp-server-tools))
 
 (claude-code-ide-make-tool
@@ -2159,6 +2181,14 @@ durable log; only delivery to the steward is suppressed."
          (:name "text"
                 :type string
                 :description "The text to type into that session before submitting. May contain newlines for a multi-line prompt; only the final submit presses Enter.")))
+
+(claude-code-ide-make-tool
+ :function #'cc-butler-tool-accept-trust-dialog
+ :name "accept_trust_dialog"
+ :description "Press \"Yes, I trust this folder\" on session NAME's one-time folder-trust dialog — the safety handle for the case where the automatic launch-time gate missed it and the session is sitting stuck on \"No, exit\". Acts ONLY if a trust dialog is actually showing on that session's live screen right now; if not (an ordinary prompt, an unrelated menu, or nothing at all), it refuses explicitly and sends zero keys rather than guessing. Never use this speculatively — check read_session_output first if unsure what is actually on screen."
+ :args '((:name "name"
+                :type string
+                :description "Session name from list_claude_sessions whose screen is stuck on the trust dialog.")))
 
 (provide 'cc-butler-orchestrator)
 ;;; cc-butler-orchestrator.el ends here
