@@ -1909,13 +1909,13 @@ waiting is the wrong answer when nothing is ever going to make it idle
                    '("session_status" "compact_session" "compact_large_sessions")))
          claude-code-ide-mcp-server-tools))
 
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-session-status
    :name "session_status"
    :description "Show every live session's CONTEXT SIZE alongside its model, whether it is waiting for input, and whether it can be compacted right now. Use this to decide what needs compacting — list_claude_sessions gives the model but not the context size, and scraping the terminal for it is unreliable. Includes the butler and steward, which are usually the largest."
    :args nil)
 
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-compact-session
    :name "compact_session"
    :description "Compact one session's context: switches it to a cheap model, answers the prompt-cache confirmation, runs /compact, and restores the original model. Driven entirely from elisp — do NOT try to type these commands into a session yourself; each step needs its own submission and the confirmation is a modal. You MAY target the butler, the steward, and YOURSELF: if the target is mid-turn the compaction is queued and starts by itself once that turn ends, so calling this on yourself works — queue it and finish your turn normally. It still refuses outright if a menu is open or someone has genuinely typed something into the input box, since waiting does not fix those. Pass force=true ONLY when an operator has explicitly said to compact this session right now, not for the routine case — it ignores busy and starts immediately instead of queuing, which matters for a session whose idle window keeps getting reset by something other than itself (e.g. a notification hook) and so would otherwise never idle."
@@ -1925,7 +1925,7 @@ waiting is the wrong answer when nothing is ever going to make it idle
                   :description "Ignore busy and start immediately, even mid-turn. Only for an operator's explicit \"do it now\" — every other guard (open menu, unsubmitted input, unrestorable model) still refuses outright."
                   :optional t)))
 
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-compact-large-sessions
    :name "compact_large_sessions"
    :description "Compact every session whose context is over the threshold, largest first — the routine fleet-wide sweep. The butler and steward are included by design; they are the sessions that grow without bound. Sessions that are busy or have something open are skipped with a reason rather than blocking the sweep."

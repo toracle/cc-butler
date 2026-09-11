@@ -1311,7 +1311,7 @@ just silent."
            (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                    '("self_check")))
          claude-code-ide-mcp-server-tools))
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-self-check
    :name "self_check"
    :description "Pull the full state of cc-butler's periodic consistency self-check (existence -> consistency), on demand, from any fleet session. Nine checks: MCP bound port vs. each live session's actual connection port; governance memory write-path vs. read-path; the North Star file's existence + location inside the current governance store; the running module code's ancestry vs. origin/main (deliberately partial -- pending a separate stable-install-path decision); tracked customizable variables' persisted-vs-live state (would this survive a restart); WARMBLE_JUMBLE_PATH vs. the governance store (a cross-tool vault-drift canary); code-vs-live defcustom drift (is a live value already stuck on a superseded code default RIGHT NOW, restart or not); orphaned mail inboxes (a not-live agent's inbox with old unread mail nobody will ever read); and queue-room thread activity (surfaces each locally-open decision's Matrix thread -- sender and message counts, not a closure verdict -- forward-only, file-driven only, never a reverse room scan). Returns EVERY check's state, ok and failing both -- a clean run is positively confirmable, not just silent."
@@ -1338,7 +1338,7 @@ itself must not repeat that same erasure."
            (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                    '("acknowledge_orphan_inbox")))
          claude-code-ide-mcp-server-tools))
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-acknowledge-orphan-inbox
    :name "acknowledge_orphan_inbox"
    :description "Mark an already-known orphaned mail inbox (a not-live agent's inbox with old unread mail, as flagged by check 8 in self_check) as acknowledged-for-now. This is NOT permanent and NOT a deletion -- it only rewrites a marker file at the inbox root, never any message; a new message arriving in that inbox after acknowledgment automatically un-acknowledges it, and check 8 will flag it as failing again on its own, with no further action needed to re-arm it. Requires a reason: a marker recording only a timestamp erases who judged the inbox fine and why, which is exactly the erasure this check exists to surface -- so the acknowledgment itself must not repeat it."
