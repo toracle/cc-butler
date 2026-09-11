@@ -812,6 +812,7 @@ un-recorded room vs. a wrong recorded room vs. a fetch failure)."
     ('no-room "no :Room:/:Delivered-room: recorded")
     ('room-conflict ":Room: and :Delivered-room: disagree")
     ('not-in-room "recorded room does not contain the event (M_NOT_FOUND)")
+    ('root-fetch-error "delivered event verified in room, but its thread root fetch failed")
     ('fetch-error "fetch failed")
     (_ (symbol-name reason))))
 
@@ -850,13 +851,26 @@ Returns a plist:
                                                 thread activity at all\".
   (:bucket unverifiable :reason R)          -- R one of `no-delivery' `no-room'
                                                 `room-conflict' `not-in-room'
-                                                `fetch-error'.
+                                                `root-fetch-error' `fetch-error'.
 Either property missing (`no-delivery'/`no-room') is checked BEFORE ever
 calling out to Matrix at all -- an unverifiable decision must never guess
 at a room to fetch from.  Likewise `room-conflict' (`:Room:' and
 `:Delivered-room:' both present and naming different rooms): which one is
 right is not decidable from the file alone, so this never silently picks
 either side.
+
+When `:Delivered-to-matrix:' (the delivered event -- what this check
+exists to verify) and `:Delivered-thread:' (its thread root -- a
+hand-written record of its own, the same kind of record that drifted, so
+it cannot vouch for the delivery) differ, room membership is decided by
+querying the DELIVERED EVENT first: `not-in-room' means the delivery
+itself is unverifiable in the recorded room, before the root is ever
+touched.  Only once that succeeds is the root queried for activity data.
+A failure on that second, root-only query is `root-fetch-error' -- NEVER
+`not-in-room' -- a root-side failure must not misreport an already-verified
+delivery as a wrong-room one.  When root and delivered event are the same
+event (no `:Delivered-thread:', or a root-equals-self delivery), one query
+serves both purposes, exactly as before.
 
 This check has NO closure bucket.  A thread reply -- even one from this
 fleet's own identity -- is not evidence of an answer: this fleet's own
@@ -875,16 +889,47 @@ controls pinning this down."
      ((not room) (list :bucket 'unverifiable :reason 'no-room))
      ((eq room 'conflict) (list :bucket 'unverifiable :reason 'room-conflict))
      (t
-      (let ((resp (matrix-bridge-thread-replies
-                    room (cc-butler--decision-thread-root-event-id path))))
-        (pcase (plist-get resp :status)
-          ('not-in-room (list :bucket 'unverifiable :reason 'not-in-room))
-          ('error (list :bucket 'unverifiable :reason 'fetch-error))
-          ('ok
-           (list :bucket 'open
-                 :scanned (plist-get resp :scanned)
-                 :senders (cc-butler-self-check--queue-room-sender-counts
-                           (plist-get resp :events))))))))))
+      (let ((root (cc-butler--decision-thread-root-event-id path)))
+        (if (equal root event-id)
+            (cc-butler-self-check--queue-room-classify-fetch
+             (matrix-bridge-thread-replies room root))
+          (cc-butler-self-check--queue-room-verify-leaf-then-fetch-root
+           room event-id root)))))))
+
+(defun cc-butler-self-check--queue-room-open-result (resp)
+  "Build the OPEN-bucket plist from RESP, a successful (`:status' `ok')
+`matrix-bridge-thread-replies' response."
+  (list :bucket 'open
+        :scanned (plist-get resp :scanned)
+        :senders (cc-butler-self-check--queue-room-sender-counts
+                  (plist-get resp :events))))
+
+(defun cc-butler-self-check--queue-room-classify-fetch (resp)
+  "Classify RESP, a `matrix-bridge-thread-replies' response for a query that
+serves both room-verification and activity in one call (root and
+delivered event are the same event) -- the pre-two-query behavior."
+  (pcase (plist-get resp :status)
+    ('not-in-room (list :bucket 'unverifiable :reason 'not-in-room))
+    ('error (list :bucket 'unverifiable :reason 'fetch-error))
+    ('ok (cc-butler-self-check--queue-room-open-result resp))))
+
+(defun cc-butler-self-check--queue-room-verify-leaf-then-fetch-root (room event-id root)
+  "When the delivered EVENT-ID differs from its thread ROOT: verify EVENT-ID's
+membership in ROOM first -- that is the fact this check exists to verify,
+and `:Delivered-thread:' is itself a hand-written record that cannot vouch
+for it -- then, only once EVENT-ID is confirmed, fetch activity from ROOT.
+A ROOT-only failure after EVENT-ID already verified is `root-fetch-error',
+NEVER `not-in-room' -- a root-side failure must not misreport an
+already-confirmed delivery as a wrong-room one."
+  (let ((leaf-resp (matrix-bridge-thread-replies room event-id)))
+    (pcase (plist-get leaf-resp :status)
+      ('not-in-room (list :bucket 'unverifiable :reason 'not-in-room))
+      ('error (list :bucket 'unverifiable :reason 'fetch-error))
+      ('ok
+       (let ((root-resp (matrix-bridge-thread-replies room root)))
+         (if (eq (plist-get root-resp :status) 'ok)
+             (cc-butler-self-check--queue-room-open-result root-resp)
+           (list :bucket 'unverifiable :reason 'root-fetch-error)))))))
 
 (defun cc-butler-self-check--queue-room-thread-activity ()
   "Check 9: surfaces Matrix thread activity for each open/ decision queue
@@ -903,8 +948,10 @@ Otherwise, each candidate lands in one of two buckets
 fetched -- `:detail' carries its scanned-message count and a raw
 sender/count breakdown, for a human to read) or UNVERIFIABLE (missing
 `:Delivered-to-matrix:'/room property, `:Room:' and `:Delivered-room:'
-disagreeing, the recorded room turned out wrong, or the fetch itself
-failed).  Every candidate in either bucket counts toward
+disagreeing, the recorded delivered event turned out to be in the wrong
+room, its thread root's own fetch failed even though the delivered event
+was verified, or the fetch itself failed outright).  Every candidate in
+either bucket counts toward
 the same \"still awaiting answer\" total -- nothing here ever removes a
 decision from that count.
 
@@ -942,7 +989,7 @@ nothing\" apart from \"the check silently didn't run\"."
       (let* ((reason-counts
               (mapcar (lambda (reason)
                         (cons reason (length (seq-filter (lambda (u) (eq (cdr u) reason)) unverifiable))))
-                      '(no-delivery no-room room-conflict not-in-room fetch-error)))
+                      '(no-delivery no-room room-conflict not-in-room root-fetch-error fetch-error)))
              (detail
               (format "queue-room thread activity: %d candidate(s) — open %d%s · unverifiable %d (%s) — %d decision(s) checked, %d total thread message(s) scanned — this check never judges closure; read each before treating any as answered"
                       (length files)
