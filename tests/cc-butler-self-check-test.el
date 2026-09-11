@@ -1152,6 +1152,60 @@ err toward a push to the steward, never toward silence."
             (should-not (plist-get r :ok))
             (should (string-match-p "FAIL 1" (plist-get r :detail)))))))))
 
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-hold-beyond-horizon-fails ()
+  "A hold more than `cc-butler-self-check-max-delivery-hold' seconds out
+(e.g. a mistyped year) is INVALID, not active -- evaluated as unheld, so
+an aged item still FAILs rather than being silenced for a year with only
+:detail as the record."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (let ((until (format-time-string "%Y-%m-%d %H:%M"
+                                        (time-add (current-time) (seconds-to-time (* 73 60 60))))))
+        (cc-butler-self-check-test--seed-open-decision
+         "heldbeyondhorizon" nil nil nil nil (concat until " too far out")))
+      (cc-butler-self-check-test--with-file-age
+          (+ cc-butler-self-check-no-delivery-age-threshold 60)
+        (cc-butler-self-check-test--with-thread-replies-stub
+            (lambda (_room _event-id) (error "must not be called -- never delivered"))
+          (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "FAIL 1" (plist-get r :detail)))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-hold-within-horizon-stays-ok ()
+  "Positive control for the horizon test above: a hold well within
+`cc-butler-self-check-max-delivery-hold' (here 12h, under the 72h
+default) still stays `:ok t' and named -- the horizon caps unreasonably
+far holds, it does not disable the escape hatch."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (let ((until (format-time-string "%Y-%m-%d %H:%M"
+                                        (time-add (current-time) (seconds-to-time (* 12 60 60))))))
+        (cc-butler-self-check-test--seed-open-decision
+         "heldwithinhorizon" nil nil nil nil (concat until " within horizon"))
+        (cc-butler-self-check-test--with-file-age
+            (+ cc-butler-self-check-no-delivery-age-threshold 60)
+          (cc-butler-self-check-test--with-thread-replies-stub
+              (lambda (_room _event-id) (error "must not be called -- never delivered"))
+            (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+              (should (plist-get r :ok))
+              (should (string-match-p "held 1" (plist-get r :detail)))
+              (should (string-match-p (regexp-quote until) (plist-get r :detail))))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-unparseable-filename-fails ()
+  "A no-delivery item whose filename does not parse into an age (should
+never happen -- filenames are code-generated) must FAIL, not sit in
+`grace' forever uncounted: nil age means silence otherwise, which is
+exactly the wrong default for something that should never occur."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision "unparseable")
+      (cl-letf (((symbol-function 'cc-butler--decision-file-time) (lambda (_filename) nil)))
+        (cc-butler-self-check-test--with-thread-replies-stub
+            (lambda (_room _event-id) (error "must not be called -- never delivered"))
+          (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "FAIL 1" (plist-get r :detail)))))))))
+
 ;;;; ---- the four PERMANENT negative controls -----------------------
 
 (ert-deftest cc-butler-self-check/queue-room-no-file-means-structurally-invisible ()

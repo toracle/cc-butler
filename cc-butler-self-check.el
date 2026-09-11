@@ -543,6 +543,21 @@ for went undetected for 5 hours) within about 4 self-check ticks."
   :type 'integer
   :group 'cc-butler)
 
+(defcustom cc-butler-self-check-max-delivery-hold (* 72 60 60)
+  "Seconds beyond `now' that a `:Delivery-held-until:' hold may extend into
+before check 9 treats it as INVALID rather than active -- an
+unboundedly-far hold would silence a `no-delivery' FAIL for however long
+the timestamp says, visible only in :detail, which nobody reads by
+construction (that invisibility is the exact failure class this PR
+exists to close).  A hold further out than this horizon is evaluated as
+unheld, under the normal age rule -- so a mistyped year (`2027-...') FAILs
+loudly instead of silencing that item for a year.
+
+72 hours (this default) covers a weekend hold; the one measured
+overnight hold in the live queue was roughly 6.5 hours."
+  :type 'integer
+  :group 'cc-butler)
+
 (defun cc-butler-self-check--live-inbox-slugs ()
   "Return the set of maildir slugs every currently live session maps to
 \(a hash-table, for O(1) membership tests), via `cc-butler--sessions' --
@@ -973,32 +988,49 @@ which takes a bare filename, not a full path)."
   (let ((time (cc-butler--decision-file-time (file-name-nondirectory path))))
     (and time (- (float-time) time))))
 
+(defun cc-butler-self-check--queue-room-hold-active-p (entry now)
+  "Non-nil when no-delivery ENTRY's `:held-until' is a currently active,
+IN-HORIZON hold as of NOW (a float-time): present, still in the future,
+and no more than `cc-butler-self-check-max-delivery-hold' seconds out.  A
+hold further out than that horizon is treated as INVALID -- evaluated as
+unheld under the normal age rule, same as missing or unparseable -- so a
+mistyped year does not silence a FAIL for a year with only :detail
+\(which nobody reads\) as the record."
+  (let ((held-until (plist-get entry :held-until)))
+    (and held-until
+         (< now held-until)
+         (<= held-until (+ now cc-butler-self-check-max-delivery-hold)))))
+
 (defun cc-butler-self-check--queue-room-no-delivery-failing-p (entry now)
   "Non-nil when a no-delivery ENTRY (a plist with `:age'/`:held-until', as
 built by `cc-butler-self-check--queue-room-thread-activity-one') should
 FAIL check 9 as of NOW (a float-time): aged at or past
-`cc-butler-self-check-no-delivery-age-threshold' AND not covered by a
-still-active `:Delivery-held-until:' hold.  A missing or unparseable
-`:Delivery-held-until:' is indistinguishable here from no hold at all --
-both fall through to this same age check, per that property's own
-docstring."
-  (let ((age (plist-get entry :age))
-        (held-until (plist-get entry :held-until)))
-    (and age
-         (>= age cc-butler-self-check-no-delivery-age-threshold)
-         (not (and held-until (< now held-until))))))
+`cc-butler-self-check-no-delivery-age-threshold' -- OR its age is nil
+(the filename did not parse; code generates these filenames, so this
+should never happen, which is exactly why it must fail loud rather than
+count as grace forever) -- AND not covered by a still-active,
+in-horizon `:Delivery-held-until:' hold
+\(`cc-butler-self-check--queue-room-hold-active-p'\).  A missing,
+unparseable, or too-far-out `:Delivery-held-until:' is indistinguishable
+here from no hold at all -- all three fall through to this same age
+check, per that property's own docstring."
+  (let ((age (plist-get entry :age)))
+    (and (or (null age) (>= age cc-butler-self-check-no-delivery-age-threshold))
+         (not (cc-butler-self-check--queue-room-hold-active-p entry now)))))
 
 (defun cc-butler-self-check--queue-room-no-delivery-detail (entries now)
   "Format a `[FAIL N; held N (until ...); grace N]' breakdown of no-delivery
 ENTRIES for `:detail' -- empty string when ENTRIES is nil.  A held item's
 until-time (and reason, when recorded) is always named, so a human can
-tell a deliberate wait from a stall without opening the file."
+tell a deliberate wait from a stall without opening the file.  Uses the
+same `cc-butler-self-check--queue-room-hold-active-p' the FAIL decision
+does, so \"shown as held\" and \"actually suppresses the FAIL\" can never
+disagree."
   (if (null entries)
       ""
     (let ((failing (seq-filter (lambda (e) (cc-butler-self-check--queue-room-no-delivery-failing-p e now))
                                 entries))
-          (held (seq-filter (lambda (e)
-                               (let ((u (plist-get e :held-until))) (and u (< now u))))
+          (held (seq-filter (lambda (e) (cc-butler-self-check--queue-room-hold-active-p e now))
                              entries)))
       (format " [FAIL %d; held %d%s; grace %d]"
               (length failing)
