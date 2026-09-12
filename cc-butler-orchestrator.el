@@ -1389,17 +1389,31 @@ Progress = any transcript write since the event was recorded (the
 session resumed by itself — a sub-agent completed, a turn ran); such an
 event resolves silently.  A session still static after the window
 escalates through the normal wake gate.  Either way the entry is
-dropped: the durable inbox still holds the event, so nothing is lost."
+dropped: the durable inbox still holds the event, so nothing is lost.
+
+EXCEPTION: the butler is never escalated here.  Static/idle IS its
+healthy resting state — it waits on 정수님, not on transcript progress —
+so the progress test below can never resolve in its favor and would
+otherwise re-escalate every window forever (observed: three empty wakes
+in ~20 minutes, 2026-09-12).  `cc-butler-steward-inbox-design.md'
+already decided this direction for `escalate_to_butler' (\"deliver-only,
+no poke ... because nothing ever pokes the butler on arrival\"); this
+just extends it to the one caller that was still poking it."
   (when-let ((entry (gethash dir cc-butler--forward-deferred)))
     (remhash dir cc-butler--forward-deferred)
     (let ((last (cc-butler--session-last-activity dir)))
-      (if (and last (> last (plist-get entry :since)))
-          (cc-butler--log "forward: deferred %s self-resolved"
-                          (cc-butler--who-dir dir))
+      (cond
+       ((and (boundp 'cc-butler--butler) (equal dir cc-butler--butler))
+        (cc-butler--log "forward: deferred %s dropped (butler idle-on-human is healthy, not stalled)"
+                        (cc-butler--who-dir dir)))
+       ((and last (> last (plist-get entry :since)))
+        (cc-butler--log "forward: deferred %s self-resolved"
+                        (cc-butler--who-dir dir)))
+       (t
         (cc-butler--forward-wake ops dir
                                  (format "%s (idle %ss, no progress)"
                                          (plist-get entry :body)
-                                         cc-butler-forward-defer-window))))))
+                                         cc-butler-forward-defer-window)))))))
 
 (defun cc-butler--forward-backstop ()
   "Periodic sweep: push once if events sit undrained and nothing woke ops.
