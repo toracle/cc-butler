@@ -1837,6 +1837,21 @@ that ambiguity, it does not resolve it)."
       (should (string-match-p "no progress" (car sent))))
     (should (null (gethash "/worker/" cc-butler--forward-deferred)))))
 
+(ert-deftest cc-butler-orchestrator/forward-butler-idle-never-escalates ()
+  "The butler waiting on the human is the healthy resting state, not a
+stall — a static butler must never escalate to `--forward-wake', no
+matter how long it stays static past the window (regression guard for
+the empty-wake-every-5-minutes loop, 2026-09-12)."
+  (cc-butler-orchestrator-test--with-forward-fixture
+    (let ((cc-butler--butler "/worker/"))
+      (puthash "/ops/" (- (float-time) 120) activity)
+      (puthash "/worker/" (- (float-time) 3600) activity) ; static long past the window
+      (cc-butler--forward-to-ops
+       (cc-butler-orchestrator-test--event "Claude is waiting for your input"))
+      (cc-butler--forward-defer-check "/ops/" "/worker/")
+      (should (null (cc-butler-orchestrator-test--recorded-writes)))
+      (should (null (gethash "/worker/" cc-butler--forward-deferred))))))
+
 (ert-deftest cc-butler-orchestrator/forward-backstop-pushes-once-per-interval ()
   "Given undrained events and a free ops session, the backstop fires ONE
 push, and a second sweep inside the same interval fires none. An empty
