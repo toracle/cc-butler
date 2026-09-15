@@ -375,10 +375,16 @@ window blinded us to a session's size as well as its model.  Read each field
 independently and let a missing one be nil on its own.")
 
 (defconst cc-butler-cleanup--statusline-model-re
-  "MODEL:\\([A-Za-z0-9_.-]+\\)"
+  "MODEL:\\([A-Za-z0-9_.-]+\\)\\(?:[ \t]\\|$\\)"
   "The model field, matched independently of CTX and of field order.
 `MODEL:?' does not match: `?' is outside the class, so the statusline's own
-\"unknown\" sentinel stays honestly nil rather than becoming the string \"?\".")
+\"unknown\" sentinel stays honestly nil rather than becoming the string \"?\".
+The tag must be followed by whitespace or end the line, for the same reason
+the CTX number must (see `cc-butler-cleanup--statusline-re'): a narrow window
+cuts on a character count and leaves `MODEL:Fab…' for `Fable-5.1' (the butler,
+2026-09-15, #254).  Without the guard that scraped as `Fab' — a tag that names
+no restorable model — and compaction refused.  Interrupted means nil, and the
+transcript answers instead.")
 
 (defun cc-butler-cleanup--statusline-fields (out)
   "Parse the session's OWN statusline out of terminal text OUT.
