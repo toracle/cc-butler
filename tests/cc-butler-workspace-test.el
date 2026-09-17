@@ -454,5 +454,49 @@ spawned worker."
       (cc-butler--start-session-in "/tmp/some-worker/"))
     (should (string-match-p "--model sonnet\\b" captured-flags))))
 
+;;;; ------------------------------------------------------------------
+;;;; Clone: a repo that ships scripts/git-hooks gets core.hooksPath set
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-workspace-test--fixture-repo (with-hooks)
+  "Return a path to a fresh one-commit git repo; WITH-HOOKS adds scripts/git-hooks."
+  (let ((default-directory (file-name-as-directory (make-temp-file "cc-clone-src" t))))
+    (when with-hooks
+      (make-directory "scripts/git-hooks" t)
+      (write-region "#!/bin/sh\nexit 0\n" nil "scripts/git-hooks/pre-commit"))
+    (write-region "x\n" nil "README")
+    (dolist (args '(("init" "-q")
+                    ("add" "-A")
+                    ("-c" "user.name=t" "-c" "user.email=t@t" "commit" "-q" "-m" "init")))
+      (should (eq 0 (apply #'call-process "git" nil nil nil args))))
+    (directory-file-name default-directory)))
+
+(defun cc-butler-workspace-test--clone-hooks-path (with-hooks)
+  "Clone a fixture (WITH-HOOKS or not) via `cc-butler--clone-repos'.
+Return the clone's local core.hooksPath, or nil when unset."
+  (let* ((src (cc-butler-workspace-test--fixture-repo with-hooks))
+         (topic (file-name-as-directory (make-temp-file "cc-clone-topic" t)))
+         (result 'pending)
+         (deadline (+ (float-time) 30)))
+    (cc-butler--clone-repos topic (list src) (lambda (ok) (setq result ok)))
+    (while (and (eq result 'pending) (< (float-time) deadline))
+      (accept-process-output nil 0.1))
+    (should (eq result t))
+    (with-temp-buffer
+      (when (eq 0 (call-process "git" nil t nil "-C"
+                                (expand-file-name (file-name-nondirectory src) topic)
+                                "config" "--local" "core.hooksPath"))
+        (string-trim (buffer-string))))))
+
+(ert-deftest cc-butler-workspace/clone-sets-hooks-path-when-repo-ships-hooks ()
+  "A fresh clone that ships scripts/git-hooks must come up with
+core.hooksPath pointing there, or its pre-commit gate never runs."
+  (should (equal (cc-butler-workspace-test--clone-hooks-path t)
+                 "scripts/git-hooks")))
+
+(ert-deftest cc-butler-workspace/clone-leaves-hooks-path-unset-without-hooks ()
+  "Negative control: a repo without scripts/git-hooks is left untouched."
+  (should (null (cc-butler-workspace-test--clone-hooks-path nil))))
+
 (provide 'cc-butler-workspace-test)
 ;;; cc-butler-workspace-test.el ends here

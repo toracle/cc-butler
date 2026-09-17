@@ -167,6 +167,13 @@ with t (all succeeded) or nil (a clone failed)."
                (if (eq 0 (process-exit-status proc))
                    (progn
                      (when (buffer-live-p buf) (kill-buffer buf))
+                     ;; A repo shipping its own hooks (e.g. a pre-commit gate)
+                     ;; only runs them once core.hooksPath points there.
+                     ;; Best effort: a config failure must not fail the chain.
+                     (when (file-directory-p (expand-file-name "scripts/git-hooks" dest))
+                       (ignore-errors
+                         (call-process "git" nil nil nil "-C" dest "config"
+                                       "core.hooksPath" "scripts/git-hooks")))
                      (cc-butler--clone-repos topic-dir rest done-fn))
                  (message "cc-butler: `git clone %s' failed — see %s"
                           url (buffer-name buf))
