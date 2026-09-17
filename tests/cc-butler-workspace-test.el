@@ -476,11 +476,14 @@ pre-commit is not executable, so git would silently run nothing)."
       (should (eq 0 (apply #'call-process "git" nil nil nil args))))
     (directory-file-name default-directory)))
 
-(defun cc-butler-workspace-test--clone (hooks)
+(defun cc-butler-workspace-test--clone (hooks &optional preseed)
   "Clone a fixture (see `cc-butler-workspace-test--fixture-repo' for HOOKS)
 via `cc-butler--clone-repos'.  Return (HOOKS-PATH . WARNINGS): the clone's
 local core.hooksPath (nil when unset) and the list of `display-warning'
-argument lists raised during the clone.  Fixture dirs are removed after."
+argument lists raised during the clone.  With PRESEED, the destination is
+first created by a plain `git clone' (core.hooksPath unset), so
+`cc-butler--clone-repos' finds it already present.  Fixture dirs are
+removed after."
   (let* ((src (cc-butler-workspace-test--fixture-repo hooks))
          (topic (file-name-as-directory (make-temp-file "cc-clone-topic" t)))
          (result 'pending)
@@ -489,6 +492,11 @@ argument lists raised during the clone.  Fixture dirs are removed after."
     (unwind-protect
         (cl-letf (((symbol-function 'display-warning)
                    (lambda (&rest args) (push args warnings))))
+          (when preseed
+            (let ((dest (expand-file-name (file-name-nondirectory src) topic)))
+              (should (eq 0 (call-process "git" nil nil nil "clone" "-q" src dest)))
+              (call-process "git" nil nil nil "-C" dest
+                            "config" "--local" "--unset" "core.hooksPath")))
           (cc-butler--clone-repos topic (list src) (lambda (ok) (setq result ok)))
           (while (and (eq result 'pending) (< (float-time) deadline))
             (accept-process-output nil 0.1))
@@ -529,6 +537,43 @@ and raises no warning."
   (let ((r (cc-butler-workspace-test--clone nil)))
     (should (null (car r)))
     (should (null (cdr r)))))
+
+(ert-deftest cc-butler-workspace/clone-sets-hooks-path-on-already-present-clone ()
+  "A clone already present in the topic (reused or pre-seeded) is not
+re-cloned, but still gets core.hooksPath set — stale clones were found
+exactly in this unset state."
+  (let ((r (cc-butler-workspace-test--clone 'executable t)))
+    (should (equal (car r) "scripts/git-hooks"))
+    (should (null (cdr r)))))
+
+(ert-deftest cc-butler-workspace/already-present-clone-without-hooks-stays-unset ()
+  "Negative control: an already-present clone of a repo without
+scripts/git-hooks is left untouched, and raises no warning."
+  (let ((r (cc-butler-workspace-test--clone nil t)))
+    (should (null (car r)))
+    (should (null (cdr r)))))
+
+(ert-deftest cc-butler-workspace/ensure-repo-hooks-warns-when-read-back-differs ()
+  "If the core.hooksPath write does not take, the read-back catches it and
+raises an error-level `cc-butler' warning instead of signalling."
+  (let ((src (cc-butler-workspace-test--fixture-repo 'executable))
+        (real-call-process (symbol-function 'call-process))
+        (warnings nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'display-warning)
+                   (lambda (&rest args) (push args warnings)))
+                  ((symbol-function 'call-process)
+                   (lambda (prog &optional infile dest display &rest args)
+                     (if (and (member "core.hooksPath" args)
+                              (member "scripts/git-hooks" args))
+                         1              ; the write silently fails
+                       (apply real-call-process prog infile dest display args)))))
+          (cc-butler--ensure-repo-hooks src)
+          (should (= 1 (length warnings)))
+          (should (eq (nth 0 (car warnings)) 'cc-butler))
+          (should (eq (nth 2 (car warnings)) :error))
+          (should (string-match-p "core.hooksPath" (nth 1 (car warnings)))))
+      (delete-directory src t))))
 
 (provide 'cc-butler-workspace-test)
 ;;; cc-butler-workspace-test.el ends here
