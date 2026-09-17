@@ -173,7 +173,16 @@ with t (all succeeded) or nil (a clone failed)."
                      (when (file-directory-p (expand-file-name "scripts/git-hooks" dest))
                        (ignore-errors
                          (call-process "git" nil nil nil "-C" dest "config"
-                                       "core.hooksPath" "scripts/git-hooks")))
+                                       "core.hooksPath" "scripts/git-hooks"))
+                       ;; The config alone is not a guard: without an
+                       ;; executable pre-commit git silently runs nothing.
+                       (unless (file-executable-p
+                                (expand-file-name "scripts/git-hooks/pre-commit" dest))
+                         (display-warning
+                          'cc-butler
+                          (format "%s: scripts/git-hooks/pre-commit is missing or not executable — the pre-commit gate is INACTIVE"
+                                  dest)
+                          :error)))
                      (cc-butler--clone-repos topic-dir rest done-fn))
                  (message "cc-butler: `git clone %s' failed — see %s"
                           url (buffer-name buf))
