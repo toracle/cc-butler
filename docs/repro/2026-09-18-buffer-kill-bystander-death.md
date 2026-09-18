@@ -265,3 +265,39 @@ alive, controlled by `cc-butler-close-topic-refuse-concurrent-ghostel`
 `tests/cc-butler-workspace-test.el` cover: refusal under the hazard
 condition, pass-through when solo or on a non-ghostel backend, and the
 escape hatch. Full suite: 1048/1048 passing after the change.
+
+## Correction (added after this PR's head; pre-registration and results above are unchanged)
+
+A second round of pre-registered, decisive trials (isolated `ccb-repro`
+daemon, same as above; branch `repro/buffer-kill-round2`, commit `942d4ac`)
+tested the two creation-order rules this document's inference section
+speculated about:
+
+- Rule A ("fixed": killing any session kills the 2nd-newest live session,
+  position-independent).
+- Rule B ("relative": killing the session at creation-order position N kills
+  position N-1; the oldest session has no victim).
+
+**Both are falsified** by their own pre-registered falsification conditions
+in round 2 — see `repro/buffer-kill-round2`'s pre-registration and results
+commits for the full tables. **The victim rule is UNKNOWN.**
+
+Round 2 also produced a post-hoc rule ("the predecessor dies, except killing
+the oldest session instead hits index N-2 of the live set") that fits all 9
+of round 2's own trials with zero exceptions. That rule is **not promoted
+here as the answer**: checked against the steward's read-only census of 5
+real bystander deaths observed on the live fleet the same day, it agrees
+with only 2 of the 5 (the two where every candidate rule agrees) and fails
+the other 3 — for example, killing `github-app-install` (12:34:19) is
+predicted by this rule to kill `mobile-voice` (12:34:16, alive), but the
+session that actually died was `d365` (12:34:29). No rule tested so far —
+A, B, or the round-2 post-hoc rule — fits both the isolated-daemon data and
+the live-fleet census.
+
+The fd/pty-slot-ordering hypothesis and the native reaper-close hypothesis
+(`ghostel-20260823.1350/src/PosixPtyProcess.zig`, `NativeProcess.zig`) remain
+open and untested at the mechanism level; the live fleet's slot order can
+diverge from creation order in a way the isolated daemon so far has not
+exercised, which is one candidate reason no creation-order-only rule fits
+both datasets. This does not change the live-fleet safety recommendation
+above: **keep the freeze.**
