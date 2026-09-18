@@ -2027,6 +2027,22 @@ n=1 rep per state (5 states) — this is explicitly a boundary-mapping
 pass, not a statistical claim; only the Point-1 paired design carries
 n=3 and a "safe"/"unsafe" read.
 
+### Correction to Point 2, before any row ran
+
+**Point 2 (the 5 state-of-session rows) is UNTESTED by this round, not
+silently dropped.** Flagged by butler before any Part-2 row was
+attempted: whether a session in a given state (mid-turn, typed-but-
+unsubmitted text, open menu/wizard, unresponsive) accepts `/exit` is a
+behavior of the real Claude Code CLI's own TUI/line-editor/screen-mode
+handling — a shell stub (`trap ... HUP TERM; cat` or any lightly
+extended variant of it) has no such states to approximate faithfully,
+and forcing a pty-level proxy for them (as originally sketched above)
+would answer a different, stub-specific question, not the one asked.
+This round runs Point 1 only. Point 2 remains open, and would need
+either the real `claude` CLI (a real hazard, ruled out for this round's
+scope — victims here are stub sessions only) or a differently-scoped
+future round to test.
+
 ### Cost note (told to the steward before starting, per instruction)
 
 All sessions in this addendum, both arms and all state rows, are the
