@@ -111,16 +111,25 @@ this shape and dropped out of the recallable index."
 ;;;; ------------------------------------------------------------------
 
 (defmacro cc-butler-governance-test--with-store (&rest body)
-  "Run BODY with a throwaway store and memory dir wired together."
+  "Run BODY with a throwaway store, memory dir, and (empty) vault root wired
+together. The vault-root binding matters even for tests that never look at
+citations: without it, `cc-butler-governance-regenerate''s citation-count
+grep (see `cc-butler-governance--citation-count-map') falls back to
+whatever `cc-butler-governance-vault-root' resolves to for real on the
+machine running the suite -- real, slow, and machine-dependent, exactly
+what these tests must never quietly depend on."
   (declare (indent 0))
   `(let* ((store (file-name-as-directory (make-temp-file "gov-store" t)))
           (mem (file-name-as-directory (make-temp-file "gov-mem" t)))
+          (vault (file-name-as-directory (make-temp-file "gov-vault" t)))
           (cc-butler-governance-dir store)
           (cc-butler-governance-user-dir nil)
-          (cc-butler-governance-memory-dir mem))
+          (cc-butler-governance-memory-dir mem)
+          (cc-butler-governance-vault-root vault))
      (unwind-protect (progn ,@body)
        (delete-directory store t)
-       (delete-directory mem t))))
+       (delete-directory mem t)
+       (delete-directory vault t))))
 
 (ert-deftest cc-butler-governance/record-writes-the-store-frontmatter ()
   "The tool writes the frontmatter, so a caller cannot get the schema wrong.
@@ -2295,6 +2304,57 @@ stamp.  It must be kept, not silently treated as a duplicate to strip."
                (regexp-quote "(최초 기록: a different unrelated line, 02-02)") text))
       ;; the note's REAL original stamp still carries forward, unchanged
       (should (string-match-p "최초 기록: worker-a (sess-1)" text)))))
+
+;;;; --- integration: the motivating bug, through the REAL pipeline ---
+
+(ert-deftest cc-butler-governance/regenerate-bulk-commit-does-not-swallow-band-a ()
+  "THE motivating bug, reproduced through the REAL pipeline: a single commit
+touching many notes at once (a stand-in for the real 91-file wikilink-
+redirect commit) must not occupy the whole front of the index -- only
+`cc-butler-governance-band-a-commit-cap' of its members, the most-cited
+ones, make Band A; the rest are pushed behind a genuinely-solo recent
+commit and are still findable, just in Band B.
+
+RED against unmodified pure-recency `--rewrite-sorted-index' (all 20 bulk
+notes lead by recency alone; `loved' -- committed slightly earlier but far
+more cited -- sorts behind every one of them); GREEN once
+`--rewrite-sorted-index' routes through `cc-butler-governance--band-order'."
+  (skip-unless (executable-find "git"))
+  (cc-butler-governance-test--with-store
+    (let ((cc-butler-governance-band-a-commit-cap 3))
+      (cc-butler-governance-test--git-init store)
+      (let ((now (floor (float-time))))
+        ;; 20 notes, one bulk commit, 30 minutes ago
+        (dotimes (i 20)
+          (cc-butler-governance-test--commit-note
+           store (format "bulk-%02d" i)
+           (cc-butler-governance--render (format "bulk-%02d" i) "d" "body" nil)
+           (- now 1800)))
+        ;; one solo note, committed slightly EARLIER (1 hour ago) but far
+        ;; more heavily cited
+        (cc-butler-governance-test--commit-note
+         store "loved" (cc-butler-governance--render "loved" "d" "body" nil)
+         (- now 3600)))
+      (with-temp-file (expand-file-name "citing.md" vault)
+        ;; `loved' and one bulk file (bulk-07) are the only cited notes --
+        ;; standing in for the mass of files a mechanical redirect touches
+        ;; without any of them individually being popular
+        (insert "[[loved]] [[loved]] [[bulk-07]]\n"))
+      (cc-butler-tool-regenerate-governance)
+      (let* ((index-text (with-temp-buffer
+                           (insert-file-contents (expand-file-name "MEMORY.md" mem))
+                           (buffer-string)))
+             (slugs (cc-butler-governance--index-butler-slugs index-text))
+             (bulk-slugs (seq-filter (lambda (s) (string-prefix-p "bulk-" s)) slugs)))
+        ;; all 20 bulk notes are still indexed SOMEWHERE -- the cap reorders,
+        ;; it never drops a note
+        (should (= (length bulk-slugs) 20))
+        ;; the cited bulk survivor and the heavily-cited solo note lead
+        (should (member "loved" (seq-take slugs 4)))
+        (should (member "bulk-07" (seq-take slugs 4)))
+        ;; the cap actually bit: strictly fewer than all 20 bulk notes lead
+        ;; the index alongside them -- most of the 20 are pushed behind
+        (should (< (length (seq-intersection (seq-take slugs 4) bulk-slugs)) 20))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Two-band MEMORY.md index (reimplemented from PR #197 against main's
