@@ -944,13 +944,20 @@ backlog signal only. Defaults to `cc-butler-drained-keep''s existing
 
 (defun cc-butler--inbox-queue-save ()
   "Rewrite `cc-butler-inbox-queue-file' to mirror the current `cc-butler--inbox'.
-Call after every mutation (push or drain) so the file never lags."
+Call after every mutation (push or drain) so the file never lags.  Written to
+a sibling temp file first, then renamed over the real target -- same
+filesystem, so the rename is atomic -- rather than writing the target
+directly, so a reader (or a crash mid-write) never sees a half-written file."
   (ignore-errors
     (make-directory (file-name-directory cc-butler-inbox-queue-file) t)
-    (with-temp-file cc-butler-inbox-queue-file
-      (let ((print-length nil) (print-level nil))
-        (prin1 cc-butler--inbox (current-buffer))
-        (insert "\n"))))
+    (let ((tmp (make-temp-file
+                (expand-file-name "cc-butler-inbox-queue-"
+                                  (file-name-directory cc-butler-inbox-queue-file)))))
+      (with-temp-file tmp
+        (let ((print-length nil) (print-level nil))
+          (prin1 cc-butler--inbox (current-buffer))
+          (insert "\n")))
+      (rename-file tmp cc-butler-inbox-queue-file t)))
   (when (> (length cc-butler--inbox) cc-butler-inbox-queue-warn-threshold)
     (cc-butler--log "inbox queue backlog: %d undrained (warn threshold %d)"
                     (length cc-butler--inbox) cc-butler-inbox-queue-warn-threshold)))
