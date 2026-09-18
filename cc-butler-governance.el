@@ -187,6 +187,101 @@ repo, git missing, git log failed) and the fall back to plain insertion
 order happened instead. Read by `cc-butler-tool-regenerate-governance' so a
 silent fallback can never look like a normal successful run.")
 
+(defcustom cc-butler-governance-band-a-days 7
+  "Wall-clock day window for Band A of MEMORY.md's index (see
+`cc-butler-governance--band-order'): a note whose latest commit is within
+this many days of NOW qualifies for Band A; everything else falls to Band B,
+ordered by inbound-citation count instead. Measured against \"now\" at
+render time, never against some other commit's timestamp -- that distinction
+is what makes this a genuine freshness signal instead of a second disguised
+form of `cc-butler-governance-band-a-commit-cap''s bulk-commit problem."
+  :type 'integer
+  :group 'cc-butler)
+
+(defcustom cc-butler-governance-band-a-commit-cap 8
+  "K: the most notes any SINGLE commit (identified by its exact commit
+timestamp -- every file one commit touches shares it verbatim) may place
+into Band A of MEMORY.md's index. A commit touching more than K notes has
+only its top-K, by inbound-citation count, admitted; the rest fall through
+to Band B. This cap is the ONLY thing standing between Band A and a repeat
+of the failure that motivated it: a single bulk mechanical commit (91
+files) occupying the entire top of the index.
+
+8, not the originally-suggested 5 -- chosen against the real store: of six
+reference notes that needed to survive, one shares its commit with
+`relay-safe-worker-decisions.md' inside that exact 91-file bulk commit,
+and ranks 8th in it by inbound-citation count. 5 silently dropped it; 8 is
+the smallest cap that keeps all six while still cutting that 91-file commit
+down by 91% (91 -> 8) -- still enough to stop the swallow."
+  :type 'integer
+  :group 'cc-butler)
+
+(defcustom cc-butler-governance-vault-root nil
+  "Root of the Obsidian vault scanned for inbound [[wikilink]] citation
+counts (see `cc-butler-governance--citation-count-map'), which order Band B
+of MEMORY.md's index (and break Band A's within-commit cap ties).
+
+Nil -- the default -- falls back to the hardcoded path below, the one real
+vault this fleet uses. Set only when genuinely different; an explicit value
+is always honoured. Read-only: nothing here ever writes into the vault."
+  :type '(choice (const :tag "Hardcoded fleet default" nil) directory)
+  :group 'cc-butler)
+
+(defun cc-butler-governance--vault-root ()
+  "Absolute path of the vault `cc-butler-governance--citation-count-map'
+scans, actually in effect."
+  (file-name-as-directory
+   (or cc-butler-governance-vault-root
+       (expand-file-name "~/obsidian/warmble-jumble/"))))
+
+(defun cc-butler-governance--citation-count-map ()
+  "Cons (MAP . REASON): MAP is a hash table of every bare slug (a note's
+filename minus its `.md') to how many `[[wikilink]]' references that exact
+slug across the WHOLE vault (`cc-butler-governance--vault-root', not just
+the governance store) -- built from ONE recursive `grep' over the vault,
+counted in Lisp, never one grep per note, the same batching discipline as
+`cc-butler-governance--commit-recency-map'. A `[[target|display text]]'
+link counts toward TARGET only -- the `|' suffix is excluded by the same
+regexp that selects the match. A `[[target#heading]]' link is NOT
+normalized -- it counts toward the literal slug \"target#heading\", a
+distinct key from \"target\" -- matching the exact single-pass method this
+was decided against (`grep -rhoE \\='\\\\[\\\\[[^]|]+\\=' | sort | uniq -c'),
+not a resolver that understands Obsidian's link syntax.
+
+`docs/' and `site/' are excluded: this vault publishes an MkDocs build of
+itself into those two directories, a byte-for-byte-ish MIRROR of the real
+content directories -- scanning them in ALONGSIDE the source roughly
+doubles every count and destabilizes several individual files' occurrence
+counts, an artifact of the build, not a second real citation -- so
+counting them would inflate every note's number by the same rendering
+artifact rather than reflect an actual second reader citing it.
+
+REASON is nil on success; otherwise a short string naming why counting was
+unavailable (vault missing, grep missing, grep failed) -- on failure MAP is
+an empty hash table (every count reads as 0), a graceful degradation: this
+map only orders Band B and breaks Band-A ties, it never gates whether a note
+appears in the index at all."
+  (let ((vault (cc-butler-governance--vault-root)))
+    (cond
+     ((not (file-directory-p vault))
+      (cons (make-hash-table :test 'equal) "vault directory does not exist"))
+     ((not (executable-find "grep"))
+      (cons (make-hash-table :test 'equal) "grep executable not found"))
+     (t
+      (with-temp-buffer
+        (let ((status (call-process "grep" nil t nil
+                                     "-rhoE" "\\[\\[[^]|]+" "--include=*.md"
+                                     "--exclude-dir=docs" "--exclude-dir=site" vault)))
+          ;; grep exits 1 (not an error here) when nothing matches at all;
+          ;; only >1 (a real grep failure -- bad pattern, I/O error) is fatal.
+          (if (> status 1)
+              (cons (make-hash-table :test 'equal) (format "citation grep failed (exit %s)" status))
+            (let ((map (make-hash-table :test 'equal)))
+              (dolist (line (split-string (buffer-string) "\n" t))
+                (let ((slug (if (string-prefix-p "[[" line) (substring line 2) line)))
+                  (puthash slug (1+ (gethash slug map 0)) map)))
+              (cons map nil)))))))))
+
 (defun cc-butler-governance-memory-store ()
   "Absolute path of the Claude Code memory dir actually in effect.
 Mirrors `cc-butler-governance-store': the single place this is decided,

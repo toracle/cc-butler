@@ -2295,3 +2295,59 @@ stamp.  It must be kept, not silently treated as a duplicate to strip."
                (regexp-quote "(최초 기록: a different unrelated line, 02-02)") text))
       ;; the note's REAL original stamp still carries forward, unchanged
       (should (string-match-p "최초 기록: worker-a (sess-1)" text)))))
+
+;;;; ------------------------------------------------------------------
+;;;; Two-band MEMORY.md index (reimplemented from PR #197 against main's
+;;;; current `--rewrite-sorted-index'/`--index-line-regexp'/PR #216
+;;;; hoist-fix shape): commit-recency alone has the SAME failure shape as
+;;;; the `mtime' key it replaced -- one bulk mechanical commit occupies
+;;;; the entire top of the index. Band A (recent commits, capped per
+;;;; commit so one bulk commit cannot swallow it) followed by Band B
+;;;; (everything else, by inbound-citation count) is the fix.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-governance/citation-count-map-counts-across-the-vault ()
+  "One recursive grep over the vault, counted per exact `[[wikilink]]' target
+text -- `[[a]]' and `[[a|display text]]' both count toward `a'; a distinct
+target is a distinct key."
+  (let ((vault (file-name-as-directory (make-temp-file "gov-cite-vault" t))))
+    (unwind-protect
+        (let ((cc-butler-governance-vault-root vault))
+          (with-temp-file (expand-file-name "note1.md" vault)
+            (insert "See [[a]] and [[a|alias text]] and [[b]].\n"))
+          (with-temp-file (expand-file-name "note2.md" vault)
+            (insert "Also [[a]].\n"))
+          (let ((result (cc-butler-governance--citation-count-map)))
+            (should (null (cdr result)))
+            (should (equal (gethash "a" (car result)) 3))
+            (should (equal (gethash "b" (car result)) 1))
+            (should (null (gethash "nobody-links-here" (car result))))))
+      (delete-directory vault t))))
+
+(ert-deftest cc-butler-governance/citation-count-map-excludes-docs-and-site-mirrors ()
+  "REGRESSION guard: the real vault publishes an MkDocs build of itself into
+`docs/' and `site/', a near-duplicate of the real content directories.
+Counting those in ALONGSIDE the source inflates every count by a
+rendering artifact, not a second real citation. `docs/' and `site/' must
+stay excluded."
+  (let ((vault (file-name-as-directory (make-temp-file "gov-cite-vault2" t))))
+    (unwind-protect
+        (let ((cc-butler-governance-vault-root vault))
+          (make-directory (expand-file-name "docs" vault))
+          (make-directory (expand-file-name "site" vault))
+          (with-temp-file (expand-file-name "note.md" vault) (insert "[[a]]\n"))
+          (with-temp-file (expand-file-name "docs/note.md" vault) (insert "[[a]]\n"))
+          (with-temp-file (expand-file-name "site/note.md" vault) (insert "[[a]]\n"))
+          (should (equal (gethash "a" (car (cc-butler-governance--citation-count-map))) 1)))
+      (delete-directory vault t))))
+
+(ert-deftest cc-butler-governance/citation-count-map-missing-vault-degrades-gracefully ()
+  "A vault that does not exist (or is not yet configured) must never break
+regeneration -- Band B's ordering is a nice-to-have, not a gate on whether
+notes appear in the index at all. Failure reads as an empty map plus a
+named reason, not an error."
+  (let* ((missing (expand-file-name "does-not-exist" (make-temp-file "gov-cite-missing" t)))
+         (cc-butler-governance-vault-root missing))
+    (let ((result (cc-butler-governance--citation-count-map)))
+      (should (zerop (hash-table-count (car result))))
+      (should (stringp (cdr result))))))
