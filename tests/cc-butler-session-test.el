@@ -2869,6 +2869,39 @@ common long token this log actually contains."
       (should (string-match-p (regexp-quote sha) logged))
       (should-not (string-match-p "<redacted:" logged)))))
 
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-a-file-path-alone ()
+  "A long file path is not a token/key-shaped run and must survive
+unredacted -- the prior review's exact repro: with `/' inside the
+generic character class, an ordinary path this long was swallowed
+whole (`/home/toracle/.../dashboard.org' -> `<redacted:69>')."
+  (cc-butler-session-test--with-ops-log
+    (let* ((path "/home/toracle/emacsd/ccbutler/butler/docs/logs/September/dashboardorg")
+           (logged (cc-butler-session-test--logged-body
+                    (format "see %s for details" path))))
+      (should (string-match-p (regexp-quote path) logged))
+      (should-not (string-match-p "<redacted:" logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-a-url-alone ()
+  "A long URL is not a token/key-shaped run either -- same fix, same
+repro from the prior review (a cdnjs URL getting partially redacted)."
+  (cc-butler-session-test--with-ops-log
+    (let* ((url "https://cdnjs.cloudflare.com/ajax/libs/reactdom/production/reactdommin")
+           (logged (cc-butler-session-test--logged-body
+                    (format "fetch %s" url))))
+      (should (string-match-p (regexp-quote url) logged))
+      (should-not (string-match-p "<redacted:" logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-uppercase-hex-secret ()
+  "An uppercase-hex-shaped secret of git-SHA length must still be
+masked -- `cc-butler--looks-like-hex-only' must not case-fold its
+match and wrongly treat an uppercase secret as a lowercase SHA."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "DEADBEEF1234567890ABCDEF1234567890ABCDEF")
+           (logged (cc-butler-session-test--logged-body
+                    (format "key %s in there" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; forward-only ops/msg log rotation
 ;;;; ------------------------------------------------------------------
