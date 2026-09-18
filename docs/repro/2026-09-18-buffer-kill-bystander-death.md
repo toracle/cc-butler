@@ -2138,3 +2138,42 @@ handler delays, child processes), which this round cannot speak to.
 All `ccb-repro-r6` processes stopped; verified via `ps` by both the fork
 and me: 0 ccb-repro, 0 stub, 0 zig processes, no r6 socket. Live daemon
 never addressed.
+
+# Round 6 follow-up (doc-only, no runs): status, queued round-7 row, gap ranking
+
+Added after Round 6 results (`ed7a756`), on a follow-up from x600 via
+butler. Insert-only; nothing above is rewritten. No experiment was run
+for this section.
+
+## Status line
+
+**Self-exit clean for newest-position stubs only; untested for
+non-newest.** Position is the disqualifying gap: both fleets retire OLD
+idle sessions, never the newest, and Round 6 only exercised the newest
+slot (S10 of 10). Round 6's "/exit safe" verdict therefore does NOT
+cover the way sessions are actually retired in practice.
+
+## Queued round-7 row (NOT run; HOLD stands)
+
+Self-exit a NON-newest session (e.g. S3 of N=10, isolated daemon, stub
+sessions, same Ctrl-D-into-pty trigger, no kill-buffer/delete-process/
+signal-process from Lisp during the trigger). Check whether the
+~13ms-late claude-code-ide cleanup (delete-process/signal-process on the
+already-dead pid, then kill-buffer on the session's own buffer) still
+lands with no bystander death. Purpose: separate the ORDERING hypothesis
+(a signal to a LIVE pid during teardown is the trigger; the dead-pid
+cleanup path is harmless whatever the slot) from the POSITION hypothesis
+(the slot itself matters, e.g. creation-order effects on neighbours).
+Include a PAIRED `kill-buffer` control on the same non-newest slot, same
+N, same daemon; the self-exit row is only interpretable if the control
+reproduces a bystander there (the Round 6 addendum's rule, unchanged).
+Pass/fail and the exact interpretation table are to be pre-registered
+before that round runs, not here.
+
+## Ranking of uncovered items (most to least important)
+
+1. Non-newest position (the queued round-7 row above).
+2. Real `claude` CLI `/exit` (stub Ctrl-D-to-`cat` may differ: exit
+   handlers, child processes).
+3. Daemon age (the live daemon is long-lived; Round 6's was minutes old).
+4. Other N.
