@@ -727,3 +727,182 @@ fleet's actual fd-fragmentation shape exactly, only that it is
 non-contiguous by the same coarse measure the live census used. Discards
 (setup failure, dtrace non-attach, ambiguous block-map read) are counted
 and reported with reasons, not silently dropped.
+
+---
+
+## Round 3 results
+
+### Setup actually used
+
+Isolated `ccb-repro` (fresh) / `ccb-r3-aged` (aged) daemons, `emacs
+--daemon=<sock> -Q --load init.el`, no live init.el. `emacs-version`
+reported `GNU Emacs 30.2 ... of 2026-06-10` — matches the live daemon's
+30.2 (per steward). `claude-code-ide-cli-path` was pointed at
+`stub-claude.sh` explicitly in `init.el` this round (Round 1/2 apparently
+set this ad hoc in a since-lost interactive session; without it, a fresh
+daemon's default `claude-code-ide-cli-path` is `"claude"` and would have
+launched the REAL CLI — caught before any kill ran, by noticing the stub
+logs stayed empty on the first attempt; no real `claude` process was
+launched by this round's harness). Victim detection used the same method
+Round 1/2's saved logs show they used: polling `(buffer-list)` on the
+daemon for a bystander's `*claude-code[label]*` buffer disappearing, not
+the stub's own signal-trap log (see Methodological note below for why).
+
+### dtrace/dtruss: cannot attach on this machine — CONFIRMED, as pre-registered
+
+`csrutil status` → System Integrity Protection is **enabled**, and this
+account has no passwordless `sudo`. `dtruss -p $$` (self-test, no target
+daemon needed) fails immediately: `dtrace: failed to initialize dtrace:
+DTrace requires additional privileges`. Per the pre-registration's own
+fallback, this is **not** forced further — the reaper-close smoking-gun
+test (item 5) is **INCONCLUSIVE**, and only the lsof before/after
+block-map comparison (item 6) was run.
+
+### Methodological note: the stub's own HUP-trap log is NOT a reliable check
+
+Initial attempts checked the stub script's own `HUP`/`EXIT-TRAP` log lines
+after a kill. Two problems, found and fixed before any pre-registered row
+ran for real:
+
+1. **Killing the daemon itself (`kill-emacs`) sends a real SIGHUP to every
+   still-alive stub process at once** — confirmed directly: two idle
+   sessions with no kill at all both logged `HUP ... EXIT-TRAP` the moment
+   `emacsclient --eval '(kill-emacs)'` ran. Any check that reads the log
+   *after* the daemon-stop step (even by a separate later shell command)
+   will see every surviving session as a false "victim." All rows below
+   read the logs strictly before calling `stop_daemon`, and the driver's
+   `wait_and_report` timing was independently verified via a **15-second,
+   no-kill idle control** (3 sessions, no kill, checked at t=+15s): zero
+   spontaneous `HUP` lines. So an observed HUP is not spontaneous
+   background noise on this build.
+2. **The killed session's own process shows `killed_own_hup=0` in every
+   single trial (18/18)** — it never logs `HUP` or `EXIT-TRAP` at all.
+   This is consistent with, not contrary to, the background finding that
+   ghostel's pipe-sentinel path (`ghostel.el:4435`) sends `signal-process
+   ... 9` (SIGKILL, untrappable) directly to the killed session's own
+   native pid — so the killed target's own stub never runs its trap
+   handler. The bystander death, by contrast, IS observable via the trap
+   log when it fires — it's specifically that its *timing* relative to a
+   fixed-length wait was unreliable standalone, which is why buffer-list
+   polling (matching Round 1/2's own saved logs) was used as the primary
+   signal instead. Every trial that showed a `buffer-list` victim also
+   showed that victim's own stub log gain a new `HUP` line, corroborating
+   the two signals agree when both are checked.
+
+### Fresh-daemon rows: raw observation
+
+| Row | Killed (creation position) | n | Victim (all 3 reps) |
+|---|---|---|---|
+| F1 | Z (newest, 3rd) | 3 | Y (100%, 3/3) |
+| F2 | X (oldest, 1st) | 3 | Y (100%, 3/3) |
+| F3 | Y (before-newest, 2nd) | 3 | X (100%, 3/3) |
+
+9/9 kill events, zero discards, `polls=1` on every trial (the bystander's
+buffer was already gone by the very first 1-second poll after the kill —
+tighter than Round 1's "0.8-3s" estimate, most likely because each poll's
+`emacsclient --eval` round-trip is itself what gives Emacs's event loop
+the chance to run the deferred sentinel, consistent with Round 1's
+"under-observed... only surfaced once a later emacsclient call gave Emacs
+another chance" note).
+
+These three outcomes exactly match Round 2's own falsifying data (kill Y
+→ X died; kill X → Y died) and Round 2's post-hoc "rule C" prediction for
+all three positions (predecessor dies; oldest's kill hits the
+second-newest instead) — 9/9 agreement, no exceptions, on a freshly
+re-run, independently-driven harness.
+
+### Aging procedure: raw observation
+
+On a separate daemon (`ccb-r3-aged`), 5 throwaway ghostel sessions were
+spawned (confirmed via block map: 5 distinct `pipe,pipe,ptmx` blocks,
+fds 16-18 through 52-54), then throwaway #2 and #4 were killed and 5 more
+rounds of non-ghostel churn (`make-process`, `make-network-process`,
+`make-pipe-process`, each opened and immediately deleted) were run.
+Result: **2 non-contiguous surviving blocks**, `16,17,18` and `52,53,54`,
+with a measured **33-fd gap** between them (throwaway #3 also disappeared
+on its own — not explicitly killed — most likely the same "quick
+EOF/respawn" churn noted in Round 1/2 hitting an early-created session;
+counted as an uncontrolled loss, not a discard, since it only strengthens
+the non-contiguity already achieved). This satisfies the pre-registered
+aging requirement (non-contiguous ghostel blocks, evidenced by the lsof
+map before any A-row ran).
+
+### Aged-daemon rows (A1/A2/A3): raw observation
+
+| Row | Killed (creation position) | n | Victim (all 3 reps) |
+|---|---|---|---|
+| A1 | Z (newest) | 3 | Y (100%, 3/3) |
+| A2 | X (oldest) | 3 | Y (100%, 3/3) |
+| A3 | Y (before-newest) | 3 | X (100%, 3/3) |
+
+9/9 kill events, zero discards. **Identical to the fresh-daemon rows in
+every row**, both which position dies and (checked directly against the
+recorded before/after block maps) in fd-adjacency: in every aged-daemon
+rep, the test triad's own three blocks landed contiguously and in
+creation order when they filled the gap left by the aged base (e.g. A1
+rep 1's before-map was `16,17,18(throwaway-1) 25,26,27(X) 34,35,36(Y)
+43,44,45(Z) 52,53,54(throwaway-5)` — X, Y, Z's own blocks are still
+fd-adjacent in creation order relative to each other, even though the
+*overall* daemon fd space around them is fragmented).
+
+### Inference (explicitly separated from the above)
+
+- **H_fd-block-reuse (item 6): FALSIFIED**, per the pre-registered
+  condition ("all three rows' outcomes are identical between fresh and
+  aged daemons, by both creation-order position and fd-adjacency") — the
+  outcomes are identical, 9/9 aged = 9/9 fresh, row for row.
+- **Important limitation on that falsification, stated plainly rather
+  than overclaimed**: this round's aging fragmented the *overall* daemon
+  fd space (proven: the 33-fd gap), but did **not** achieve a case where
+  the specific X/Y/Z triad under test had fd-adjacency ordering different
+  from their own creation order — they filled the gap sequentially, in
+  the same relative order they were created in, so fd-adjacency and
+  creation-order-adjacency never actually came apart *for the tested
+  triad itself* in this round. The falsification is real for what was
+  tested (fragmenting the surrounding fd space does not change the
+  outcome), but a stronger test — deliberately reusing an EARLIER-freed
+  slot for a LATER-created session, so a later session's block sits
+  *before* an earlier session's block in fd order — was not achieved and
+  remains open. Until that specific configuration is tested, "fd-block
+  reuse is ruled out" should be read as "ruled out for ambient
+  fragmentation, not yet tested for slot-order/creation-order inversion."
+- **H_reaper-cross-session-close (item 5): INCONCLUSIVE**, exactly as the
+  pre-registration's own fallback condition anticipated — `dtrace`/
+  `dtruss` cannot attach on this machine (SIP enabled, no passwordless
+  sudo), confirmed directly rather than assumed. The lsof-only before/
+  after block-map fallback was run instead: it shows WHICH block
+  disappears (always the victim session's own block, cleanly, in all 18
+  trials) but — as the pre-registration itself noted this fallback
+  cannot do — does not show which thread or native call closed it, so it
+  cannot itself confirm or rule out a cross-session reaper close. Per the
+  pre-registered falsification/next-step rule, since the reaper trace
+  itself could not be captured at all (not "captured and clean"), item
+  (1)'s elisp-layer advice trace is the next honest step, not yet run
+  this round for time-budget reasons — flagged as pending, not silently
+  dropped.
+- Rule C (Round 2's post-hoc rule: predecessor dies, oldest's kill hits
+  the second-newest) fit all 18 of this round's trials with zero
+  exceptions, on both fresh and aged daemons. This is now 27/27 across
+  Round 2 + Round 3 combined on isolated daemons. It is still **not**
+  promoted as the general answer — the Correction on branch
+  `repro/buffer-kill-bystander-death` (commit 6166757) already shows it
+  fits only 2 of 5 real live-fleet deaths — and this round adds no new
+  live-fleet data, so that gap is unchanged. What Round 3 narrows is
+  specifically the fd-reuse explanation for *why* the isolated data and
+  the live census disagree: ambient fd fragmentation alone does not
+  explain it (H_fd-block-reuse falsified, with the stated limitation
+  above); a live-daemon-realistic slot-order inversion, or the native
+  reaper-close mechanism itself (still untested directly), remain the
+  live candidates.
+
+### Sample-size / scope honesty (Round 3)
+
+18 kill events (9 fresh + 9 aged), zero discards (one uncontrolled
+throwaway loss during aging, noted above, which helped rather than hurt
+the aging goal). One machine, one day, same build as Rounds 1-2, Emacs
+version cross-checked against the live daemon's 30.2. This shows the
+mechanism is insensitive to ambient fd fragmentation on THIS machine and
+that `dtrace` is unavailable for a direct native trace here — it does
+NOT show the mechanism is insensitive to a genuine creation-order/fd-slot
+inversion (not achieved), does not reach inside the native module, and
+does not add to or subtract from the live-fleet census comparison.
