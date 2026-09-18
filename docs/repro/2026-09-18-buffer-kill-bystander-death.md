@@ -906,3 +906,206 @@ that `dtrace` is unavailable for a direct native trace here — it does
 NOT show the mechanism is insensitive to a genuine creation-order/fd-slot
 inversion (not achieved), does not reach inside the native module, and
 does not add to or subtract from the live-fleet census comparison.
+
+---
+
+# Round 4 pre-registration: elisp trace, native build, slot inversion, victim shape
+
+Written before any Round 4 run. Frozen once committed; results appended
+below it, never edited into it. One round, per steward's instruction —
+items (1)-(4) below, then report. Isolated daemon only; the live daemon
+(now running merged commit `238a08cb`, not yet reloaded into the live
+runtime) is never touched, not even read-only.
+
+## Item 1: elisp-layer advice trace
+
+Advise (`:around` or `:before`, log-only, no behavior change)
+`signal-process`, `delete-process`, `kill-process`, `process-send-eof`,
+and every signal/close call site in `ghostel.el` that Rounds 1-3 already
+identified (`ghostel--sentinel`, the pipe-sentinel's `signal-process`
+call, `ghostel--kill-native-processes-on-exit`) to log: the target
+process object, its pid (if any) and `process-get ... 'ghostel--native-pid`,
+`current-buffer`, and the backtrace head (`backtrace-frames` truncated to
+~10 frames), on every call during a kill trial. Run this on top of the
+standard 3-session (X, Y, Z) fresh-daemon setup used in Rounds 1-3, one
+kill of each creation-order position (kill Z, kill Y, kill X), n=3 each —
+the same F1/F2/F3 shape as Round 3, so this round's elisp trace is
+directly comparable to Round 3's lsof-only data on identical rows.
+
+**Prediction**: every logged call's target resolves to the KILLED
+session's own process/pid — none will resolve to the eventual bystander.
+This is the same finding Rounds 1 and 3 already produced from a narrower
+instrumentation (`signal-process`-only, and lsof-block-only,
+respectively); this round's wider net (more call sites, full backtraces)
+is the decisive check for whether that finding survives more scrutiny.
+
+**Falsification**: if ANY signal/delete/kill/EOF call, on ANY of the 9
+kill trials, is observed with a target that resolves to the eventual
+bystander (not the killed session), this FALSIFIES "the wrong target is
+never picked at the elisp layer" and reopens the elisp layer as a locus,
+contradicting Rounds 1 and 3's inference. If, as predicted, no such call
+is ever observed, elisp-layer targeting is CONFIRMED correct across a
+wider instrumentation net, strengthening (not merely repeating) the
+existing native-module inference.
+
+## Item 2: native close() trace via a from-scratch instrumented build
+
+`ghostel-20260823.1350`'s `build.zig.zon` requires **exactly Zig 0.16.0**
+(enforced by a `comptime` check in `build.zig`); Homebrew's current `zig`
+formula is stable at **0.16.0**, bottled, no-sudo, user-prefix
+(`/opt/homebrew`) — this is judged to satisfy "installable user-local, no
+sudo, no system change" and will be installed via `brew install zig` if
+not already present, without touching anything outside the Homebrew
+prefix. The source under `~/.emacs.d/elpa/ghostel-20260823.1350/src/`
+will be COPIED (not built in place) to a scratchpad build directory; the
+live elpa directory and the live-loaded `ghostel-module.dylib` are never
+touched, written to, or rebuilt in place.
+
+Planned instrumentation (added to the copy only): a log line in
+`PosixPtyProcess.zig`'s `deinitAndWait` (around the `primary_fd` close at
+the reported `:358-374` range) and in `NativeProcess.zig`'s reaper path
+(`retireBackend`/`reapChild`/`finishEventChannel`), each printing the fd
+number being closed, the owning session's identifying info available at
+that point (native pid, or whatever handle the struct carries), and
+`std.Thread.getCurrentId()`. Output goes to a stderr/file log distinguishable
+from Emacs's own `*Messages*`.
+
+If the build succeeds, the resulting `.dylib` is loaded ONLY by
+overriding the isolated daemon's own `load-path` / package directory to
+point at the scratchpad build output — never by editing
+`~/.emacs.d/elpa/ghostel-20260823.1350` in place and never by changing the
+live daemon's `load-path`. The same F1/F2/F3 kill rows (n=3 each) are run
+against it.
+
+If the build does NOT succeed (missing toolchain component, network
+fetch of the vendored `ghostty` dependency fails, incompatible local
+environment, or any other blocker within a reasonable time-box), this is
+reported as "no native build achievable" with the specific blocker named
+— per steward's instruction, this is not chased with workarounds beyond
+one reasonably direct attempt, and item 2 is marked SKIPPED rather than
+forced.
+
+**Prediction (if the build succeeds and loads)**: at least one captured
+`close()`/`deinitAndWait` call, across the 9 kill trials, targets an fd
+that (per that trial's own recorded fd-block map) belongs to the
+bystander session's block, not the killed session's own block — this
+would be the direct "smoking gun" Round 3 could not capture without
+`dtrace`. Secondary, weaker prediction if that specific smoking gun is
+NOT observed: the timing/thread-id data may still show the reaper thread
+for the KILLED session doing work that overlaps with the bystander's
+death window, which would be suggestive but not conclusive on its own.
+
+**Falsification**: the cross-session-close hypothesis (item 5, carried
+over from Round 3) is FALSIFIED for this build if every captured
+close()/deinitAndWait call across all 9 trials resolves only to the
+killed session's own fd block — in which case the mechanism is NOT a
+wrong-fd close by the module's own reaper, and the next candidate becomes
+a process-group-level signal delivery effect (e.g. a pty group/session
+leadership relationship causing the kernel itself to deliver SIGHUP
+somewhere unexpected) rather than an application-level bug, which this
+investigation does not currently have instrumentation to test and would
+need to be reported as a new open question rather than invented evidence.
+
+## Item 3: deliberate slot-order inversion
+
+Setup: spawn A, B, C (creation order, monotonic fds — verified via lsof).
+Kill A (the oldest). Spawn D. Verify via `lsof`, BEFORE any further kill,
+whether D's fd block is numerically LOWER than B's and C's (i.e., D
+reused A's freed block) — if the daemon/OS/module does not reuse the
+freed slot this way (e.g., fds keep allocating monotonically upward
+regardless of frees), this is reported as "inversion not achieved" and
+**no row below is counted**, per steward's instruction.
+
+If the inversion IS achieved (live set by creation order: B, C, D; by fd
+order: D, B, C):
+
+- **Row 3a — kill B** (creation-order-oldest of the live B/C/D set).
+  - Prediction under Round 2/3's creation-order "rule C": the oldest-kill
+    special case fires (hits index N-2 of the live-by-creation-order
+    set = **C**).
+  - Prediction under an fd-adjacency hypothesis (victim = the session
+    whose fd block sits immediately below the killed session's, mirroring
+    how "predecessor" and "fd-adjacent-below" were indistinguishable in
+    every prior round's always-monotonic setup): **D** dies (D's reused,
+    low block sits below B's).
+  - These two predictions differ — that is what makes this row decisive.
+    Falsification: rule C (creation-order) is weakened if D dies instead
+    of C; the fd-adjacency hypothesis is falsified if C dies instead of
+    D; if neither B's nor D's death-shape data is clean 2/3+ agreement
+    for one specific victim, report "no stable outcome," not a forced
+    pick.
+- **Row 3b — kill D** (creation-order-newest, but fd-order-lowest/edge).
+  - Prediction under creation-order rule C (ordinary newest-kill case,
+    not the oldest special case): predecessor by creation order dies =
+    **C**.
+  - Prediction under a strict fd-adjacency hypothesis: D has no fd block
+    below it (it is the fd-order minimum) — analogous to the original
+    "oldest has no predecessor" edge case, so either NO bystander dies,
+    or an anomalous target is hit.
+  - Falsification: if C dies cleanly (2/3+), this favors creation-order
+    over literal fd position (since D, by fd, has no valid fd-predecessor
+    yet a bystander still dies exactly where creation-order predicts) —
+    a clean falsification of "the mechanism is keyed to literal fd
+    number" as opposed to some other per-session identifier that happens
+    to correlate with fd number only when allocation is monotonic. If no
+    one dies, or something other than C dies, that instead favors the
+    fd-position hypothesis and is reported as such.
+
+n=3 reps per row (3a, 3b), plus the setup verification itself reported
+with its own lsof evidence either way.
+
+## Item 4: victim-shape row (fat stubs)
+
+Replace the thin `trap ...; cat` stub with a "fat" stub that, at startup:
+spawns 2-3 long-lived child processes (e.g. `sleep infinity &` a few
+times), one of which itself spawns a grandchild, and opens 1-2 extra
+pipes/ptys of its own (e.g. via `script`/`pty` helper or a background
+`cat` on a fifo) — approximating a real `claude` CLI's process tree and
+fd footprint more closely than the current single-process stub. Spawn
+three such fat sessions (P, Q, R, standard fresh monotonic daemon, no
+inversion needed for this item). Run the same three rows as Round 3's
+F1/F2/F3 (kill newest, kill oldest, kill before-newest), n=3 each.
+
+**Prediction**: rule C continues to hold unchanged (predecessor dies;
+oldest's kill hits the second-newest) — the working assumption is that
+ghostel tracks exactly one pty/reaper pair per ghostel session regardless
+of how many OTHER, ghostel-unaware child processes that session's own
+shell happens to spawn, so extra fds/processes hanging off a session
+should not change which session's ghostel-native bookkeeping slot is
+adjacent to which.
+
+**Falsification**: if the victim differs from rule C's prediction for fat
+stubs on any row where thin stubs (Rounds 1-3) matched it cleanly, this
+FALSIFIES "victim shape doesn't matter" and implicates something
+proportional to per-session fd/process count (e.g. a byte-offset or fd-
+count-based index rather than a pure creation-order-position index) as a
+live candidate — which would also be a plausible reason a real `claude`
+session's live-fleet behavior (rich process tree, many fds) diverges from
+this investigation's own thin-stub isolated data as much as it does.
+
+## Sample-size limits (stated now)
+
+Items 1 and 4: 9 kill trials each (3 rows × n=3), same shape/discipline
+as Rounds 1-3. Item 3: up to 6 kill trials (2 rows × n=3) IF the
+inversion is achieved, 0 if not (reported, not padded). Item 2: 9 kill
+trials IF the build succeeds and loads, 0 (SKIPPED, with the blocker
+named) if not. One machine, one day, same Emacs/ghostel/claude-code-ide
+build as prior rounds where applicable (item 2's instrumented build is
+necessarily a different binary from the live-loaded module — its
+FUNCTIONAL behavior, not its logging, is expected to match, since only
+log lines are added; this assumption is stated, not proven, and any
+observed behavior change versus Rounds 1-3's thin-stub rows on the SAME
+row shape would itself be reported as a discrepancy). This round, even at
+full success on every item, still cannot generalize past this one
+machine and day, and does not add live-fleet data.
+
+## Safety boundary (restated, unchanged)
+
+Isolated daemon(s) only, distinct socket names per concurrent daemon to
+avoid any cross-daemon confusion. No bare `emacsclient`. No kill-buffer /
+delete-process / signal aimed at the live daemon, not even read-only for
+this round's own additional checks. The live-loaded ghostel module and
+`~/.emacs.d/elpa/ghostel-20260823.1350` are never edited, rebuilt in
+place, or pointed to by the live daemon's load-path. All daemons and any
+build/toolchain processes started for this round are stopped/cleaned up
+when done.
