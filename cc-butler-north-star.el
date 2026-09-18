@@ -63,6 +63,23 @@ actually uses; do not infer the running value from this default."
   :type 'number
   :group 'cc-butler)
 
+(defcustom cc-butler-north-star-session nil
+  "Working-dir of the session that receives North Star nudges, or nil.
+nil (the default) preserves today's behaviour exactly: nudges go to the
+designated butler (`cc-butler--butler'). When set to a session's
+working-dir string, nudges go to that session instead of the butler —
+e.g. a dedicated session whose only job is North Star upkeep, so it is
+idle between ticks by construction and `cc-butler--forward-ops-free-p'
+goes back to being a genuine idle check rather than a starvation mode
+against a butler that is busy on every hourly tick.
+
+Not rebound by `reload_butler_code': reloading loads this defcustom's
+definition but leaves an already-set value alone, same as any other
+defcustom — setting a value is a separate act from loading the code
+that defines it."
+  :type '(choice (const :tag "Butler (default)" nil) string)
+  :group 'cc-butler)
+
 (defvar cc-butler--north-star-timer nil
   "Repeating timer driving `cc-butler--north-star-fire', or nil before first use.")
 
@@ -151,11 +168,12 @@ north-star-macbook-m1-max.org처럼 서로 다른 fleet의 목표 파일이 나�
           cc-butler-north-star-file cc-butler--north-star-template))
 
 (defun cc-butler--north-star-fire ()
-  "Nudge the butler to self-check active North Stars against their DoD.
-Mirrors `cc-butler--forward-backstop': only types into the butler's
+  "Nudge the target session (`cc-butler-north-star-session', or the
+butler when nil) to self-check active North Stars against their DoD.
+Mirrors `cc-butler--forward-backstop': only types into the target's
 terminal when it looks idle (`cc-butler--forward-ops-free-p'), so an
 hourly housekeeping ping cannot land mid-turn and scramble whatever the
-butler is actually doing.  Also refuses outright if `cc-butler-north-star-file'
+target is actually doing.  Also refuses outright if `cc-butler-north-star-file'
 is still unnamespaced (see `cc-butler--north-star-file-namespaced-p') —
 this is the one gate that protects the manual `cc-butler-north-star-check'
 path too, since that command calls straight into this function.
@@ -180,7 +198,7 @@ there is no live butler terminal at all (no butler designated, or its
 terminal buffer is gone)."
   (if (not (cc-butler--north-star-file-namespaced-p))
       (progn (cc-butler--north-star-warn-not-namespaced) 'skipped-unnamespaced)
-    (when-let* ((butler cc-butler--butler)
+    (when-let* ((butler (or cc-butler-north-star-session cc-butler--butler))
                 (buf (get-buffer (claude-code-ide--get-buffer-name butler)))
                 ((buffer-live-p buf)))
       (if (not (cc-butler--forward-ops-free-p butler))
