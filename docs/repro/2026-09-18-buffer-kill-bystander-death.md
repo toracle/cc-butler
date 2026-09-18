@@ -1816,3 +1816,137 @@ All daemons (`ccb-repro-r5a`, `ccb-repro-r5-control`,
 `ccb-repro-r5-treatment`) and the zig build processes were stopped;
 confirmed via `ps` and per-pid checks that no leftover daemon, stub, or
 build process remained running afterward.
+
+# Pre-registration: Round 6 — exit-control arm
+
+Written before any Round 6 run. Frozen once committed; results get
+appended below, never edited into it. Dispatched by the steward, under
+butler/정수님's explicit authorization for this one narrow round only —
+the HOLD announced after Round 5 otherwise stands and resumes
+immediately after this round's report.
+
+## Background (why this round, not measured by me)
+
+Every prior round (1, 3, 4, 5) triggered the "bystander death" signature
+using an explicit `kill-buffer` (or equivalent forced native close) on
+the target session, while ≥2 (established: ≥3) other ghostel sessions
+were alive. Round 1's own pre-registration planned a "typed `exit`
+(control arm)" trial as a baseline comparison, but no round's results
+ever report it having actually been run — confirmed by grep across this
+entire document for every kill/delete-process/exit/sentinel mention: all
+executed trials in Rounds 1, 3, 4, and 5 used an externally-initiated
+kill as the sole trigger. Separately, in this session, the steward asked
+a read-only question about retiring a worker via in-session `/exit`
+(child exits on its own) instead of `kill-buffer`; the honest answer
+given was "not covered" — Round 4's own converging inference (items 1+2:
+neither elisp nor the native reaper ever targets the wrong session; the
+bystander's own process receives a real signal from somewhere outside
+both, "most likely at the kernel process-group/session level") does not
+rule out self-exit as an equally valid trigger for that same class of
+kernel-level effect, since POSIX session-leader-exit → SIGHUP-to-
+foreground-process-group is triggered by ANY termination of a session
+leader, not specifically by how Emacs asked it to die. This round exists
+to close that specific, previously-unrun gap — nothing else.
+
+## What this pre-registration commits to before seeing results
+
+### Setup
+
+Isolated `ccb-repro-r6`-named daemon only (fresh, not reusing any prior
+round's daemon). Victims: real `claude-code-ide--create-terminal-session`
+ghostel sessions (`claude-code-ide-terminal-backend` = `ghostel`),
+`claude-code-ide-cli-path` pointed at a stub script — same family as
+every prior round's stub, `trap ... HUP TERM; cat` — chosen specifically
+because closing its stdin (EOF) makes `cat` terminate **on its own**,
+exit code 0, with no signal delivered to it from anywhere. This is the
+closest local analogue to a real `claude` session's user-typed `/exit`:
+the child process ends itself; nothing external signals it, calls
+`kill-buffer`, `delete-process`, or `close_topic` on it, and its own
+Emacs-side buffer is not killed by this trial (matching the literal
+question asked: "the Claude process exits on its own, the Emacs buffer
+stays open, nobody calls kill-buffer/close_topic").
+
+Spawn three sessions in order A, B, C (matching every prior round's
+three-session shape, the smallest setup under which the bystander
+pattern has ever reproduced). Confirm via `(process-live-p proc)` and
+`(process-get proc 'ghostel--native-pid)` that all three are alive and
+distinct before triggering anything.
+
+### Trial
+
+**Trigger self-exit on C (the newest)** — the exact position that, under
+every prior round's kill-arm F1 row (kill Z/newest), reliably killed B
+(before-newest) 3/3 in Rounds 4 and 5 and matched the same pattern in
+Round 1. Self-exit C by closing its pty's write end / sending EOF to its
+stdin (whichever the ghostel session's process object actually exposes —
+read the real API before the run, do not guess) rather than any signal
+or Emacs-side kill call. Then poll for up to 12s (Round 4's fixed,
+full-window poller) whether B (before-newest) or A (oldest) shows the
+bystander-death signature: an unprompted `HUP`/exit trap-log entry or a
+`ghostel--events-filter` numeric exit-status event, with neither
+`kill-buffer`, `delete-process`, nor `signal-process` ever having been
+called on it by anything in this trial.
+
+n=3 reps (fresh A/B/C each time, same daemon). Zero discards planned;
+if any rep needs to be discarded, state exactly why, per this
+investigation's standing practice.
+
+### Interpretation rules (decided now, not after)
+
+- **Self-exit reproduces the mechanism** if, in ≥2/3 reps, B shows the
+  bystander-death signature (real HUP/exit event on B's own real child,
+  confirmed via backtrace the same way Round 4 items 1+2 did — not the
+  naive automated flag alone) within the poll window, with no kill call
+  of any kind observed targeting B or C beyond C's own self-initiated
+  EOF/exit.
+- **Self-exit does NOT reproduce the mechanism** if 0/3 or 1/3 reps show
+  it — read as evidence (on this machine, this day, n=3) that an
+  externally-triggered kill/signal on the target is necessary, and a
+  session's own graceful self-termination is NOT sufficient to trigger
+  the same effect. This would falsify the concern raised in this
+  session's "not covered" answer, on this machine, at this n — it would
+  NOT retroactively prove self-exit is safe on the live fleet (see
+  sample-size limits).
+- **Ambiguous / setup failure** (e.g. the stub's EOF path doesn't cleanly
+  produce a signal-free exit, or C's own death can't be distinguished
+  from an externally-caused one) is reported as such, verbatim, and not
+  forced into either of the above.
+
+### Falsification conditions
+
+- The "self-exit reproduces" reading is FALSIFIED if any of the 3 reps
+  that show a bystander-death signature on B also show a `kill-buffer`,
+  `delete-process`, or `signal-process` call logged against B or C from
+  any source other than C's own natural termination path — i.e. if the
+  effect can be explained by an ordinary kill sneaking into the trial
+  rather than genuine self-exit.
+- The "self-exit does NOT reproduce" reading is FALSIFIED (i.e. treated
+  as inconclusive, not confirmed-safe) if the poll window or trap-log
+  instrumentation itself is shown to have missed an event during the
+  run (e.g. Emacs's event loop wasn't pumped again before the final
+  check, the same false-negative risk Round 1 flagged for its own
+  "clean" pairs) — in that case this round reports "inconclusive," not
+  "safe."
+
+### Sample-size / scope honesty (stated now)
+
+n=3 self-exit reps, one machine, one day, one narrow position (self-exit
+the newest of exactly 3 sessions, checking for the before-newest
+bystander). This can show presence or absence of the effect under THIS
+specific trigger and shape, on this build, today. It does NOT test
+self-exit of the oldest or before-newest position, does not test >3
+sessions, does not establish an incidence rate, and does not by itself
+resolve whether `/exit` + `cc-butler--roster-forget` is safe on the live
+fleet — a "does not reproduce" result narrows the open question, it does
+not close it.
+
+### Safety note (unchanged from every prior round)
+
+Isolated `ccb-repro-r6` daemon only. No bare `emacsclient` (always `-s
+ccb-repro-r6`). No `kill-buffer`, `delete-process`, or signal aimed at
+the live daemon, not even read-only beyond what's already relayed.
+Victims are cheap stub sessions only, never the real `claude` binary —
+confirm `claude-code-ide-cli-path` is pointed at the stub before
+spawning anything, per the standing hazard noted in every prior round.
+All daemon and any build/toolchain processes stopped and confirmed via
+`ps` when done.
