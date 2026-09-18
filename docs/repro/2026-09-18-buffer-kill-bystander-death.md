@@ -265,3 +265,184 @@ alive, controlled by `cc-butler-close-topic-refuse-concurrent-ghostel`
 `tests/cc-butler-workspace-test.el` cover: refusal under the hazard
 condition, pass-through when solo or on a non-ghostel backend, and the
 escape hatch. Full suite: 1048/1048 passing after the change.
+
+---
+
+## Round 2 pre-registration (written before any Round-2 run; freezes here)
+
+Butler/x600 tasked two follow-ups. Both use the same ccb-repro isolated
+daemon, same safety boundary (no bare emacsclient, live daemon never
+touched, not even read-only).
+
+### Module version being loaded (stated before running, checked, not assumed)
+
+`~/.emacs.d/elpa/ghostel-20260823.1350/ghostel-module.version` = `0.51.0`.
+The stale `~/.emacs.d/elpa/ghostel-20260804.2129/` on disk is `0.49.0`. My
+ccb-repro `init.el` puts `ghostel-20260823.1350` on `load-path` explicitly
+(see the Setup section above) — this matches the live m1 daemon's loaded
+copy (0.51.0), confirmed by reading the version file directly, not
+inferred.
+
+### Task (b): position-rule decisive test — hypothesis A vs hypothesis B
+
+Round 1 (X, Y, Z created in order; kill Z → Y dies, X survives) is
+consistent with two different rules that were not yet separated:
+
+- **Hypothesis A (fixed position):** the victim is always "the
+  second-most-recently-created still-alive session at the moment of the
+  kill," independent of *which* session you choose to kill.
+- **Hypothesis B (relative position):** killing the session created at
+  creation-order position N kills the session at position N-1 (the one
+  created immediately before it); a session with no predecessor (the
+  oldest) has no victim.
+
+**Predictions, stated now, before running:**
+
+| Row | Kill | A predicts | B predicts |
+|---|---|---|---|
+| 1 (done, Round 1) | Z (newest of X,Y,Z) | Y dies | Y dies |
+| 2 | Y (middle of X,Y,Z) | no bystander (Y itself is both target and the position the rule names — vacuous) | X dies |
+| 3 | X (oldest of X,Y,Z) | Y dies (Y is still 2nd-newest of the surviving set after accounting for X being removed — see note) | no bystander (X has no predecessor) |
+| 4 (repeat of row 1, control) | newest, with 2 fresh throwaways spawned right before | a throwaway (newest-but-one at spawn time) dies | a throwaway (immediately-preceding one) dies |
+
+Row 3 note: A's prediction for "kill the oldest" is stated as "Y dies"
+under the reading that the fixed position is evaluated over the ORIGINAL
+three-session set minus the target, i.e. still names Y. If instead A is
+read as recomputing "2nd-newest among the survivors after removing the
+target first," it would predict no clean single answer for a 2-survivor
+set of {Y, Z} (2nd-newest of 2 survivors is Y again) — both readings of A
+converge on "Y dies" for row 3, so this row still discriminates against B
+cleanly (B predicts nobody dies).
+
+**Interpretation rule:** ≥2 of 3 repeats per row agreeing counts as that
+row's outcome (a single flaky run, given the delayed-observation caveat
+already on record, does not overturn the row). Rows 2 and 3 are the
+decisive ones — if row 2 shows X dying (not Y, not nobody) AND row 3 shows
+nobody dying, B is confirmed and A is falsified. If row 2 shows nobody
+dying and row 3 shows Y dying, A is confirmed and B is falsified. Any
+other combination (e.g. row 2 kills neither X nor nobody, or both rows'
+outcomes support neither table cleanly) is reported as "neither cleanly
+fits" with the raw data, not forced into A or B.
+
+**Falsification conditions:** A is falsified if row 2 ever shows X (not
+nobody) dying, or row 3 ever shows nobody dying is required (i.e. it
+predicts row 3 = "Y dies", which is B's non-death that would falsify B, so
+if row 3 shows a death, B is falsified). B is falsified if row 2 ever
+shows nobody dying, or row 3 ever shows anybody dying.
+
+**Sample-size limit:** n=3 per row (rows 2 and 3), same single machine,
+same day. This can distinguish A from B given the two are logically
+exclusive in their row-2/row-3 predictions; it cannot rule out a THIRD
+rule that happens to coincide with A or B on these two rows only.
+
+### Task (c): native module source
+
+Contrary to my Round-1 report, the ghostel elpa package DOES ship full
+Zig source for the native pty/reaper logic — I had only grepped
+`src/module.zig` (175 lines, Emacs dynamic-module glue only) and
+incorrectly generalized "no source" from that one file. The real logic is
+in `src/PosixPtyProcess.zig` and `src/NativeProcess.zig` (both present in
+`~/.emacs.d/elpa/ghostel-20260823.1350/src/`). Upstream:
+`https://github.com/dakra/ghostel`, pinned at commit
+`447cacd64370e5fc3ee3fa71719d7d6e3da7a624` per `ghostel-pkg.el`. Read
+directly (not cloned — the two files above were sufficient to find the
+candidate defect; cloning add no additional evidence beyond what's already
+on disk, so I did not spend the extra step unless asked).
+
+**Candidate site, read (not yet proven the sole cause):**
+`src/PosixPtyProcess.zig`, function `deinitAndWait` (lines 358-374):
+
+```zig
+pub fn deinitAndWait(self: *Self) u32 {
+    std.debug.assert(self.pid > 0);
+    self.pty.deinit();              // closes primary_fd (pty master) BY RAW INT
+    _ = sys.close(self.wake_pipe[0]);
+    _ = sys.close(self.wake_pipe[1]);
+    while (true) {
+        var status: c_int = undefined;
+        switch (sys.errno(sys.waitpid(self.pid, &status, 0))) { ... }
+```
+
+This runs on a **detached reaper thread**
+(`NativeProcess.zig`, `run()`: `reaper_thread.detach()`, calling
+`reapChild` → `deinitAndWait`), spawned only after the read loop exits.
+`self.pty.primary_fd` is a raw POSIX file descriptor integer (`c_int`),
+closed via `sys.close()` with no generation counter, no owner-identity
+check, and no coordination with any other session's pty lifecycle.
+Closing a pty's master fd is a real kernel operation: on last-close of the
+master side, the tty driver delivers a hang-up condition (SIGHUP) to the
+foreground process group of whatever is attached to the CORRESPONDING
+slave (this is the actual SIGHUP mechanism observed for the bystander in
+Round 1 — a real kernel signal, not confusion at the Lisp level).
+
+**The hazard (inferred, not proven with a targeted test in Round 2 —
+flagged as inference):** because this close runs on a detached thread with
+no synchronization against when OTHER sessions' ptys are opened, if this
+particular `deinitAndWait` call is delayed (e.g. queued behind OS
+scheduling, or behind a slow `waitpid` on a process that took a moment to
+actually die) past the point where the OS has reused that exact fd number
+for a **newly-opened** pty belonging to a different, newer session, the
+`sys.close()` — and the kernel hang-up it triggers — lands on that newer
+session's pty instead of the original one's. This is a
+raw-file-descriptor-identity race (close-after-reuse), not a "slot index"
+data structure bug as I speculated in Round 1 — same class of defect
+(identity confusion via a bare OS handle), different specific mechanism.
+I have NOT instrumented and confirmed the exact fd-number collision with a
+targeted test (e.g. logging `primary_fd` values across sessions and
+watching for a repeat); this is a code-reading-supported hypothesis, held
+to the same "inference, not observation" standard as Round 1's guesses.
+
+### Draft upstream issue (NOT filed — for steward/butler review)
+
+**Title:** `Detached reaper's deinitAndWait() closes the pty master fd on
+a background thread with no protection against fd-number reuse by a
+different, newer session`
+
+**Body (draft):**
+
+> `PosixPtyProcess.deinitAndWait` (src/PosixPtyProcess.zig:358-374) closes
+> `self.pty.primary_fd` — a raw POSIX fd integer — via `sys.close()`,
+> then waits on the child. This call happens on a **detached** reaper
+> thread (`NativeProcess.run`, `reaper_thread.detach()`), spawned only
+> after the terminal's read loop exits, with no synchronization against
+> other sessions' pty lifecycles and no way for the caller (Emacs, via
+> `ghostel-exec`/kill-buffer teardown) to know when it actually runs.
+>
+> Because `primary_fd` is a bare integer with no generation check, if this
+> particular close is delayed long enough for the OS to reuse that exact
+> fd number for a **different, newly-opened** pty (opened by a different
+> ghostel terminal buffer created shortly after), the close — and the
+> resulting kernel-level pty hang-up (SIGHUP delivered to the foreground
+> process group of the corresponding slave) — lands on the wrong,
+> unrelated session's child process instead of the one actually being
+> torn down.
+>
+> **Observed symptom (reproduced 11/13 times across 3 batches in
+> `claude-code-ide.el`, an Emacs package that uses ghostel as a terminal
+> backend):** killing ONE ghostel-backed terminal buffer (via
+> `kill-buffer`, while ≥2 other ghostel sessions are alive in the same
+> Emacs process) causes a DIFFERENT, untouched ghostel session's real
+> child process to receive a genuine SIGHUP and exit — confirmed via the
+> native reaper's own exit-status event (`"129"` = 128+SIGHUP) for the
+> BYSTANDER session's own pipe, not a misdirected signal from Emacs Lisp.
+> The effect requires ≥3 sessions' worth of creation history in the same
+> Emacs process to appear reliably in our testing.
+>
+> **Minimal repro (Emacs Lisp, ghostel alone, no claude-code-ide
+> needed):** create 3 ghostel buffers running a trivial `trap 'echo HUP'
+> HUP; cat` shell script in quick succession; kill the newest buffer;
+> check whether the SECOND-newest buffer's shell also receives HUP despite
+> never being touched. (Our own repro additionally routed through
+> claude-code-ide for fidelity to the reported bug; a ghostel-only
+> reduction was not separately re-verified as of this draft — flagged so
+> whoever files this can confirm the reduction first.)
+>
+> **Suggested direction (not fully verified):** give the pty backend a
+> stable, checkable identity (e.g. re-validate the fd still refers to the
+> same pty, via `fstat`+device/inode comparison, or a generation
+> counter/handle wrapper) before closing it on the detached reaper thread,
+> or synchronize reaper-thread teardown so a stale close cannot outlive a
+> new pty's allocation of the same fd number.
+
+This draft is intentionally NOT filed. It is held here for steward/butler
+review before anyone opens it upstream.
