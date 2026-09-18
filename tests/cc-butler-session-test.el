@@ -2828,6 +2828,23 @@ left behind to reappear on the next restart."
     (should-not cc-butler--inbox)
     (delete-file cc-butler-inbox-queue-file)))
 
+(ert-deftest cc-butler-session/inbox-queue-file-is-created-0600 ()
+  "The queue mirrors worker report bodies verbatim; a plain `write-region'/
+`with-temp-file' creation would take the process umask (typically 644),
+silently widening it back open every save.  `cc-butler--inbox-queue-save'
+must set the mode explicitly at creation time, same precedent as
+`cc-butler--roster-write' (cc-butler-persist.el)."
+  (let* ((tmpdir (file-name-as-directory (make-temp-file "cc-butler-inbox-queue-test" t)))
+         (cc-butler-inbox-queue-file (expand-file-name "queue.eld" tmpdir))
+         (cc-butler--inbox (list (list :time (current-time) :dir "/w/"
+                                        :name "w" :id nil :body "x"))))
+    (unwind-protect
+        (progn
+          (cc-butler--inbox-queue-save)
+          (should (file-exists-p cc-butler-inbox-queue-file))
+          (should (= #o600 (file-modes cc-butler-inbox-queue-file))))
+      (delete-directory tmpdir t))))
+
 (ert-deftest cc-butler-session/inbox-queue-warn-threshold-matches-drained-keep-precedent ()
   "Decision lock (2026-09-04): the backlog-warning threshold reuses
 `cc-butler-drained-keep' as its number -- this fleet's existing precedent
