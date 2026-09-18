@@ -53,6 +53,7 @@
 (require 'cc-butler-cleanup)
 (require 'cc-butler-compact)
 (require 'cc-butler-north-star)
+(require 'cc-butler-fleet-report)
 (require 'cc-butler-self-check)
 
 (require 'hydra)
@@ -104,7 +105,7 @@
     cc-butler-doc-panel cc-butler-docs cc-butler-persist
     cc-butler-mail cc-butler-decision cc-butler-inbox cc-butler-governance
     cc-butler-provenance cc-butler-cleanup cc-butler-compact
-    cc-butler-north-star matrix-bridge cc-butler-self-check)
+    cc-butler-north-star cc-butler-fleet-report matrix-bridge cc-butler-self-check)
   "cc-butler modules, in dependency order.")
 
 (defconst cc-butler--modules-directory-exceptions
