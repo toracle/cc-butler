@@ -63,6 +63,23 @@ actually uses; do not infer the running value from this default."
   :type 'number
   :group 'cc-butler)
 
+(defcustom cc-butler-north-star-session nil
+  "Working-dir of the session that receives North Star nudges, or nil.
+nil (the default) preserves today's behaviour exactly: nudges go to the
+designated butler (`cc-butler--butler'). When set to a session's
+working-dir string, nudges go to that session instead of the butler —
+e.g. a dedicated session whose only job is North Star upkeep, so it is
+idle between ticks by construction and `cc-butler--forward-ops-free-p'
+goes back to being a genuine idle check rather than a starvation mode
+against a butler that is busy on every hourly tick.
+
+Not rebound by `reload_butler_code': reloading loads this defcustom's
+definition but leaves an already-set value alone, same as any other
+defcustom — setting a value is a separate act from loading the code
+that defines it."
+  :type '(choice (const :tag "Butler (default)" nil) string)
+  :group 'cc-butler)
+
 (defvar cc-butler--north-star-timer nil
   "Repeating timer driving `cc-butler--north-star-fire', or nil before first use.")
 
@@ -144,18 +161,19 @@ north-star-macbook-m1-max.org처럼 서로 다른 fleet의 목표 파일이 나�
 
 각 활성 목표에 대해:
 1. 그 목표의 DoD가 실제로 충족되었는가? (\"어려움이 있었다\"는 완료의 증거가 아니다 — governance store의 dod-vs-ultimate-goal 기준 적용.)
-2. 아직이라면 막힌 지점이 있는가? manager/enabler로서 시도할 수 있는 안전한 조치를 먼저 강구할 것.
+2. 아직이라면 막힌 지점이 있는가? \"막혀 있음\"·park으로 적힌 항목이면 그 판단을 그대로 믿지 말고 지금 «다시» 재라 — 재기 전에 governance store를 먼저 grep해 같은 모양의 기존 원칙(예: a-blocking-premise-is-never-re-examined-while-it-blocks, a-blocked-screen-is-not-evidence-that-unblocking-has-value)이 있는지 확인할 것. 산출물은 선언(\"재검토함\")이 아니라 실제로 실행한 명령과 그 출력이어야 한다. manager/enabler로서 시도할 수 있는 안전한 조치를 먼저 강구할 것.
 3. 판단이 불명확하면 escalate_to_butler로 정수님께 질문할 것 — 짐작으로 채우지 말 것.
 4. DoD가 충족된 목표는 이 파일에서 제거하고 완료 서사를 wb-para 프로젝트 노트로 아카이브할 것 — 진행 기록은 이 파일이 아니라 프로젝트 노트에 (governance: north-star-file-holds-intent-not-progress).
 원래 목표와 무관한 부수 작업(yak-shaving)에 머물러 있지는 않은지도 함께 점검할 것."
           cc-butler-north-star-file cc-butler--north-star-template))
 
 (defun cc-butler--north-star-fire ()
-  "Nudge the butler to self-check active North Stars against their DoD.
-Mirrors `cc-butler--forward-backstop': only types into the butler's
+  "Nudge the target session (`cc-butler-north-star-session', or the
+butler when nil) to self-check active North Stars against their DoD.
+Mirrors `cc-butler--forward-backstop': only types into the target's
 terminal when it looks idle (`cc-butler--forward-ops-free-p'), so an
 hourly housekeeping ping cannot land mid-turn and scramble whatever the
-butler is actually doing.  Also refuses outright if `cc-butler-north-star-file'
+target is actually doing.  Also refuses outright if `cc-butler-north-star-file'
 is still unnamespaced (see `cc-butler--north-star-file-namespaced-p') —
 this is the one gate that protects the manual `cc-butler-north-star-check'
 path too, since that command calls straight into this function.
@@ -180,7 +198,7 @@ there is no live butler terminal at all (no butler designated, or its
 terminal buffer is gone)."
   (if (not (cc-butler--north-star-file-namespaced-p))
       (progn (cc-butler--north-star-warn-not-namespaced) 'skipped-unnamespaced)
-    (when-let* ((butler cc-butler--butler)
+    (when-let* ((butler (or cc-butler-north-star-session cc-butler--butler))
                 (buf (get-buffer (claude-code-ide--get-buffer-name butler)))
                 ((buffer-live-p buf)))
       (if (not (cc-butler--forward-ops-free-p butler))

@@ -63,6 +63,9 @@
 (require 'cl-lib)
 (require 'cc-butler-session)                ; cc-butler--log
 (require 'claude-code-ide)
+(require 'claude-code-ide-mcp-http-server)  ; --send-json-error (Layer 3);
+                                             ; claude-code-ide only requires
+                                             ; this lazily, at server start
 
 ;;;; ------------------------------------------------------------------
 ;;;; Layer 0 — make claude-code-ide's own error signal catchable
@@ -98,6 +101,58 @@
 ;; it does not fix `claude-code-ide' for anyone using it standalone — an
 ;; upstream fix is still the real fix, tracked separately.
 (define-error 'json-rpc-error "JSON-RPC Error" 'error)
+
+;;;; ------------------------------------------------------------------
+;;;; Layer 3 — recover the request id an error response discards
+;;;; ------------------------------------------------------------------
+;;
+;; Pin this advice targets: claude-code-ide.el v0.2.7, commit
+;; a9485f766ea69f6cb3a3f08dea20d44fd6596673 (see project CLAUDE.md — the
+;; pin is deliberate; whoever next bumps it should re-check this file
+;; still applies).
+;;
+;; `--handle-post' binds the JSON-RPC `id' inside a `let*' that its own
+;; `condition-case' handlers cannot see, so all three handlers pass a
+;; literal `nil' for id to `--send-json-error':
+;;
+;;   (json-parse-error (--send-json-error request nil -32700 "Parse error"))
+;;   (quit             (--send-json-error request nil -32001 "Operation cancelled by user"))
+;;   (error            (--send-json-error request nil -32603 (format "Internal error: %s" ...)))
+;;
+;; The diagnostic MESSAGE is built correctly every time -- "Missing
+;; required argument: text" is right there in the payload -- but the
+;; caller never sees it: the MCP client rejects the whole envelope
+;; because a JSON-RPC response's `id' is required and null fails schema
+;; validation, so "a normal missing-argument mistake" and "the server is
+;; dead" present identically. See the governance note
+;; malformed-mcp-result-means-a-discarded-elisp-error.md (six recorded
+;; recurrences as of this fix).
+;;
+;; -32700 (Parse error) is deliberately left alone: JSON-RPC 2.0
+;; mandates id:null there (the body never parsed enough to have a
+;; usable id), and if this advice's own re-parse also fails there is
+;; nothing to recover anyway. The other two codes ARE recoverable
+;; because by the time they fire, `--handle-post' already parsed the
+;; body successfully once -- id just isn't lexically visible from the
+;; handler clause. Re-parsing it from the request the caller still
+;; holds needs no new information, only a second look at what already
+;; parsed.
+
+(defun cc-butler--mcp-recover-error-id (orig request id code message)
+  ":around `claude-code-ide-mcp-http-server--send-json-error' — Layer 3.
+
+When ID is nil and CODE is not -32700, re-parse `(ws-body request)' and
+use its `id' field if present. A second parse failure (or any other
+problem recovering it) leaves ID nil exactly as before this advice
+existed -- never worse than the unpatched behavior."
+  (funcall orig request
+           (if (and (null id) (not (eq code -32700)))
+               (or (ignore-errors
+                     (alist-get 'id (json-parse-string (ws-body request)
+                                                        :object-type 'alist)))
+                   id)
+             id)
+           code message))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Layer 1 — don't wipe the registry while sessions are alive
@@ -191,14 +246,18 @@ existing advice rather than stacking a duplicate, so a hot reload
   (advice-add 'claude-code-ide-mcp-server--stop-server
               :around #'cc-butler--mcp-guard-stop-server)
   (advice-add 'claude-code-ide-mcp-server-get-session-context
-              :around #'cc-butler--mcp-recover-session-context))
+              :around #'cc-butler--mcp-recover-session-context)
+  (advice-add 'claude-code-ide-mcp-http-server--send-json-error
+              :around #'cc-butler--mcp-recover-error-id))
 
 (defun cc-butler-mcp-resilience-uninstall ()
-  "Remove both resilience advices (used by tests; not part of normal life)."
+  "Remove all resilience advices (used by tests; not part of normal life)."
   (advice-remove 'claude-code-ide-mcp-server--stop-server
                  #'cc-butler--mcp-guard-stop-server)
   (advice-remove 'claude-code-ide-mcp-server-get-session-context
-                 #'cc-butler--mcp-recover-session-context))
+                 #'cc-butler--mcp-recover-session-context)
+  (advice-remove 'claude-code-ide-mcp-http-server--send-json-error
+                 #'cc-butler--mcp-recover-error-id))
 
 (cc-butler-mcp-resilience-install)
 

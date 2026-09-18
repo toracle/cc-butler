@@ -38,6 +38,7 @@
 (require 'cc-butler-session)
 (require 'cc-butler-orchestrator)
 (require 'cc-butler-doc-panel)
+(require 'cc-butler-persist)
 (require 'claude-code-ide)
 (require 'subr-x)
 
@@ -118,10 +119,15 @@
   (let (rows)
     (dolist (s (cc-butler--ordered (cc-butler--sessions)))
       (let* ((dir (plist-get s :dir))
+             (sstate (cc-butler--session-state s))
              (tag (cond ((equal dir cc-butler--butler) " (butler)")
-                        ((cc-butler--waiting-p dir) " (waiting)")
+                        ((eq sstate 'gate) " (gate)")
+                        ((eq sstate 'blocked-on-dialog) " (blocked)")
+                        ((eq sstate 'waiting) " (waiting)")
                         (t "")))
-             (state (if (cc-butler--waiting-p dir) "WAITING" "running"))
+             (state (pcase sstate
+                      ('gate "GATE") ('blocked-on-dialog "BLOCKED-ON-DIALOG")
+                      ('waiting "WAITING") ('running "running")))
              (branch (let ((b (plist-get s :branch))) (if (string-empty-p b) "-" b)))
              (pr (let ((f (plist-get s :forge))) (if (string-empty-p f) "-" f)))
              ;; :osc (live harness-pushed activity) and :status (a note a
@@ -146,6 +152,25 @@
               rows)))
     (nreverse rows)))
 
+(defun cc-butler-docs--stale-session-rows ()
+  "Return Org table rows for roster-recorded sessions that are not
+currently live -- appended after the live rows so a dashboard refresh
+during a partial recovery does not overwrite the table down to just
+whichever sessions happen to be up yet, silently erasing the record of
+the rest (cc-butler#5: `butler_dashboard' called with 2/16 sessions live
+during the 2026-07-21 recovery clobbered the table to 2 rows -- the
+fallback the recovery runbook itself points to, destroyed by the act of
+consulting it)."
+  (let (rows)
+    (dolist (r (cc-butler--dead-records))
+      (let ((dir (plist-get r :dir)))
+        (push (format "| %s (offline) | OFFLINE | %s | - | - | - | %s |"
+                      (cc-butler-docs--cell (or (plist-get r :name) (cc-butler--display-name dir)))
+                      (cc-butler-docs--cell (or (plist-get r :branch) ""))
+                      (cc-butler-docs--cell (or (plist-get r :status) "")))
+              rows)))
+    (nreverse rows)))
+
 (defvar cc-butler-docs--overview nil
   "The butler's free-text overview, shown on the dashboard.")
 (defvar cc-butler-docs--decisions nil
@@ -153,7 +178,7 @@
 
 (defun cc-butler-docs--render-dashboard ()
   "Render the dashboard Org document from live state + butler-set text."
-  (let ((rows (cc-butler-docs--session-rows)))
+  (let ((rows (append (cc-butler-docs--session-rows) (cc-butler-docs--stale-session-rows))))
     (concat
      "#+TITLE: Butler dashboard\n#+STARTUP: overview\n"
      (format "Last updated: %s\n" (format-time-string "[%Y-%m-%d %a %H:%M]"))
@@ -183,21 +208,22 @@
 (defun cc-butler-docs--ensure-index ()
   "Create the docs index file if it does not exist yet.  Return its path."
   (when-let ((file (cc-butler-docs--index-file)))
-    (make-directory (file-name-directory file) t)
+    (with-file-modes #o700 (make-directory (file-name-directory file) t))
     (unless (file-exists-p file)
-      (write-region
-       (concat "#+TITLE: Butler docs\n\n"
-               "Operational document repository for the cc-butler butler.\n\n"
-               "- [[file:dashboard.org][Dashboard]] — current snapshot"
-               " (sessions, overview, open decisions)\n"
-               "- [[file:log/][Log]] — per-day, append-only timeline\n")
-       nil file nil 'silent))
+      (with-file-modes #o600
+        (write-region
+         (concat "#+TITLE: Butler docs\n\n"
+                 "Operational document repository for the cc-butler butler.\n\n"
+                 "- [[file:dashboard.org][Dashboard]] — current snapshot"
+                 " (sessions, overview, open decisions)\n"
+                 "- [[file:log/][Log]] — per-day, append-only timeline\n")
+         nil file nil 'silent)))
     file))
 
 (defun cc-butler-docs--append-log (kind entry)
   "Append a KIND ENTRY to today's log file.  Return the path, or nil."
   (when-let ((dir (cc-butler-docs--log-dir)))
-    (make-directory dir t)
+    (with-file-modes #o700 (make-directory dir t))
     (let* ((file (cc-butler-docs--log-file))
            (new (not (file-exists-p file)))
            (text (concat
@@ -205,26 +231,34 @@
                     (format "#+TITLE: Butler log — %s\n#+STARTUP: showeverything\n\n"
                             (format-time-string "%Y-%m-%d")))
                   (cc-butler-docs--render-log-entry kind entry))))
-      (write-region text nil file t 'silent)
+      (with-file-modes #o600
+        (write-region text nil file t 'silent))
       file)))
 
 (defun cc-butler-docs--write-dashboard ()
   "(Re)write the dashboard file from current state.  Return the path, or nil."
   (when-let ((file (cc-butler-docs--dashboard-file)))
-    (make-directory (file-name-directory file) t)
-    (write-region (cc-butler-docs--render-dashboard) nil file nil 'silent)
+    (with-file-modes #o700 (make-directory (file-name-directory file) t))
+    (with-file-modes #o600
+      (write-region (cc-butler-docs--render-dashboard) nil file nil 'silent))
     file))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Automatic capture: worker events -> daily log
 ;;;; ------------------------------------------------------------------
 
-(defun cc-butler-docs--auto-log (dir body)
-  "Advice on `cc-butler--inbox-push': mirror a worker event into the daily log."
+(defun cc-butler-docs--auto-log (dir body &optional name-override)
+  "Advice on `cc-butler--inbox-push': mirror a worker event into the daily
+log.  NAME-OVERRIDE mirrors that function's own optional third arg (DIR
+nil, e.g. a self-check transition) -- `:after' advice is called with
+every argument the advised function received, so this must accept it too
+or a 3-arg call errors here with wrong-number-of-arguments; and
+`cc-butler--who-dir' itself errors on a nil DIR, the same reason
+`cc-butler--inbox-push' needed the override in the first place."
   (when (and cc-butler-docs-auto-log (cc-butler-docs--home))
     (ignore-errors
       (cc-butler-docs--append-log
-       "event" (format "%s — %s" (cc-butler--who-dir dir) (or body ""))))))
+       "event" (format "%s — %s" (or name-override (cc-butler--who-dir dir)) (or body ""))))))
 
 (advice-add 'cc-butler--inbox-push :after #'cc-butler-docs--auto-log)
 
@@ -274,9 +308,11 @@ The Sessions table is always regenerated from live cc-butler state."
   (when (and decisions (stringp decisions))
     (setq cc-butler-docs--decisions decisions))
   (cc-butler-docs--ensure-index)
-  (let ((file (cc-butler-docs--write-dashboard)))
-    (format "Dashboard updated (%d live sessions): %s"
+  (let ((file (cc-butler-docs--write-dashboard))
+        (offline (length (cc-butler--dead-records))))
+    (format "Dashboard updated (%d live session(s)%s): %s"
             (length (cc-butler--sessions))
+            (if (> offline 0) (format ", %d offline (kept in table)" offline) "")
             (abbreviate-file-name file))))
 
 ;; Idempotent (re)registration.
@@ -287,7 +323,7 @@ The Sessions table is always regenerated from live cc-butler state."
                  '("butler_log" "butler_dashboard")))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-log
  :name "butler_log"
  :description "Append a timestamped entry to the butler's append-only daily log (docs/log/YYYY-MM-DD.org under the butler home). Use it to record decisions you made, progress worth remembering, or notes — the durable timeline that survives the chat scrolling away. Worker reports/notifications are logged automatically; use this for the curated, higher-signal entries. Call it when something happens that future-you (or a fresh context) should be able to reconstruct."
@@ -299,7 +335,7 @@ The Sessions table is always regenerated from live cc-butler state."
                 :description "Entry kind: 'decision', 'progress', 'event', or 'note' (default 'note'). Optional."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-dashboard
  :name "butler_dashboard"
  :description "Update the butler's at-a-glance dashboard (docs/dashboard.org under the butler home). The per-session status table (running/waiting, branch, PR, model, live activity, and any status note left via set_session_info) is regenerated automatically from live session state — you do NOT supply it. You supply the human judgment: a short OVERVIEW of the current situation and the list of OPEN DECISIONS awaiting input. Call it whenever the big picture changes so the snapshot stays current. Omitting an argument keeps its previous text."

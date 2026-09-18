@@ -305,6 +305,155 @@ allowlist requires cc-butler's own marker."
         (should-not (cc-butler--close-topic-deletable-p plain))
       (delete-directory plain t))))
 
+;;;; ---- close-topic git-safety audit: non-git and loose top-level items --
+;;;; cc-butler#8 follow-up (steward review, 2026-09-05): a real fleet audit
+;;;; found 26 of 27 roster entries have a non-git top level, one of them a
+;;;; 14-nested-repo container with handoff docs (`recovered-notes-20260809/',
+;;;; `RESUME-817.md', `handover-image-editing-20260810.md') sitting loose at
+;;;; the root, outside every child repo -- invisible to an audit that only
+;;;; ever walked into repos it already knew about.
+
+(defun cc-butler-workspace-test--container-dir (child-repo-names loose-names)
+  "Make a temp multi-repo container and return its path.
+Each of CHILD-REPO-NAMES gets a repo-shaped `.git' subdir (a bare directory
+is enough: these tests mock `cc-butler--close-topic-unsafe' rather than
+shelling out to real git, matching this file's existing convention).
+LOOSE-NAMES are plain empty files sitting directly at the container root,
+outside every child repo."
+  (let* ((base (make-temp-file "cc-container" t))
+         (topic (file-name-as-directory (expand-file-name "container-x" base))))
+    (make-directory topic t)
+    (dolist (name child-repo-names)
+      (make-directory (expand-file-name ".git" (expand-file-name name topic)) t))
+    (dolist (name loose-names)
+      (write-region "" nil (expand-file-name name topic) nil 'silent))
+    topic))
+
+(ert-deftest cc-butler-workspace/close-topic-audit-refuses-non-git-empty-topic ()
+  "A topic dir that is not itself a git repo and has neither a child repo
+nor any loose item must still be refused, not silently pass as \"nothing
+to check, so safe\" — the original gap this audit had."
+  (let ((topic (file-name-as-directory (make-temp-file "cc-empty-topic" t))))
+    (unwind-protect
+        (should (cc-butler--close-topic-audit topic))
+      (delete-directory topic t))))
+
+(ert-deftest cc-butler-workspace/close-topic-audit-refuses-loose-top-level-file ()
+  "A container whose child repos are ALL clean must still be refused when it
+also holds a top-level file outside every child repo — \"every child repo
+is clean\" is not \"safe to delete\"; this is the exact real-incident shape.
+The refusal message must name the loose file so the next person can act on
+it without re-discovering it themselves."
+  (let ((topic (cc-butler-workspace-test--container-dir
+                '("app" "infra") '("RESUME-817.md"))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'cc-butler--close-topic-unsafe) (lambda (_repo) nil)))
+          (let ((bad (cc-butler--close-topic-audit topic)))
+            (should bad)
+            (should (cl-some (lambda (cell)
+                                (string-match-p "RESUME-817.md" (string-join (cdr cell) " ")))
+                              bad))))
+      (delete-directory topic t))))
+
+(ert-deftest cc-butler-workspace/close-topic-audit-vets-a-worktree-child-as-a-repo ()
+  "A child checkout whose `.git' is a FILE (worktree / submodule gitlink)
+must be vetted as a repo, not reported as an unaccounted-for loose item.
+
+Before `cc-butler--git-checkout-p' single-sourced the probe, the audit
+tested `.git' with `file-directory-p', which answers no for every
+worktree.  The worktree then fell through to the loose-entry check, so
+deletion WAS still refused -- but the stated reason was \"top-level
+item(s) outside any child repo, unaccounted for\", which reads like
+stray junk.  An operator who dismisses that reason and forces the delete
+loses real uncommitted work, and the per-repo git checks never ran at
+all.  Assert the reason, not merely that something was refused."
+  (let* ((topic (cc-butler-workspace-test--container-dir '("app") nil))
+         (wt (expand-file-name "wt" topic)))
+    (unwind-protect
+        (progn
+          ;; worktree shape: .git is a file, not a directory
+          (make-directory wt t)
+          (write-region "gitdir: /elsewhere/.git/worktrees/wt\n" nil
+                        (expand-file-name ".git" wt) nil 'silent)
+          (should (member (file-name-as-directory wt)
+                          (mapcar #'file-name-as-directory
+                                  (cc-butler--close-topic-repos topic))))
+          ;; and therefore NOT mistaken for stray content
+          (should-not (member wt (cc-butler--close-topic-loose-entries topic)))
+          (cl-letf (((symbol-function 'cc-butler--close-topic-unsafe)
+                     (lambda (repo)
+                       (when (string-match-p "/wt/?\\'" (directory-file-name repo))
+                         (list "uncommitted changes")))))
+            (let ((bad (cc-butler--close-topic-audit topic)))
+              (should bad)
+              (should (cl-some (lambda (cell)
+                                 (and (string-match-p "/wt/?\\'" (directory-file-name (car cell)))
+                                      (member "uncommitted changes" (cdr cell))))
+                               bad))
+              ;; the misleading reason must be gone
+              (should-not (cl-some (lambda (cell)
+                                     (string-match-p "unaccounted for"
+                                                     (string-join (cdr cell) " ")))
+                                   bad)))))
+      (delete-directory topic t))))
+
+;;;; ------------------------------------------------------------------
+;;;; Buffer-kill bystander-death guard (2026-09-18)
+;;;;
+;;;; See docs/repro/2026-09-18-buffer-kill-bystander-death.md: killing one
+;;;; ghostel-backed claude-code-ide session's buffer, while ANOTHER such
+;;;; session is alive, was reproduced (ccb-repro, 5+ independent runs) to
+;;;; send a real SIGHUP to the untouched session and end it. The defect
+;;;; lives in ghostel's native pty module (vendored dylib; not fixable
+;;;; here), so this guard only prevents cc-butler from ever triggering it.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-workspace/close-topic-kill-session-refuses-concurrent-ghostel ()
+  "Refuses to kill-buffer a session while another ghostel session is alive."
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (claude-code-ide--processes (make-hash-table :test 'equal)))
+    (puthash "/tmp/dir-a/" 'fake-proc-a claude-code-ide--processes)
+    (puthash "/tmp/dir-b/" 'fake-proc-b claude-code-ide--processes)
+    (should-error (cc-butler--close-topic-kill-session "/tmp/dir-a/")
+                  :type 'user-error)))
+
+(ert-deftest cc-butler-workspace/close-topic-kill-session-allows-solo-ghostel ()
+  "Proceeds normally when it is the only tracked ghostel session (no buffer
+exists for the fake dir, so the ordinary body is just a no-op, not an error)."
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (claude-code-ide--processes (make-hash-table :test 'equal)))
+    (puthash "/tmp/dir-a/" 'fake-proc-a claude-code-ide--processes)
+    (should (equal nil (cc-butler--close-topic-kill-session "/tmp/dir-a/")))))
+
+(ert-deftest cc-butler-workspace/close-topic-kill-session-allows-non-ghostel-backend ()
+  "The guard is scoped to the ghostel backend, where the defect lives; a
+vterm/eat setup with >1 tracked session is untouched by this guard."
+  (let ((claude-code-ide-terminal-backend 'vterm)
+        (claude-code-ide--processes (make-hash-table :test 'equal)))
+    (puthash "/tmp/dir-a/" 'fake-proc-a claude-code-ide--processes)
+    (puthash "/tmp/dir-b/" 'fake-proc-b claude-code-ide--processes)
+    (should (equal nil (cc-butler--close-topic-kill-session "/tmp/dir-a/")))))
+
+(ert-deftest cc-butler-workspace/close-topic-kill-session-escape-hatch ()
+  "Setting the defcustom to nil restores the pre-guard behavior."
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (claude-code-ide--processes (make-hash-table :test 'equal))
+        (cc-butler-close-topic-refuse-concurrent-ghostel nil))
+    (puthash "/tmp/dir-a/" 'fake-proc-a claude-code-ide--processes)
+    (puthash "/tmp/dir-b/" 'fake-proc-b claude-code-ide--processes)
+    (should (equal nil (cc-butler--close-topic-kill-session "/tmp/dir-a/")))))
+
+(ert-deftest cc-butler-workspace/close-topic-audit-passes-clean-scaffolded-topic ()
+  "The ordinary case must still pass: one clean child repo plus only
+cc-butler's own scaffold files (marker + CLAUDE.md) at the root is NOT
+refused — the loose-entry allowlist exists precisely so this common shape
+keeps working, not so the audit refuses everything indiscriminately."
+  (let ((topic (cc-butler-workspace-test--scaffold-dir)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'cc-butler--close-topic-unsafe) (lambda (_repo) nil)))
+          (should (null (cc-butler--close-topic-audit topic))))
+      (delete-directory topic t))))
+
 (ert-deftest cc-butler-workspace/deletable-keeps-shallow-and-home-guards ()
   "The pre-existing backstops still hold: home, root, .emacs.d, and shallow
 paths are refused regardless of markers."
@@ -330,6 +479,147 @@ so the kill step is a no-op)."
             (should (string-match-p "not a cc-butler-scaffolded topic"
                                     (plist-get res :note)))))
       (when (file-directory-p proj) (delete-directory proj t)))))
+
+;;;; ------------------------------------------------------------------
+;;;; Worker launch pins the model explicitly (2026-09-07) — a corrupted
+;;;; machine-wide `/model' default (compaction's restore step rewrites it,
+;;;; see cc-butler-compact.el) must not silently mis-tier a newly spawned
+;;;; worker.  Only `cc-butler--start-session-in' is fixed here — every
+;;;; caller of it launches a worker (butler/steward launch via their own
+;;;; fixed home directories, never through here).
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-workspace/start-session-in-pins-worker-model ()
+  "`cc-butler--start-session-in' pins the model explicitly via `--model' so a
+corrupted machine-wide `/model' default cannot silently mis-tier a newly
+spawned worker."
+  (let (captured-flags
+        (cc-butler-worker-launch-model "sonnet"))
+    (cl-letf (((symbol-function 'cc-butler--launch-session)
+               (lambda (_dir) (setq captured-flags claude-code-ide-cli-extra-flags))))
+      (cc-butler--start-session-in "/tmp/some-worker/"))
+    (should (string-match-p "--model sonnet\\b" captured-flags))))
+
+;;;; ------------------------------------------------------------------
+;;;; Clone: a repo that ships scripts/git-hooks gets core.hooksPath set
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-workspace-test--fixture-repo (hooks)
+  "Return a path to a fresh one-commit git repo.
+HOOKS is nil (no scripts/git-hooks), `executable' (an executable
+pre-commit, the realistic case) or `inert' (the directory exists but its
+pre-commit is not executable, so git would silently run nothing)."
+  (let ((default-directory (file-name-as-directory (make-temp-file "cc-clone-src" t))))
+    (when hooks
+      (make-directory "scripts/git-hooks" t)
+      (write-region "#!/bin/sh\nexit 0\n" nil "scripts/git-hooks/pre-commit")
+      (set-file-modes "scripts/git-hooks/pre-commit"
+                      (if (eq hooks 'executable) #o755 #o644)))
+    (write-region "x\n" nil "README")
+    (dolist (args '(("init" "-q")
+                    ("-c" "core.fileMode=true" "add" "-A")
+                    ("-c" "user.name=t" "-c" "user.email=t@t" "commit" "-q" "-m" "init")))
+      (should (eq 0 (apply #'call-process "git" nil nil nil args))))
+    (directory-file-name default-directory)))
+
+(defun cc-butler-workspace-test--clone (hooks &optional preseed)
+  "Clone a fixture (see `cc-butler-workspace-test--fixture-repo' for HOOKS)
+via `cc-butler--clone-repos'.  Return (HOOKS-PATH . WARNINGS): the clone's
+local core.hooksPath (nil when unset) and the list of `display-warning'
+argument lists raised during the clone.  With PRESEED, the destination is
+first created by a plain `git clone' (core.hooksPath unset), so
+`cc-butler--clone-repos' finds it already present.  Fixture dirs are
+removed after."
+  (let* ((src (cc-butler-workspace-test--fixture-repo hooks))
+         (topic (file-name-as-directory (make-temp-file "cc-clone-topic" t)))
+         (result 'pending)
+         (warnings nil)
+         (deadline (+ (float-time) 30)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'display-warning)
+                   (lambda (&rest args) (push args warnings))))
+          (when preseed
+            (let ((dest (expand-file-name (file-name-nondirectory src) topic)))
+              (should (eq 0 (call-process "git" nil nil nil "clone" "-q" src dest)))
+              (call-process "git" nil nil nil "-C" dest
+                            "config" "--local" "--unset" "core.hooksPath")))
+          (cc-butler--clone-repos topic (list src) (lambda (ok) (setq result ok)))
+          (while (and (eq result 'pending) (< (float-time) deadline))
+            (accept-process-output nil 0.1))
+          (should (eq result t))
+          (cons (with-temp-buffer
+                  (when (eq 0 (call-process "git" nil t nil "-C"
+                                            (expand-file-name (file-name-nondirectory src) topic)
+                                            "config" "--local" "core.hooksPath"))
+                    (string-trim (buffer-string))))
+                warnings))
+      (delete-directory src t)
+      (delete-directory topic t))))
+
+(ert-deftest cc-butler-workspace/clone-sets-hooks-path-when-repo-ships-hooks ()
+  "A fresh clone that ships an executable scripts/git-hooks/pre-commit comes
+up with core.hooksPath pointing there, and raises no warning."
+  (let ((r (cc-butler-workspace-test--clone 'executable)))
+    (should (equal (car r) "scripts/git-hooks"))
+    (should (null (cdr r)))))
+
+(ert-deftest cc-butler-workspace/clone-warns-when-pre-commit-not-executable ()
+  "core.hooksPath alone is not a guard: with scripts/git-hooks present but
+no executable pre-commit, git silently runs nothing.  That must surface
+as an error-level `cc-butler' warning naming the clone, without failing
+the clone chain."
+  (let* ((r (cc-butler-workspace-test--clone 'inert))
+         (w (cdr r)))
+    (should (equal (car r) "scripts/git-hooks"))
+    (should (= 1 (length w)))
+    (should (eq (nth 0 (car w)) 'cc-butler))
+    (should (eq (nth 2 (car w)) :error))
+    (should (string-match-p "pre-commit" (nth 1 (car w))))
+    (should (string-match-p "cc-clone-src" (nth 1 (car w))))))
+
+(ert-deftest cc-butler-workspace/clone-leaves-hooks-path-unset-without-hooks ()
+  "Negative control: a repo without scripts/git-hooks is left untouched,
+and raises no warning."
+  (let ((r (cc-butler-workspace-test--clone nil)))
+    (should (null (car r)))
+    (should (null (cdr r)))))
+
+(ert-deftest cc-butler-workspace/clone-sets-hooks-path-on-already-present-clone ()
+  "A clone already present in the topic (reused or pre-seeded) is not
+re-cloned, but still gets core.hooksPath set — stale clones were found
+exactly in this unset state."
+  (let ((r (cc-butler-workspace-test--clone 'executable t)))
+    (should (equal (car r) "scripts/git-hooks"))
+    (should (null (cdr r)))))
+
+(ert-deftest cc-butler-workspace/already-present-clone-without-hooks-stays-unset ()
+  "Negative control: an already-present clone of a repo without
+scripts/git-hooks is left untouched, and raises no warning."
+  (let ((r (cc-butler-workspace-test--clone nil t)))
+    (should (null (car r)))
+    (should (null (cdr r)))))
+
+(ert-deftest cc-butler-workspace/ensure-repo-hooks-warns-when-read-back-differs ()
+  "If the core.hooksPath write does not take, the read-back catches it and
+raises an error-level `cc-butler' warning instead of signalling."
+  (let ((src (cc-butler-workspace-test--fixture-repo 'executable))
+        (real-call-process (symbol-function 'call-process))
+        (warnings nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'display-warning)
+                   (lambda (&rest args) (push args warnings)))
+                  ((symbol-function 'call-process)
+                   (lambda (prog &optional infile dest display &rest args)
+                     (if (and (member "core.hooksPath" args)
+                              (member "scripts/git-hooks" args))
+                         1              ; the write silently fails
+                       (apply real-call-process prog infile dest display args)))))
+          (cc-butler--ensure-repo-hooks src)
+          (should (= 1 (length warnings)))
+          (should (eq (nth 0 (car warnings)) 'cc-butler))
+          (should (eq (nth 2 (car warnings)) :error))
+          (should (string-match-p "core.hooksPath" (nth 1 (car warnings)))))
+      (delete-directory src t))))
 
 (provide 'cc-butler-workspace-test)
 ;;; cc-butler-workspace-test.el ends here

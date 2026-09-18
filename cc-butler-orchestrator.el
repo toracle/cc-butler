@@ -32,10 +32,10 @@
 ;; (`cc-butler-mail', loaded after this file); declared so the byte-compiler is
 ;; content and the runtime dispatch on `cc-butler-message-transport' works.
 (declare-function cc-butler-mail-up-report "cc-butler-mail" (from-dir body))
-(declare-function cc-butler-mail-up-decision "cc-butler-mail" (from-dir summary needs))
+(declare-function cc-butler-mail-up-decision "cc-butler-mail" (from-dir summary needs &optional sender-label))
 (declare-function cc-butler-mail-up-drain "cc-butler-mail" (agent-dir))
 (declare-function cc-butler--check-inbox-drain-as "cc-butler-mail" (agent-name))
-(declare-function cc-butler-decision-create "cc-butler-decision" (from-dir summary needs options &optional kind))
+(declare-function cc-butler-decision-create "cc-butler-decision" (from-dir summary needs options &optional kind sender-label))
 (declare-function cc-butler--decision-parse-options "cc-butler-decision" (s))
 (declare-function cc-butler-docs--auto-log "cc-butler-docs" (dir body))
 (defvar cc-butler-decision-workflow)
@@ -376,7 +376,11 @@ Locations are derived from the butler home (the shared operational home)."
                      "  3. **\"Index check: 0 un-indexed\" is not \"index matches"
                      " store.\"** It only\n     counts slugs with zero lines; a slug whose"
                      " line is stale-but-present still\n     reads as 0, so a green check"
-                     " here says nothing about whether descriptions\n     are current.\n")
+                     " here says nothing about whether descriptions\n     are current.\n"
+                     "\n  The shared memory above is a *generated cache* of this store —"
+                     " route a new\n  operational learning by editing the store +"
+                     " regenerate, never by hand-editing\n  memory. A hand-edit there is"
+                     " overwritten on the next regenerate, silently.\n")
              (abbreviate-file-name (cc-butler-governance-store)))
      "\n")))
 
@@ -460,6 +464,7 @@ WHICH is `butler' or `steward'."
    "   `send_to_session` (find its name via `list_claude_sessions`).\n"
    "3. When the human asks something specific about a worker, you may\n"
    "   `read_session_output` / `send_to_session` that worker directly.\n\n"
+   (cc-butler--prod-data-boundary-md 'butler)
    "## Tools\n\n"
    "- `pending_decisions` — drain your quiet decision queue.\n"
    "- `list_claude_sessions` / `read_session_output` / `send_to_session`.\n"
@@ -478,6 +483,67 @@ WHICH is `butler' or `steward'."
    "instead of delivering your text (`relay-safe-worker-decisions`).\n\n"
    (cc-butler--learning-duty 'butler)
    (cc-butler--shared-state-note)))
+
+(defun cc-butler--prod-data-boundary-md (role)
+  "Return the shared `## Prod-data boundary' section for ROLE (a symbol,
+`butler' or `steward').
+
+Generated for BOTH roles on purpose.  The newest incident in the store
+(2026-09-04) is the BUTLER asking 정수님 to approve a data-plane prod DB
+read — the asking was itself already over the line — so a version of this
+section that only the steward carries would have missed the one recurrence
+it most needed to prevent.
+
+Deliberately carries NO dated list of past incidents.  This text is frozen
+into a generated cache: whatever is written here propagates into both live
+homes on the next `cc-butler-home-regenerate' and cannot notice that the
+store moved on.  An earlier draft hardcoded \"recurred three times
+(2026-08-01, 2026-08-11, 2026-09-02)\" plus \"needs per-instance approval
+— escalate it\", and by then the store had already twice made the rule
+STRONGER (2026-09-03, 2026-09-04); regenerating would have propagated the
+weaker, superseded wording into both homes with nothing to notice.  So keep
+only the invariant here and let the store hold the record."
+  (concat
+   "## Prod-data boundary — you cannot grant it, and \"read-only\" is not a defense\n\n"
+   "Production **code** is ordinary work. Production **data** is not, and it splits\n"
+   "in two — the split IS the rule:\n\n"
+   "- **Config, metrics, logs → yes.** Control-plane (Monocle MCP) *reads*, "
+   "CloudWatch\n  metrics and logs, Performance Insights. A pre-approved class "
+   "(정수님, 2026-08-25);\n  control-plane *writes* stay gated. Nothing else inherits this.\n"
+   "- **Rows → no.** Data-plane prod DB rows (tenant-schema users, schedules,\n"
+   "  documents, transactions) are **not something the fleet does.** Not an\n"
+   "  escalation — a thing we do not do. **Do not ask for approval**; asking is\n"
+   "  already past the line.\n"
+   "- **In between → per-instance approval.** Prod credentials, SSM tunnels into\n"
+   "  prod RDS, prod API responses carrying tenant or customer records. "
+   (if (eq role 'steward)
+       "You are\n  NOT exempt: **the steward cannot approve this for a worker.** Escalate it.\n"
+     "Route it\n  to 정수님 — but read the row rule above first: some of what reaches you as a\n  decision is not a decision.\n")
+   "\n"
+   "A standing duty, not a fact you are assumed to remember:\n\n"
+   "1. **In every dispatch that touches real systems, write the access boundary\n"
+   "   explicitly** — which environments, which credentials, and that prod data is\n"
+   "   out of scope. An agent reads \"verify against real data\" as authorization for\n"
+   "   *whatever data is real*. That inference is the defect, and it is upstream in\n"
+   "   your dispatch, not in the worker. Repeat it in every sub-agent brief too —\n"
+   "   a prohibition is not inherited.\n"
+   "2. **Never write \"읽기 전용이니 승인한다\".** That sentence is the exact failure\n"
+   "   mode the steward recurrences used. Reversibility does not license it — a\n"
+   "   read is reversible in state but not in exposure.\n"
+   "3. **When you need a number from prod, make the system emit it** — a metric the\n"
+   "   enumerator or consumer publishes — instead of querying for it once. The\n"
+   "   queried value is a snapshot that goes stale and costs a human's hand every\n"
+   "   time; the metric is written once and read free thereafter. Until it exists,\n"
+   "   the field is `[미확인 — 정수님 결정으로 조회 안 함]`: not \"not measured yet\"\n"
+   "   but \"decided not to measure.\"\n"
+   "4. **A worker that stops and asks is behaving correctly.** Say so plainly.\n"
+   "   Self-disclosure must stay cheap or the next one stays quiet.\n"
+   "5. **Ask what the code alone can settle** — usually more than it first appears,\n"
+   "   and it costs nothing.\n"
+   "\n"
+   "The store holds the incident record and any refinement newer than this text:\n"
+   "`prod-data-access-requires-explicit-approval`. It is authoritative; this is a\n"
+   "cache.\n\n"))
 
 (defun cc-butler--steward-claude-md ()
   "Return the bootstrap CLAUDE.md text for the steward (operations) role."
@@ -545,6 +611,7 @@ WHICH is `butler' or `steward'."
    "   Enter you send is live and dangerous.\n"
    "See `relay-safe-worker-decisions` in the governance store for the full\n"
    "rationale — this has recurred, steward included, so restate it every time.\n\n"
+   (cc-butler--prod-data-boundary-md 'steward)
    "## Tools\n\n"
    "- `list_claude_sessions` / `read_session_output` / `send_to_session`.\n"
    "- `pending_events` — drain the worker firehose.\n"
@@ -1322,17 +1389,31 @@ Progress = any transcript write since the event was recorded (the
 session resumed by itself — a sub-agent completed, a turn ran); such an
 event resolves silently.  A session still static after the window
 escalates through the normal wake gate.  Either way the entry is
-dropped: the durable inbox still holds the event, so nothing is lost."
+dropped: the durable inbox still holds the event, so nothing is lost.
+
+EXCEPTION: the butler is never escalated here.  Static/idle IS its
+healthy resting state — it waits on 정수님, not on transcript progress —
+so the progress test below can never resolve in its favor and would
+otherwise re-escalate every window forever (observed: three empty wakes
+in ~20 minutes, 2026-09-12).  `cc-butler-steward-inbox-design.md'
+already decided this direction for `escalate_to_butler' (\"deliver-only,
+no poke ... because nothing ever pokes the butler on arrival\"); this
+just extends it to the one caller that was still poking it."
   (when-let ((entry (gethash dir cc-butler--forward-deferred)))
     (remhash dir cc-butler--forward-deferred)
     (let ((last (cc-butler--session-last-activity dir)))
-      (if (and last (> last (plist-get entry :since)))
-          (cc-butler--log "forward: deferred %s self-resolved"
-                          (cc-butler--who-dir dir))
+      (cond
+       ((and (boundp 'cc-butler--butler) (equal dir cc-butler--butler))
+        (cc-butler--log "forward: deferred %s dropped (butler idle-on-human is healthy, not stalled)"
+                        (cc-butler--who-dir dir)))
+       ((and last (> last (plist-get entry :since)))
+        (cc-butler--log "forward: deferred %s self-resolved"
+                        (cc-butler--who-dir dir)))
+       (t
         (cc-butler--forward-wake ops dir
                                  (format "%s (idle %ss, no progress)"
                                          (plist-get entry :body)
-                                         cc-butler-forward-defer-window))))))
+                                         cc-butler-forward-defer-window)))))))
 
 (defun cc-butler--forward-backstop ()
   "Periodic sweep: push once if events sit undrained and nothing woke ops.
@@ -1426,20 +1507,55 @@ NEEDS is not split the same way: in practice it stays a short one-line ask,
 and this file's own `from:'/`needs:' sub-lines already assume single-line
 values -- flagged here, not fixed, since nothing observed exercises it."
   (when-let ((file (cc-butler--decisions-file)))
-    (make-directory (file-name-directory file) t)
+    (with-file-modes #o700 (make-directory (file-name-directory file) t))
     (let* ((new (not (file-exists-p file)))
            (summary-lines (split-string (string-trim (or summary "")) "\n"))
            (summary-head (or (car summary-lines) ""))
            (summary-rest (cdr summary-lines)))
-      (write-region
-       (concat (when new "#+TITLE: Open decisions\n#+STARTUP: showeverything\n\n")
-               (format "* %s %s\n" (format-time-string "[%Y-%m-%d %a %H:%M]") summary-head)
-               (when summary-rest
-                 (concat (mapconcat (lambda (l) (concat "  " l)) summary-rest "\n") "\n"))
-               (when from (format "  from: %s\n" (cc-butler--who-dir from)))
-               (when (and needs (stringp needs) (not (string-empty-p (string-trim needs))))
-                 (format "  needs: %s\n" (string-trim needs))))
-       nil file t 'silent))))
+      (with-file-modes #o600
+        (write-region
+         (concat (when new "#+TITLE: Open decisions\n#+STARTUP: showeverything\n\n")
+                 (format "* %s %s\n" (format-time-string "[%Y-%m-%d %a %H:%M]") summary-head)
+                 (when summary-rest
+                   (concat (mapconcat (lambda (l) (concat "  " l)) summary-rest "\n") "\n"))
+                 (when from (format "  from: %s\n" (cc-butler--who-dir from)))
+                 (when (and needs (stringp needs) (not (string-empty-p (string-trim needs))))
+                   (format "  needs: %s\n" (string-trim needs))))
+         nil file t 'silent)))))
+
+(defconst cc-butler--report-tag-strings
+  '("<summary>" "</summary>" "<status>" "</status>" "<needs>" "</needs>")
+  "Tag-shaped substrings that must never appear literally inside a
+`report_to_steward'/`escalate_to_butler' string argument.  Seeing one here
+means the caller emitted tool-call-looking XML as plain text instead of
+using separate parameters -- observed in the wild as fragments like
+`</summary><parameter name=\"status\">' landing verbatim in the steward's
+queue and 정수님's decision document.  Rejecting (rather than silently
+relocating the text) is deliberate: a summary that legitimately quotes one
+of these tags as an example would have its content silently rewritten by
+an auto-move, which is worse than an occasional false-positive rejection
+the caller can see and fix.")
+
+(defun cc-butler--reject-embedded-tags (params)
+  "Error if any (NAME . VALUE) pair in PARAMS contains a tag from
+`cc-butler--report-tag-strings'.  Names the exact tag and the exact
+parameter it was found in, so the caller can fix the call instead of
+guessing which field is corrupted.
+
+Logs before erroring, for the same reason the `<invoke'/`<parameter'
+guard does (cc-butler#135): the error reaches only the calling session,
+which is the one that just got this wrong.  Without a line on disk the
+rejection rate is invisible, so nobody can tell a caller-side fix from a
+caller that simply stopped reporting."
+  (dolist (pair params)
+    (let ((name (car pair)) (value (cdr pair)))
+      (when (stringp value)
+        (dolist (tag cc-butler--report-tag-strings)
+          (when (string-match-p (regexp-quote tag) value)
+            (cc-butler--log "REJECTED: %s contains the literal tag %s — see #135"
+                            name tag)
+            (error "%s contains the literal tag %s -- pass summary/status/needs/options as separate arguments, not embedded tags inside one string"
+                   name tag)))))))
 
 (defun cc-butler--escalate-kind (kind)
   "Normalize an `escalate_to_butler' KIND string to `decision' or `note'.
@@ -1455,13 +1571,32 @@ escalate-to-butler-is-decision-only-a-notification-sent-through-it-never-closes.
       'note
     'decision))
 
-(defun cc-butler-tool-escalate-to-butler (summary &optional needs options kind)
+(defun cc-butler--payload-leak-marker (s)
+  "Return the leaked raw tool-call-XML marker found in S, or nil.
+cc-butler#135: a caller occasionally sends SUMMARY/NEEDS/OPTIONS text that
+already contains a fragment of raw Anthropic tool-call markup (`<invoke
+...>', `<parameter name=\"...\">...'), apparently echoed rather than
+authored content. Used at the `escalate_to_butler' trust boundary to
+reject such a payload outright rather than silently store it."
+  (and s (stringp s) (string-match "</?invoke\\b\\|</?parameter\\b" s)
+       (match-string 0 s)))
+
+(defun cc-butler-tool-escalate-to-butler (summary &optional needs options kind sender-label)
   "MCP tool (steward -> butler): raise a DECISION or a NOTIFICATION for
 the butler to relay to the human.
 SUMMARY is the question or status, NEEDS is what is needed (decisions
 only), OPTIONS an optional string of choices (one `Label — tradeoff'
 per line) for a pick-one answer, and KIND \"decision\" (default) or
 \"notification\". Types NOTHING into any terminal.
+
+SENDER-LABEL is NOT part of the MCP tool surface (deliberately absent
+from the `:args' below, so an MCP caller can never supply one and spoof
+a sender identity) -- it exists only for a non-interactive Lisp caller
+with no MCP session context to derive a sender from at all, e.g. a
+timer-driven escalation (`cc-butler-self-check--report' passes one for
+its own FAILING/RECOVERED notifications). Without it, such a caller's
+`self' (`cc-butler--caller-dir') is nil and the rendered document would
+otherwise show an unidentifiable sender.
 
 KIND governs whether this needs an answer at all. Ask before calling:
 would anything the human could say change what happens next? If not,
@@ -1499,17 +1634,46 @@ the next one."
          (s (string-trim summary))
          (n (and needs (stringp needs)
                  (not (string-empty-p (string-trim needs))) (string-trim needs)))
-         (k (cc-butler--escalate-kind kind)))
+         (k (cc-butler--escalate-kind kind))
+         (leak (or (cc-butler--payload-leak-marker s)
+                   (cc-butler--payload-leak-marker n)
+                   (cc-butler--payload-leak-marker options))))
+    ;; Trust-boundary check, not a downstream reader guard (cc-butler#135):
+    ;; 88/885 decision docs were found with a raw tool-call-XML fragment
+    ;; (<invoke ...>, <parameter name="...">) embedded in summary/needs/
+    ;; options -- apparently echoed by the calling session rather than
+    ;; authored content. A prior fix silently stripped it before storage;
+    ;; that hides the caller-side defect instead of surfacing it, so a
+    ;; contaminated payload could keep arriving forever with no signal.
+    ;; Reject outright (nothing is created) and log it, so the rate is
+    ;; observable and a caller-side fix can be verified by that log
+    ;; converging to zero.
+    (when leak
+      (cc-butler--log "%s -> butler │ REJECTED escalate_to_butler: payload contains a leaked tool-call fragment (%s) — see #135"
+                      (if self (cc-butler--who-dir self) "steward") leak)
+      (error "escalate_to_butler: summary/needs/options contains a raw tool-call fragment (%s) rather than authored text -- not created. See cc-butler#135; resend without it." leak))
+    ;; Second net, deliberately BELOW the first.  Both guards reject leaked
+    ;; tool-call XML, on disjoint patterns: the check above matches `<invoke'
+    ;; / `<parameter' and LOGS, this one matches the `<summary>'-family tags
+    ;; and only errors.  Run above the `let*' -- where it was written, before
+    ;; the two landed together -- it pre-empts the logging guard for the most
+    ;; common payload shape, so the rejection rate #135 exists to watch would
+    ;; silently read zero while rejections kept happening.  Order is the whole
+    ;; fix; `escalate-rejects-and-logs-leaked-tool-call-payload' fails if it
+    ;; is moved back up.
+    (cc-butler--reject-embedded-tags (list (cons "summary" summary)
+                                            (cons "needs" needs)
+                                            (cons "options" options)))
     (cond
      ;; human adapter create-path: decision/note → 정수님's inbox (the watcher renders it)
      ((bound-and-true-p cc-butler-decision-workflow)
-      (cc-butler-decision-create self s n (cc-butler--decision-parse-options options) k))
+      (cc-butler-decision-create self s n (cc-butler--decision-parse-options options) k sender-label))
      ;; durable agent path: butler's maildir inbox
      ((eq cc-butler-message-transport 'maildir)
-      (cc-butler-mail-up-decision self s n))
+      (cc-butler-mail-up-decision self s n sender-label))
      ;; legacy in-memory queue
      (t (push (list :time (current-time) :dir self
-                    :name (and self (cc-butler--display-name self))
+                    :name (or sender-label (and self (cc-butler--display-name self)))
                     :summary s :needs n)
               cc-butler--butler-inbox)))
     (cc-butler--append-decision self s needs)   ; decisions.org audit doc, all paths
@@ -1633,6 +1797,11 @@ only says how many and how stale the oldest is."
                                      (if (plist-get e :name) (format " (from %s)" (plist-get e :name)) "")
                                      (if (plist-get e :needs) (format " . needs: %s" (plist-get e :needs)) "")))
                            events "\n")))
+               ;; Durability log BEFORE the clear below -- see
+               ;; `cc-butler--log-escalation-drain''s own docstring for why
+               ;; that order matters and why its internal `ignore-errors'
+               ;; already makes a second guard here redundant.
+               (cc-butler--log-escalation-drain "butler-inbox" events)
                (setq cc-butler--butler-inbox-drained
                      (cc-butler--archive-drained cc-butler--butler-inbox-drained events))
                (setq cc-butler--butler-inbox nil)
@@ -1651,7 +1820,7 @@ only says how many and how stale the oldest is."
                  '("escalate_to_butler" "pending_decisions")))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-escalate-to-butler
  :name "escalate_to_butler"
  :description "Steward only: raise a DECISION or send a NOTIFICATION to the user-facing butler's quiet queue. A decision needs a human answer (a choice, an approval, missing info) — use it for that, not routine progress. A notification (kind='notification') is for status that only needs to be READ — a correction, a completion, a 'you should know this' — and renders read-only, same as a decision, in the same open/ location; it is never answerable, and it does not count toward the ⚖ answer-required backlog (indicator or pending_decisions), but a human still closes it with one keypress (r) rather than it disappearing on its own. Ask yourself first: would anything the human could say change what happens next? If not, send it as a notification. Getting this wrong (sending status as a decision) silently accumulates as a backlog that looks like neglect but is really miscategorized FYIs. The butler drains decisions via pending_decisions and relays the answer back to you with send_to_session; a notification has nothing to relay back."
@@ -1671,7 +1840,7 @@ only says how many and how stale the oldest is."
                 :description "'decision' (default) if this needs a pick-one/approve answer; 'notification' if it's status only and should be READ, not answered. Anything other than exactly 'notification' is treated as a decision — when unsure, the default is the safe choice."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-pending-decisions
  :name "pending_decisions"
  :description "Butler only: drain your quiet decision queue — the decisions the steward has escalated for the human to decide. Call it at the start of a turn (and when nudged) to see what needs the boss's attention, without the worker firehose. Returns the decisions and clears them; present them cleanly to the human, then relay each answer down to the steward with send_to_session."
@@ -1706,7 +1875,9 @@ only says how many and how stale the oldest is."
                       (cond ((equal dir self) " (you)")
                             ((equal dir cc-butler--butler) " (butler)")
                             (t ""))
-                      (if (cc-butler--waiting-p dir) "WAITING-FOR-INPUT" "running")
+                      (pcase (cc-butler--session-state s)
+                        ('gate "STUCK-AT-RESUME-GATE") ('waiting "WAITING-FOR-INPUT")
+                        ('blocked-on-dialog "BLOCKED-ON-DIALOG") ('running "running"))
                       (let ((b (plist-get s :branch))) (if (string-empty-p b) "-" b))
                       (let ((f (plist-get s :forge))) (if (string-empty-p f) "" (concat " " f)))
                       (let ((o (plist-get s :osc))) (if (string-empty-p o) "" (concat " | activity:" o)))
@@ -1737,6 +1908,70 @@ screen is worse than seeing none.  Check the cc-butler log for the refresh error
                   name))
          ((string-empty-p out) "(no output)")
          (t out))))))
+
+(defun cc-butler--accept-trust-dialog-error-facts (name dir err)
+  "Build a FACT-ONLY summary of ERR — a caught error from
+`cc-butler--accept-trust-dialog' for session NAME at DIR — for an MCP
+tool's return text: session name, which step failed, and (when the
+buffer is still readable) whether the trust marker/shape predicates hold
+and how many lines the live tail window covers.
+
+Deliberately never includes any buffer TEXT. An MCP tool's return value
+lands in the CALLING session's own transcript on disk — the two error
+paths inside `cc-butler--accept-trust-dialog-new-shape' embed the whole
+terminal buffer in their (LOCAL-only) error message precisely so a human
+debugging live can see the screen; repeating that into an MCP return
+would ship whatever that buffer held (credentials, client names, paths)
+to a different session's transcript. The step is classified by matching
+fixed substrings of THIS codebase's own error strings — never anything
+read from the buffer — and the caller is expected to also log the full
+error (buffer text included) locally via `message' before calling this
+(2026-09-11 steward review of #248)."
+  (let* ((msg (error-message-string err))
+         (step (cond
+                ((string-match-p "no live terminal buffer\\|no terminal buffer for" msg)
+                 "no live terminal buffer for the session")
+                ((string-match-p "did not move" msg)
+                 "settle timeout: highlight never landed on \"Yes, I trust this folder\"")
+                ((string-match-p "shape unrecognized" msg)
+                 "trust marker present but shape unrecognized (neither old nor new v2.1.260+ shape)")
+                (t "other (see this session's own *Messages* log for the full error)")))
+         (buf (ignore-errors (get-buffer (claude-code-ide--get-buffer-name dir)))))
+    (if (and buf (buffer-live-p buf))
+        (format "accept_trust_dialog on %s failed — %s.  marker present: %s, new-shape: %s, old-shape showing: %s, live tail window: %s lines."
+                name step
+                (if (cc-butler--trust-dialog-marker-present-p buf) "yes" "no")
+                (if (cc-butler--trust-dialog-new-shape-p buf) "yes" "no")
+                (if (cc-butler--trust-dialog-showing-p buf) "yes" "no")
+                (cc-butler--live-screen-tail-lines))
+      (format "accept_trust_dialog on %s failed — %s.  (no live terminal buffer left to inspect for further facts.)"
+              name step))))
+
+(defun cc-butler-tool-accept-trust-dialog (name)
+  "MCP tool: press \"Yes, I trust this folder\" on session NAME's trust
+dialog — ONLY if one is actually showing on its live screen right now.
+Refuses explicitly, with zero keys sent, when no trust dialog is showing.
+See `cc-butler--accept-trust-dialog' for the safety discipline (screen
+re-checked immediately before every key, both known dialog shapes
+recognized by their exact predicates, never a blind keypress).
+
+On error, the returned text carries FACTS about the screen, never the
+screen itself — see `cc-butler--accept-trust-dialog-error-facts'. The
+full error, buffer dump included, is logged locally only, via `message'."
+  (let ((dir (cc-butler--dir-by-name name)))
+    (if (not dir)
+        (format "No session named %S.  Call list_claude_sessions for names." name)
+      (condition-case err
+          (pcase (cc-butler--accept-trust-dialog dir)
+            ('accepted
+             (format "Trust dialog on %s accepted — confirmed gone from the screen." name))
+            ('no-dialog
+             (format "No trust dialog is showing on %s right now — refused, zero keys sent." name))
+            ('still-showing
+             (format "Sent a key to %s's trust dialog, but it is still on screen afterward — needs a human look, do not retry blindly." name)))
+        (error
+         (message "cc-butler: accept_trust_dialog on %s failed: %s" name (error-message-string err))
+         (cc-butler--accept-trust-dialog-error-facts name dir err))))))
 
 (defun cc-butler--relay-command-p (text)
   "Non-nil when TEXT is a bare slash command rather than a message.
@@ -1838,6 +2073,12 @@ alias for already-connected callers."
   (let ((self (cc-butler--caller-dir)))
     (unless self
       (error "No calling session context for this report"))
+    (when (equal self (cc-butler--ops-dir))
+      (error "Refusing to report to the calling session itself (%s) -- report_to_steward/report_to_butler always delivers to the ops session, and the caller IS that session, so this would loop back to its own inbox with no one else seeing it. See cc-butler#47, #116."
+             (cc-butler--who-dir self)))
+    (cc-butler--reject-embedded-tags (list (cons "summary" summary)
+                                            (cons "status" status)
+                                            (cons "needs" needs)))
     (let* ((parts (delq nil
                         (list (and (stringp summary) (not (string-empty-p summary)) summary)
                               (and (stringp status) (not (string-empty-p status))
@@ -1907,6 +2148,14 @@ durable log; only delivery to the steward is suppressed."
                                             (plist-get e :body)))
                                   deliverable "\n")
                      "No pending worker events.")))
+        ;; Durability log BEFORE the clear below -- see
+        ;; `cc-butler--log-escalation-drain''s own docstring for why that
+        ;; order matters and why its internal `ignore-errors' already
+        ;; makes a second guard here redundant.  Logs EVENTS (everything
+        ;; removed from the queue), not the narrower DELIVERABLE, so the
+        ;; steward's own filtered-out self-notifications are not the one
+        ;; thing this fix still lets vanish untraced.
+        (cc-butler--log-escalation-drain "worker-inbox" events)
         (setq cc-butler--inbox-drained
               (cc-butler--archive-drained cc-butler--inbox-drained events))
         (setq cc-butler--inbox nil)
@@ -1919,16 +2168,17 @@ durable log; only delivery to the steward is suppressed."
          (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                  '("list_claude_sessions" "read_session_output"
                    "send_to_session" "pending_events"
-                   "report_to_steward" "report_to_butler")))
+                   "report_to_steward" "report_to_butler"
+                   "accept_trust_dialog")))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-inbox
  :name "pending_events"
  :description "Steward only: drain your inbox of pending events from worker sessions that need attention (a worker asked a question, finished, reported via report_to_steward, or hit a prompt), newest last. Each line is a timestamped worker name (with its session id) and message. Call this at the start of each turn (and whenever you are nudged) to learn what changed without anything being typed into your input box. Returns the events and clears them."
  :args nil)
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-report-to-steward
  :name "report_to_steward"
  :description "Report up to the steward with real content — not just 'I need attention'. State WHAT happened / what you did, the current STATE, and exactly what you NEED (a decision, input, or nothing). Your session name and id are attached automatically; the steward drains this via pending_events and tracks/dispatches you from there. This does NOT reach the human/butler directly — the steward escalates to the butler only when something genuinely needs a human decision. Call it when you finish, get blocked, or have a status update."
@@ -1944,7 +2194,7 @@ durable log; only delivery to the steward is suppressed."
                 :description "What you need to proceed, e.g. 'review this PR' or 'which auth method to use'. Omit (or 'nothing') if you are only informing. Optional."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-report-to-butler
  :name "report_to_butler"
  :description "DEPRECATED — renamed to `report_to_steward' on 2026-07-09 (this tool never actually reached the butler; it always landed with the steward). Kept only so already-connected sessions don't hit a tool-not-found error. Use report_to_steward instead."
@@ -1960,13 +2210,13 @@ durable log; only delivery to the steward is suppressed."
                 :description "What you need to proceed. Omit (or 'nothing') if you are only informing. Optional."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-list-sessions
  :name "list_claude_sessions"
- :description "List the other live Claude Code sessions running in this Emacs (the workers you orchestrate): their stable name, whether each is WAITING-FOR-INPUT, its git branch, its live activity title (what it's doing right now), any status note it deliberately left via set_session_info (e.g. parked with a reason), and (when known) the model it's running. Call this first to learn the names used by read_session_output and send_to_session."
+ :description "List the other live Claude Code sessions running in this Emacs (the workers you orchestrate): their stable name, whether each is WAITING-FOR-INPUT (idle at its prompt, dispatchable) or BLOCKED-ON-DIALOG (stuck inside an open dialog/confirmation menu it never resolved -- NOT dispatchable, and NOT answerable remotely either: sending it anything lands as prompt text and the trailing Enter falls on whatever the dialog's default happens to be, silently \"answering\" it wrong; this needs a human at the keyboard), its git branch, its live activity title (what it's doing right now), any status note it deliberately left via set_session_info (e.g. parked with a reason), and (when known) the model it's running. Call this first to learn the names used by read_session_output and send_to_session."
  :args nil)
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-read-session
  :name "read_session_output"
  :description "Read the recent terminal screen of another Claude session by name, to see what it is doing or asking. The text is that session's live TUI screen (may include UI chrome). The input row is returned only when the session's terminal cursor shows a human really typed into it; a ghost/autocomplete suggestion painted into an empty box is replaced with a plain marker, and a row whose state cannot be determined is replaced with an UNVERIFIED marker rather than shown as if it were real input."
@@ -1978,7 +2228,7 @@ durable log; only delivery to the steward is suppressed."
                 :description "How many trailing lines to return (default 40)."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-send-session
  :name "send_to_session"
  :description "Type a prompt/answer into another Claude session by name and submit it (press Enter), to direct that worker. Use to answer a worker's question, give it a task, or unblock it. You cannot send to yourself. Multi-line is supported: include newlines in text — they are delivered as a paste and stay literal, and Enter is pressed only once, at the end, to submit. CAUTION when sending free-form text (not answering a question you just asked): if the target has an open interactive prompt or menu (e.g. from AskUserQuestion), your one submit-Enter lands on whatever is highlighted there, not on your text — it is silently swallowed on both ends. Check with read_session_output first when unsure, and tell dispatched workers to prefer report_to_steward/escalate_to_butler over AskUserQuestion so this cannot happen."
@@ -1988,6 +2238,14 @@ durable log; only delivery to the steward is suppressed."
          (:name "text"
                 :type string
                 :description "The text to type into that session before submitting. May contain newlines for a multi-line prompt; only the final submit presses Enter.")))
+
+(cc-butler--make-guarded-tool
+ :function #'cc-butler-tool-accept-trust-dialog
+ :name "accept_trust_dialog"
+ :description "Press \"Yes, I trust this folder\" on session NAME's one-time folder-trust dialog — the safety handle for the case where the automatic launch-time gate missed it and the session is sitting stuck on \"No, exit\". Acts ONLY if a trust dialog is actually showing on that session's live screen right now; if not (an ordinary prompt, an unrelated menu, or nothing at all), it refuses explicitly and sends zero keys rather than guessing. Never use this speculatively — check read_session_output first if unsure what is actually on screen."
+ :args '((:name "name"
+                :type string
+                :description "Session name from list_claude_sessions whose screen is stuck on the trust dialog.")))
 
 (provide 'cc-butler-orchestrator)
 ;;; cc-butler-orchestrator.el ends here

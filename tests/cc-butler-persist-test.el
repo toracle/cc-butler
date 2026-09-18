@@ -43,6 +43,21 @@ shrink the persisted file down to that subset."
           (should (= 3 (length (cc-butler--load-roster)))))
       (delete-directory tmpdir t))))
 
+(ert-deftest cc-butler-persist/roster-write-is-created-0600 ()
+  "The roster is a list of workspace paths; a plain `write-region'/
+`with-temp-file' creation would take the process umask (typically
+644), silently widening it back open every save.  `cc-butler--roster-write'
+must set the mode explicitly at creation time, not rely on a one-off
+chmod done elsewhere."
+  (let* ((tmpdir (file-name-as-directory (make-temp-file "cc-butler-persist-test" t)))
+         (cc-butler-roster-file (expand-file-name "roster.eld" tmpdir)))
+    (unwind-protect
+        (progn
+          (cc-butler--roster-write nil)
+          (should (file-exists-p cc-butler-roster-file))
+          (should (= #o600 (file-modes cc-butler-roster-file))))
+      (delete-directory tmpdir t))))
+
 (ert-deftest cc-butler-persist/roster-drops-record-once-directory-gone ()
   "A record is pruned once its directory is actually removed — how
 `cc-butler-close-topic' retires a topic — so closed topics don't linger
@@ -216,6 +231,59 @@ body in isolation), so the fix is exercised at the actual call site."
           (should (seq-some (lambda (m) (string-match-p (regexp-quote (cc-butler--display-name (nth 1 dirs))) m))
                              messages)))
       (delete-directory tmpdir t))))
+
+;;;; ---- worker model pinned at launch, resume path included (2026-09-07) --
+;;;; `cc-butler--resume-in' is the SHARED resume path for every role's dead
+;;;; session, so a worker-only fix here must discriminate by directory
+;;;; rather than pinning unconditionally -- unlike `cc-butler--start-
+;;;; session-in' (cc-butler-workspace.el), which is worker-only by
+;;;; construction and needs no such check.
+
+(ert-deftest cc-butler-persist/worker-dir-p-excludes-butler-and-steward-homes ()
+  "`cc-butler--worker-dir-p' is false for the butler's and steward's fixed
+homes, true for anything else -- the predicate that scopes worker-only
+launch-time fixes (e.g. model pinning) away from the two roles whose model
+is a human-owned value we must not silently override."
+  (let ((cc-butler-home "/tmp/cc-butler-home-test/")
+        (cc-butler-steward-home "/tmp/cc-butler-steward-home-test/"))
+    (should-not (cc-butler--worker-dir-p cc-butler-home))
+    (should-not (cc-butler--worker-dir-p cc-butler-steward-home))
+    (should (cc-butler--worker-dir-p "/tmp/some-worker-topic/"))))
+
+(ert-deftest cc-butler-persist/resume-in-pins-worker-model-for-a-worker-dir ()
+  "`cc-butler--resume-in' appends `--model' for an ordinary worker directory
+-- the resume path is the OTHER spawn site (besides `cc-butler--start-
+session-in') a worker can come up through, and a fix that only covers fresh
+spawns still leaks every RESUMED worker into whatever the machine-wide
+default happens to be."
+  (let (captured-flags
+        (cc-butler-home "/tmp/cc-butler-home-test/")
+        (cc-butler-steward-home "/tmp/cc-butler-steward-home-test/")
+        (cc-butler-worker-launch-model "sonnet"))
+    (cl-letf (((symbol-function 'claude-code-ide)
+               (lambda (&rest _) (setq captured-flags claude-code-ide-cli-extra-flags)))
+              ((symbol-function 'cc-butler--configure-session) #'ignore)
+              ((symbol-function 'cc-butler--ensure-pty-size) #'ignore)
+              ((symbol-function 'cc-butler--wait-for-session-ready) #'ignore))
+      (cc-butler--resume-in "/tmp/some-worker-topic/"))
+    (should (string-match-p "--model sonnet\\b" captured-flags))))
+
+(ert-deftest cc-butler-persist/resume-in-does-not-pin-model-for-butler-or-steward ()
+  "`cc-butler--resume-in' must NOT append `--model' when resuming the
+butler's or steward's home -- their model is a human-owned value 정수님
+hand-changes, and this is the SHARED resume path for every role's dead
+session, so it must discriminate rather than pinning unconditionally."
+  (let (captured-flags
+        (cc-butler-home "/tmp/cc-butler-home-test/")
+        (cc-butler-steward-home "/tmp/cc-butler-steward-home-test/")
+        (cc-butler-worker-launch-model "sonnet"))
+    (cl-letf (((symbol-function 'claude-code-ide)
+               (lambda (&rest _) (setq captured-flags claude-code-ide-cli-extra-flags)))
+              ((symbol-function 'cc-butler--configure-session) #'ignore)
+              ((symbol-function 'cc-butler--ensure-pty-size) #'ignore)
+              ((symbol-function 'cc-butler--wait-for-session-ready) #'ignore))
+      (cc-butler--resume-in cc-butler-home))
+    (should-not (string-match-p "--model" captured-flags))))
 
 (provide 'cc-butler-persist-test)
 ;;; cc-butler-persist-test.el ends here

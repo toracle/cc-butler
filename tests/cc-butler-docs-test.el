@@ -36,5 +36,25 @@ better silence than a line that looks like it means something."
     (let ((out (cc-butler-docs--render-dashboard)))
       (should-not (string-match-p "Source:" out)))))
 
+;;;; ------------------------------------------------------------------
+;;;; Dashboard refresh must not clobber offline sessions (cc-butler#5)
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-docs/dashboard-keeps-offline-sessions-in-the-table ()
+  "Regenerating the dashboard while only some roster-recorded sessions are
+live must not overwrite the table down to just the live set -- cc-butler#5:
+`butler_dashboard' called mid-recovery (2/16 live) clobbered the session
+table to 2 rows, destroying the record of the other 14, which the recovery
+runbook itself points to as a fallback."
+  (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () nil))
+            ((symbol-function 'cc-butler--dead-records)
+             (lambda () (list (list :dir "/offline/" :name "offline-worker"
+                                     :title "" :status "waiting on PR" :branch "feature/x"
+                                     :butler nil)))))
+    (let ((out (cc-butler-docs--render-dashboard)))
+      (should (string-match-p "OFFLINE" out))
+      (should (string-match-p "offline-worker" out))
+      (should (string-match-p "waiting on PR" out)))))
+
 (provide 'cc-butler-docs-test)
 ;;; cc-butler-docs-test.el ends here

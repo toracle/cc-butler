@@ -80,6 +80,51 @@ not mistaken for one."
   ;; Prose containing digits is not a menu.
   (should-not (cc-butler-compact--menu-p "step 1. do it\nthen finish")))
 
+(defconst cc-butler-compact-test--new-shape-trust-dialog-screen
+  (string-join
+   '("────────────────────────"
+     " Accessing workspace:"
+     ""
+     " /Users/jeongsoopark/projects/monocle-wiki-engine-sdd"
+     ""
+     " Quick safety check: Is this a project you created or one you trust?"
+     ""
+     " Claude Code'll be able to read, edit, and execute files here."
+     ""
+     " Security guide"
+     ""
+     "❯ No, exit"
+     "  Yes, I trust this folder"
+     ""
+     " Enter to confirm · Esc to cancel")
+   "\n")
+  "The v2.1.260+ folder-trust dialog (cc-butler#8): no numbered options at
+all, so `cc-butler-compact--menu-p''s numbered-option regex structurally
+cannot match it — this is the screen the restore gate must still block on.
+Wording trimmed from the real capture in cc-butler-session-test.el; only
+the trust marker and the unnumbered `❯' option rows matter here.")
+
+(ert-deftest cc-butler-compact/menu-p-detects-new-shape-trust-dialog ()
+  "The unnumbered v2.1.260+ trust dialog has no `[0-9]+\\.' option rows, so
+it must be caught by the marker-text fallback, not the numbered-menu
+regex (cc-butler#8 follow-up: this gate missing the new shape is what let
+a restore type into an unanswered trust dialog)."
+  (should (cc-butler-compact--menu-p
+           cc-butler-compact-test--new-shape-trust-dialog-screen)))
+
+(ert-deftest cc-butler-compact/menu-p-marker-outside-tail-is-not-a-menu ()
+  "The trust marker sitting in scrollback — pushed above the live
+`cc-butler-compact-menu-lines' tail by enough filler — must not trip the
+gate; only a marker actually on the live screen counts (same narrowing
+`cc-butler--live-screen-tail-start' already applies on the session.el
+side, reused here rather than duplicated)."
+  (let ((filler (make-list cc-butler-compact-menu-lines "…")))
+    (should-not
+     (cc-butler-compact--menu-p
+      (concat "Quick safety check: quoted from an old bug report, not a live dialog.\n\n"
+              (string-join filler "\n") "\n"
+              "❯ \n")))))
+
 (ert-deftest cc-butler-compact/busy-detected-by-the-interrupt-hint ()
   "A running turn is recognized by the spinner's interrupt hint; the idle
 screen (past-tense spinner line, hint gone) and the modal are not busy.
@@ -1525,6 +1570,85 @@ the guard check and the start call."
       (should (equal started '("/busy/"))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; P5: idle-too-long as a SECOND, independent candidacy gate (2026-09-08)
+;;;;
+;;;; GAP: size was the sole gate — a session sitting at 270k never crosses
+;;;; 300k just by waiting, so it was never swept no matter how long it sat
+;;;; idle and uncompacted. Measured the same day: 12 waiting workers held
+;;;; ~2,489k tokens combined, all of them already safely compactable, and
+;;;; the automatic sweep caught zero because none had crossed the size
+;;;; threshold. A session is now a candidate on EITHER gate.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/idle-candidate-under-threshold-is-not-flagged ()
+  "Just under `cc-butler-compact-idle-candidate-threshold' is not a candidate."
+  (let ((cc-butler-compact-idle-candidate-threshold 7200))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (- (float-time) 7199)))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 90000)))
+      (should-not (cc-butler-compact--idle-candidate-p "/d/")))))
+
+(ert-deftest cc-butler-compact/idle-candidate-at-boundary-is-flagged ()
+  "AT the idle threshold (not just past it) is a candidate -- at/above, not
+strictly above, matching `cc-butler-compact--over-threshold-p''s convention."
+  (let ((cc-butler-compact-idle-candidate-threshold 7200))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (- (float-time) 7200)))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 90000)))
+      (should (cc-butler-compact--idle-candidate-p "/d/")))))
+
+(ert-deftest cc-butler-compact/idle-candidate-well-past-and-well-under-size-is-flagged ()
+  "The exact gap this closes: 90k tokens (nowhere near 300k) but idle 3
+hours -- must now be a candidate."
+  (let ((cc-butler-compact-idle-candidate-threshold 7200))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (- (float-time) 10800)))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 90000)))
+      (should (cc-butler-compact--idle-candidate-p "/d/")))))
+
+(ert-deftest cc-butler-compact/idle-candidate-unknown-last-activity-not-flagged ()
+  "No known transcript activity (`cc-butler--session-last-activity' nil) is
+\"cannot confirm\", never treated as \"idle forever\"."
+  (let ((cc-butler-compact-idle-candidate-threshold 7200))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 90000)))
+      (should-not (cc-butler-compact--idle-candidate-p "/d/")))))
+
+(ert-deftest cc-butler-compact/idle-candidate-unknown-size-not-flagged ()
+  "An unreadable context size is never a candidate either, even if idle a
+long time -- same 'unknown is not a guess' principle as the size gate."
+  (let ((cc-butler-compact-idle-candidate-threshold 7200))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (- (float-time) 10800)))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) nil)))
+      (should-not (cc-butler-compact--idle-candidate-p "/d/")))))
+
+(ert-deftest cc-butler-compact/candidates-include-idle-sessions-well-under-size-threshold ()
+  "`cc-butler-compact-candidates' must pick up an idle-but-small session
+that `cc-butler-compact--over-threshold-p' alone would miss entirely --
+the actual regression this closes, at the level the sweep calls."
+  (let ((cc-butler-compact-threshold 300000)
+        (cc-butler-compact-idle-candidate-threshold 7200))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () '((:dir "/idle-small/") (:dir "/busy-small/"))))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 90000))
+              ((symbol-function 'cc-butler--session-last-activity)
+               (lambda (d) (if (equal d "/idle-small/")
+                               (- (float-time) 10800)
+                             (float-time)))))
+      (should (equal (cc-butler-compact-candidates) '("/idle-small/"))))))
+
+(ert-deftest cc-butler-compact/candidates-still-include-oversized-even-if-freshly-active ()
+  "The size gate must still work standalone -- an oversized session that is
+NOT idle (last activity just now) is still a candidate on size alone."
+  (let ((cc-butler-compact-threshold 300000)
+        (cc-butler-compact-idle-candidate-threshold 7200))
+    (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () '((:dir "/big/"))))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 350000))
+              ((symbol-function 'cc-butler--session-last-activity) (lambda (_d) (float-time))))
+      (should (equal (cc-butler-compact-candidates) '("/big/"))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; cc-butler#125: --display-pct must never reconstruct a percentage from
 ;;;; the stale `cc-butler-cleanup-context-window' constant.  Nil, not a
 ;;;; guess, when the fresh statusline pct is unavailable.
@@ -1677,6 +1801,61 @@ footer legitimately names the gate percentage)."
         (should (string-match-p "150k" row))       ; ctx IS known
         ;; but no numeric percentage may appear -- it is not computable.
         (should-not (string-match-p "[0-9]+%" row))))))
+
+;;;; ---- CONTEXT freshness marking on the status row (cc-butler#8 follow-up)
+;;;; Real incident, 2026-09-05: a session read 314k/157%/OVER THRESHOLD for
+;;;; 6.5 hours while a dialog blocked its statusline, then 326k/33%/ok the
+;;;; moment it cleared -- indistinguishable in the table from a genuinely
+;;;; fresh reading. `--display-pct' already can't fabricate a percentage
+;;;; (cc-butler#125); these mark CONTEXT (and therefore anything derived
+;;;; from it, like OVER THRESHOLD) with the same `~' MODEL already uses.
+
+(ert-deftest cc-butler-compact/status-line-marks-stale-context-with-tilde ()
+  "A carried-forward (not-fresh) CONTEXT reading gets a trailing `~' — the
+real incident's own number (326k), so a stale figure is never visually
+identical to a fresh self-report."
+  (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
+            ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 326000))
+            ((symbol-function 'cc-butler-cleanup-context-fresh-p) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
+            ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--statusline-fields-now) (lambda (_d) nil)))
+    (let ((row (cc-butler-compact--status-line "/w/")))
+      (should (string-match-p "326k~" row)))))
+
+(ert-deftest cc-butler-compact/status-line-omits-tilde-when-context-is-fresh ()
+  "The ordinary case — a live, confirmed-this-cycle CONTEXT reading — shows
+no staleness marker."
+  (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
+            ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 326000))
+            ((symbol-function 'cc-butler-cleanup-context-fresh-p) (lambda (_d) t))
+            ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
+            ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil))
+            ((symbol-function 'cc-butler-compact--statusline-fields-now) (lambda (_d) nil)))
+    (let ((row (cc-butler-compact--status-line "/w/")))
+      (should (string-match-p "326k" row))
+      (should-not (string-match-p "326k~" row)))))
+
+(ert-deftest cc-butler-compact/status-line-over-threshold-still-fires-on-stale-context ()
+  "The explicit decision this PR encodes (steward review): OVER THRESHOLD
+and severity are NOT suppressed just because CONTEXT is stale — a session
+over threshold before a dialog covered its screen does not become an
+acceptable risk merely because it went unconfirmed. The row still says
+OVER THRESHOLD; the `~' says only that the number backing it is
+unconfirmed this cycle, not that the risk itself is retracted."
+  (let ((cc-butler-compact-threshold 300000))
+    (cl-letf (((symbol-function 'cc-butler--display-name) (lambda (_d) "worker"))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 326000))
+              ((symbol-function 'cc-butler-cleanup-context-fresh-p) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--model-for-status-line) (lambda (_d) "Opus-4.8"))
+              ((symbol-function 'cc-butler--waiting-p) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--blocked-reason) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-compact--statusline-fields-now) (lambda (_d) nil)))
+      (let ((row (cc-butler-compact--status-line "/w/")))
+        (should (string-match-p "326k~" row))
+        (should (string-match-p "OVER THRESHOLD" row))))))
 
 (ert-deftest cc-butler-compact/compact-tool-resolves-a-session-by-name ()
   "compact_session takes the name the LLM already has, not a directory."
