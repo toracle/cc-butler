@@ -1258,3 +1258,211 @@ of the 9 trials (stated above, not hidden). All daemons and build
 processes for this item were stopped/cleaned up; confirmed via `ps` that
 no `ccb-repro-r4a` daemon or its stub processes remained running
 afterward.
+
+---
+
+## Round 4 results — Items 1, 3, 4
+
+Run in parallel with Item 2 (a separate fork), isolated sockets
+`ccb-repro-r4b1-*` (item 1), `ccb-repro-r4b3-*` (item 3),
+`ccb-repro-r4b4-*` (item 4). `emacs-version` matched Emacs 30.2. No real
+`claude` binary was launched (explicitly verified in `init-r4b.el`/
+`init-r4b-fat.el`, both of which set `claude-code-ide-cli-path` before
+any spawn).
+
+### Methodological correction made before the pre-registered rows ran
+
+`wait_and_report`, reused from Round 3's driver, broke out of its polling
+loop on the FIRST poll that found any victim. Before running any item-1
+row, a manual check showed a case where a SECOND session's stub also
+logged a real `HUP` a few seconds later — a possible second bystander
+Round 1-3's own driver could never have seen, because it always stopped
+polling at the first hit. Fixed for this round only: the poll loop now
+always runs its full window (12s, extended from Round 3's 8s) and reports
+every session whose buffer disappeared, with which poll it was first
+missing. Re-run after the fix, that specific case did NOT reproduce a
+second victim (n=1 each way, inconclusive on its own) — flagged here as
+an open question for a future round (is a second, later bystander ever
+real, or was that one occurrence a stub-restart artifact coincidentally
+timed near the kill?), not resolved by this round's data. All items below
+used the fixed, full-window poller.
+
+### Item 1: elisp-layer advice trace — raw observation
+
+9/9 kill trials (F1/F2/F3, n=3 each), zero discards. Victims: F1
+(kill newest) → before-newest, 3/3; F2 (kill oldest) → before-newest
+(second-newest), 3/3; F3 (kill before-newest) → oldest, 3/3 — matching
+Round 2/3's rule C exactly, 9/9.
+
+A naive automated check (does any `delete-process`/`kill-process`/
+`signal-process`/`process-send-eof` call's target resolve to the
+bystander's own pid?) flagged **0/3 F1, 0/3 F2, but 3/3 F3** as "hits."
+Manual backtrace inspection of all three F3 hits (identical shape in
+every rep) shows this is NOT elisp picking the wrong target. The actual
+sequence, from the trace (F3 rep 1, X=pid 41016 the bystander, Y=pid
+41028 the killed target):
+
+1. `17:50:35.872 signal-process target=41028 ...` — `(signal-process
+   41028 9)`, i.e. Y's own real pid, called directly to kill the actual
+   `kill-buffer` target. Correct.
+2. `17:50:35.891` (19ms later) — `(signal-process 41016 9)` PLUS a
+   `delete-process` on the process object literally named
+   `ghostel-native-process` (Emacs's own uniquification: the *first*
+   ghostel native process object created in this daemon, i.e. X's own,
+   since X was spawned first) whose `ghostel--native-pid` property reads
+   back **41016 — X's own real pid**. The backtrace shows this call
+   originates from inside a **sentinel invoked for that same process
+   object**, with an event string beginning `"finished"` — i.e. X's own
+   tracked process independently reported a finish/exit event, and
+   elisp's sentinel then correctly (if redundantly, since the process is
+   already ending) signals and deletes X's own, already-finishing
+   process.
+
+This is the same shape in F3 reps 2 and 3 (X's own pid in both cases,
+same ~15-19ms gap after the real target's own kill signal). **Item 1's
+finding, read correctly (not by the naive automated flag alone): elisp
+never targets a session other than the one whose own process object's
+sentinel is firing.** The wider net (more call sites, full backtraces)
+CONFIRMS Rounds 1 and 3's narrower finding rather than falsifying it —
+per the pre-registration's own prediction. The open question this raises,
+not answered here, is *why* X's own tracked process enters a "finished"
+state within ~19ms of a *different* session being killed — which is
+exactly the same gap Item 2 (run in parallel) independently converges on:
+Item 2's native reaper trace shows the bystander's own child exits with
+`exit_code=0` (a trappable signal caught by its own trap), never touching
+another session's fd. Together, items 1 and 2 triangulate the same
+conclusion from two independent instrumentation layers: **neither elisp
+nor the native module's own reaper ever targets the wrong session — the
+bystander's own process receives a real signal from somewhere outside
+both of those, most likely at the kernel process-group/session level**,
+which neither fork's instrumentation could trace further this round.
+
+`ghostel--kill-native-processes-on-exit` (the `kill-emacs-hook`) never
+fired during any of the 9 trials, as expected (it only runs on Emacs
+shutdown, not a single `kill-buffer`).
+
+### Item 3: deliberate slot-order inversion — raw observation
+
+**Deviation from the literal pre-registration, stated plainly**: the
+pre-registered setup (spawn A,B,C; kill A the oldest; spawn D) could not
+be used as written — killing A collaterally kills the second-newest too
+(Round 2/3's own established oldest-kill rule), collapsing the intended
+B,C,D triad to a pair before D was even spawned. Adapted (and this
+adaptation is itself informative, see below): spawn A,B,C,E (4 sessions);
+kill B (not oldest, not newest of the 4) to free a slot; spawn D; use
+whichever two of {A,C,E} actually survive, plus D, as the live triad for
+the decisive rows.
+
+**Unplanned finding from the setup step itself**: killing B (creation
+position 2 of 4) was expected, by naive extension of the established
+"predecessor dies" rule, to kill A (position 1). Instead, in the first
+setup attempt, **C (position 3, the *successor*, not the predecessor)
+died** — the established rule, derived only from N=3 pools in Rounds
+1-3, does **not** simply generalize to "kill position i, position i-1
+dies" at N=4. This is reported as a new, real, unplanned data point, not
+smoothed over. In three subsequent setup runs (used for the counted rows
+below), the collateral casualty was consistently **C** again (A and E
+survived every time) — so for N=4, killing position 2 consistently killed
+position 3, not position 1, across 4/4 setup attempts total. This
+directly means: whatever "predecessor" meant at N=3 is not simply
+"index-1" at N=4; the live pool size or absolute position changes which
+neighbor dies.
+
+Inversion (D's fd lower than at least one longer-lived survivor's fd) was
+**achieved in all 4 setup attempts used** (survivors A, E each time; D
+reused B's freed slot, landing fd-wise BETWEEN A's original low block and
+E's original high block — i.e., D sits fd-adjacent-below E while being
+newest by creation, which is the decisive inversion needed).
+
+Live triad every time: by creation order, A (oldest) then E then D
+(newest, spawned last). By fd order: A (lowest, untouched original
+block), D (middle, reused B's freed low-but-not-lowest block), E
+(highest, untouched original block) — so creation order and fd order
+disagree specifically about D and E's relative position, which is the
+decoupling this item needs.
+
+- **Row 3a — kill A** (creation-oldest of the live triad, ALSO the
+  fd-minimum, no fd-neighbor below it): victim = **E**, 3/3 clean.
+  Matches creation-order rule C's oldest-kill special case (hits the
+  second-newest of the live-by-creation set [A,E,D] = E). Does NOT match
+  any fd-adjacency-below hypothesis (A has no lower fd-neighbor to blame;
+  a death occurred anyway, and it targeted the creation-order prediction
+  exactly).
+- **Row 3b — kill D** (creation-newest of the live triad, fd-MIDDLE, not
+  fd-edge): victim = **E**, 3/3 clean. Matches creation-order rule C's
+  ordinary predecessor case (predecessor of D by creation order = E).
+  Does NOT match an fd-adjacency-below hypothesis, which would predict A
+  (D's nearest lower-fd neighbor) — A survived every time.
+
+6/6 trials, zero discards (beyond the pre-registered non-count of setup
+attempts that fail the inversion/survivor-count check, of which there
+were none in the counted batch — the one earlier attempt using the
+original A-kill setup design was discarded before any row ran, per the
+pre-registration's own rule, and is not counted as a trial).
+
+### Item 4: victim-shape row (fat stubs) — raw observation
+
+Fat stub spawns 2 long-lived children, one parent-of-a-grandchild triple,
+and an extra fifo/pipe of its own (verified present via the stub's own
+process tree at spawn time; cleaned up post-kill via `pkill` on
+identifiable child names, since a real `SIGKILL` to the stub — matching
+ghostel's own kill path — does not run the stub's bash `EXIT` trap and so
+cannot self-clean its own children).
+
+9/9 kill trials (F1/F2/F3, n=3 each), zero discards: F1 (kill newest) →
+before-newest, 3/3; F2 (kill oldest) → before-newest (second-newest),
+3/3; F3 (kill before-newest) → oldest, 3/3 — **identical to Rounds 1-3's
+thin-stub results and to this round's own Item 1 thin-stub rows.**
+
+### Inference (Items 1, 3, 4; separated from the above)
+
+- **Item 1 prediction CONFIRMED**: elisp-layer targeting is correct in
+  every trial, including on a wider instrumentation net (more call
+  sites, full backtraces) than Rounds 1/3 used. The naive automated
+  "wrong-target" flag in F3 was a false positive from not reading the
+  backtrace; corrected by manual inspection, reported above rather than
+  either hidden or left unexplained.
+- **Item 3 (H_fd-block-reuse vs. creation-order rule C), DECISIVELY
+  separated**: with fd order and creation order genuinely decoupled (a
+  real achievement Round 3 could not manage), **creation-order rule C
+  predicted the victim correctly in 6/6 trials; a literal fd-adjacency
+  hypothesis was wrong in 6/6** (predicting no-death/A for row 3a, A for
+  row 3b; the actual victim was E both times). This is the clearest
+  falsification yet of "the mechanism is keyed to fd number" and the
+  clearest confirmation that whatever key it uses tracks **creation
+  order among the currently-live set**, not fd/slot position — though
+  Item 3's own unplanned N=4 finding (predecessor-rule does not simply
+  generalize past N=3) shows "creation order" itself is not as simple as
+  "index-1," and the exact indexing rule remains open.
+- **Item 4 prediction CONFIRMED**: victim shape (fat, multi-process,
+  multi-fd stubs vs. thin single-process stubs) does not change the
+  victim. This weakens "session fd/process count" as an explanation for
+  why the live fleet's rich-process-tree sessions behave differently from
+  this investigation's stub data (Item 4 at least shows shape alone,
+  independent of fd-block position, is not the reason) — the live-fleet
+  divergence (Correction, commit `6166757`) remains open and is not
+  resolved by this finding.
+- Rule C (as refined by Item 3's N=4 caveat) continues to fit every
+  isolated-daemon trial across Rounds 2-4 with zero exceptions at N=3; it
+  still only explains 2 of 5 real live-fleet deaths, unchanged.
+
+### Sample-size / scope honesty (Items 1, 3, 4)
+
+Item 1: 9 trials, 0 discards. Item 3: 6 counted trials (2 rows × n=3), 1
+setup attempt discarded per its own pre-registered rule (inversion not
+achieved under the ORIGINAL A-kill design) before adapting the setup —
+the adapted design's 4/4 setup attempts all achieved inversion, so no
+further discards under the adapted design. Item 4: 9 trials, 0 discards.
+One machine, one day, same build. This round shows the elisp layer is
+clean (Item 1), that fd/slot position does not drive the victim even
+when deliberately decoupled from creation order (Item 3), and that
+victim shape does not change the outcome (Item 4) — combined with Item
+2's parallel finding (native reaper is also clean), this narrows the
+remaining live candidate to a kernel/process-group-level signal delivery
+effect neither fork could instrument further this round. It does not
+identify that mechanism, does not add live-fleet data, and Item 3's
+open N=4 indexing question is a new gap, not a closed one.
+
+All `ccb-repro-r4b1-*`, `ccb-repro-r4b3-*`, and `ccb-repro-r4b4-*`
+daemons were stopped; confirmed via `ps` that no daemon, stub, or
+fat-stub child process remained running afterward.
