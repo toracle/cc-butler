@@ -1250,7 +1250,11 @@ SURFACED instead (`cc-butler-cleanup-surface-function') and its skip count
 resets, so surfacing does not also repeat every run forever."
   (dolist (dir (cc-butler-cleanup--scheduled-candidates))
     (let ((name (cc-butler--display-name dir))
-          (reason (cc-butler-cleanup--scheduled-blocked-reason dir)))
+          ;; TOCTOU: candidacy was decided at list time; a session may have
+          ;; gone busy since.  Re-check WAITING right before firing.
+          (reason (or (cc-butler-cleanup--scheduled-blocked-reason dir)
+                      (and (not (cc-butler--waiting-p dir))
+                           "no longer waiting (became busy since candidate listing)"))))
       (cond
        ((not reason)
         (remhash dir cc-butler-cleanup--scheduled-skip-count)
@@ -1270,10 +1274,15 @@ resets, so surfacing does not also repeat every run forever."
                      (format "scheduled cleanup skipped %d times in a row (%s)"
                              n reason)))))))))
 
-(defun cc-butler-cleanup--scheduled-ensure-timer ()
-  "(Re)register the scheduled cleanup timer; idempotent for hot reloads."
+(defun cc-butler-cleanup--scheduled-cancel-timer ()
+  "Cancel the scheduled cleanup timer, if any."
   (when (timerp cc-butler-cleanup--scheduled-timer)
     (cancel-timer cc-butler-cleanup--scheduled-timer))
+  (setq cc-butler-cleanup--scheduled-timer nil))
+
+(defun cc-butler-cleanup--scheduled-ensure-timer ()
+  "(Re)register the scheduled cleanup timer; idempotent for hot reloads."
+  (cc-butler-cleanup--scheduled-cancel-timer)
   (setq cc-butler-cleanup--scheduled-timer
         (run-with-timer cc-butler-cleanup-scheduled-interval
                          cc-butler-cleanup-scheduled-interval
@@ -1507,7 +1516,22 @@ Returns the list of worker dirs a fresh settings file was written into."
   (when (boundp 'cc-butler-mode-map)
     (define-key cc-butler-mode-map "C" #'cc-butler-cleanup-scan)))
 
-(cc-butler-cleanup--scheduled-ensure-timer)
+;;;###autoload
+(define-minor-mode cc-butler-cleanup-scheduled-mode
+  "Run the daily autonomous idle-worker cleanup sweep (tier `clear' only).
+
+ON BY DEFAULT, started when this module loads, mirroring
+`cc-butler-compact-monitor-mode'.  Turn it off with
+`(cc-butler-cleanup-scheduled-mode -1)' to stop the sweep; that cancels the
+timer.  Enabling is idempotent: it never leaves two timers armed."
+  :global t :group 'cc-butler :init-value nil
+  (if cc-butler-cleanup-scheduled-mode
+      (cc-butler-cleanup--scheduled-ensure-timer)
+    (cc-butler-cleanup--scheduled-cancel-timer)))
+
+;; Start with cc-butler itself (same as the compact monitor); re-running on
+;; `cc-butler-reload' cannot duplicate the timer.
+(cc-butler-cleanup-scheduled-mode 1)
 
 (provide 'cc-butler-cleanup)
 ;;; cc-butler-cleanup.el ends here

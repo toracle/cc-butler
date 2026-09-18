@@ -106,7 +106,7 @@ candidate dir whose blocked-reason is BLOCKED-REASON (nil = not blocked).
 Records every `cc-butler-session-cleanup' call in `sent' and every surface
 call in `surfaced' (list of REASON strings, newest last)."
   (declare (indent 1))
-  `(let* ((sent nil) (surfaced nil)
+  `(let* ((sent nil) (surfaced nil) (waiting-now t)
           (cc-butler-cleanup-scheduled-skip-limit 3)
           (cc-butler-cleanup--scheduled-skip-count (make-hash-table :test 'equal))
           (cc-butler-cleanup--scheduled-pending (make-hash-table :test 'equal))
@@ -119,6 +119,7 @@ call in `surfaced' (list of REASON strings, newest last)."
                ((symbol-function 'cc-butler-cleanup--session)
                 (lambda (dir) (list :dir dir :name "worker")))
                ((symbol-function 'cc-butler--display-name) (lambda (_dir) "worker"))
+               ((symbol-function 'cc-butler--waiting-p) (lambda (_dir) waiting-now))
                ((symbol-function 'cc-butler--log) (lambda (&rest _) nil))
                ((symbol-function 'cc-butler-session-cleanup)
                 (lambda (dir tier) (push (cons dir tier) sent))))
@@ -160,6 +161,57 @@ any prior skip streak for it is cleared rather than carried forward."
     (should (null (gethash "/w/" cc-butler-cleanup--scheduled-skip-count)))
     (should (gethash "/w/" cc-butler-cleanup--scheduled-pending))
     (should (null surfaced))))
+
+;;;; ---- TOCTOU, timer mode, promote ------------------------------------------
+
+(ert-deftest cc-butler-cleanup/scheduled-fire-rechecks-waiting-before-firing ()
+  "Listed as a candidate while idle, busy by the time of firing -> nothing sent."
+  (cc-butler-cleanup-scheduled-test--with-fire-stubs nil
+    (setq waiting-now nil)
+    (cc-butler-cleanup--scheduled-fire)
+    (should (null sent))
+    (should (null (gethash "/w/" cc-butler-cleanup--scheduled-pending)))))
+
+(ert-deftest cc-butler-cleanup/scheduled-mode-enable-arms-one-timer-disable-cancels ()
+  (let ((cc-butler-cleanup--scheduled-timer nil)
+        (cc-butler-cleanup-scheduled-mode nil)
+        (timers nil))
+    (cl-letf (((symbol-function 'run-with-timer)
+               (lambda (&rest _) (let ((tm (timer-create))) (push tm timers) tm)))
+              ((symbol-function 'cancel-timer)
+               (lambda (tm) (setq timers (delq tm timers)))))
+      (cc-butler-cleanup-scheduled-mode 1)
+      (cc-butler-cleanup-scheduled-mode 1)
+      (should (= 1 (length timers)))
+      (cc-butler-cleanup-scheduled-mode -1)
+      (should (null timers))
+      (should (null cc-butler-cleanup--scheduled-timer)))))
+
+(ert-deftest cc-butler-cleanup/scheduled-ensure-timer-is-idempotent ()
+  (let ((cc-butler-cleanup--scheduled-timer nil) (timers nil))
+    (cl-letf (((symbol-function 'run-with-timer)
+               (lambda (&rest _) (let ((tm (timer-create))) (push tm timers) tm)))
+              ((symbol-function 'cancel-timer)
+               (lambda (tm) (setq timers (delq tm timers)))))
+      (cc-butler-cleanup--scheduled-ensure-timer)
+      (cc-butler-cleanup--scheduled-ensure-timer)
+      (should (= 1 (length timers)))
+      (should (eq (car timers) cc-butler-cleanup--scheduled-timer)))))
+
+(ert-deftest cc-butler-cleanup/scheduled-promote-consumes-pending-flag-once ()
+  (let ((cc-butler-cleanup--scheduled-pending (make-hash-table :test 'equal))
+        (calls 0)
+        (cc-butler-cleanup-promote-function (lambda (_s) (cl-incf calls) t))
+        (session (list :dir "/w/" :name "worker")))
+    (cl-letf (((symbol-function 'cc-butler--log) (lambda (&rest _) nil)))
+      ;; not flagged -> no promote
+      (cc-butler-cleanup--scheduled-promote-after-externalize session)
+      (should (= 0 calls))
+      (puthash "/w/" t cc-butler-cleanup--scheduled-pending)
+      (cc-butler-cleanup--scheduled-promote-after-externalize session)
+      (cc-butler-cleanup--scheduled-promote-after-externalize session)
+      (should (= 1 calls))
+      (should (null (gethash "/w/" cc-butler-cleanup--scheduled-pending))))))
 
 (provide 'cc-butler-cleanup-scheduled-test)
 ;;; cc-butler-cleanup-scheduled-test.el ends here
