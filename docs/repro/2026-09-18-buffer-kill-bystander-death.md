@@ -116,4 +116,152 @@ pre-registration's scope.
 
 ---
 
-*(Results appended below this line only, after this file's initial commit.)*
+## Results (appended after the pre-registration commit, ccb-repro on this machine)
+
+### Setup actually used
+
+`emacs --daemon=ccb-repro -Q`, load-path pointed at this machine's real
+`ghostel-20260823.1350`, `claude-code-ide` (pinned commit, see this repo's
+CLAUDE.md) and this branch's `cc-butler` checkout — no live init.el loaded.
+Victims: real `claude-code-ide--create-terminal-session` ghostel sessions
+(`claude-code-ide-terminal-backend` = `ghostel`), `claude-code-ide-cli-path`
+pointed at a stub script (`trap ... HUP TERM; cat`) instead of the real
+`claude` binary — the pre-registered victim shape. `signal-process` and
+`ghostel--sentinel` were instrumented via `advice-add` to log every call
+(arg, current-buffer, throw/no-throw) without changing behavior.
+
+### Observation (raw, machine-checkable)
+
+- **The bystander-death mechanism reproduces on this machine.** Across three
+  separate batches (a 5-trial batch, a second 5-trial batch with a
+  treatment applied, and a 3-session X/Y/Z probe — 13 kill events total),
+  a `kill-buffer` on one ghostel-backed session's buffer repeatedly (11 of
+  13 kill events; the other 2 were the very first kill of a batch, where no
+  qualifying second session had been alive long enough yet — see Sample
+  limits) coincided with a *different*, untouched ghostel session's real
+  child process logging `HUP <pid> ...` from its own trap handler and
+  exiting — the same "graceful exit on the bystander, abrupt death on the
+  target" signature the live fleet showed.
+- **Confirmed via backtrace + native-reaper trace, not inferred:** in every
+  reproducing case, `ghostel--events-filter` received a genuine numeric
+  exit-status event (`"129"` = 128+SIGHUP) *from the bystander's own
+  native reaper thread*, for the bystander's *own* pipe process, which then
+  ran the bystander's own `claude-code-ide--cleanup-on-exit`. This is a
+  real child-process death (the bystander's actual PID received a real
+  SIGHUP), not a misdirected `signal-process` call from Lisp landing on
+  the wrong target.
+- **`signal-process` was never observed called with `nil`.** Every logged
+  call had a concrete pid argument (either the killed session's own native
+  pid, or, in the delayed cross-contamination case, the bystander's own
+  native pid) — H2 (butler-relayed, "signal-process nil resolves to
+  current-buffer's process") was already retracted before any run here;
+  this machine's trace does not resurrect it. `native-pid` properties were
+  always integers, never nil, in every buffer inspected.
+- **The double `cleanup-on-exit` call is real (confirmed by backtrace) but
+  is NOT sufficient to explain the effect.** A treatment
+  (`ccb-repro--cleanup-on-exit-fixed`, `:override` advice removing the
+  `kill-buffer-hook nil` binding around the recursive `kill-buffer` call,
+  while keeping `kill-buffer-query-functions nil`) was applied and a fresh
+  5-trial batch run under it. The bystander effect still occurred in 4/4
+  qualifying trials under the treatment — same signature, same
+  `ghostel--events-filter` "129" trace.
+- **The effect is not "kill A hits A's own pair-partner B."** Two isolated
+  fresh pairs (no third session in play) showed no bystander effect at the
+  time checked. The effect appeared specifically once a *third* session
+  existed: killing the newest of 3 concurrently-tracked ghostel sessions
+  hit the middle one (created immediately before it), not the oldest.
+  Repeating this with fresh directories reproduced the same "hits the
+  immediately-previously-created still-alive session" pattern 8 times
+  across two different batches, plus once more in the isolated 3-session
+  probe (X created, Y created, Z created, kill Z → Y dies, X survives).
+- `lsof` on the ccb-repro Emacs process showed each session's pty master on
+  its own fd (18u, 28u/34u, distinct minor tty numbers) with no shared fd
+  visible from the Lisp/fd-table level before or after a kill.
+
+### Inference (explicitly separated from the above)
+
+- The double-`cleanup-on-exit` call (originally suspect (a)) is real but
+  **ruled out** as sufficient cause by the treatment result above. It may
+  still matter as a contributing/enabling condition under a different
+  scenario than tested, but no evidence here supports that, and I am not
+  claiming it does.
+- The retracted H1 (pid reuse) and H2 (`signal-process nil` → current
+  buffer) hypotheses are **not resurrected** by this data — nil arguments
+  were never observed, and the killed processes' own pids were always the
+  ones passed to `signal-process`, correctly.
+- Given the bystander's own native reaper genuinely reports its own real
+  child's death by SIGHUP, and this requires ≥3 sessions' worth of history
+  in the same Emacs process before it manifests, and always lands on the
+  session created immediately before the most-recently-created one — my
+  best-supported inference is that the defect is **inside ghostel's
+  native pty module** (compiled `ghostel-module.dylib`; the only source
+  shipped in the elpa package, `src/module.zig`, is 175 lines of Emacs
+  dynamic-module glue with no pty/reaper/spawn logic in it — that logic is
+  not available to read on this machine). A plausible shape (not
+  confirmed): an off-by-one or FIFO/slot-reuse bug in per-session
+  reaper/pty bookkeeping keyed to creation order rather than to session
+  identity or pid. This is inference, not a measured mechanism — I did not
+  get inside the compiled module.
+- I also cannot rule out that my two "clean" isolated-pair checks were
+  false negatives from checking too early / not pumping Emacs's event loop
+  again afterward (the reproducing cases only surfaced their
+  `ghostel--events-filter` event once a *later* `emacsclient` call gave
+  Emacs another chance to run pending process filters/sentinels). I did
+  not re-verify this specific point with a longer wait before reporting.
+
+### Falsification-condition outcomes (as pre-registered)
+
+- H_double-cleanup (suspect a): **FALSIFIED** as sufficient cause — the
+  guard-preserving treatment removing the blanket `kill-buffer-hook nil`
+  binding did not stop the bystander death (4/4 still hit).
+- H_signal-process-unguarded (suspect b, ghostel.el:4435's missing
+  `ignore-errors`): not directly tested with a guard in this batch (time
+  budget); not evidenced as *the* cause either — no `signal-process` call
+  was ever observed throwing in any trace collected. Open.
+- "No mechanism found" outcome: does **not** apply — the mechanism
+  reproduces reliably (11/13 qualifying kill events across three batches)
+  once the ≥3-session precondition holds.
+
+### Sample-size / scope honesty
+
+- 13 kill events total across 3 batches on ONE machine, ONE day, this
+  exact Emacs 30.2 / ghostel-20260823.1350 / claude-code-ide (pinned
+  a9485f7) build. This shows presence of a real, reproducible mechanism
+  and rules out two specific prior hypotheses — it does NOT establish the
+  live fleet's 5/5 incidence rate, does not fully characterize the
+  triggering precondition (best guess: ≥3 ghostel sessions' worth of
+  creation history in one Emacs process; not independently re-verified
+  beyond the 3 batches above), and does not reach inside the compiled
+  native module to name an exact defect line.
+- Discards: 2 of the 13 kill events (the very first kill in the two
+  5-trial batches) showed no bystander effect at check time and were
+  initially logged as "clean" — per the note above, these are likely
+  under-observed rather than genuinely clean, since the qualifying
+  precondition (a third session) did not yet exist at that point in the
+  batch. Reported as ambiguous, not counted as either confirming or
+  refuting.
+
+### Live-fleet safety recommendation
+
+**Keep the freeze** (no `kill-buffer` / `close_topic` on ghostel-backed
+sessions) until ghostel's native module is fixed upstream or a verified
+safe precondition is found. No Lisp-level fix in cc-butler or
+claude-code-ide can correct this — the reproducing mechanism is inside the
+vendored native module, which per this investigation's scope is reported,
+not edited in place, and is not its own repo to open an issue against
+(lives inside `~/.emacs.d`).
+
+### What shipped in this branch instead of a "fix"
+
+Since the actual defect is not in code this investigation can patch, the
+PR from this branch does not claim to fix the underlying bug. It converts
+the manual freeze into an enforced code-level guard:
+`cc-butler--close-topic-kill-session` (the single choke point both
+`cc-butler-close-topic` and the `close_topic` MCP tool route through, via
+`cc-butler--teardown-workspace`) now refuses with `user-error` to kill a
+ghostel-backed session while another ghostel-backed session is tracked
+alive, controlled by `cc-butler-close-topic-refuse-concurrent-ghostel`
+(default t). Red-first tests in
+`tests/cc-butler-workspace-test.el` cover: refusal under the hazard
+condition, pass-through when solo or on a non-ghostel backend, and the
+escape hatch. Full suite: 1048/1048 passing after the change.
