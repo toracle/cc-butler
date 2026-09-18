@@ -1109,3 +1109,152 @@ this round's own additional checks. The live-loaded ghostel module and
 place, or pointed to by the live daemon's load-path. All daemons and any
 build/toolchain processes started for this round are stopped/cleaned up
 when done.
+
+---
+
+## Round 4 results — Item 2: native build
+
+(Item 2 only; items 1/3/4 were run concurrently by a separate worker and
+are reported in their own section, appended separately, above or below
+this one — this section does not depend on or alter their content.)
+
+### Toolchain and build
+
+`zig` was **not already present**; installed via `brew install zig`
+(bottled `0.16.0_1`, user-prefix `/opt/homebrew`, no sudo) — matches
+`build.zig`'s `comptime` requirement of exactly Zig 0.16.0. The ghostel
+source (`src/`, `build.zig`, `build.zig.zon`, `vendor/`) was copied from
+`~/.emacs.d/elpa/ghostel-20260823.1350` into a scratchpad build
+directory; the live elpa directory was never written to. `zig build`
+fetched the vendored `ghostty` dependency over the network per
+`build.zig.zon` and **built cleanly on the first structurally-complete
+attempt** (two earlier attempts failed on this investigation's own
+instrumentation code — Zig 0.16 moved file APIs into `std.Io.Dir`, not
+`std.fs`, and a bare integer literal can't cross a C-variadic boundary
+without an explicit cast — both fixed in the instrumentation, not in
+ghostel's own code). Output:
+`<scratchpad>/ghostel-r4a-build/zig-out/ghostel-module.dylib`, sidecar
+`ghostel-module.version` = `0.51.0` (matches the live/isolated daemons'
+expected version, confirmed via `ghostel-module-directory`'s version
+gate rather than assumed).
+
+Instrumentation added (to the scratchpad copy only, never to the live
+elpa package): logging in `PosixPtyProcess.zig`'s `deinitAndWait` (before
+`pty.deinit()` and again before closing `wake_pipe`, printing `pid`,
+`primary_fd`, `replica_fd`, `wake_pipe`, thread id) and in
+`NativeProcess.zig`'s `reapChild`/`finishEventChannel` (printing the
+backend's pid, `event_writer` fd, exit code, thread id). First attempt
+logged via `sys.write(STDERR_FILENO, ...)` on the theory that inherited
+stderr would do — **this was tested and found wrong**: a plain
+`(message "PING")` sent to the running isolated daemon *after* its
+startup banner already did not reach the redirected stderr file either
+(the startup banner itself, printed before Emacs finishes daemonizing,
+did) — so Emacs's daemonization detaches/redirects standard streams
+after startup, and any post-startup write to inherited fd 2 is lost.
+Fixed by having the instrumentation open, append to, and close a real
+file (`/tmp/ghostel-r4a-reaper.log`) on every log call, via the same raw
+`sys.open`/`sys.write`/`sys.close` style already used elsewhere in
+`PosixPtyProcess.zig` — no `std.Io`/`Dir` threading needed through free
+functions.
+
+### Loaded module path (as requested)
+
+The isolated daemon (`ccb-repro-r4a`) had `ghostel-module-directory` set
+to the scratchpad build's `zig-out/` directory *before* `(require
+'ghostel)`, which is the documented seam (`ghostel-module-install.el`)
+for pointing at a native module outside the package tree. Confirmed
+loaded via `(ghostel--module-version)` → `"0.51.0"` and `(featurep
+'ghostel-module)` → `t` immediately after daemon start. The live daemon's
+own `load-path`/module directory was never touched.
+
+### Kill rows: raw observation
+
+Same F1/F2/F3 shape as Round 3, n=3 each, one long-running daemon (not
+restarted between reps — item 2's own spec did not require it, unlike
+item 6's fresh-vs-aged comparison). 9/9 kills, zero discards:
+
+| Row | Killed | n | Victim (all 3 reps) | Survivor |
+|---|---|---|---|---|
+| F1 | Z (newest) | 3 | Y | X |
+| F2 | X (oldest) | 3 | Y | Z |
+| F3 | Y (before-newest) | 3 | X | Z |
+
+Identical to Round 2 and Round 3's own F1/F2/F3 data and to rule C's
+prediction, on an independently rebuilt module — 9/9, no exceptions.
+
+### Native-level finding (the direct trace Round 3 could not get without `dtrace`)
+
+For every one of the 9 trials, the reaper log shows **exactly two**
+`reapChild`/`deinitAndWait` groups: one for the pid I explicitly killed,
+one for the bystander — never a third, and never one for the session
+that survived. The killed session's own reap always reports
+`exit_code=137` (`128 + SIGKILL`, i.e. `WIFSIGNALED`, consistent with
+ghostel's own pipe-sentinel calling `signal-process ... 9` directly on
+its target). The bystander's own reap always reports **`exit_code=0`**
+(`WIFEXITED` with status 0 — a *normal* exit, not a signaled one) — this
+is a new, independent confirmation (from the native module's own exit
+status, not from Rounds 1-3's separately-read stub trap log) that the
+bystander's own child process received some signal its own trap handler
+caught and responded to by calling `exit 0`, exactly as the stub script's
+`trap ... exit 0` would produce.
+
+Cross-checked directly against the pre-kill fd-block map (trial 1, native
+pids x=53208/y=53213/z=53222, kill z): Y's own recorded block was
+`25,26` (pipe pair) `+ 27` (ptmx); the reaper log for pid `53213` (Y)
+reports `primary_fd=27`, matching exactly. Z's own recorded block was
+`34,35 + 36`; the reaper log for pid `53222` (Z, the one explicitly
+killed) reports `primary_fd=36`, matching exactly. **No cross-session fd
+appears in either.** Fd-level re-verification for trials 2-9 individually
+was not completed with the same rigor (later trials accumulate several
+still-alive surviving sessions from earlier reps, since only F1/F2's two
+casualties die per rep — X in F1's case, Z in F2/F3's case, survive and
+pile up — making fd-block correlation by hand error-prone without a
+proper spawn-order-tracking parser I did not build this round); this is
+stated as a scope limitation, not glossed over. The aggregate,
+whole-log-level evidence still holds without needing that per-trial
+correlation: across all 18 `reapChild` groups (9 killed + 9 bystanders),
+**the surviving session in every trial never appears in the reaper log at
+all** — no reaper thread, for any of the 9 trials, ever touched the
+survivor's resources.
+
+### Inference (separated from the above)
+
+- **H_reaper-cross-session-close (item 5): FALSIFIED**, per the
+  pre-registered condition ("every captured close()/deinitAndWait call
+  across all 9 trials resolves only to the killed session's own fd
+  block") — directly confirmed for trial 1's fd numbers, and supported at
+  the whole-log level (exactly 2 reapers per trial, always matching the
+  killed pid and the bystander pid, the survivor never appearing) for all
+  9. Per the pre-registration's own next step for this outcome: the
+  cross-session-close mechanism is not what is happening: the bystander's
+  own reaper runs cleanly on the bystander's own resources. The
+  live candidate becomes a **process-group/session-level signal delivery
+  effect** — something outside ghostel's Zig teardown code delivers a
+  real, trappable signal to the bystander's own child, which this
+  investigation does not have instrumentation to trace further (it would
+  require tracing kernel-level pty/session/process-group state, not
+  application code) and is reported as a new open question, not invented
+  evidence.
+- The exit-code distinction (137 vs. 0) independently corroborates
+  Rounds 1-3's stub-trap-log-based finding that the killed session dies
+  by an untrappable signal (SIGKILL) while the bystander dies via a
+  trappable one its own trap handler catches — this is now confirmed from
+  a second, independent data source (the native module's own reported
+  exit status) rather than resting on the elisp/stub-log method alone.
+- This does not identify WHAT delivers the signal to the bystander or
+  WHY it targets specifically the predecessor-by-creation-order (or
+  second-newest, for the oldest-kill case) — that remains open, same as
+  every prior round.
+
+### Sample-size / scope honesty (Item 2)
+
+9 kill trials, zero discards, one machine, one day, one independently
+rebuilt module (functionally intended to match 0.51.0 except for the
+added logging). This directly rules out the specific "wrong-fd close by
+the module's own reaper" mechanism for the trials captured — it does NOT
+identify the true mechanism, does not trace kernel/process-group signal
+delivery, and the fd-level cross-check was only done rigorously for one
+of the 9 trials (stated above, not hidden). All daemons and build
+processes for this item were stopped/cleaned up; confirmed via `ps` that
+no `ccb-repro-r4a` daemon or its stub processes remained running
+afterward.
