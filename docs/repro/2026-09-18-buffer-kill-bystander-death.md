@@ -1466,3 +1466,26 @@ open N=4 indexing question is a new gap, not a closed one.
 All `ccb-repro-r4b1-*`, `ccb-repro-r4b3-*`, and `ccb-repro-r4b4-*`
 daemons were stopped; confirmed via `ps` that no daemon, stub, or
 fat-stub child process remained running afterward.
+
+---
+
+## Draft upstream issue: WITHDRAWN (post-Round 4)
+
+The draft upstream issue written in Round 2 (pre-registration commit
+`2bd2d80`, reaffirmed "unchanged recommendation" in the Round 2 results)
+proposed a mechanism: a raw pty-master fd closed on a detached,
+unsynchronized reaper thread (`PosixPtyProcess.zig`'s `deinitAndWait`),
+closing the wrong session's fd. Round 4 item 2 (native build results,
+commit `c619ee5`) directly instrumented and traced every `close()`/
+`deinitAndWait` call across 9 kill trials and found the reaper never
+touches any fd outside the killed session's own block — the survivor
+never appears in the reaper log at all, in any trial. That falsifies
+the specific mechanism the draft issue describes.
+
+**The draft is WITHDRAWN. It will not be filed against
+`github.com/dakra/ghostel` as written.** The text above is left
+unedited (insert-only correction, per standing practice in this doc) so
+the reasoning trail stays intact; this section is the authoritative
+statement that it no longer reflects the current best understanding of
+the mechanism. Any future upstream report should be written fresh, from
+whatever Round 5+ establishes, not by patching the withdrawn draft.
