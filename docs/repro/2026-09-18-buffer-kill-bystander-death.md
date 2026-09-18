@@ -1671,3 +1671,148 @@ place, or pointed to by the live daemon's load-path. No upstream filing
 this round regardless of outcome — steward routes that decision. All
 daemons and build/toolchain processes started for this round are
 stopped/cleaned up when done.
+
+---
+
+## Round 5 results
+
+### Setup
+
+Isolated daemons only: `ccb-repro-r5a` (item (a), reproduction),
+`ccb-repro-r5-control` and `ccb-repro-r5-treatment` (item (b), each
+loaded via `ghostel-module-directory` pointed at its own scratchpad
+build — never the live elpa dir or live daemon). `zig` (0.16.0) was
+already installed from Round 4; no reinstall needed. `claude-code-ide-cli-path`
+explicitly set to `stub-claude.sh` in every init file before any spawn —
+verified before first use each time.
+
+### Item (a): reproduction — raw observation
+
+S1..S6 spawned in creation order on `ccb-repro-r5a` (daemon pid 757).
+For each child, its own fd table was compared to the daemon's own
+`lsof` snapshot by DEVICE column (lsof's pipe-identity field on this
+platform — an exact string match against the daemon's own entry for
+the claimed fd, not a numeric coincidence):
+
+| Child (native pid) | Inherited+own fds | Count |
+|---|---|---|
+| S1 (1197) | [17] | 1 |
+| S2 (1851) | [17, 26] | 2 |
+| S3 (1873) | [17, 26, 35] | 3 |
+| S4 (1925) | [17, 26, 35, 44] | 4 |
+| S5 (1941) | [17, 26, 35, 44, 53] | 5 |
+| S6 (2001) | [17, 26, 35, 44, 53, 62] | 6 |
+
+Daemon's own blocks (verified against the same snapshot): S1 pipe-pair
+16/17, ptmx 18; S2 25/26, ptmx 27; S3 34/35, ptmx 36; S4 43/44, ptmx 45;
+S5 52/53, ptmx 54; S6 61/62, ptmx 63 — every pipe-pair's two fds share
+the identical DEVICE value (confirming they are `dup()`s of the same
+underlying pipe end, matching `process.c:8604`'s plain `dup()` call
+exactly, no separate allocation).
+
+**All four properties CONFIRMED, per-property, zero ambiguity**:
+1. **Monotone**: 1,2,3,4,5,6 — strictly increasing with creation order.
+2. **Nested**: every consecutive pair (S1→S2, S2→S3, S3→S4, S4→S5,
+   S5→S6) is the previous set plus exactly one new fd. 5/5 transitions
+   clean.
+3. **ptmx-1**: every fd in every child's set equals that session's own
+   `(ptmx fd) - 1` exactly — 17=18-1, 26=27-1, 35=36-1, 44=45-1,
+   53=54-1, 62=63-1. 6/6, exact.
+4. **Own write end**: S1 (the oldest, nothing earlier to inherit) holds
+   exactly `[17]` — its own `ptmx-1` — not `[]`. Every later child's
+   newest fd is its own `ptmx-1` (S4's `44`, etc). Confirmed for all 6.
+
+Zero discards. The isolated build reproduces the relayed live-fleet
+measurement's corrected shape exactly, on all four properties
+independently, not just qualitatively.
+
+### Item (b): treatment vs. control — raw observation
+
+**Fix used**: the module-side `fcntl(F_SETFD, FD_CLOEXEC)` approach was
+directly reachable and used (not the exec-time fallback). The exact
+call site: `GhostelTerm.zig`'s `ghostel--spawn-native-process` impl
+calls `env.openChannel(pipe_val)` to get the raw event-channel fd
+before passing it to `term.spawnNativeProcess`; the fix captures that
+fd into a local, calls `std.c.fcntl(fd, std.c.F.SETFD, @as(c_int,
+std.c.FD_CLOEXEC))` on it immediately, then passes the same fd onward
+unchanged. Both builds compiled cleanly on the first attempt (module
+version confirmed `0.51.0` for both, matching the live/isolated
+baseline).
+
+**Pre-kill nesting check (input (ii), before any kill)**: control
+(unpatched) reproduced the same nesting pattern as item (a) (S1:[17],
+S2:[17,26], S3:[17,26,35] — 3 sessions checked, consistent). Treatment
+(patched): **zero** inherited or own-write-end pipe fds in any of 3
+freshly-spawned children — the fix removes the leak completely,
+including each session's own write end in its own child, not just
+others'. Re-verified AFTER all 9 treatment kills below (a 10th, final
+spawn): still zero leaked fds — the fix held for the whole run, not
+just at the start.
+
+**Kill rows, n=3 each, both daemons (18 kills total, zero discards)**:
+
+| Row | Killed | Control victim (3/3) | Treatment victim (3/3) |
+|---|---|---|---|
+| F1 | Z (newest) | Y | Y |
+| F2 | X (oldest) | Y | Y |
+| F3 | Y (before-newest) | X | X |
+
+**Every row: identical victim under treatment and control.** Input (i)
+(do deaths stop under treatment?) is NO for every row — 9/9 treatment
+kills match 9/9 control kills exactly, despite input (ii) (nesting
+gone?) being YES, confirmed both before and after the full kill
+sequence.
+
+### Inference (separated from the above)
+
+- **Item (a)**: the relayed lead reproduces exactly, on the corrected
+  (monotone/nested/ptmx-1/own-write-end) shape butler/x600 supplied —
+  not just the original, tty-order-confounded version. This is a real,
+  confirmed leak on this build, independently of whether it turns out
+  to be causal.
+- **Item (b), read against the pre-registered table**: every row lands
+  in the **"Nesting gone but deaths persist"** cell. Per the
+  pre-registered reading: **the leak is real but NOT causal.** The
+  `FD_CLOEXEC` fix demonstrably and completely closes the fd-inheritance
+  leak (item (a)'s properties all disappear under treatment, checked
+  both before and after the kill sequence) while having zero effect on
+  which session dies or whether one dies at all. This FALSIFIES the
+  Round 5 lead as the mechanism, per its own pre-registered decision
+  rule — reported plainly, not downplayed.
+- Combined with Round 4 (elisp clean, native reaper clean) and this
+  round, THREE independently-instrumented candidate mechanisms are now
+  cleared: wrong elisp target, wrong-fd native close, and inherited
+  event-channel fd. Rule C (predecessor dies; oldest's kill hits the
+  second-newest, with the N=4 caveat from Round 4 item 3) continues to
+  fit every isolated N=3 trial across Rounds 2, 3, 4, and now 5 with
+  zero exceptions — the mechanism producing that specific pattern is
+  still not identified at the code level, and increasingly looks like
+  it sits below every instrumentation layer this investigation has been
+  able to reach from Lisp or from a rebuilt native module (e.g. genuine
+  kernel/pty/process-group state, as Round 4 already flagged as the
+  remaining candidate).
+- No new live-fleet data this round; the Correction (commit `6166757`,
+  rule C fits only 2/5 real deaths) is unaffected either way by this
+  round's isolated-only findings.
+
+### Sample-size / scope honesty (Round 5)
+
+Item (a): 6 spawns, one daemon, one day — enough to confirm all four
+properties present and exact on this build; does not reproduce the live
+fleet's literal per-tty fd numbers (build/version/uptime-dependent) nor
+prove the mechanism is identical across machines, only that the same
+structural leak exists here too. Item (b): 18 kill trials (9 control +
+9 treatment), zero discards, one machine, one day, two independently
+built module variants differing by exactly one `fcntl` call plus the
+capture of its return value into a local (no other code changes). This
+directly rules out the fd-inheritance leak as causal for the pattern
+tested — it does not rule out a DIFFERENT causal role for the leak
+under a scenario this round didn't test (e.g. many more sessions,
+different kill patterns, or interaction with the still-unidentified
+kernel-level candidate), and does not identify what does cause the
+bystander death.
+
+All daemons (`ccb-repro-r5a`, `ccb-repro-r5-control`,
+`ccb-repro-r5-treatment`) and the zig build processes were stopped;
+confirmed via `ps` and per-pid checks that no leftover daemon, stub, or
+build process remained running afterward.
