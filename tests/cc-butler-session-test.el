@@ -2922,6 +2922,29 @@ runs under the generic pattern; the dedicated shape must still mask it."
                  "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t9"))
       (should (equal s (cc-butler--mask-secret-shapes s))))))
 
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-aws-secret-after-equals ()
+  "`KEY=value', `?k=value' and alnum-prefixed forms must still mask the key."
+  (let ((secret "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"))
+    (dolist (s (list (concat "AWS_SECRET_ACCESS_KEY=" secret)
+                     (concat "xxKEY=" secret)
+                     (concat "https://h/x?k=" secret)))
+      (should-not (string-match-p (regexp-quote secret)
+                                  (cc-butler--mask-secret-shapes s)))
+      (should (string-match-p "<redacted:40>" (cc-butler--mask-secret-shapes s))))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-url-query-path-alone ()
+  "A 40-char path-ish value after `=' in a URL must survive."
+  (let ((s "https://x/a=docs/Design/notes/2026/September/Report1"))
+    (should (equal s (cc-butler--mask-secret-shapes s)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-huge-run-never-drops-record ()
+  "A 1M-char alnum run must not overflow the regexp matcher and drop the record."
+  (cc-butler-session-test--with-ops-log
+    (let* ((run (make-string 1000000 ?a))
+           (logged (cc-butler-session-test--logged-body (concat "x " run " y"))))
+      (should (stringp logged))
+      (should-not (string-match-p "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" logged)))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; forward-only ops/msg log rotation
 ;;;; ------------------------------------------------------------------

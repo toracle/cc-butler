@@ -685,22 +685,22 @@ secret of the same length is still masked."
   (let ((case-fold-search nil))
     (string-match-p "\\`[0-9a-f]+\\'" s)))
 
-(defconst cc-butler--aws-secret-run-pattern "[A-Za-z0-9/+=]+"
-  "Maximal run of base64 characters, the unit `cc-butler--aws-secret-shape-p'
+(defconst cc-butler--aws-secret-run-pattern "[A-Za-z0-9/+]+"
+  "Maximal run of base64 characters (no `=', so `KEY=value' splits at `='), the unit `cc-butler--aws-secret-shape-p'
 judges.  Taking the whole run (not a 40-char slice) is the strict boundary:
 a slice of a longer path or base64 blob is never examined.")
 
 (defun cc-butler--aws-secret-shape-p (run)
   "Non-nil if RUN looks like an AWS Secret Access Key that contains `/' or `+'.
-Exactly 40 chars, no `=', at least one `/' or `+', a digit and a lower->UPPER
+Exactly 40 chars, at least one `/' or `+', a digit and a lower->UPPER
 case transition (implies a mix of upper and lower).  Keys with neither `/' nor `+' are already caught by
 `cc-butler--secret-shape-generic-pattern'.  Also rejects a leading `/' or a
 `//' -- absolute paths and URL remnants, not keys -- so ordinary
-path-like text of this length is not over-redacted."
+path-like text of this length is not over-redacted.  Accepted: misses ~3.5% of random keys (leading `/' or `//')."
   (let ((case-fold-search nil))
     (and (= (length run) 40)
          (string-match-p "[/+]" run)
-         (not (string-match-p "=\\|\\`/\\|//" run))
+         (not (string-match-p "\\`/\\|//" run))
          ;; A lower->UPPER transition inside a word: random keys have them,
          ;; path segments (`Design', `September', `Report1') do not.
          (string-match-p "[a-z][A-Z]" run)
@@ -713,6 +713,13 @@ investigative value matters (see 2026-09-04 retention audit: report
 bodies in this log are routinely the evidence a correction is based
 on), so this only ever removes the one thing that must not be at rest
 here, never anything around it."
+  (condition-case nil
+      (cc-butler--mask-secret-shapes-1 body)
+    ;; e.g. "Stack overflow in regexp matcher" on a huge unbroken run: never drop the record nor log raw.
+    (error "<redacted:body-unmaskable>")))
+
+(defun cc-butler--mask-secret-shapes-1 (body)
+  "Unguarded worker for `cc-butler--mask-secret-shapes' on BODY."
   (let ((out body))
     (dolist (pat cc-butler--secret-shape-patterns)
       (setq out (replace-regexp-in-string
