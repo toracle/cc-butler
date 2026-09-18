@@ -248,7 +248,9 @@ distinct key from \"target\" -- matching the exact single-pass method this
 was decided against (`grep -rhoE \\='\\\\[\\\\[[^]|]+\\=' | sort | uniq -c'),
 not a resolver that understands Obsidian's link syntax.
 
-`docs/' and `site/' are excluded: this vault publishes an MkDocs build of
+`docs/' and `site/' are excluded (grep's `--exclude-dir' matches a
+directory of that name at ANY depth, not only the top-level mirrors, so a
+nested `docs/' or `site/' anywhere in the vault is skipped too): this vault publishes an MkDocs build of
 itself into those two directories, a byte-for-byte-ish MIRROR of the real
 content directories -- scanning them in ALONGSIDE the source roughly
 doubles every count and destabilizes several individual files' occurrence
@@ -274,7 +276,7 @@ appears in the index at all."
                                      "--exclude-dir=docs" "--exclude-dir=site" vault)))
           ;; grep exits 1 (not an error here) when nothing matches at all;
           ;; only >1 (a real grep failure -- bad pattern, I/O error) is fatal.
-          (if (> status 1)
+          (if (or (not (integerp status)) (> status 1))
               (cons (make-hash-table :test 'equal) (format "citation grep failed (exit %s)" status))
             (let ((map (make-hash-table :test 'equal)))
               (dolist (line (split-string (buffer-string) "\n" t))

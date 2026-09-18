@@ -1786,19 +1786,19 @@ catch a missing sort."
            (index (expand-file-name "MEMORY.md" mem)))
       (should (> (string-bytes old-line) cc-butler-governance-max-index-line-bytes))
       (cc-butler-governance-test--git-init store)
-      ;; Seed order: short-note first, then the long slug's oversized line --
-      ;; the OPPOSITE of the expected post-sort order below. Timestamps are
-      ;; relative to NOW (not a fixed 1970 epoch) so both land inside the
-      ;; two-band index's Band A window -- otherwise both fall through to
-      ;; Band B and this test's `pos-long < pos-short' assertion would pass
-      ;; by alphabetical coincidence ("an-..." < "short-...") rather than
-      ;; because the sort actually ran.
+      ;; Seed order: the long slug's oversized line first, then short-note --
+      ;; the OPPOSITE of the expected post-sort order below. short-note is
+      ;; the NEWER commit, yet sorts alphabetically AFTER "an-...": recency
+      ;; order is the opposite of both seed order and slug order, so the
+      ;; assertion below passes only if Band A's recency sort really ran
+      ;; (both in Band B would give "an-..." first). Timestamps are
+      ;; relative to NOW so both land inside Band A's window.
       (let ((now (floor (float-time))))
-        (with-temp-file index (insert "- butler-short-note.md — d\n" old-line))
+        (with-temp-file index (insert old-line "- butler-short-note.md — d\n"))
         (cc-butler-governance-test--commit-note
-         store "short-note" (cc-butler-governance--render "short-note" "d" "body" "feedback") (- now 2000))
+         store slug (cc-butler-governance--render slug desc "body" "feedback") (- now 2000))
         (cc-butler-governance-test--commit-note
-         store slug (cc-butler-governance--render slug desc "body" "feedback") (- now 1000)))
+         store "short-note" (cc-butler-governance--render "short-note" "d" "body" "feedback") (- now 1000)))
       (cc-butler-governance-regenerate)
       (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
         (should-not (string-search old-line text))
@@ -1814,9 +1814,9 @@ catch a missing sort."
         (let ((pos-long (string-match (concat "butler-" (regexp-quote slug) "\\.md") text))
               (pos-short (string-match "butler-short-note\\.md" text)))
           (should (and pos-long pos-short))
-          ;; The long slug was committed MORE recently -- it must sort first,
-          ;; even though it was seeded second.
-          (should (< pos-long pos-short)))))))
+          ;; short-note was committed MORE recently -- it must sort first,
+          ;; despite being seeded second AND sorting after "an-..." by slug.
+          (should (< pos-short pos-long)))))))
 
 (ert-deftest cc-butler-governance/regenerate-preserves-a-hand-curated-line-across-a-sort ()
   "Curated-line preservation invariant, interleaved case: a hand-authored
@@ -2368,7 +2368,8 @@ more cited -- sorts behind every one of them); GREEN once
         (should (member "bulk-07" (seq-take slugs 4)))
         ;; the cap actually bit: strictly fewer than all 20 bulk notes lead
         ;; the index alongside them -- most of the 20 are pushed behind
-        (should (< (length (seq-intersection (seq-take slugs 4) bulk-slugs)) 20))))))
+        (should (<= (length (seq-intersection (seq-take slugs 4) bulk-slugs))
+                    cc-butler-governance-band-a-commit-cap))))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; Two-band MEMORY.md index (reimplemented from PR #197 against main's
