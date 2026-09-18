@@ -215,3 +215,70 @@ any prior skip streak for it is cleared rather than carried forward."
 
 (provide 'cc-butler-cleanup-scheduled-test)
 ;;; cc-butler-cleanup-scheduled-test.el ends here
+
+(defun cc-butler-cleanup-test--sweep-timers ()
+  "Real timers in `timer-list' whose function is the scheduled sweep."
+  (cl-remove-if-not
+   (lambda (tm) (eq (timer--function tm) #'cc-butler-cleanup--scheduled-fire))
+   timer-list))
+
+(ert-deftest cc-butler-cleanup/loading-file-arms-no-timer ()
+  "Default-off: (re)loading the file must not arm the scheduled sweep."
+  (let ((cc-butler-cleanup--scheduled-timer nil)
+        (cc-butler-cleanup-scheduled-mode nil))
+    (unwind-protect
+        (progn
+          (load (locate-library "cc-butler-cleanup.el") nil t)
+          (should (null cc-butler-cleanup--scheduled-timer))
+          (should (null cc-butler-cleanup-scheduled-mode))
+          (should (null (cc-butler-cleanup-test--sweep-timers))))
+      (cc-butler-cleanup-scheduled-mode -1))))
+
+(ert-deftest cc-butler-cleanup/scheduled-mode-twice-leaves-one-real-timer ()
+  (mapc #'cancel-timer (cc-butler-cleanup-test--sweep-timers)) ; isolate from orphans
+  (let ((cc-butler-cleanup--scheduled-timer nil)
+        (cc-butler-cleanup-scheduled-mode nil))
+    (unwind-protect
+        (progn
+          (cc-butler-cleanup-scheduled-mode 1)
+          (cc-butler-cleanup-scheduled-mode 1)
+          (should (= 1 (length (cc-butler-cleanup-test--sweep-timers))))
+          (cc-butler-cleanup-scheduled-mode -1)
+          (should (null (cc-butler-cleanup-test--sweep-timers))))
+      (cc-butler-cleanup-scheduled-mode -1))))
+
+(ert-deftest cc-butler-cleanup/scheduled-dry-run-reports-and-touches-nothing ()
+  (let* ((day 86400.0) (calls nil)
+         (cc-butler-cleanup-scheduled-idle-days 3)
+         (skip (make-hash-table :test 'equal))
+         (pending (make-hash-table :test 'equal))
+         (cc-butler-cleanup--scheduled-skip-count skip)
+         (cc-butler-cleanup--scheduled-pending pending)
+         (cc-butler-cleanup--scheduled-timer nil)
+         res)
+    (puthash "/k/" 2 skip) (puthash "/a/" t pending)
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () (list (list :dir "/a/") (list :dir "/k/")
+                                (list :dir "/y/") (list :dir "/b/"))))
+              ((symbol-function 'cc-butler--display-name)
+               (lambda (d) (string-trim d "/" "/")))
+              ((symbol-function 'cc-butler-cleanup--worker-p) (lambda (_) t))
+              ((symbol-function 'cc-butler--waiting-p)
+               (lambda (d) (unless (equal d "/b/") (float-time))))
+              ((symbol-function 'cc-butler-cleanup--transcript-last-timestamp)
+               (lambda (d) (- (float-time) (if (equal d "/y/") day (* 4 day)))))
+              ((symbol-function 'cc-butler-cleanup--scheduled-blocked-reason)
+               (lambda (d) (when (equal d "/k/") "on `cc-butler-cleanup-keep'")))
+              ((symbol-function 'cc-butler--send-input) (lambda (&rest a) (push a calls)))
+              ((symbol-function 'cc-butler-session-cleanup) (lambda (&rest a) (push a calls))))
+      (setq res (cc-butler-cleanup-scheduled-dry-run)))
+    (message "DRY-RUN EXAMPLE: %S" res)
+    (should (null calls))
+    (should (equal (mapcar (lambda (e) (plist-get e :status)) res)
+                   '(would-fire skip not-candidate not-candidate)))
+    (should (equal (plist-get (nth 1 res) :reason) "on `cc-butler-cleanup-keep'"))
+    (should (< 3.9 (plist-get (nth 0 res) :idle-days) 4.1))
+    (should (= 1 (hash-table-count skip)))
+    (should (= 2 (gethash "/k/" skip)))
+    (should (eq t (gethash "/a/" pending)))
+    (should (null cc-butler-cleanup--scheduled-timer))))

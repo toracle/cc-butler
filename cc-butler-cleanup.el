@@ -1245,6 +1245,55 @@ only by someone who happens to reopen that dir later."
 (add-hook 'cc-butler-cleanup-after-externalize-functions
           #'cc-butler-cleanup--scheduled-promote-after-externalize)
 
+(defun cc-butler-cleanup--scheduled-reason (dir)
+  "Why candidate DIR must not be cleaned right now, else nil.
+Shared by the real sweep and `cc-butler-cleanup-scheduled-dry-run'."
+  (or (cc-butler-cleanup--scheduled-blocked-reason dir)
+      (and (not (cc-butler--waiting-p dir))
+           "no longer waiting (became busy since candidate listing)")))
+
+(defun cc-butler-cleanup-scheduled-dry-run ()
+  "Report what the scheduled sweep would do now, WITHOUT doing anything.
+Returns a list of plists, one per session: (:name :dir :idle-days :status
+:reason).  :status is `would-fire' (a sweep would /clear it), `skip'
+\(candidate, but blocked: keep list, cleanup in flight, no terminal, menu,
+typed input, busy) or `not-candidate' (not an ordinary worker, not waiting,
+or idle below `cc-butler-cleanup-scheduled-idle-days').  Sends nothing, and
+touches no skip counters, pending flags or timers.  No last-report
+timestamp is included: this module does not track one."
+  (interactive)
+  (let* ((cands (cc-butler-cleanup--scheduled-candidates))
+         (out
+          (mapcar
+           (lambda (s)
+             (let* ((dir (plist-get s :dir))
+                    (worker (cc-butler-cleanup--worker-p dir))
+                    (idle (and worker (cc-butler-cleanup--scheduled-idle-seconds dir)))
+                    (reason (cond ((not worker) "not an ordinary worker")
+                                  ((not (cc-butler--waiting-p dir)) "not waiting")
+                                  ((not (member dir cands))
+                                   (format "idle < %s days" cc-butler-cleanup-scheduled-idle-days))
+                                  (t (cc-butler-cleanup--scheduled-reason dir)))))
+               (list :name (cc-butler--display-name dir) :dir dir
+                     :idle-days (and idle (/ idle 86400.0))
+                     :status (cond ((not (member dir cands)) 'not-candidate)
+                                   (reason 'skip)
+                                   (t 'would-fire))
+                     :reason (or reason
+                                 (format "waiting, idle >= %s days"
+                                         cc-butler-cleanup-scheduled-idle-days)))))
+           (cc-butler--sessions))))
+    (when (called-interactively-p 'any)
+      (message "scheduled cleanup dry-run:\n%s"
+               (mapconcat (lambda (e)
+                            (format "  %-9s %s (%s d) %s" (plist-get e :status)
+                                    (plist-get e :name)
+                                    (if (plist-get e :idle-days)
+                                        (format "%.1f" (plist-get e :idle-days)) "?")
+                                    (plist-get e :reason)))
+                          out "\n")))
+    out))
+
 (defun cc-butler-cleanup--scheduled-fire ()
   "Run one scheduled idle-worker cleanup sweep.
 Tier `clear' ONLY, never `delete-dir'; never the butler/steward
@@ -1258,9 +1307,7 @@ resets, so surfacing does not also repeat every run forever."
     (let ((name (cc-butler--display-name dir))
           ;; TOCTOU: candidacy was decided at list time; a session may have
           ;; gone busy since.  Re-check WAITING right before firing.
-          (reason (or (cc-butler-cleanup--scheduled-blocked-reason dir)
-                      (and (not (cc-butler--waiting-p dir))
-                           "no longer waiting (became busy since candidate listing)"))))
+          (reason (cc-butler-cleanup--scheduled-reason dir)))
       (cond
        ((not reason)
         (remhash dir cc-butler-cleanup--scheduled-skip-count)
@@ -1526,18 +1573,15 @@ Returns the list of worker dirs a fresh settings file was written into."
 (define-minor-mode cc-butler-cleanup-scheduled-mode
   "Run the daily autonomous idle-worker cleanup sweep (tier `clear' only).
 
-ON BY DEFAULT, started when this module loads, mirroring
-`cc-butler-compact-monitor-mode'.  Turn it off with
-`(cc-butler-cleanup-scheduled-mode -1)' to stop the sweep; that cancels the
-timer.  Enabling is idempotent: it never leaves two timers armed."
+OFF BY DEFAULT: loading this module arms nothing.  Enable with
+`(cc-butler-cleanup-scheduled-mode 1)'; `(cc-butler-cleanup-scheduled-mode -1)'
+cancels the timer.  Enabling is idempotent: it never leaves two timers armed.
+Preview what a sweep would do, without acting, with
+`cc-butler-cleanup-scheduled-dry-run'."
   :global t :group 'cc-butler :init-value nil
   (if cc-butler-cleanup-scheduled-mode
       (cc-butler-cleanup--scheduled-ensure-timer)
     (cc-butler-cleanup--scheduled-cancel-timer)))
-
-;; Start with cc-butler itself (same as the compact monitor); re-running on
-;; `cc-butler-reload' cannot duplicate the timer.
-(cc-butler-cleanup-scheduled-mode 1)
 
 (provide 'cc-butler-cleanup)
 ;;; cc-butler-cleanup.el ends here
