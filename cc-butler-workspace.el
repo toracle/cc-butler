@@ -485,7 +485,20 @@ and end it — a genuine cross-session defect traced into ghostel's native
 pty module (a vendored dylib; the double `cleanup-on-exit' call
 originally suspected was tested and ruled out). That module cannot be
 fixed here, so this guard only prevents cc-butler from ever triggering
-it. Set to nil only once the upstream defect is fixed."
+it through `cc-butler-close-topic' / the `close_topic' MCP tool.
+
+This guard does NOT cover a plain `kill-buffer' done outside cc-butler
+\(e.g. interactively, or from any other code path\) on a ghostel session's
+buffer: that carries the identical bystander-death risk, unguarded. That
+gap is closed by operational rule only \(the live-fleet freeze\), not by
+code.
+
+The one legitimate reason to set this to nil is complying with the
+fleet's worker session cap \(2026-09-16: 10 workers + butler + steward,
+max 12, adjusted up and down as needed\) when it collides with this
+guard's refusal. This is a known collision between the cap and the
+guard, not a fix: disabling the option accepts the bystander-death risk
+until the upstream root cause is fixed."
   :type 'boolean
   :group 'cc-butler)
 
