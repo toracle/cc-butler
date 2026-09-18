@@ -2052,3 +2052,89 @@ cat`, or a lightly extended variant for states 2-5 above) — not the real
 `ccb-repro-r6` Emacs daemon, which the live fleet's session cap does not
 track. Reported to the steward before spinning up anything; proceeding
 only after acknowledgement.
+
+# Round 6 results — exit-control arm (Point 1 only; Point 2 untested)
+
+Executed per the Round 6 pre-registration (`9cf2552`), addendum
+(`30add76`), and the Point-2-untested correction (`c300cd0`). Raw logs
+live in the executing fork's scratchpad (`ccb-repro/r6-out/*.txt`,
+`*.calls.txt`), not committed.
+
+## Observation (raw, machine-checkable)
+
+Setup: fresh isolated `ccb-repro-r6` daemon, `claude-code-ide-cli-path`
+confirmed = stub before any spawn, backend `ghostel`, cc-butler NOT
+loaded (its concurrent-ghostel guard cannot fire). Each rep: 10 fresh
+stub sessions S1..S10, all confirmed alive with 10 distinct native pids,
+trigger on S10 (newest), 12 polls at 1s across S1..S9. Signature = the
+stub's own `HUP <pid>` trap line + `ghostel--events-filter` "129" on the
+bystander's own pipe + its buffer disappearing.
+
+**Control (kill-buffer on S10), n=3:** bystander = S9 (creation position
+N-1, the predecessor of the newest), 3/3; S1-S8 alive at +12s in all
+three, no second bystander. Elisp `signal-process` targeted only S10's
+own pid before S9 died; S9's own pid was signalled only after its "129"
+event, in S9's own cleanup (c1: `.126 signal-process` S10's pid, `.145
+EVENTS-FILTER "129"`, `.146 signal-process` S9's pid).
+
+**Treatment (self-exit on S10), n=3:** 0 bystanders; S1-S9 alive at +12s
+in all three, no HUP/TERM lines. Trigger = Ctrl-D written into S10's pty
+(`ghostel-send-string "\C-d"`), so `cat` sees EOF and the stub ends
+itself (`CAT-RETURNED`, `EXIT-TRAP`, reaper event "0"). `process-send-eof`
+on the Lisp process object did not work (pipe, `process-id` nil) and was
+not used. Independently re-checked by me on all three treatment logs:
+between `TRIGGER-BEGIN` and `TRIGGER-END` no `kill-buffer`,
+`delete-process`, or `signal-process` was logged.
+
+**Unplanned observation, contradicts a premise of the steward's
+question:** after a natural self-exit the buffer does NOT stay open.
+~13ms after the "0" event, `ghostel--events-filter`/sentinel calls
+`delete-process` and `signal-process 9` on S10's own already-dead pid,
+then `claude-code-ide--cleanup-on-exit`, which calls `kill-buffer` on
+S10's own buffer — automatic, on S10's own objects, no bystander
+followed. In the kill arm the same teardown is entered through the live
+`kill-buffer` with a `signal-process 9` on S10's LIVE pid, and the
+bystander dies.
+
+Deviations (from the fork, stated plainly): (1) a zsh word-splitting
+slip made one run labelled `c` execute the self-exit branch; control
+reps were rerun as c2/c3, net n=3 per arm (kill = c1,c2,c3; self-exit =
+t1,c,t). (2) Consequently order was c1,t1,c,t,c2,c3, not interleaved;
+c2/c3 ran in a slightly older daemon. (3) In c1 only, S1 restarted once
+(stub exited and relaunched); no effect on S9/S10. (4) Stub timestamps
+have `.3N` artefacts (BSD `date`); ordering taken from the Emacs-side
+log. (5) The auto-cleanup-on-natural-exit behaviour was observed here,
+not verified against the live daemon.
+
+## Inference (separated from the above)
+
+- Per the addendum's exact rule: control reproduced a bystander (3/3)
+  AND self-exit did not (0/3), same N, same daemon ⇒ **"/exit safe"
+  holds — for exactly this scope**: N=10, newest position only, stub
+  sessions, Ctrl-D-on-pty trigger, one machine, one day, a daemon
+  minutes old (~70 stub spawns).
+- Rule C (predecessor of the newest dies) reproduced at N=10 under
+  kill-buffer, 3/3 — the first N>4 data point; the Round 4 item 3 N=4
+  anomaly concerned killing a MIDDLE position and is not contradicted.
+- The result is consistent with (does not prove) the trigger being a
+  signal delivered to a LIVE pid during teardown, rather than
+  `kill-buffer` as such: the self-exit path also ends in `kill-buffer`
+  on the session's own buffer, but only after the process is already
+  dead, and produced no bystander. This is inference on n=3.
+- The steward's proposed retirement sequence ("process exits on its own,
+  buffer stays open, then roster-forget") does not match observed
+  behaviour: the buffer is auto-killed by claude-code-ide's own cleanup.
+  The observed safe path is "process exits on its own → auto-cleanup".
+
+## Not tested / scope
+
+Point 2 (state of the session receiving `/exit`) untested, as
+pre-registered. Daemon age untested (explicit axis). Real `claude` CLI
+`/exit` not tested (stub only; the optional real-session row was not
+run). Self-exit of non-newest positions, N≠10, >3 reps not tested. The
+real-CLI `/exit` may end differently than Ctrl-D-to-`cat` (e.g. exit
+handler delays, child processes), which this round cannot speak to.
+
+All `ccb-repro-r6` processes stopped; verified via `ps` by both the fork
+and me: 0 ccb-repro, 0 stub, 0 zig processes, no r6 socket. Live daemon
+never addressed.
