@@ -199,7 +199,7 @@ any prior skip streak for it is cleared rather than carried forward."
       (should (eq (car timers) cc-butler-cleanup--scheduled-timer)))))
 
 (ert-deftest cc-butler-cleanup/scheduled-promote-consumes-pending-flag-once ()
-  (let ((cc-butler-cleanup--scheduled-pending (make-hash-table :test 'equal))
+  (let* ((cc-butler-cleanup--scheduled-pending (make-hash-table :test 'equal))
         (calls 0)
         (cc-butler-cleanup-promote-function (lambda (_s) (cl-incf calls) t))
         (session (list :dir "/w/" :name "worker")))
