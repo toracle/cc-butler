@@ -1624,9 +1624,7 @@ Always queues it for the next `pending_events' drain, and additionally
 types it in when `cc-butler-compact-monitor-notify' says so and the
 target is safely idle.  Returns non-nil if it was actually typed."
   (let ((ops (cc-butler--ops-dir)))
-    (push (list :time (current-time) :dir nil :name "cc-butler" :id nil
-                :body summary)
-          cc-butler--inbox)
+    (cc-butler--inbox-push nil summary "cc-butler")
     ;; Typing reuses the compaction guard unchanged: if it is not safe to
     ;; type a slash command at this session, it is not safe to type a
     ;; report at it either.  A blocked target still has the queued copy.

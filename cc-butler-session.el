@@ -916,6 +916,111 @@ session to look one up for."
                     who (length (or body "")))
     (cc-butler--log-message "report" who "butler" body)))
 
+(defcustom cc-butler-inbox-queue-file
+  (expand-file-name
+   "cc-butler/cc-butler-inbox-queue.eld"
+   (let ((xdg (getenv "XDG_STATE_HOME")))
+     (if (and xdg (not (string-empty-p xdg))) xdg
+       (expand-file-name ".local/state" "~"))))
+  "On-disk mirror of `cc-butler--inbox', so an undrained worker event
+survives an Emacs restart instead of being silently lost. Always holds
+exactly the CURRENT live queue, never a history: rewritten on every
+push and rewritten empty the instant the queue drains, so a drained
+item's disk copy disappears in the same operation that drains it in
+memory. Same XDG derivation as `cc-butler-ops-log-dir', duplicated for
+the same require-order reason (see that defcustom's docstring)."
+  :type 'file
+  :group 'cc-butler)
+
+(defcustom cc-butler-inbox-queue-warn-threshold 20
+  "Live (undrained) inbox length that triggers a one-line ops-log warning.
+Never drops an event to enforce this -- discarding an undelivered event
+to satisfy a size cap would reproduce the exact bug the drain-order fix
+avoids (see `cc-butler--pending-events-hook-payload'); this is a
+backlog signal only. Defaults to `cc-butler-drained-keep''s existing
+20, this fleet's established size for a small bounded event window."
+  :type 'integer
+  :group 'cc-butler)
+
+(defvar cc-butler--inbox-queue-warned nil
+  "Non-nil while the backlog warning has fired for the current crossing.")
+
+(defun cc-butler--inbox-queue-save ()
+  "Rewrite `cc-butler-inbox-queue-file' to mirror the current `cc-butler--inbox'.
+Call after every mutation (push or drain) so the file never lags.  Written to
+a sibling temp file first, then renamed over the real target -- same
+filesystem, so the rename is atomic -- rather than writing the target
+directly, so a reader (or a crash mid-write) never sees a half-written file.
+
+Created 0600 -- the queue holds worker report bodies verbatim, same
+sensitivity class and same `with-file-modes' mechanism (mode set before
+creation, travels with the rename) as `cc-butler--roster-write'
+\(cc-butler-persist.el\)."
+  (let (tmp)
+    (condition-case err
+        (unwind-protect
+            (progn
+              (make-directory (file-name-directory cc-butler-inbox-queue-file) t)
+              (with-file-modes #o600
+                (setq tmp (make-temp-file
+                           (expand-file-name "cc-butler-inbox-queue-"
+                                             (file-name-directory cc-butler-inbox-queue-file))))
+                (with-temp-file tmp
+                  (let ((print-length nil) (print-level nil))
+                    (prin1 cc-butler--inbox (current-buffer))
+                    (insert "\n")))
+                (rename-file tmp cc-butler-inbox-queue-file t)))
+          ;; After a successful rename TMP no longer exists; on any failure
+          ;; it is the leaked temp file.
+          (when (and tmp (file-exists-p tmp)) (ignore-errors (delete-file tmp))))
+      (error (cc-butler--log "inbox queue save failed: %s" (error-message-string err)))))
+  ;; Warn once per crossing: re-arm only when back at/below the threshold.
+  (if (> (length cc-butler--inbox) cc-butler-inbox-queue-warn-threshold)
+      (unless cc-butler--inbox-queue-warned
+        (setq cc-butler--inbox-queue-warned t)
+        (cc-butler--log "inbox queue backlog: %d undrained (warn threshold %d)"
+                        (length cc-butler--inbox) cc-butler-inbox-queue-warn-threshold))
+    (setq cc-butler--inbox-queue-warned nil)))
+
+(defun cc-butler--inbox-queue-save-on-push (&rest _)
+  "Advice: persist the inbox queue after every push.  See `cc-butler--inbox-queue-save'."
+  (cc-butler--inbox-queue-save))
+
+(advice-add 'cc-butler--inbox-push :after #'cc-butler--inbox-queue-save-on-push)
+
+(defun cc-butler--inbox-queue-valid-p (v)
+  "Non-nil if V is a proper list of plists each carrying :body."
+  (and (proper-list-p v)
+       (seq-every-p (lambda (e) (and (proper-list-p e) (plist-member e :body))) v)))
+
+(defun cc-butler--inbox-queue-load ()
+  "Restore `cc-butler--inbox' from `cc-butler-inbox-queue-file' if present.
+Only fills in when the in-memory queue is still empty, so re-evaluating
+this file (or requiring it twice) can never clobber events already
+pushed this session.  An unreadable or malformed file is NOT loaded; it is
+renamed to `<file>.corrupt.<timestamp>' (evidence kept, so the next push
+cannot silently overwrite it) and the event is logged."
+  (when (and (null cc-butler--inbox) (file-exists-p cc-butler-inbox-queue-file))
+    (let ((v (condition-case nil
+                 (with-temp-buffer
+                   (insert-file-contents cc-butler-inbox-queue-file)
+                   (let ((form (read (current-buffer))))
+                     ;; Trailing garbage after the form = truncated/edited.
+                     (skip-chars-forward " \t\n")
+                     (if (eobp) form :invalid)))
+               (error :invalid))))
+      (if (cc-butler--inbox-queue-valid-p v)
+          (setq cc-butler--inbox v)
+        (let ((bad (format "%s.corrupt.%s" cc-butler-inbox-queue-file
+                           (format-time-string "%Y%m%dT%H%M%S"))))
+          (condition-case err
+              (progn (rename-file cc-butler-inbox-queue-file bad t)
+                     (cc-butler--log "inbox queue file invalid; kept as %s" bad))
+            (error (cc-butler--log "inbox queue file invalid and could not be preserved: %s"
+                                   (error-message-string err)))))))))
+
+(cc-butler--inbox-queue-load)
+
 ;; The steward is designated in `cc-butler-orchestrator' (loaded after this
 ;; file); forward-declare it so the list UI can pin/label it.
 (defvar cc-butler--steward)
