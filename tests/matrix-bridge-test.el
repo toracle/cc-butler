@@ -504,8 +504,8 @@ directly.  Covered as a positive/negative pair, same pattern as
 ;;;;; parse-mxc: url splitting --------------------------------------------
 
 (ert-deftest matrix-bridge/parse-mxc-splits-server-and-media-id ()
-  (should (equal (matrix-bridge--parse-mxc "mxc://warmblood-lounge/abc123")
-                 '("warmblood-lounge" . "abc123"))))
+  (should (equal (matrix-bridge--parse-mxc "mxc://example.org/abc123")
+                 '("example.org" . "abc123"))))
 
 (ert-deftest matrix-bridge/parse-mxc-rejects-non-mxc-url ()
   (should-not (matrix-bridge--parse-mxc "https://example.com/x")))
@@ -583,6 +583,37 @@ with no explicit reply-to still carries an m.in_reply_to to the root."
                                     (m.in_reply_to . ((event_id . "$tgt")))))
                    (msgtype . "m.image") (body . "shot.png") (url . "mxc://x/1")
                    (info . ((mimetype . "image/png") (size . 123)))))))
+
+;;;; --- poison event: one malformed event must not stall the since-cursor ----
+;; A signal escaping the per-event dispatch skips `(setq matrix-bridge--since
+;; next)', so the same /sync batch is re-fetched and re-delivered forever.
+
+(ert-deftest matrix-bridge/malformed-audio-event-does-not-stall-since-cursor ()
+  "An m.audio event with a non-string `url' (5) must not abort the batch:
+the event after it is still delivered, `since' advances, and it is saved."
+  (matrix-bridge-test--with-media-dir
+    (let* ((matrix-bridge-self-user-id "@fake-self:example.org")
+           (matrix-bridge-human-user-id "@fake-human:example.org")
+           (matrix-bridge--room-id "!fake-room:example.org")
+           (matrix-bridge--since "s1")
+           (saved nil)
+           (body (concat
+                  "{\"next_batch\":\"s2\",\"rooms\":{\"join\":{\"!fake-room:example.org\":"
+                  "{\"timeline\":{\"events\":["
+                  "{\"type\":\"m.room.message\",\"sender\":\"@fake-peer:example.org\","
+                  "\"event_id\":\"$bad\",\"content\":{\"msgtype\":\"m.audio\","
+                  "\"body\":\"v.ogg\",\"url\":5}},"
+                  "{\"type\":\"m.room.message\",\"sender\":\"@fake-peer:example.org\","
+                  "\"event_id\":\"$good\",\"content\":{\"msgtype\":\"m.text\","
+                  "\"body\":\"still delivered\"}}]}}}}}")))
+      (cl-letf (((symbol-function 'matrix-bridge--save-since)
+                 (lambda (tok) (setq saved tok)))
+                ((symbol-function 'matrix-bridge--reschedule) #'ignore))
+        (matrix-bridge-test--capture-delivery delivered
+          (matrix-bridge--handle matrix-bridge--generation nil body nil)
+          (should (equal matrix-bridge--since "s2"))
+          (should (equal saved "s2"))
+          (should (cl-some (lambda (d) (string-match-p "still delivered" d)) delivered)))))))
 
 ;;;; --- matrix-bridge-thread-replies: synchronous thread fetch ---------------
 ;;

@@ -422,10 +422,11 @@ async like every other network call in this file -- never
   DATA and ERR both nil  -- MXC-URL did not parse as `mxc://server/id'
                              (branch 2); no request was even attempted.
   otherwise              -- DATA is the raw (undecoded) response bytes."
-  (if (not (string-match "\\`mxc://\\([^/]+\\)/\\(.+\\)\\'" (or mxc-url "")))
+  (if (not (matrix-bridge--parse-mxc mxc-url))
       (funcall callback nil nil)
-    (let* ((server (match-string 1 mxc-url))
-           (media-id (match-string 2 mxc-url))
+    (let* ((parsed (matrix-bridge--parse-mxc mxc-url))
+           (server (car parsed))
+           (media-id (cdr parsed))
            (url (format "%s/_matrix/client/v1/media/download/%s/%s"
                         matrix-bridge-homeserver server media-id))
            (url-request-method "GET")
@@ -542,7 +543,7 @@ in `matrix-bridge--handle'.  Mirrors audio_axis.py's
          (content (matrix-bridge--get ev 'content))
          (event-id (or (matrix-bridge--get ev 'event_id) ""))
          (body (or (matrix-bridge--get content 'body) "voice"))
-         (url (or (matrix-bridge--get content 'url) ""))
+         (url (let ((u (matrix-bridge--get content 'url))) (if (stringp u) u "")))
          (audio-path (matrix-bridge--media-path event-id body)))
     (matrix-bridge--log "RECV [matrix · %s%s] %s"
                         (matrix-bridge-attribution sender)
@@ -573,10 +574,20 @@ in `matrix-bridge--handle'.  Mirrors audio_axis.py's
          ;; monocle does afterwards can take it away.  No safety-net
          ;; `condition-case' around the whole flow is needed or wanted; the
          ;; ordering alone provides the guarantee.
-         (let ((coding-system-for-write 'no-conversion))
-           (write-region data nil audio-path nil 'silent))
-         (matrix-bridge--log "audio saved: %s (%d bytes)" audio-path (length data))
-         (matrix-bridge--transcribe-audio audio-path sender event-id content)))))))
+         (if (condition-case werr
+                 (let ((coding-system-for-write 'no-conversion))
+                   (write-region data nil audio-path nil 'silent)
+                   nil)
+               (error
+                (matrix-bridge--log "audio: could not write %s: %S" audio-path werr)
+                (matrix-bridge--deliver
+                 (matrix-bridge--format-line
+                  sender event-id content
+                  (format "(음성 메시지 저장 실패: %S)" werr)))
+                t))
+             nil
+           (matrix-bridge--log "audio saved: %s (%d bytes)" audio-path (length data))
+           (matrix-bridge--transcribe-audio audio-path sender event-id content))))))))
 
 ;;; --- media (images/files) --------------------------------------------------
 ;;
@@ -903,14 +914,21 @@ corrupt the bytes before they ever reach disk."
                               join (intern matrix-bridge--room-id)))
                        (events (matrix-bridge--get
                                 (matrix-bridge--get room 'timeline) 'events)))
+                  ;; Per-event guard: one malformed event must not skip the
+                  ;; since-cursor advance below, or the whole batch is
+                  ;; re-fetched and re-delivered on every retry.
                   (dolist (ev (append events nil))
-                    (cond
-                     ((matrix-bridge--audio-event-p ev) (matrix-bridge--handle-audio ev))
-                     ((matrix-bridge--media-event-p ev) (matrix-bridge--deliver-media-event ev))
-                     (t (let ((line (matrix-bridge-event-line ev)))
-                          (when line
-                            (matrix-bridge--log "RECV %s" line)
-                            (matrix-bridge--deliver line))))))))
+                    (condition-case eerr
+                        (cond
+                         ((matrix-bridge--audio-event-p ev) (matrix-bridge--handle-audio ev))
+                         ((matrix-bridge--media-event-p ev) (matrix-bridge--deliver-media-event ev))
+                         (t (let ((line (matrix-bridge-event-line ev)))
+                              (when line
+                                (matrix-bridge--log "RECV %s" line)
+                                (matrix-bridge--deliver line)))))
+                      (error
+                       (matrix-bridge--log "skipping event %s: %S"
+                                           (matrix-bridge--get ev 'event_id) eerr))))))
               (setq matrix-bridge--since next)
               (matrix-bridge--save-since next)))
         (error
