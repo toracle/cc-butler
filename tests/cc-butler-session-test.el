@@ -2794,6 +2794,158 @@ one shared launch path, not an opt-in a caller could forget."
     (should mitigated)))
 
 ;;;; ------------------------------------------------------------------
+;;;; write-site token/key masking (msg-log)
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-session-test--logged-body (body)
+  "Call `cc-butler--log-message' with BODY and return the `body' field
+actually written to today's message log."
+  (cc-butler--log-message "report" "worker" "steward" body)
+  (let* ((got (cc-butler-session-test--msg-file-string))
+         (record (json-parse-string got :object-type 'alist)))
+    (alist-get 'body record)))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-openai-style-key ()
+  "An sk-... key must never reach the on-disk message log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234")
+           (logged (cc-butler-session-test--logged-body
+                    (format "here is a key %s in the body" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged))
+      (should (string-match-p "here is a key" logged))
+      (should (string-match-p "in the body" logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-github-pat ()
+  "A ghp_... GitHub token must never reach the log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "ghp_1234567890abcdefGHIJKLMNOPQR")
+           (logged (cc-butler-session-test--logged-body
+                    (format "token %s here" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-aws-access-key-id ()
+  "An AKIA... AWS access key id must never reach the log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "AKIAABCDEFGHIJKL1234")
+           (logged (cc-butler-session-test--logged-body
+                    (format "key %s in there" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-jwt ()
+  "A JWT (eyJ...) must never reach the log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret (concat "eyJhbGciOiJIUzI1NiJ9."
+                            "eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+                            "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"))
+           (logged (cc-butler-session-test--logged-body
+                    (format "jwt %s here" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-generic-long-base64-run ()
+  "A generic long base64-looking blob (no specific prefix) must never
+reach the log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret (concat "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVoxMjM0"
+                            "NTY3ODkwYWJjZGVmZ2hpams="))
+           (logged (cc-butler-session-test--logged-body
+                    (format "blob %s end" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-a-git-sha-alone ()
+  "A 40+-char lowercase-hex git commit SHA -- the same length class as
+the generic rule, and something this fleet's own reports quote
+constantly -- must survive unredacted, or the whole reason the rest of
+the body is preserved (investigative value) is lost on the single most
+common long token this log actually contains."
+  (cc-butler-session-test--with-ops-log
+    (let* ((sha "e429387abcdef1234567890abcdef1234567890ab")
+           (logged (cc-butler-session-test--logged-body
+                    (format "squash commit %s into main" sha))))
+      (should (string-match-p (regexp-quote sha) logged))
+      (should-not (string-match-p "<redacted:" logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-a-file-path-alone ()
+  "A long file path is not a token/key-shaped run and must survive
+unredacted -- the prior review's exact repro: with `/' inside the
+generic character class, an ordinary path this long was swallowed
+whole (`/home/toracle/.../dashboard.org' -> `<redacted:69>')."
+  (cc-butler-session-test--with-ops-log
+    (let* ((path "/home/toracle/emacsd/ccbutler/butler/docs/logs/September/dashboardorg")
+           (logged (cc-butler-session-test--logged-body
+                    (format "see %s for details" path))))
+      (should (string-match-p (regexp-quote path) logged))
+      (should-not (string-match-p "<redacted:" logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-a-url-alone ()
+  "A long URL is not a token/key-shaped run either -- same fix, same
+repro from the prior review (a cdnjs URL getting partially redacted)."
+  (cc-butler-session-test--with-ops-log
+    (let* ((url "https://cdnjs.cloudflare.com/ajax/libs/reactdom/production/reactdommin")
+           (logged (cc-butler-session-test--logged-body
+                    (format "fetch %s" url))))
+      (should (string-match-p (regexp-quote url) logged))
+      (should-not (string-match-p "<redacted:" logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-uppercase-hex-secret ()
+  "An uppercase-hex-shaped secret of git-SHA length must still be
+masked -- `cc-butler--looks-like-hex-only' must not case-fold its
+match and wrongly treat an uppercase secret as a lowercase SHA."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "DEADBEEF1234567890ABCDEF1234567890ABCDEF")
+           (logged (cc-butler-session-test--logged-body
+                    (format "key %s in there" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-aws-secret-access-key ()
+  "AWS's documented example secret contains `/', so it splits into short
+runs under the generic pattern; the dedicated shape must still mask it."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+           (logged (cc-butler-session-test--logged-body
+                    (format "secret %s end" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p "<redacted:40>" logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-40-char-paths-alone ()
+  "Adversarial path-like strings of exactly 40 chars must survive."
+  (cc-butler-session-test--with-ops-log
+    (dolist (s '("src/components/some/deeply/nested/path/file1"
+                 "src/Components/some/deeply/nested/File1xyz"
+                 "/Users/Foo/Projects/Bar2/src/components/x"
+                 "docs/Design/notes/2026/September/Report1"
+                 "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t9"))
+      (should (equal s (cc-butler--mask-secret-shapes s))))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-aws-secret-after-equals ()
+  "`KEY=value', `?k=value' and alnum-prefixed forms must still mask the key."
+  (let ((secret "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"))
+    (dolist (s (list (concat "AWS_SECRET_ACCESS_KEY=" secret)
+                     (concat "xxKEY=" secret)
+                     (concat "https://h/x?k=" secret)))
+      (should-not (string-match-p (regexp-quote secret)
+                                  (cc-butler--mask-secret-shapes s)))
+      (should (string-match-p "<redacted:40>" (cc-butler--mask-secret-shapes s))))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-url-query-path-alone ()
+  "A 40-char path-ish value after `=' in a URL must survive."
+  (let ((s "https://x/a=docs/Design/notes/2026/September/Report1"))
+    (should (equal s (cc-butler--mask-secret-shapes s)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-huge-run-never-drops-record ()
+  "A 1M-char alnum run must not overflow the regexp matcher and drop the record."
+  (cc-butler-session-test--with-ops-log
+    (let* ((run (make-string 1000000 ?a))
+           (logged (cc-butler-session-test--logged-body (concat "x " run " y"))))
+      (should (stringp logged))
+      (should-not (string-match-p "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" logged)))))
+
+;;;; ------------------------------------------------------------------
 ;;;; inbox queue persistence across restarts
 ;;;; ------------------------------------------------------------------
 

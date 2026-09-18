@@ -648,6 +648,97 @@ creation rather than chmod'd after."
   (expand-file-name (format-time-string "msg-%Y-%m-%d.log")
                     cc-butler-ops-log-dir))
 
+(defconst cc-butler--secret-shape-patterns
+  '("sk-[A-Za-z0-9]\\{20,\\}"
+    "ghp_[A-Za-z0-9]\\{20,\\}"
+    "AKIA[0-9A-Z]\\{16\\}"
+    "eyJ[A-Za-z0-9_-]\\{10,\\}\\(?:\\.[A-Za-z0-9_-]\\{10,\\}\\)\\{1,2\\}")
+  "Regexps for token/key shapes masked at the msg-log write site by
+`cc-butler--mask-secret-shapes': an OpenAI-style key, a GitHub PAT, an
+AWS access key id, and a JWT. Excludes the generic long-run shape,
+which needs an extra hex-only exclusion Emacs regexps can't express in
+one pattern (no lookahead) -- handled separately, see
+`cc-butler--secret-shape-generic-pattern'.")
+
+(defconst cc-butler--secret-shape-generic-pattern
+  "[A-Za-z0-9+]\\{40,\\}=\\{0,2\\}"
+  "Generic long base64/alnum run -- the fifth masked shape. Excludes `/'
+so an ordinary file path or URL (routinely 40+ chars) is not treated as
+one long run -- none of the shapes this pattern targets need it: `sk-',
+`ghp_', and `AKIA' have their own anchored patterns, AWS keys are
+alphanumeric, and JWTs use base64url (`-'/`_', not `/').  Also matches
+a purely lowercase-hex run (a git SHA is exactly this shape), which
+`cc-butler--mask-secret-shapes' filters back out via
+`cc-butler--looks-like-hex-only' so ordinary commit hashes in report
+bodies survive.")
+
+(defun cc-butler--looks-like-hex-only (s)
+  "Non-nil if S is entirely LOWERCASE hex digits -- a git SHA's shape,
+not a secret's.  Binds `case-fold-search' to nil: `string-match-p'
+inherits the caller's dynamic value, which defaults to t, and under
+that default `[0-9a-f]' matches its uppercase counterparts too, so an
+uppercase-hex-shaped SECRET (e.g. a 40-char run of A-F/0-9) was wrongly
+classified as \"hex-only\" and skipped by `cc-butler--mask-secret-shapes'
+-- surviving unmasked. Binding it to nil makes the match case-sensitive,
+so only an actual lowercase git SHA is excluded and an uppercase-hex
+secret of the same length is still masked."
+  (let ((case-fold-search nil))
+    (string-match-p "\\`[0-9a-f]+\\'" s)))
+
+(defconst cc-butler--aws-secret-run-pattern "[A-Za-z0-9/+]+"
+  "Maximal run of base64 characters (no `=', so `KEY=value' splits at `='), the unit `cc-butler--aws-secret-shape-p'
+judges.  Taking the whole run (not a 40-char slice) is the strict boundary:
+a slice of a longer path or base64 blob is never examined.")
+
+(defun cc-butler--aws-secret-shape-p (run)
+  "Non-nil if RUN looks like an AWS Secret Access Key that contains `/' or `+'.
+Exactly 40 chars, at least one `/' or `+', a digit and a lower->UPPER
+case transition (implies a mix of upper and lower).  Keys with neither `/' nor `+' are already caught by
+`cc-butler--secret-shape-generic-pattern'.  Also rejects a leading `/' or a
+`//' -- absolute paths and URL remnants, not keys -- so ordinary
+path-like text of this length is not over-redacted.  Accepted: misses ~3.5% of random keys (leading `/' or `//')."
+  (let ((case-fold-search nil))
+    (and (= (length run) 40)
+         (string-match-p "[/+]" run)
+         (not (string-match-p "\\`/\\|//" run))
+         ;; A lower->UPPER transition inside a word: random keys have them,
+         ;; path segments (`Design', `September', `Report1') do not.
+         (string-match-p "[a-z][A-Z]" run)
+         (string-match-p "[0-9]" run))))
+
+(defun cc-butler--mask-secret-shapes (body)
+  "Replace token/key-shaped runs in BODY with <redacted:LEN>, LEN the
+length of what was there. Everything else in BODY is left untouched --
+investigative value matters (see 2026-09-04 retention audit: report
+bodies in this log are routinely the evidence a correction is based
+on), so this only ever removes the one thing that must not be at rest
+here, never anything around it."
+  (condition-case nil
+      (cc-butler--mask-secret-shapes-1 body)
+    ;; e.g. "Stack overflow in regexp matcher" on a huge unbroken run: never drop the record nor log raw.
+    (error "<redacted:body-unmaskable>")))
+
+(defun cc-butler--mask-secret-shapes-1 (body)
+  "Unguarded worker for `cc-butler--mask-secret-shapes' on BODY."
+  (let ((out body))
+    (dolist (pat cc-butler--secret-shape-patterns)
+      (setq out (replace-regexp-in-string
+                 pat (lambda (m) (format "<redacted:%d>" (length m)))
+                 out t t)))
+    (setq out (replace-regexp-in-string
+               cc-butler--secret-shape-generic-pattern
+               (lambda (m)
+                 (if (cc-butler--looks-like-hex-only m) m
+                   (format "<redacted:%d>" (length m))))
+               out t t))
+    (replace-regexp-in-string
+     cc-butler--aws-secret-run-pattern
+     (lambda (m)
+       (if (cc-butler--aws-secret-shape-p m)
+           (format "<redacted:%d>" (length m))
+         m))
+     out t t)))
+
 (defcustom cc-butler-ops-log-retention-days 14
   "Days a dated ops/msg log file is kept before rotation deletes it.
 Only ever applies to files dated after `cc-butler-ops-log-rotation-epoch'
@@ -775,7 +866,7 @@ precondition for the operation being logged.  Dir/file created
                                    (cons 'kind kind)
                                    (cons 'from (or from ""))
                                    (cons 'to (or to ""))
-                                   (cons 'body (or body ""))))
+                                   (cons 'body (cc-butler--mask-secret-shapes (or body "")))))
                "\n")
        nil (cc-butler--msg-log-file) 'append 'silent))))
 
