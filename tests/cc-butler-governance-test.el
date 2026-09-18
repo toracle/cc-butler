@@ -2348,12 +2348,17 @@ more cited -- sorts behind every one of them); GREEN once
         ;; more heavily cited
         (cc-butler-governance-test--commit-note
          store "loved" (cc-butler-governance--render "loved" "d" "body" nil)
-         (- now 3600)))
+         (- now 3600))
+        ;; one long-stale note, cited once: the first genuine Band B entry
+        ;; (bulk leftovers have 0 citations) -- marks where Band A ends
+        (cc-butler-governance-test--commit-note
+         store "stale" (cc-butler-governance--render "stale" "d" "body" nil)
+         (- now (* 400 86400))))
       (with-temp-file (expand-file-name "citing.md" vault)
         ;; `loved' and one bulk file (bulk-07) are the only cited notes --
         ;; standing in for the mass of files a mechanical redirect touches
         ;; without any of them individually being popular
-        (insert "[[loved]] [[loved]] [[bulk-07]]\n"))
+        (insert "[[loved]] [[loved]] [[bulk-07]] [[stale]]\n"))
       (cc-butler-tool-regenerate-governance)
       (let* ((index-text (with-temp-buffer
                            (insert-file-contents (expand-file-name "MEMORY.md" mem))
@@ -2368,7 +2373,12 @@ more cited -- sorts behind every one of them); GREEN once
         (should (member "bulk-07" (seq-take slugs 4)))
         ;; the cap actually bit: strictly fewer than all 20 bulk notes lead
         ;; the index alongside them -- most of the 20 are pushed behind
-        (should (<= (length (seq-intersection (seq-take slugs 4) bulk-slugs))
+        ;; measured over the WHOLE Band A region (everything ahead of the
+        ;; first Band-B-only note, `stale'), so a flood cannot hide past a
+        ;; short window
+        (should (<= (length (seq-filter (lambda (s) (string-prefix-p "bulk-" s))
+                                        (seq-take-while (lambda (s) (not (equal s "stale")))
+                                                        slugs)))
                     cc-butler-governance-band-a-commit-cap))))))
 
 ;;;; ------------------------------------------------------------------
