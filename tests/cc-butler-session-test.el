@@ -2867,6 +2867,70 @@ caught neither value drifting from the real backlog behavior below.)"
           (should (cl-some (lambda (l) (string-match-p "backlog" l)) logged)))
       (delete-file cc-butler-inbox-queue-file))))
 
+;;; Load validation / save failure (review findings).
+
+(defmacro cc-butler-session-test--with-queue-file (contents &rest body)
+  "Run BODY with the queue file bound to a temp file holding CONTENTS (string
+or nil for absent), with `cc-butler--log' captured into `logged'."
+  (declare (indent 1))
+  `(let* ((tmpdir (file-name-as-directory (make-temp-file "cc-butler-iq-test" t)))
+          (cc-butler-inbox-queue-file (expand-file-name "q.eld" tmpdir))
+          (cc-butler--inbox nil)
+          logged)
+     (when ,contents (with-temp-file cc-butler-inbox-queue-file (insert ,contents)))
+     (unwind-protect
+         (cl-letf (((symbol-function 'cc-butler--log)
+                    (lambda (fmt &rest args) (push (apply #'format fmt args) logged))))
+           ,@body)
+       (delete-directory tmpdir t))))
+
+(defun cc-butler-session-test--corrupt-files ()
+  (directory-files (file-name-directory cc-butler-inbox-queue-file) nil "\\.corrupt"))
+
+(dolist (case '(("atom" . "42\n") ("string" . "\"str\"\n")
+                ("non-plist-list" . "(1 2 3)\n")
+                ("truncated" . "((:time (26 1) :dir \"/w/\" :bo")))
+  (let ((name (car case)) (text (cdr case)))
+    (eval `(ert-deftest ,(intern (format "cc-butler-session/inbox-queue-load-rejects-%s" name)) ()
+             (cc-butler-session-test--with-queue-file ,text
+               (cc-butler--inbox-queue-load)
+               (should-not cc-butler--inbox)
+               (should-not (file-exists-p cc-butler-inbox-queue-file))
+               (should (= 1 (length (cc-butler-session-test--corrupt-files))))
+               (should (cl-some (lambda (l) (string-match-p "invalid" l)) logged))
+               ;; a later push must still work (not wedged)
+               (cc-butler--inbox-push "/w/" "after")
+               (should (= 1 (length cc-butler--inbox)))))
+          t)))
+
+(ert-deftest cc-butler-session/inbox-queue-load-accepts-a-good-file ()
+  (cc-butler-session-test--with-queue-file
+      "((:time (26 1) :dir \"/w/\" :name \"w\" :id nil :body \"hi\"))\n"
+    (cc-butler--inbox-queue-load)
+    (should (equal "hi" (plist-get (car cc-butler--inbox) :body)))
+    (should-not (cc-butler-session-test--corrupt-files))))
+
+(ert-deftest cc-butler-session/inbox-queue-save-failure-cleans-temp-and-logs ()
+  (cc-butler-session-test--with-queue-file nil
+    ;; Target is a directory, so the rename over it fails.
+    (make-directory cc-butler-inbox-queue-file)
+    (let ((cc-butler--inbox (list (list :time (current-time) :dir "/w/" :body "x"))))
+      (cc-butler--inbox-queue-save))
+    (should-not (directory-files (file-name-directory cc-butler-inbox-queue-file)
+                                 nil "\\`cc-butler-inbox-queue-"))
+    (should (cl-some (lambda (l) (string-match-p "save failed" l)) logged))))
+
+(ert-deftest cc-butler-session/inbox-queue-backlog-warns-once-per-crossing ()
+  (cc-butler-session-test--with-queue-file nil
+    (let ((cc-butler-inbox-queue-warn-threshold 1)
+          (cc-butler--inbox-queue-warned nil))
+      (let ((cc-butler--inbox '(:a :b))) (cc-butler--inbox-queue-save))
+      (let ((cc-butler--inbox '(:a :b :c))) (cc-butler--inbox-queue-save))
+      (should (= 1 (cl-count-if (lambda (l) (string-match-p "backlog" l)) logged)))
+      (let ((cc-butler--inbox '(:a))) (cc-butler--inbox-queue-save))
+      (let ((cc-butler--inbox '(:a :b))) (cc-butler--inbox-queue-save))
+      (should (= 2 (cl-count-if (lambda (l) (string-match-p "backlog" l)) logged))))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; forward-only ops/msg log rotation
 ;;;; ------------------------------------------------------------------
