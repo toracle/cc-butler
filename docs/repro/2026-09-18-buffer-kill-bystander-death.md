@@ -446,3 +446,105 @@ different, newer session`
 
 This draft is intentionally NOT filed. It is held here for steward/butler
 review before anyone opens it upstream.
+
+## Round 2 results (appended after the Round-2 pre-registration commit)
+
+### Module version (observation)
+
+ccb-repro's `init.el` loaded `ghostel-20260823.1350`; confirmed live in the
+daemon via `(locate-library "ghostel")` → that exact path.
+`ghostel-module.version` in that directory reads `0.51.0`, matching the m1
+daemon per butler. The stale `ghostel-20260804.2129` (`0.49.0`) was never
+on this daemon's `load-path`.
+
+### Task (b): decisive rows (observation, raw)
+
+3 fresh X/Y/Z triples per row, ~1.2s wait plus one extra `emacsclient`
+round-trip (to pump Emacs's event loop again) before checking each
+session's log for `HUP`:
+
+| Row | Killed | X | Y | Z | Victim |
+|---|---|---|---|---|---|
+| 1 (Round 1, for reference) | Z | survives | **HUP** | (killed) | Y |
+| 2, run 1/3 | Y | **HUP** | (killed) | survives | X |
+| 2, run 2/3 | Y | **HUP** | (killed) | survives | X |
+| 2, run 3/3 | Y | **HUP** | (killed) | survives | X |
+| 3, run 1/3 | X | (killed) | **HUP** | survives | Y |
+| 3, run 2/3 | X | (killed) | **HUP** | survives | Y |
+| 3, run 3/3 | X | (killed) | **HUP** | survives | Y |
+
+Row 4 (2 fresh throwaways W1/W2 spawned right after X/Y/Z, then the OLD
+target X killed), 3 runs, order X<Y<Z<W1<W2 by creation:
+
+| Run | X | Y | Z | W1 | W2 | Victim |
+|---|---|---|---|---|---|---|
+| 1/3 | (killed) | survives | survives | **HUP** | survives | W1 |
+| 2/3 | (killed) | survives | survives | **HUP** | survives | W1 |
+| 3/3 | (killed) | survives | survives | **HUP** | survives | W1 |
+
+Every run within a row agreed 3/3 — no discards, no flaky rows this time.
+
+### Falsification-condition outcomes (as pre-registered)
+
+- **Hypothesis A (fixed: always the 2nd-newest overall) is FALSIFIED**:
+  row 2 shows X dying (not "nobody"), which the pre-registration named
+  explicitly as A's falsification condition.
+- **Hypothesis B (relative: kill N → N-1 dies, oldest has no victim) is
+  FALSIFIED**: row 3 shows Y dying when X (the oldest) was killed, where
+  B predicted nobody would die — the pre-registered falsification
+  condition for B.
+- Per the pre-registered interpretation rule, this combination ("row 2
+  matches B not A; row 3 matches A's stated reading, not B") is reported
+  as **neither hypothesis cleanly fits**, with the raw data above, not
+  forced into either table.
+
+### Inference: a refined rule that fits all 9 trials (kept separate from the above observation)
+
+Looking at the position pattern across all 4 rows (0-indexed by creation
+order, N = live session count at kill time):
+
+- Killing a session that is NOT the oldest (index > 0) kills its
+  immediate predecessor (index − 1) — this is exactly hypothesis B, and
+  it held in every non-oldest-kill trial (row 1: idx2 killed → idx1
+  victim; row 2: idx1 killed → idx0 victim).
+- Killing the OLDEST session (index 0) instead kills the session at index
+  **N − 2** — the second-newest of the CURRENT live set (not "nobody," and
+  not the newest either). Row 3 (N=3): index 3−2=1=Y ✓. Row 4 (N=5, since
+  W1/W2 were alive too): index 5−2=3=W1 ✓.
+
+This merged rule (call it **C**: "predecessor, except the oldest session's
+kill instead lands on the second-newest of the live set") fits all 9
+kill trials run across both rounds with zero exceptions. This is
+INFERENCE — a pattern read off 9 data points on one machine, one day —
+not a confirmed code-level mechanism. I did not find (and did not spend
+further budget hunting for) the exact arithmetic in
+`PosixPtyProcess.zig`/`NativeProcess.zig` that would produce precisely
+this shape (a plain circular "index − 1 mod N" would land the oldest's
+victim on the NEWEST, not the second-newest, so whatever produces this is
+some other indexing detail, e.g. a small fixed-size history/handoff
+structure with its own off-by-one, not a simple ring buffer over all live
+sessions). The candidate site named earlier
+(`PosixPtyProcess.zig:358-374`, a detached reaper thread closing a raw pty
+fd) remains the most likely general LOCATION of the defect (it's the only
+place in the read source that closes an OS-level fd tied to a specific
+session asynchronously), but I have not proven rule C traces to that exact
+line — flagging this gap rather than overclaiming precision.
+
+### Sample-size / scope honesty (Round 2)
+
+9 kill trials total (3+3+3 across rows 2–4), zero discards, one machine,
+one day, same build as Round 1. This is enough to cleanly falsify both
+pre-registered hypotheses and to notice rule C fits everything tried — it
+is NOT enough to claim rule C is exhaustive (a 4-or-more-position kill, or
+a session created and killed out of the simple "spawn all, then kill one"
+pattern used here, was not tested) or to claim it generalizes past this
+build/machine.
+
+### Draft upstream issue — unchanged recommendation
+
+The draft issue text above still stands as the best available write-up:
+it correctly describes the observed symptom and the general hazard shape
+(closing a raw pty fd on a detached, unsynchronized thread). I have NOT
+updated it to claim rule C's exact "N−2 for the oldest" detail as a proven
+mechanism, since that would overclaim past what Round 2 established. It
+remains unfiled, for steward/butler review.
