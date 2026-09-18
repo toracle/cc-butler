@@ -397,6 +397,52 @@ all.  Assert the reason, not merely that something was refused."
                                    bad)))))
       (delete-directory topic t))))
 
+;;;; ------------------------------------------------------------------
+;;;; Buffer-kill bystander-death guard (2026-09-18)
+;;;;
+;;;; See docs/repro/2026-09-18-buffer-kill-bystander-death.md: killing one
+;;;; ghostel-backed claude-code-ide session's buffer, while ANOTHER such
+;;;; session is alive, was reproduced (ccb-repro, 5+ independent runs) to
+;;;; send a real SIGHUP to the untouched session and end it. The defect
+;;;; lives in ghostel's native pty module (vendored dylib; not fixable
+;;;; here), so this guard only prevents cc-butler from ever triggering it.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-workspace/close-topic-kill-session-refuses-concurrent-ghostel ()
+  "Refuses to kill-buffer a session while another ghostel session is alive."
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (claude-code-ide--processes (make-hash-table :test 'equal)))
+    (puthash "/tmp/dir-a/" 'fake-proc-a claude-code-ide--processes)
+    (puthash "/tmp/dir-b/" 'fake-proc-b claude-code-ide--processes)
+    (should-error (cc-butler--close-topic-kill-session "/tmp/dir-a/")
+                  :type 'user-error)))
+
+(ert-deftest cc-butler-workspace/close-topic-kill-session-allows-solo-ghostel ()
+  "Proceeds normally when it is the only tracked ghostel session (no buffer
+exists for the fake dir, so the ordinary body is just a no-op, not an error)."
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (claude-code-ide--processes (make-hash-table :test 'equal)))
+    (puthash "/tmp/dir-a/" 'fake-proc-a claude-code-ide--processes)
+    (should (equal nil (cc-butler--close-topic-kill-session "/tmp/dir-a/")))))
+
+(ert-deftest cc-butler-workspace/close-topic-kill-session-allows-non-ghostel-backend ()
+  "The guard is scoped to the ghostel backend, where the defect lives; a
+vterm/eat setup with >1 tracked session is untouched by this guard."
+  (let ((claude-code-ide-terminal-backend 'vterm)
+        (claude-code-ide--processes (make-hash-table :test 'equal)))
+    (puthash "/tmp/dir-a/" 'fake-proc-a claude-code-ide--processes)
+    (puthash "/tmp/dir-b/" 'fake-proc-b claude-code-ide--processes)
+    (should (equal nil (cc-butler--close-topic-kill-session "/tmp/dir-a/")))))
+
+(ert-deftest cc-butler-workspace/close-topic-kill-session-escape-hatch ()
+  "Setting the defcustom to nil restores the pre-guard behavior."
+  (let ((claude-code-ide-terminal-backend 'ghostel)
+        (claude-code-ide--processes (make-hash-table :test 'equal))
+        (cc-butler-close-topic-refuse-concurrent-ghostel nil))
+    (puthash "/tmp/dir-a/" 'fake-proc-a claude-code-ide--processes)
+    (puthash "/tmp/dir-b/" 'fake-proc-b claude-code-ide--processes)
+    (should (equal nil (cc-butler--close-topic-kill-session "/tmp/dir-a/")))))
+
 (ert-deftest cc-butler-workspace/close-topic-audit-passes-clean-scaffolded-topic ()
   "The ordinary case must still pass: one clean child repo plus only
 cc-butler's own scaffold files (marker + CLAUDE.md) at the root is NOT

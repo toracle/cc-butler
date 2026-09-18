@@ -473,9 +473,46 @@ follow-up)."
             bad))
     (nreverse bad)))
 
+(defcustom cc-butler-close-topic-refuse-concurrent-ghostel t
+  "When non-nil, refuse to kill a ghostel-backed session's buffer while
+another ghostel-backed `claude-code-ide' session is concurrently alive.
+
+Reproduced 2026-09-18 (see
+docs/repro/2026-09-18-buffer-kill-bystander-death.md, ccb-repro, 5+
+independent runs): killing one ghostel-backed terminal buffer while
+another is alive can send a real SIGHUP to the OTHER, untouched session
+and end it — a genuine cross-session defect traced into ghostel's native
+pty module (a vendored dylib; the double `cleanup-on-exit' call
+originally suspected was tested and ruled out). That module cannot be
+fixed here, so this guard only prevents cc-butler from ever triggering
+it through `cc-butler-close-topic' / the `close_topic' MCP tool.
+
+This guard does NOT cover a plain `kill-buffer' done outside cc-butler
+\(e.g. interactively, or from any other code path\) on a ghostel session's
+buffer: that carries the identical bystander-death risk, unguarded. That
+gap is closed by operational rule only \(the live-fleet freeze\), not by
+code.
+
+The one legitimate reason to set this to nil is complying with the
+fleet's worker session cap \(2026-09-16: 10 workers + butler + steward,
+max 12, adjusted up and down as needed\) when it collides with this
+guard's refusal. This is a known collision between the cap and the
+guard, not a fix: disabling the option accepts the bystander-death risk
+until the upstream root cause is fixed."
+  :type 'boolean
+  :group 'cc-butler)
+
+(defun cc-butler--concurrent-ghostel-sessions-p ()
+  "Non-nil when >1 ghostel-backed `claude-code-ide' session is tracked live."
+  (and (eq claude-code-ide-terminal-backend 'ghostel)
+       (> (hash-table-count claude-code-ide--processes) 1)))
+
 (defun cc-butler--close-topic-kill-session (dir)
   "Terminate the Claude session for DIR (process, buffers, state).
 Returns the list of buffer names killed."
+  (when (and cc-butler-close-topic-refuse-concurrent-ghostel
+             (cc-butler--concurrent-ghostel-sessions-p))
+    (user-error "cc-butler: refusing to kill session for %s — another ghostel session is alive (buffer-kill bystander-death bug, docs/repro/2026-09-18-buffer-kill-bystander-death.md); close the other sessions first, or set cc-butler-close-topic-refuse-concurrent-ghostel to nil once upstream is fixed" dir))
   (let* ((name (cc-butler--display-name dir))
          (bufname (claude-code-ide--get-buffer-name dir))
          (buf (get-buffer bufname))
