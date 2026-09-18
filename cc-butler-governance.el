@@ -693,14 +693,19 @@ citations sorts as citation 0 in Band B. Neither ever errors."
                                (if (= ca cb) (string< a b) (> ca cb)))))))
         (append band-a band-b)))))
 
-(defun cc-butler-governance--rewrite-sorted-index (slugs recency-map)
+(defun cc-butler-governance--rewrite-sorted-index (slugs recency-map citation-map)
   "Rewrite `MEMORY.md's block of this store's own generated lines (see
 `cc-butler-governance--index-line-regexp') so SLUGS appear as one
-contiguous run ordered by RECENCY-MAP (store filename -> unix time, from
-`cc-butler-governance--commit-recency-map') descending — the
-most-recently-committed principle first, so a note that keeps getting
-revised (still alive, still load-bearing) surfaces near the top of
-`MEMORY.md' instead of wherever it happened to land historically.
+contiguous run ordered by `cc-butler-governance--band-order' (RECENCY-MAP
+and CITATION-MAP passed straight through) — a note git-committed in the
+last `cc-butler-governance-band-a-days' days first (Band A, capped per
+commit at `cc-butler-governance-band-a-commit-cap' so one bulk mechanical
+commit cannot occupy the whole band), everything else after ordered by
+inbound-citation count (Band B). A straight commit-recency sort has the
+SAME failure shape as the `mtime' key it itself replaced: one bulk
+mechanical commit occupies the entire top of the index, pushing out both
+the notes that actually needed surfacing and any very-high-citation note
+that merely lacks a recent commit — the per-commit cap is what stops that.
 
 Every line NOT in this store's own generated shape — hand-authored content
 the store does not own — is left byte-for-byte untouched, and ALL such
@@ -758,11 +763,7 @@ stale, still-oversized text to a new spot."
         (goto-char (point-max))
         (unless (or (bobp) (bolp)) (insert "\n"))
         (let* ((insert-pos (point))
-               (ordered
-                (sort (copy-sequence slugs)
-                      (lambda (a b)
-                        (> (or (gethash (concat a ".md") recency-map) -1)
-                           (or (gethash (concat b ".md") recency-map) -1)))))
+               (ordered (cc-butler-governance--band-order slugs recency-map citation-map))
                (block (mapconcat
                        (lambda (slug)
                          (or (gethash slug existing)
@@ -1044,12 +1045,14 @@ reason), shrinks any CURRENT-format line still over the byte cap (see
 both format-migration passes so it only ever sees current-shape lines and
 BEFORE the sort below, which reuses on-disk line text verbatim and would
 otherwise reposition a still-oversized line instead of a fixed one), then
-either re-sorts the store-owned entries by each principle's latest git
-commit time, descending — so a note that keeps getting revised surfaces
-near the top instead of wherever it happened to land historically (see
-`cc-butler-governance--rewrite-sorted-index') — or, when the store is not
-a git repo (or git itself is unavailable), falls back to the previous
-add-only, insertion-order merge (`cc-butler-governance--sync-index');
+either re-sorts the store-owned entries into two bands — recently
+committed first (capped per commit so one bulk commit cannot swallow the
+band), inbound-citation count after — so a note that keeps getting revised
+OR is widely cited surfaces near the top instead of wherever it happened
+to land historically (see `cc-butler-governance--rewrite-sorted-index' and
+`cc-butler-governance--band-order') — or, when the store is not a git
+repo (or git itself is unavailable), falls back to the previous add-only,
+insertion-order merge (`cc-butler-governance--sync-index');
 either way `cc-butler-governance--last-sort-unavailable-reason' records
 which happened, non-nil only on the fallback, for a caller to report
 loudly rather than let a silent fallback pass as a normal run.  Finally
@@ -1078,7 +1081,8 @@ Returns the count of principles written."
       (let ((recency (cc-butler-governance--commit-recency-map)))
         (setq cc-butler-governance--last-sort-unavailable-reason (cdr recency))
         (if (car recency)
-            (cc-butler-governance--rewrite-sorted-index slugs (car recency))
+            (cc-butler-governance--rewrite-sorted-index
+             slugs (car recency) (car (cc-butler-governance--citation-count-map)))
           (cc-butler-governance--sync-index slugs)))
       (cc-butler-governance--prune-dead-entries)
       (cc-butler-governance--refresh-banner)
@@ -1087,7 +1091,7 @@ Returns the count of principles written."
                   (if cc-butler-governance--last-sort-unavailable-reason
                       (format " (git-based sort unavailable (%s): falling back to insertion order)"
                               cc-butler-governance--last-sort-unavailable-reason)
-                    " (index sorted by git commit-recency)")))
+                    " (index in two bands: recent commits first, citation count after)")))
       n)))
 
 (defconst cc-butler-governance--index-line-regexp
@@ -2028,7 +2032,8 @@ duplicate slugs."
      (if cc-butler-governance--last-sort-unavailable-reason
          (format "Index sort: git-based sort unavailable (%s): falling back to insertion order.\n"
                  cc-butler-governance--last-sort-unavailable-reason)
-       "Index sort: entries ordered by git commit-recency, most recently committed first.\n")
+       (format "Index sort: two bands — committed within %d days first (max %d per commit), inbound-citation count after.\n"
+               cc-butler-governance-band-a-days cc-butler-governance-band-a-commit-cap))
      "Checked: store->index (notes missing an index line), index->store (index lines whose principle no longer exists), description drift (index text vs each note's current frontmatter), and duplicate slugs (any slug indexed more than once).\n"
      (if before
          (format "Merged %d previously un-indexed note(s) into MEMORY.md: %s\n"

@@ -1744,12 +1744,17 @@ count. Three notes committed oldest to newest (note-a, note-b, note-c)
 must come out newest-first."
   (cc-butler-governance-test--with-store
     (cc-butler-governance-test--git-init store)
-    (cc-butler-governance-test--commit-note
-     store "note-a" (cc-butler-governance--render "note-a" "d" "body" "feedback") 1000)
-    (cc-butler-governance-test--commit-note
-     store "note-b" (cc-butler-governance--render "note-b" "d" "body" "feedback") 2000)
-    (cc-butler-governance-test--commit-note
-     store "note-c" (cc-butler-governance--render "note-c" "d" "body" "feedback") 3000)
+    ;; Relative to NOW (not a fixed 1970 epoch) so all three land inside
+    ;; the two-band index's Band A window and this test still exercises
+    ;; commit-recency ordering rather than falling through to Band B's
+    ;; citation-count (all zero here) + alphabetical tiebreak.
+    (let ((now (floor (float-time))))
+      (cc-butler-governance-test--commit-note
+       store "note-a" (cc-butler-governance--render "note-a" "d" "body" "feedback") (- now 3000))
+      (cc-butler-governance-test--commit-note
+       store "note-b" (cc-butler-governance--render "note-b" "d" "body" "feedback") (- now 2000))
+      (cc-butler-governance-test--commit-note
+       store "note-c" (cc-butler-governance--render "note-c" "d" "body" "feedback") (- now 1000)))
     (cc-butler-governance-regenerate)
     (let* ((index (expand-file-name "MEMORY.md" mem))
            (text (with-temp-buffer (insert-file-contents index) (buffer-string))))
@@ -1782,12 +1787,18 @@ catch a missing sort."
       (should (> (string-bytes old-line) cc-butler-governance-max-index-line-bytes))
       (cc-butler-governance-test--git-init store)
       ;; Seed order: short-note first, then the long slug's oversized line --
-      ;; the OPPOSITE of the expected post-sort order below.
-      (with-temp-file index (insert "- butler-short-note.md — d\n" old-line))
-      (cc-butler-governance-test--commit-note
-       store "short-note" (cc-butler-governance--render "short-note" "d" "body" "feedback") 1000)
-      (cc-butler-governance-test--commit-note
-       store slug (cc-butler-governance--render slug desc "body" "feedback") 2000)
+      ;; the OPPOSITE of the expected post-sort order below. Timestamps are
+      ;; relative to NOW (not a fixed 1970 epoch) so both land inside the
+      ;; two-band index's Band A window -- otherwise both fall through to
+      ;; Band B and this test's `pos-long < pos-short' assertion would pass
+      ;; by alphabetical coincidence ("an-..." < "short-...") rather than
+      ;; because the sort actually ran.
+      (let ((now (floor (float-time))))
+        (with-temp-file index (insert "- butler-short-note.md — d\n" old-line))
+        (cc-butler-governance-test--commit-note
+         store "short-note" (cc-butler-governance--render "short-note" "d" "body" "feedback") (- now 2000))
+        (cc-butler-governance-test--commit-note
+         store slug (cc-butler-governance--render slug desc "body" "feedback") (- now 1000)))
       (cc-butler-governance-regenerate)
       (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
         (should-not (string-search old-line text))
@@ -1824,10 +1835,13 @@ contiguous run)."
       (cc-butler-governance-test--git-init store)
       (with-temp-file index
         (insert "- butler-note-a.md — d\n" curated "- butler-note-b.md — d\n"))
-      (cc-butler-governance-test--commit-note
-       store "note-a" (cc-butler-governance--render "note-a" "d" "body" "feedback") 1000)
-      (cc-butler-governance-test--commit-note
-       store "note-b" (cc-butler-governance--render "note-b" "d" "body" "feedback") 2000)
+      ;; Relative to NOW so both land inside the two-band index's Band A
+      ;; window (see the sibling fresh-banner test above for why).
+      (let ((now (floor (float-time))))
+        (cc-butler-governance-test--commit-note
+         store "note-a" (cc-butler-governance--render "note-a" "d" "body" "feedback") (- now 2000))
+        (cc-butler-governance-test--commit-note
+         store "note-b" (cc-butler-governance--render "note-b" "d" "body" "feedback") (- now 1000)))
       (cc-butler-governance-regenerate)
       (let ((text (with-temp-buffer (insert-file-contents index) (buffer-string))))
         ;; present exactly once, byte-for-byte -- not duplicated, not deleted.
