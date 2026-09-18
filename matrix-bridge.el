@@ -63,7 +63,7 @@ Set to nil to go live.  See the commentary at the top of this file.")
 
 (defvar matrix-bridge-target-session "butler")
 (defvar matrix-bridge-self-user-id nil
-  "This fleet's own Matrix user id, e.g. \"@butler-x600:warmblood-lounge\".
+  "This fleet's own Matrix user id, e.g. \"@example-self:example.invalid\".
 
 Deliberately nil: it feeds the \"don't re-deliver my own messages\" filter in
 `matrix-bridge-event-line', and a default belonging to ONE fleet is worse than
@@ -74,7 +74,25 @@ delivers nothing, which on screen is indistinguishable from a quiet room.
 `matrix-bridge-start' refuses to run while this is nil, so a fleet that forgets
 to set it fails loudly at startup instead of going silently deaf.  Set it in
 per-machine config, not here.")
-(defvar matrix-bridge-human-user-id "@jeongsoo:warmblood-lounge")
+(defvar matrix-bridge-human-user-id nil
+  "The human's own Matrix user id, e.g. \"@example-user:example.invalid\".
+
+Deliberately nil, mirroring `matrix-bridge-self-user-id' just above: a
+default belonging to ONE fleet's human is worse than no default, since it
+would make `matrix-bridge-attribution' and the reminder-append check in
+`matrix-bridge-event-line' silently misclassify every OTHER fleet's human
+sender as a bot -- no error, no log, just the reminder line and the
+attribution name quietly never appearing.
+
+`matrix-bridge-start' refuses to run while this is nil, for the same reason
+and with the same loudness as the `matrix-bridge-self-user-id' guard right
+below it. Set it in per-machine config, not here.
+
+2026-09-10: this was a real hardcoded fleet id here for months (public
+repo -- see `cc-butler-fixture-hygiene-test.el'). Redacting it without this
+guard would have traded a loud, visible leak for a quiet, permanent
+misclassification of the same fleet's own human sender -- a worse failure
+mode, not a fix. The guard is what makes redacting the default safe.")
 (defvar matrix-bridge-human-reminder
   "\n※ 이 메시지에 대한 답은 반드시 이 방(Matrix)에 남겨라 — 터미널 응답만으로 \
 끝내지 말 것. 답할 때는 이 줄 머리 대괄호 안의 `id:'/`thread:'/`reply:' 값을 \
@@ -138,6 +156,28 @@ Used ONLY as a `let'-bound addition to `process-environment' around the
 single `make-process' call in `matrix-bridge--transcribe-audio' -- never via
 `setenv' -- so it can never leak into the rest of this Emacs process's
 environment.  Left nil, no HOME override is applied at all.")
+
+(defgroup matrix-bridge nil
+  "Matrix lounge -> cc-butler session relay."
+  :group 'applications)
+
+(defcustom matrix-bridge-thread-fetch-timeout-seconds 10
+  "Defense timeout (seconds) around each request `matrix-bridge-thread-replies'
+makes.  That function's request is a single bounded fetch -- unlike
+`matrix-bridge--poll''s 30s `/sync' long-poll (see the file commentary on why
+THAT one must stay async), so a synchronous call is fine here; this timeout
+only guards against a wedged connection."
+  :type 'number
+  :group 'matrix-bridge)
+
+(defcustom matrix-bridge-thread-fetch-max-pages 5
+  "Hard cap on pages fetched by one `matrix-bridge-thread-replies' call (at
+`matrix-bridge--thread-fetch-page-limit' events per page, so 5*50=250 events
+by default).  Hitting this cap before the thread is naturally exhausted sets
+`:truncated t' on the result rather than silently presenting a partial scan
+as exhaustive."
+  :type 'integer
+  :group 'matrix-bridge)
 
 (defvar matrix-bridge--generation 0
   "Bumped by start and stop.  A callback or timer from an older generation
@@ -271,8 +311,26 @@ line itself."
 ;;; --- delivery -------------------------------------------------------------
 
 (defun matrix-bridge--deliver (text)
+  "Deliver TEXT for real, unless shadowed or unsafe to.
+
+`matrix-bridge-start' guards against a nil identity var only at its own
+call site. Two other paths reach here without ever calling it: a hot-reload
+of an already-running daemon (`defvar' leaves an unbound variable nil
+straight through it, and `emacs-startup-hook' does not fire again), and
+`matrix-bridge-shadow' being flipped to nil directly (documented at the
+top of this file as how to \"go live\" -- it does not route through
+`matrix-bridge-start' either). This function is the one choke point every
+real delivery passes through regardless of which path reached it, so a nil
+identity var is caught HERE -- by falling back to the shadow path, the
+same graceful degradation the clause below already uses when injection
+isn't available at all, not by signaling: this runs inside an async poll
+loop, and one bad message must not be able to take the whole loop down."
   (cond
    (matrix-bridge-shadow
+    (matrix-bridge--shadow-deliver text))
+   ((not (and matrix-bridge-self-user-id matrix-bridge-human-user-id))
+    (matrix-bridge--log "WARN identity var(s) nil -- shadowing instead of injecting \
+with broken sender classification")
     (matrix-bridge--shadow-deliver text))
    ((not (and (fboundp 'cc-butler--send-input) (fboundp 'cc-butler--dir-by-name)))
     (matrix-bridge--log "WARN cc-butler injection unavailable; shadowing instead")
@@ -629,6 +687,123 @@ See the ORDERING comment at the top of this section."
          (matrix-bridge--log "RECV %s" line)
          (matrix-bridge--deliver line))))))
 
+;;; --- synchronous thread-relations fetch ------------------------------------
+;;
+;; Unlike the `/sync' long-poll below, this is a single bounded request (one
+;; Matrix room's thread, capped page count) so `url-retrieve-synchronously'
+;; is safe here -- it must never be used for `/sync' itself (see the file
+;; commentary at the top).
+
+(defconst matrix-bridge--thread-fetch-page-limit 50
+  "Events requested per page by `matrix-bridge-thread-replies' (the `limit'
+query param).  Also the yardstick pagination stops against: a page whose
+`chunk' comes back shorter than this is the last page, `next_batch' or not.")
+
+(defun matrix-bridge--thread-relations-url (room event-id from)
+  "URL for one page of EVENT-ID's thread relations in ROOM.  FROM (a
+`next_batch' token, or nil for the first page) is passed back as the `from'
+query param.  ROOM and EVENT-ID are URL-path-encoded."
+  (concat matrix-bridge-homeserver
+          "/_matrix/client/v1/rooms/" (url-hexify-string room)
+          "/relations/" (url-hexify-string event-id) "/m.thread"
+          "?limit=" (number-to-string matrix-bridge--thread-fetch-page-limit)
+          (if from (concat "&from=" (url-hexify-string from)) "")))
+
+(defun matrix-bridge--thread-fetch-page (room event-id from)
+  "Fetch one page of EVENT-ID's thread relations in ROOM (FROM for
+pagination, nil for the first page).  Return (:http-status STATUS-OR-NIL
+:parsed PARSED-JSON-ALIST-OR-NIL).  May signal on a network failure or a
+request that never completes -- the caller (`matrix-bridge-thread-replies')
+wraps this in `condition-case'."
+  (unless matrix-bridge--token
+    (setq matrix-bridge--token (matrix-bridge--read-trimmed matrix-bridge-token-file)))
+  (let* ((url (matrix-bridge--thread-relations-url room event-id from))
+         (url-request-method "GET")
+         (url-request-extra-headers
+          (list (cons "Authorization" (concat "Bearer " matrix-bridge--token))))
+         (buf (url-retrieve-synchronously
+               url t t matrix-bridge-thread-fetch-timeout-seconds)))
+    (unless buf
+      (error "matrix-bridge: thread relations request timed out with no response"))
+    (unwind-protect
+        (with-current-buffer buf
+          (list :http-status (bound-and-true-p url-http-response-status)
+                :parsed (ignore-errors
+                          (json-parse-string (matrix-bridge--response-body)
+                                             :object-type 'alist
+                                             :null-object nil :false-object nil))))
+      (kill-buffer buf))))
+
+(defun matrix-bridge-thread-replies (room event-id)
+  "Synchronously fetch the Matrix thread rooted at EVENT-ID in ROOM (the
+`/relations/.../m.thread' endpoint), paginating via `next_batch' up to
+`matrix-bridge-thread-fetch-max-pages' pages.
+
+Returns one of exactly three shapes:
+  (:status ok :events LIST :scanned N :truncated BOOL) -- a successful
+    fetch; N (and LIST) may be empty -- a real, successful \"nothing found\"
+    is a valid, common result, not an error.  Each element of LIST is the
+    raw parsed Matrix event alist (has at least a `sender' key).
+  (:status not-in-room) -- the specific Matrix error M_NOT_FOUND /
+    \"Event not found in room\" -- ROOM does not actually contain EVENT-ID,
+    a data problem (a wrong/stale recorded room), distinct from a
+    connectivity problem.
+  (:status error :detail STRING) -- anything else (timeout, other HTTP
+    error, JSON parse failure, network failure).  Never an uncaught
+    exception -- the whole fetch is wrapped in `condition-case'.
+
+Pagination stops when a page's `next_batch' is absent, OR when that page's
+`chunk' came back shorter than the requested limit -- BOTH are
+independently sufficient to stop.  Confirmed live against a real
+homeserver (conduit): `next_batch' can be present even when `chunk' is
+short, so relying on \"`next_batch' absent\" alone under-terminates.  If the
+page cap is hit before either natural-stop condition fires, `:truncated' is
+t -- never silently presented as an exhaustive scan."
+  (condition-case err
+      (let ((events nil) (page 0) (from nil)
+            (not-in-room nil) (err-detail nil) (more t))
+        (with-timeout (matrix-bridge-thread-fetch-timeout-seconds
+                       (setq err-detail "matrix-bridge-thread-replies: timed out"
+                             more nil))
+          (while (and more (< page matrix-bridge-thread-fetch-max-pages))
+            (setq page (1+ page))
+            (let* ((resp (matrix-bridge--thread-fetch-page room event-id from))
+                   (http-status (plist-get resp :http-status))
+                   (parsed (plist-get resp :parsed)))
+              (cond
+               ((and parsed (equal (matrix-bridge--get parsed 'errcode) "M_NOT_FOUND"))
+                (setq not-in-room t more nil))
+               ((or (null http-status) (>= http-status 300))
+                (setq err-detail
+                      (format "matrix-bridge-thread-replies: HTTP %s%s"
+                              (or http-status "?")
+                              (if parsed
+                                  (format " (%s)"
+                                          (or (matrix-bridge--get parsed 'error)
+                                              (matrix-bridge--get parsed 'errcode)
+                                              ""))
+                                ""))
+                      more nil))
+               ((null parsed)
+                (setq err-detail
+                      (format "matrix-bridge-thread-replies: unparseable body (HTTP %s)"
+                              (or http-status "?"))
+                      more nil))
+               (t
+                (let* ((chunk (append (matrix-bridge--get parsed 'chunk) nil))
+                       (next (matrix-bridge--get parsed 'next_batch)))
+                  (setq events (append events chunk))
+                  (if (and next (>= (length chunk) matrix-bridge--thread-fetch-page-limit))
+                      (setq from next)
+                    (setq more nil))))))))
+        (cond
+         (not-in-room (list :status 'not-in-room))
+         (err-detail (list :status 'error :detail err-detail))
+         (t (list :status 'ok :events events :scanned (length events)
+                  :truncated (and more t)))))
+    (error (list :status 'error
+                 :detail (format "matrix-bridge-thread-replies: %S" err)))))
+
 ;;; --- the poll loop --------------------------------------------------------
 ;;
 ;; Invariant: every path out of the callback goes through
@@ -753,6 +928,10 @@ corrupt the bytes before they ever reach disk."
   (unless matrix-bridge-self-user-id
     (error "matrix-bridge: `matrix-bridge-self-user-id' is nil -- set it to \
 THIS fleet's own Matrix id before starting, or the relay cannot tell your own \
+messages from a peer's and will mis-filter them"))
+  (unless matrix-bridge-human-user-id
+    (error "matrix-bridge: `matrix-bridge-human-user-id' is nil -- set it to \
+the human's Matrix id before starting, or the relay cannot tell the human's \
 messages from a peer's and will mis-filter them"))
   (matrix-bridge-stop)
   (setq matrix-bridge--token (matrix-bridge--read-trimmed matrix-bridge-token-file)
@@ -946,36 +1125,43 @@ Not wired into any automatic trigger -- callable standalone for future use."
                     "[첨부 m.audio · voice.ogg]") t)
 
   ;; the whole line, and the two events we must drop
-  ;; The human's own messages carry the reminder ...
-  (cl-assert (equal (matrix-bridge-event-line
-                     `((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
-                       (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                    (concat "[matrix · 정수님 · id:$abc] hi"
-                            matrix-bridge-human-reminder)) t)
+  ;; The human's own messages carry the reminder ... Bound explicitly, same
+  ;; reason as the self-user-id case below: with the defvar now nil, reading
+  ;; the global here would make this assertion pass for the wrong reason
+  ;; (nil sender never equals nil id, so it would silently take the "not the
+  ;; human" branch and the missing reminder would read as a genuine failure
+  ;; of a DIFFERENT kind -- or, worse, as a pass if the branches ever changed
+  ;; shape).
+  (let ((matrix-bridge-human-user-id "@fake-human:example.org"))
+    (cl-assert (equal (matrix-bridge-event-line
+                       `((type . "m.room.message") (sender . ,matrix-bridge-human-user-id)
+                         (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
+                      (concat "[matrix · 정수님 · id:$abc] hi"
+                              matrix-bridge-human-reminder)) t))
   ;; ... and nobody else's do.  Without this negative case the assertion above
   ;; would still pass if the reminder were appended unconditionally.
   (cl-assert (equal (matrix-bridge-event-line
                      `((type . "m.room.message")
-                       (sender . "@butler-x600:warmblood-lounge")
+                       (sender . "@fake-peer:example.org")
                        (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                    "[matrix · butler-x600 · id:$abc] hi") t)
+                    "[matrix · fake-peer · id:$abc] hi") t)
   (cl-assert (equal (matrix-bridge-event-line
                      '((type . "m.room.message")
-                       (sender . "@butler-macbook-m1-max:warmblood-lounge")
+                       (sender . "@fake-peer2:example.org")
                        (event_id . "$abc") (content . ((msgtype . "m.text") (body . "hi")))))
-                    "[matrix · butler-macbook-m1-max · id:$abc] hi") t)
+                    "[matrix · fake-peer2 · id:$abc] hi") t)
   ;; Bound explicitly: with the defvar now nil, reading the global here would
   ;; make this assertion pass for the wrong reason (nil sender equals nil id).
-  (let ((matrix-bridge-self-user-id "@butler-x600:warmblood-lounge"))
+  (let ((matrix-bridge-self-user-id "@fake-self:example.org"))
     (cl-assert (null (matrix-bridge-event-line
                       `((type . "m.room.message") (sender . ,matrix-bridge-self-user-id)
                         (event_id . "$abc")
                         (content . ((msgtype . "m.text") (body . "echo")))))) t))
   (cl-assert (null (matrix-bridge-event-line
-                    '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+                    '((type . "m.room.message") (sender . "@fake-human:example.org")
                       (event_id . "$abc") (content . ())))) t)
   (cl-assert (null (matrix-bridge-event-line
-                    '((type . "m.room.member") (sender . "@jeongsoo:warmblood-lounge")
+                    '((type . "m.room.member") (sender . "@fake-human:example.org")
                       (event_id . "$abc")
                       (content . ((msgtype . "m.text") (body . "x")))))) t)
   (message "matrix-bridge-self-test: ok"))

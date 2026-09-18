@@ -135,12 +135,47 @@ Runs `cc-butler-scaffold-functions' with (TOPIC-DIR TEMPLATE) at the end."
 (defun cc-butler--start-session-in (dir)
   "Start a Claude session with DIR as the working directory.
 Routes through `cc-butler--launch-session' — the single launch+config path all
-roles share — so worker, butler, and steward ghostel config cannot diverge."
-  (cc-butler--launch-session dir))
+roles share — so worker, butler, and steward ghostel config cannot diverge.
+Every caller of this function launches a worker (butler/steward launch via
+their own fixed home directories, never through here), so the worker model
+is pinned unconditionally — see `cc-butler--with-worker-model'."
+  (cc-butler--with-worker-model (cc-butler--launch-session dir)))
+
+(defun cc-butler--ensure-repo-hooks (dest)
+  "Point DEST's core.hooksPath at its scripts/git-hooks, if it ships one.
+A repo shipping its own hooks (e.g. a pre-commit gate) only runs them once
+core.hooksPath points there.  The write is read back, and a mismatch or a
+non-executable pre-commit raises an error-level `cc-butler' warning.
+Never signals: a hooks failure must not fail the clone chain."
+  (when (file-directory-p (expand-file-name "scripts/git-hooks" dest))
+    (ignore-errors
+      (call-process "git" nil nil nil "-C" dest "config" "--local"
+                    "core.hooksPath" "scripts/git-hooks"))
+    (unless (equal (ignore-errors
+                     (with-temp-buffer
+                       (and (eq 0 (call-process "git" nil t nil "-C" dest "config"
+                                                "--local" "--get" "core.hooksPath"))
+                            (string-trim (buffer-string)))))
+                   "scripts/git-hooks")
+      (display-warning
+       'cc-butler
+       (format "%s: could not set core.hooksPath to scripts/git-hooks — the repo's hooks are INACTIVE"
+               dest)
+       :error))
+    ;; The config alone is not a guard: without an executable
+    ;; pre-commit git silently runs nothing.
+    (unless (file-executable-p
+             (expand-file-name "scripts/git-hooks/pre-commit" dest))
+      (display-warning
+       'cc-butler
+       (format "%s: scripts/git-hooks/pre-commit is missing or not executable — the pre-commit gate is INACTIVE"
+               dest)
+       :error))))
 
 (defun cc-butler--clone-repos (topic-dir repos done-fn)
   "Clone REPOS into TOPIC-DIR sequentially and asynchronously.
-Each already-present repo is skipped.  On completion DONE-FN is called
+Each already-present repo is not re-cloned, but it and every fresh clone
+get `cc-butler--ensure-repo-hooks'.  On completion DONE-FN is called
 with t (all succeeded) or nil (a clone failed)."
   (if (null repos)
       (funcall done-fn t)
@@ -149,7 +184,10 @@ with t (all succeeded) or nil (a clone failed)."
            (name (cc-butler--repo-local-name url))
            (dest (expand-file-name name topic-dir)))
       (if (file-directory-p dest)
-          (cc-butler--clone-repos topic-dir rest done-fn)
+          (progn
+            (when (file-exists-p (expand-file-name ".git" dest))
+              (cc-butler--ensure-repo-hooks dest))
+            (cc-butler--clone-repos topic-dir rest done-fn))
         (let ((default-directory (file-name-as-directory topic-dir))
               (buf (generate-new-buffer (format " *cc-butler-clone:%s*" name))))
           (message "cc-butler: cloning %s ..." url)
@@ -164,6 +202,7 @@ with t (all succeeded) or nil (a clone failed)."
                (if (eq 0 (process-exit-status proc))
                    (progn
                      (when (buffer-live-p buf) (kill-buffer buf))
+                     (cc-butler--ensure-repo-hooks dest)
                      (cc-butler--clone-repos topic-dir rest done-fn))
                  (message "cc-butler: `git clone %s' failed — see %s"
                           url (buffer-name buf))
@@ -434,9 +473,46 @@ follow-up)."
             bad))
     (nreverse bad)))
 
+(defcustom cc-butler-close-topic-refuse-concurrent-ghostel t
+  "When non-nil, refuse to kill a ghostel-backed session's buffer while
+another ghostel-backed `claude-code-ide' session is concurrently alive.
+
+Reproduced 2026-09-18 (see
+docs/repro/2026-09-18-buffer-kill-bystander-death.md, ccb-repro, 5+
+independent runs): killing one ghostel-backed terminal buffer while
+another is alive can send a real SIGHUP to the OTHER, untouched session
+and end it — a genuine cross-session defect traced into ghostel's native
+pty module (a vendored dylib; the double `cleanup-on-exit' call
+originally suspected was tested and ruled out). That module cannot be
+fixed here, so this guard only prevents cc-butler from ever triggering
+it through `cc-butler-close-topic' / the `close_topic' MCP tool.
+
+This guard does NOT cover a plain `kill-buffer' done outside cc-butler
+\(e.g. interactively, or from any other code path\) on a ghostel session's
+buffer: that carries the identical bystander-death risk, unguarded. That
+gap is closed by operational rule only \(the live-fleet freeze\), not by
+code.
+
+The one legitimate reason to set this to nil is complying with the
+fleet's worker session cap \(2026-09-16: 10 workers + butler + steward,
+max 12, adjusted up and down as needed\) when it collides with this
+guard's refusal. This is a known collision between the cap and the
+guard, not a fix: disabling the option accepts the bystander-death risk
+until the upstream root cause is fixed."
+  :type 'boolean
+  :group 'cc-butler)
+
+(defun cc-butler--concurrent-ghostel-sessions-p ()
+  "Non-nil when >1 ghostel-backed `claude-code-ide' session is tracked live."
+  (and (eq claude-code-ide-terminal-backend 'ghostel)
+       (> (hash-table-count claude-code-ide--processes) 1)))
+
 (defun cc-butler--close-topic-kill-session (dir)
   "Terminate the Claude session for DIR (process, buffers, state).
 Returns the list of buffer names killed."
+  (when (and cc-butler-close-topic-refuse-concurrent-ghostel
+             (cc-butler--concurrent-ghostel-sessions-p))
+    (user-error "cc-butler: refusing to kill session for %s — another ghostel session is alive (buffer-kill bystander-death bug, docs/repro/2026-09-18-buffer-kill-bystander-death.md); close the other sessions first, or set cc-butler-close-topic-refuse-concurrent-ghostel to nil once upstream is fixed" dir))
   (let* ((name (cc-butler--display-name dir))
          (bufname (claude-code-ide--get-buffer-name dir))
          (buf (get-buffer bufname))
@@ -615,7 +691,7 @@ state is out of scope."
            (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                    '("new_topic")))
          claude-code-ide-mcp-server-tools))
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-new-topic
    :name "new_topic"
    :description "Create a new topic workspace from a template and launch a Claude session in it — the way you grow the fleet. The workspace is scaffolded (.projectile, CLAUDE.md, and the statusLine that makes its context size readable) and the session is launched through the shared path every role uses. Pass template=\"arbitrary\" to start a session in an existing directory instead, giving that directory's absolute path as topic."

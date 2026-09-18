@@ -375,10 +375,16 @@ window blinded us to a session's size as well as its model.  Read each field
 independently and let a missing one be nil on its own.")
 
 (defconst cc-butler-cleanup--statusline-model-re
-  "MODEL:\\([A-Za-z0-9_.-]+\\)"
+  "MODEL:\\([A-Za-z0-9_.-]+\\)\\(?:[ \t]\\|$\\)"
   "The model field, matched independently of CTX and of field order.
 `MODEL:?' does not match: `?' is outside the class, so the statusline's own
-\"unknown\" sentinel stays honestly nil rather than becoming the string \"?\".")
+\"unknown\" sentinel stays honestly nil rather than becoming the string \"?\".
+The tag must be followed by whitespace or end the line, for the same reason
+the CTX number must (see `cc-butler-cleanup--statusline-re'): a narrow window
+cuts on a character count and leaves `MODEL:Fab…' for `Fable-5.1' (the butler,
+2026-09-15, #254).  Without the guard that scraped as `Fab' — a tag that names
+no restorable model — and compaction refused.  Interrupted means nil, and the
+transcript answers instead.")
 
 (defun cc-butler-cleanup--statusline-fields (out)
   "Parse the session's OWN statusline out of terminal text OUT.
@@ -1106,7 +1112,7 @@ was NOT deleted." name bufs topic))))))))))
                 (plist-get (claude-code-ide--normalize-tool-spec spec) :name)))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-close-topic
  :name "close_topic"
  :description "DESTRUCTIVE, IRREVERSIBLE: kill a finished worker's Claude session and permanently DELETE its topic workspace directory — its git clone(s) and every local file — from disk.  This cannot be undone.  Use it to tear a worker down once its work is safely committed/pushed and you no longer need its workspace.  Safety gates enforced by the tool, in order: (1) refuses unless the target is an ordinary WORKER — it can NEVER close the butler or the steward; (2) runs a git-safety audit and REFUSES, deleting nothing, if any repo in the workspace has local-only commits, uncommitted changes, or stashes — including refusing when the workspace's top level is not a git repo and no child repo can be found to check either, since \"nothing to verify\" is never treated as \"safe to delete\"; (3) only then kills the session and deletes the directory, re-checking git safety one last time immediately before removal.  Identify the target by its session NAME (from list_claude_sessions).  Returns whether the workspace was deleted, or the reason it was refused, including how to retire a non-git workspace by hand instead.  Because it is irreversible, the operator is asked to approve each call."

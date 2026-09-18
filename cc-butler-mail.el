@@ -84,7 +84,7 @@ Bind to a mock channel to contract-test the routing in isolation.")
 ;;;; ------------------------------------------------------------------
 
 (defun cc-butler--mail-slug (s)
-  (replace-regexp-in-string "[^A-Za-z0-9_.-]" "_" (or s "unknown")))
+  (replace-regexp-in-string "[^[:alnum:]_.-]" "_" (or s "unknown")))
 
 (defun cc-butler--mail-inbox (agent)
   (file-name-as-directory
@@ -267,12 +267,15 @@ Return the recipient agent."
          :from (and from-dir (cc-butler--display-name from-dir))
          :body body)))
 
-(defun cc-butler-mail-up-decision (from-dir summary needs)
-  "Deliver a decision (SUMMARY/NEEDS, from FROM-DIR) to the butler inbox."
+(defun cc-butler-mail-up-decision (from-dir summary needs &optional sender-label)
+  "Deliver a decision (SUMMARY/NEEDS, from FROM-DIR) to the butler inbox.
+SENDER-LABEL, when given, overrides the derived `:from' for a caller
+with no live session (FROM-DIR nil) to derive one from -- see
+`cc-butler-decision-create' for the same shape on the human adapter."
   (cc-butler--ch-deliver
    (cc-butler--mail-butler-agent)
    (list :kind 'decision
-         :from (and from-dir (cc-butler--display-name from-dir))
+         :from (or sender-label (and from-dir (cc-butler--display-name from-dir)))
          :summary summary :needs needs)))
 
 (defun cc-butler-mail-up-drain (agent-dir)
@@ -456,7 +459,7 @@ Reports how many were dismissed and how many coordinators were skipped."
                  '("ask_worker" "check_inbox" "reply_message" "rearm_session")))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-ask-worker
  :name "ask_worker"
  :description "Ask another session (a worker) a question over the cc-butler channel so the answer RETURNS TO YOUR INBOX automatically (unlike send_to_session, whose reply you would have to poll for). The worker is poked to read its inbox; when it answers with reply_message the reply lands in your inbox — call check_inbox to read it."
@@ -465,13 +468,13 @@ Reports how many were dismissed and how many coordinators were skipped."
          (:name "question" :type string
                 :description "What you are asking the worker.")))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-check-inbox
  :name "check_inbox"
  :description "Drain YOUR cc-butler inbox: messages other sessions sent you — questions (each with a reply_handle to answer via reply_message), replies to questions you asked, and notes. Call it at the start of a turn and whenever you are poked. Returns and clears them (archived for the audit trail)."
  :args nil)
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-reply-message
  :name "reply_message"
  :description "Answer a question from your inbox. Pass the reply_handle exactly as check_inbox gave it, and your answer as body; it is delivered to the asker's inbox (the query's return path)."
@@ -480,7 +483,7 @@ Reports how many were dismissed and how many coordinators were skipped."
          (:name "body" :type string
                 :description "Your answer.")))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-rearm-session
  :name "rearm_session"
  :description "Re-arm a running session so it picks up MCP tools registered after it connected (the custom-tools server can't push tool-list changes). It reconnects its MCP client without restarting — no work lost. Newly spawned sessions get the tools automatically and don't need this."

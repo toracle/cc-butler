@@ -253,6 +253,29 @@ return nothing at all, which lost the context reading too."
     (should (= 33 (plist-get fields :pct)))
     (should (null (plist-get fields :model)))))
 
+(ert-deftest cc-butler-cleanup/statusline-fields-rejects-a-model-tag-cut-by-the-window ()
+  "A narrow window can cut the MODEL tag itself (#254): the butler's
+`MODEL:Fable-5.1' rendered as `MODEL:Fab…', and the scrape reported `Fab' — a
+tag no `/model' argument can be derived from, so compaction refused.  The same
+whitespace-or-end guard the CTX number has must apply to the model: a tag the
+terminal interrupted is honestly nil (the transcript then answers), never a
+prefix.  A complete tag, with or without trailing text, still reads in full."
+  (let ((chrome (lambda (statusline)
+                  (string-join (list "──────" "❯ " "──────" statusline "  ⏵⏵ on")
+                               "\n"))))
+    (should (equal "Fable-5.1"
+                   (plist-get (cc-butler-cleanup--statusline-fields
+                               (funcall chrome "  CTX:139707 14% MODEL:Fable-5.1"))
+                              :model)))
+    (should (equal "Fable-5.1"
+                   (plist-get (cc-butler-cleanup--statusline-fields
+                               (funcall chrome "  CTX:139707 14% MODEL:Fable-5.1 "))
+                              :model)))
+    (let ((fields (cc-butler-cleanup--statusline-fields
+                   (funcall chrome "  CTX:139707 14% MODEL:Fab…"))))
+      (should (= 139707 (plist-get fields :ctx)))
+      (should (null (plist-get fields :model))))))
+
 (ert-deftest cc-butler-cleanup/context-survives-truncated-statusline ()
   "The context reader reports the own size from a truncated statusline."
   (cl-letf (((symbol-function 'cc-butler--read-output)

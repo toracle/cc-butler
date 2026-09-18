@@ -25,6 +25,83 @@
 (require 'json)
 
 ;;;; ------------------------------------------------------------------
+;;;; MCP tool registration: every tool goes through one error guard
+;;;; ------------------------------------------------------------------
+;;;; claude-code-ide's own generic dispatcher (an external, pinned package
+;;;; -- see this repo's CLAUDE.md; claude-code-ide-mcp-http-server.el's
+;;;; `tools/call' handler) catches any error escaping a tool's :function
+;;;; and returns `(format "Error: %s" (error-message-string err))' VERBATIM
+;;;; to the CALLING session's own transcript on disk. A census (2026-09-11,
+;;;; main 7f25a0e) found 27 of 30 cc-butler tools with no error guard at
+;;;; all and 3 partial -- and at least one real leak: `new_topic''s launch
+;;;; chain (create-topic -> finish-topic -> start-session-in ->
+;;;; launch-session -> wait-for-session-ready) can embed a WHOLE terminal
+;;;; buffer in its error text (the trust-dialog settle-poll errors -- see
+;;;; `cc-butler--accept-trust-dialog-new-shape'). Whatever that buffer held
+;;;; -- credentials, client names, paths -- would travel with it.
+;;;;
+;;;; Placed here, near the top of this file, rather than in cc-butler.el:
+;;;; cc-butler.el REQUIRES every module (including this one) at ITS OWN
+;;;; top level, so a module cannot `require' cc-butler back without a
+;;;; cycle. This file is the one every module with a tool registration
+;;;; already reaches (directly or transitively) except
+;;;; `cc-butler-governance.el', which gained an explicit
+;;;; `(require (quote cc-butler-session))' for exactly this.
+;;;;
+;;;; Every `claude-code-ide-make-tool' registration in this codebase must
+;;;; go through `cc-butler--make-guarded-tool' instead -- never call
+;;;; `claude-code-ide-make-tool' directly. See
+;;;; tests/cc-butler-session-test.el's registration-coverage test, which
+;;;; fails CI the moment a new tool registration skips this.
+
+(defun cc-butler--mcp-tool-guard (name fn)
+  "Return a function that calls FN with its args, converting any escaping
+non-`user-error' into a bounded, safe return string instead of letting the
+FULL, UNBOUNDED error message reach the calling session's transcript.
+
+A `user-error' passes through UNCHANGED -- Emacs's own convention for text
+authored for the human/caller (e.g. `record_principle''s duplicate-
+candidate guidance, cc-butler-governance.el:1670), never truncated or
+re-wrapped.
+
+Any other error: the FULL error (every line) is logged locally only, via
+`message' into *Messages* -- never returned. The return value carries only
+NAME, the error SYMBOL, and the FIRST LINE of the message, truncated to
+~200 characters. Never a later line, never the whole thing.
+
+RULE FOR AUTHORS: truncating to the first line bounds the VOLUME of what
+escapes an error, not its KIND. An error message authored anywhere in
+cc-butler must not BEGIN with a file path, buffer text, or any content
+read from disk or a terminal -- put that detail after the first line,
+where this guard keeps it local. The first line is returned to the
+calling session on TRUST that it is safe; a future author who needs to
+lead with disk/terminal content should put a safe summary first and the
+detail after, not break that trust by accident."
+  (lambda (&rest args)
+    (condition-case err
+        (apply fn args)
+      (user-error (error-message-string err))
+      (error
+       (let ((full (error-message-string err)))
+         (message "cc-butler tool %s error (%S): %s" name (car err) full)
+         (format "cc-butler tool %s failed -- %S: %s"
+                 name (car err)
+                 (let ((first-line (car (split-string full "\n"))))
+                   (if (> (length first-line) 200)
+                       (concat (substring first-line 0 200) "…")
+                     first-line))))))))
+
+(defun cc-butler--make-guarded-tool (&rest slots)
+  "Like `claude-code-ide-make-tool', but wraps SLOTS' :function through
+`cc-butler--mcp-tool-guard' first. Every cc-butler MCP tool registration
+must go through this -- never `claude-code-ide-make-tool' directly."
+  (let* ((name (plist-get slots :name))
+         (fn (plist-get slots :function)))
+    (apply #'claude-code-ide-make-tool
+           (plist-put (copy-sequence slots) :function
+                      (cc-butler--mcp-tool-guard name fn)))))
+
+;;;; ------------------------------------------------------------------
 ;;;; Channel launch flag (shared by the topic/session launchers)
 ;;;; ------------------------------------------------------------------
 
@@ -42,6 +119,25 @@ An empty string adds nothing."
   `(let ((claude-code-ide-cli-extra-flags
           (string-trim (concat (or claude-code-ide-cli-extra-flags "")
                                " " cc-butler-channel-args))))
+     ,@body))
+
+(defcustom cc-butler-worker-launch-model "sonnet"
+  "Model workers are launched with, regardless of the machine-wide `/model'
+default.  Workers are the fleet's most frequently spawned sessions and the
+least supervised at the moment they start, so a corrupted global default
+(compaction's restore step rewrites it — see cc-butler-compact.el) must not
+silently mis-tier one.  Butler/steward are deliberately NOT pinned this way:
+their model is a human-owned value 정수님 hand-changes, and pinning it would
+silently revert his decision on every relaunch."
+  :type 'string
+  :group 'cc-butler)
+
+(defmacro cc-butler--with-worker-model (&rest body)
+  "Run BODY with `cc-butler-worker-launch-model' pinned via `--model'."
+  (declare (indent 0))
+  `(let ((claude-code-ide-cli-extra-flags
+          (string-trim (concat (or claude-code-ide-cli-extra-flags "")
+                               " --model " cc-butler-worker-launch-model))))
      ,@body))
 
 ;;;; ------------------------------------------------------------------
@@ -244,17 +340,28 @@ current state read it from the screen or the transcript instead.")
   (gethash dir cc-butler--waiting))
 
 (defun cc-butler--session-state (s)
-  "Return `gate, `waiting, or `running for session plist S -- in that
-priority order.  A session parked at Claude Code's `--continue' startup
-resume gate (`cc-butler--resume-gate-showing-p') is not actually running
-even though its process is alive, and `cc-butler--waiting-p' can never
-catch it on its own: that flag is edge-triggered off a notification
-(`cc-butler--queue-on-notification') the gate never sends, so a gated
-session was reported plain \"running\" indefinitely (cc-butler#4 — a
-2026-07-21 mass restore reported \"16/16 recovered\" while 7 sessions sat
-at this exact gate)."
+  "Return `gate, `waiting, `blocked-on-dialog, or `running for session
+plist S -- in that priority order.  A session parked at Claude Code's
+`--continue' startup resume gate (`cc-butler--resume-gate-showing-p') is
+not actually running even though its process is alive, and
+`cc-butler--waiting-p' can never catch it on its own: that flag is
+edge-triggered off a notification (`cc-butler--queue-on-notification')
+the gate never sends, so a gated session was reported plain \"running\"
+indefinitely (cc-butler#4 — a 2026-07-21 mass restore reported \"16/16
+recovered\" while 7 sessions sat at this exact gate).
+
+`blocked-on-dialog is a REFINEMENT of `waiting, not a separate flag: only
+a session already flagged waiting AND whose screen matches a known open-
+dialog fingerprint (`cc-butler--blocked-on-dialog-p') gets it, so a
+session that has never notified cannot be mislabeled from screen content
+alone (2026-09-08 — see that function's docstring: false positives here
+are actively harmful, they block dispatch to a session that was never
+actually stuck)."
   (let ((dir (plist-get s :dir)) (buf (plist-get s :buffer)))
     (cond ((and buf (buffer-live-p buf) (cc-butler--resume-gate-showing-p buf)) 'gate)
+          ((and (cc-butler--waiting-p dir) buf (buffer-live-p buf)
+                (cc-butler--blocked-on-dialog-p buf))
+           'blocked-on-dialog)
           ((cc-butler--waiting-p dir) 'waiting)
           (t 'running))))
 
@@ -780,7 +887,7 @@ outlives the process)."
   (interactive)
   (pop-to-buffer (get-buffer-create cc-butler-log-buffer-name)))
 
-(defun cc-butler--inbox-push (dir body)
+(defun cc-butler--inbox-push (dir body &optional name-override)
   "Record a worker event from session DIR with BODY into the butler inbox.
 The worker's name and session id are attached, and the event is teed to
 the cc-butler log -- a short gist to the ops log (events only, kept
@@ -788,16 +895,26 @@ grep-safe and single-line), the full BODY to the message log
 (`cc-butler--log-message'), never both -- an arbitrary, possibly
 multi-line worker report body must not land verbatim in the ops event
 stream (2026-08-27: a log line quoted back into a relay message got
-re-logged as if the event it described had happened a second time)."
-  (push (list :time (current-time)
-              :dir dir
-              :name (cc-butler--display-name dir)
-              :id (cc-butler--session-id dir)
-              :body (or body ""))
-        cc-butler--inbox)
-  (cc-butler--log "%s → butler │ report (%d chars, see msg log)"
-                  (cc-butler--who-dir dir) (length (or body "")))
-  (cc-butler--log-message "report" (cc-butler--who-dir dir) "butler" body))
+re-logged as if the event it described had happened a second time).
+
+NAME-OVERRIDE is for a non-interactive Lisp caller with no real session
+DIR to derive a name from at all (DIR nil) -- same problem, same fix
+`cc-butler-tool-escalate-to-butler''s SENDER-LABEL already solves on that
+path (`cc-butler-self-check--report' is exactly such a caller): DIR nil
+would otherwise error inside `cc-butler--display-name'
+\(`expand-file-name' requires a string, not nil\).  When given,
+NAME-OVERRIDE wins outright and `:id' is left nil, since there is no real
+session to look one up for."
+  (let ((who (or name-override (cc-butler--who-dir dir))))
+    (push (list :time (current-time)
+                :dir dir
+                :name (or name-override (cc-butler--display-name dir))
+                :id (and dir (cc-butler--session-id dir))
+                :body (or body ""))
+          cc-butler--inbox)
+    (cc-butler--log "%s → butler │ report (%d chars, see msg log)"
+                    who (length (or body "")))
+    (cc-butler--log-message "report" who "butler" body)))
 
 ;; The steward is designated in `cc-butler-orchestrator' (loaded after this
 ;; file); forward-declare it so the list UI can pin/label it.
@@ -1911,8 +2028,8 @@ See `cc-butler--live-screen-tail-start'."
 
 (defun cc-butler--live-screen-tail-start (buf)
   "Return the position in BUF that starts the last
-`cc-butler--live-screen-tail-lines' lines — the live bottom of the screen,
-as opposed to scrollback.
+`cc-butler--live-screen-tail-lines' lines of actual content — the live
+bottom of the screen, as opposed to scrollback.
 
 A first cut at this (2026-09-05) anchored on a real box border found
 within a lookback window above the marker instead of on position, and
@@ -1923,11 +2040,32 @@ the border check. Position is the fix, not another content heuristic —
 cc-butler-compact--menu-p already solved exactly this class of problem
 (a structurally-real-looking match sitting in scrollback) the same way,
 and this reuses its narrowing rather than inventing a second kind
-(cc-butler#8 PR #151 review)."
+(cc-butler#8 PR #151 review).
+
+Second bug, same window, opposite edge (2026-09-11,
+`example-topic' `new_topic' launch): counting back
+from the LITERAL `point-max' broke on a freshly-rendered ghostel screen
+that pads with blank rows below the dialog to fill the full terminal
+height. Measured live: 39 total lines,
+dialog content in lines 4-19, all of lines 20-39 blank — the trust marker
+at line 8 sat above the naive tail window (lines ~15-39), so the whole
+launch-accept chain silently never fired and the session sat stuck on
+its \"No, exit\" default forever. Skipping trailing blank/whitespace
+lines before counting back fixes this without weakening the anti-quoting
+guarantee above: the scrollback-quote case pads its live bottom with real
+filler text (`cc-butler-session-test--insert-quoted-dialog-in-conversation'),
+never blank lines, so this skip never fires there.
+
+A terminal buffer is a scroll pane. Any predicate about what is currently
+on screen must say which window it reads: use this function's start,
+never `point-min' — two separate live-screen predicates in this file
+shipped with a bare `point-min' scan and both were confirmed to misread
+scrollback as the live screen (2026-09-11 steward class sweep)."
   (with-current-buffer buf
     (save-excursion
       (goto-char (point-max))
-      (forward-line (- (cc-butler--live-screen-tail-lines)))
+      (skip-chars-backward " \t\n")
+      (forward-line (- (1- (cc-butler--live-screen-tail-lines))))
       (point))))
 
 (defun cc-butler--trust-dialog-marker-present-p (buf)
@@ -1995,10 +2133,20 @@ Down keypress is CONFIRMED to have taken effect, not merely sent. This is
 the gate `cc-butler--accept-trust-dialog-new-shape' checks before sending
 Return: a Return sent on an unconfirmed Down can land on \"No, exit\"
 instead and exit the session outright (2026-09-05 steward correction —
-send confirmation is not landing confirmation)."
+send confirmation is not landing confirmation).
+
+Scoped to the live screen tail (`cc-butler--live-screen-tail-start'), not
+`point-min' — the same scrollback-exclusion every other trust-dialog
+detector in this file uses. Unscoped, a quoted \"❯ Yes, I trust this
+folder\" sitting anywhere earlier in the buffer (e.g. relayed while
+discussing this very bug) would read as landed while the live dialog below
+it still highlights \"No, exit\", and the Return this gate exists to guard
+would then be sent onto that — the exact failure this function was written
+to prevent, reintroduced via the read instead of the write (2026-09-11
+steward review of #248)."
   (with-current-buffer buf
     (save-excursion
-      (goto-char (point-min))
+      (goto-char (cc-butler--live-screen-tail-start buf))
       (search-forward "❯ Yes, I trust this folder" nil t))))
 
 (defun cc-butler--terminal-send-down (&optional buffer)
@@ -2129,6 +2277,126 @@ territory, not this function's."
              dir (with-current-buffer buf (buffer-substring-no-properties (point-min) (point-max)))))
      (t nil))))
 
+(defun cc-butler--accept-trust-dialog (dir)
+  "Press \"Yes, I trust this folder\" on DIR's live session — the callable
+handle a remote caller (the fleet, via the `accept_trust_dialog' MCP tool)
+uses to unstick a session the automatic gate in
+`cc-butler--wait-for-session-ready' missed. Acts ONLY if a trust dialog is
+actually showing on DIR's screen right NOW; refuses and sends zero keys
+otherwise — never sends a key into whatever happens to be on screen.
+
+Re-checks the screen immediately before acting, via the same pinned-key
+discipline as `cc-butler--accept-trust-dialog-new-shape' for the new
+shape (send Down, poll for the highlight to actually land on \"Yes\",
+only then send Return); the old shape needs a single Return, since \"Yes,
+I trust this folder\" is already its pre-highlighted default. Both shapes
+are recognized by their exact predicates
+(`cc-butler--trust-dialog-new-shape-p' / `cc-butler--trust-dialog-showing-p'),
+never by a fixed keypress count or an assumed highlight position. A marker
+present in some other, unrecognized shape falls through to the refusal
+branch rather than guessing.
+
+Returns one of three symbols:
+- `accepted'      — a dialog was showing; the marker is now confirmed gone
+                    from a fresh re-read of the screen.
+- `no-dialog'      — no (recognized) trust dialog was showing; zero keys
+                    were sent.
+- `still-showing'  — a key was sent, but the marker is still present on a
+                    fresh re-read afterward; needs a human look, not a
+                    blind retry."
+  (let ((buf (get-buffer (claude-code-ide--get-buffer-name dir))))
+    (unless (buffer-live-p buf)
+      (error "cc-butler: no live terminal buffer for %s" dir))
+    (cc-butler--refresh-terminal-text buf)
+    (cond
+     ((cc-butler--trust-dialog-new-shape-p buf)
+      (cc-butler--accept-trust-dialog-new-shape dir)
+      (cc-butler--refresh-terminal-text buf)
+      (if (cc-butler--trust-dialog-marker-present-p buf) 'still-showing 'accepted))
+     ((cc-butler--trust-dialog-showing-p buf)
+      (with-current-buffer buf (claude-code-ide--terminal-send-return))
+      (cc-butler--refresh-terminal-text buf)
+      (if (cc-butler--trust-dialog-marker-present-p buf) 'still-showing 'accepted))
+     (t 'no-dialog))))
+
+;;;; ---- BLOCKED-ON-DIALOG (2026-09-08) --------------------------------
+;;;; `list_claude_sessions' reported the single status WAITING-FOR-INPUT
+;;;; for both a genuinely idle prompt and a session stuck inside an open
+;;;; dialog -- indistinguishable to any caller, worker or human, without
+;;;; reading the terminal by eye. The original trigger was a claim that
+;;;; `monocle-jarvice-978' sat nine hours inside the feedback-draft dialog
+;;;; below -- RETRACTED 2026-09-09: the session itself couldn't say what
+;;;; caused that window, and the dialog card it showed was independently
+;;;; confirmed to be resolved scrollback, not a live pending prompt. See
+;;;; `cc-butler--blocked-on-dialog-p' below for why the feedback-draft
+;;;; fingerprint itself was removed as a confirmed false positive.
+;;;; (an-open-menu-cannot-be-answered-remotely.md: there is no remote way
+;;;; to answer an open dialog, so this remains visibility-only -- report a
+;;;; distinct status, never auto-answer or auto-dismiss).
+;;;;
+;;;; Detection follows the same shape as the trust-dialog detectors above:
+;;;; an exact fingerprint, scoped to the live screen tail
+;;;; (`cc-butler--live-screen-tail-start') so a dialog quoted in scrollback
+;;;; conversation cannot match. This deliberately does NOT route through
+;;;; `cc-butler--redact-ghost-input-line' (orchestrator.el) -- that
+;;;; redaction only ever replaces the framed input row's own content
+;;;; (`cc-butler--find-input-line', the box bordered by
+;;;; `cc-butler--border-rule-char'), and both fingerprints below are
+;;;; dialog chrome rendered ABOVE that row, never inside it -- exactly
+;;;; the same reasoning the trust-dialog detectors already rely on.
+
+(defconst cc-butler--classifier-confirmation-dialog-marker
+  "requires confirmation for this command"
+  "Fragment of the Auto Mode classifier confirmation's header line
+(`cc-butler-session-test--insert-mcp-classifier-prompt', captured live
+2026-09-05). Already proven NOT to collide with the trust dialog's own
+marker (cc-butler#8) -- this is a different string entirely.")
+
+(defun cc-butler--classifier-confirmation-dialog-showing-p (buf)
+  "Non-nil if BUF's live screen tail shows the Auto Mode classifier
+confirmation with its default (\"❯ 1. Yes\") highlighted. Both the header
+fragment (`cc-butler--classifier-confirmation-dialog-marker') and the
+highlighted option are required together, scoped to the live tail -- the
+same belt-and-suspenders `cc-butler--trust-dialog-showing-p' uses, so a
+screen that merely mentions confirmation, or a stray \"1. Yes\" elsewhere,
+cannot match alone.
+
+[미확인] 이 지문이 실제로 입력을 막는지는 아직 독립적으로 검증되지
+않았다. `cc-butler--feedback-draft-dialog-showing-p'(2026-09-09 제거,
+세 건의 실관측으로 false positive 확인됨)와 달리 반증된 적은 없지만,
+그렇다고 확인된 것도 아니다 -- \"아직 반증되지 않음\"을 \"확인됨\"으로
+착각하지 말 것."
+  (with-current-buffer buf
+    (save-excursion
+      (goto-char (cc-butler--live-screen-tail-start buf))
+      (and (search-forward cc-butler--classifier-confirmation-dialog-marker nil t)
+           (progn
+             (goto-char (cc-butler--live-screen-tail-start buf))
+             (search-forward "❯ 1. Yes" nil t))))))
+
+(defun cc-butler--blocked-on-dialog-p (buf)
+  "Non-nil if BUF's live screen shows a known open-dialog fingerprint --
+currently only `cc-butler--classifier-confirmation-dialog-showing-p'. Add
+a new disjunct here, not a new caller, when a further shape is identified
+-- false positives are worse than false negatives, so only exact,
+CONFIRMED-BLOCKING fingerprints belong in this list; an ambiguous screen
+must fall through to plain `waiting.
+
+`cc-butler--feedback-draft-dialog-showing-p' (the \"1 to review · 2 to
+send · 0 to dismiss\" box) used to be a second disjunct here. REMOVED
+2026-09-09: confirmed a false positive -- that dialog does not actually
+block input. Three independent live observations forced the removal:
+(1) `monocle-image-attach-2153' carried out dispatched work while the box
+was showing; (2) the same session answered an incoming message normally
+while it was showing; (3) `monocle-jarvice-978' itself reported no
+sensation of blocked input and answered every message normally while
+showing it, and its dialog card was separately confirmed to be resolved
+scrollback rather than a live pending prompt -- undermining the original
+nine-hour-stuck claim this whole feature was built to catch. Do not
+re-add a feedback-draft disjunct on a hunch; it would need a fingerprint
+actually shown to block input, which this one is not."
+  (cc-butler--classifier-confirmation-dialog-showing-p buf))
+
 (defun cc-butler--resume-gate-showing-p (buf)
   "Return non-nil if BUF's terminal currently shows Claude Code's
 `--continue' startup resume gate (\"Resume from summary\" vs \"Resume full
@@ -2138,12 +2406,18 @@ also require a specific option to be highlighted: confirmed live
 2026-09-03 across a 5-session sample that the pre-highlighted default
 varies per session (4 defaulted to \"Resume from summary\", 1 to \"Resume
 full session as-is\") -- so no caller may assume which numbered option is
-selected, or blindly send a fixed keystroke to answer this gate."
+selected, or blindly send a fixed keystroke to answer this gate.
+
+Scoped to the live screen tail (`cc-butler--live-screen-tail-start'), not
+`point-min' -- both phrases quoted anywhere earlier in scrollback (e.g. a
+relayed message discussing this very gate) must not mark an otherwise-idle
+session as stuck on it and block dispatch to it (2026-09-11 steward class
+sweep, same bug class as `cc-butler--trust-dialog-new-shape-yes-selected-p')."
   (with-current-buffer buf
     (save-excursion
-      (goto-char (point-min))
+      (goto-char (cc-butler--live-screen-tail-start buf))
       (and (search-forward "1. Resume from summary" nil t)
-           (progn (goto-char (point-min))
+           (progn (goto-char (cc-butler--live-screen-tail-start buf))
                   (search-forward "2. Resume full session as-is" nil t))))))
 
 (defun cc-butler--wait-for-session-ready (dir)
@@ -2364,7 +2638,7 @@ Emacs' default click behavior in this buffer, and was the whole problem."
                 (plist-get (claude-code-ide--normalize-tool-spec spec) :name)))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-set-session-info
  :name "set_session_info"
  :description "Set THIS Claude session's display title and/or status line in the Emacs session manager so the human can track multiple sessions at a glance. Use a short title naming the task/topic (e.g. 'billing: invoice PDF') and a concise status describing what you are doing right now (e.g. 'writing tests', 'waiting on review'). Call it whenever your focus changes."

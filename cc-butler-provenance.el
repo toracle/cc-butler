@@ -62,7 +62,7 @@ digest."
            (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                    '("resolve_reference")))
          claude-code-ide-mcp-server-tools))
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-resolve-reference
    :name "resolve_reference"
    :description "Open the VERBATIM original of 정수님's decision/approval that a dispatch references (pass the id from the dispatch's 'ref='). Use it when you need 정수님's exact words, not just the digest you were given — the dispatch carries a digest for quick action and this resolves the ground truth (progressive disclosure)."

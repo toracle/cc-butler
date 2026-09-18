@@ -42,6 +42,16 @@ session's working directory (restore last state, non-interactive)."
   "Normalize DIR for identity comparisons across roster records."
   (file-name-as-directory (expand-file-name dir)))
 
+(defun cc-butler--worker-dir-p (dir)
+  "Non-nil if DIR is a worker's directory — i.e. neither the butler's nor the
+steward's fixed home.  Scopes worker-only fixes (e.g. explicit model pinning
+at launch, see `cc-butler--with-worker-model') away from butler/steward,
+whose model is a human-owned value we must not silently override."
+  (let ((key (cc-butler--dir-key dir)))
+    (not (or (and cc-butler-home (equal key (cc-butler--dir-key cc-butler-home)))
+             (and cc-butler-steward-home
+                  (equal key (cc-butler--dir-key cc-butler-steward-home)))))))
+
 (defun cc-butler--roster-write (records)
   "Write RECORDS to `cc-butler-roster-file' as the whole persisted roster.
 Created 0600 -- the roster is a list of workspace paths, same reasoning
@@ -155,7 +165,14 @@ gets spawned, and the startup race that can drop a caller's first
 `send_to_session' (cc-butler#8) applies here too."
   (let ((claude-code-ide-cli-extra-flags
          (string-trim (concat (or claude-code-ide-cli-extra-flags "")
-                              " " (mapconcat #'identity cc-butler-resume-args " "))))
+                              " " (mapconcat #'identity cc-butler-resume-args " ")
+                              ;; Worker-only, same reasoning as
+                              ;; `cc-butler--with-worker-model': this is the
+                              ;; SHARED resume path for every role's dead
+                              ;; session, so butler/steward must not be pinned.
+                              (if (cc-butler--worker-dir-p dir)
+                                  (concat " --model " cc-butler-worker-launch-model)
+                                ""))))
         (default-directory (file-name-as-directory (expand-file-name dir))))
     (cc-butler--with-channel (claude-code-ide))
     ;; The second spawn site, so it needs the SAME uniform config as

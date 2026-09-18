@@ -1570,6 +1570,85 @@ the guard check and the start call."
       (should (equal started '("/busy/"))))))
 
 ;;;; ------------------------------------------------------------------
+;;;; P5: idle-too-long as a SECOND, independent candidacy gate (2026-09-08)
+;;;;
+;;;; GAP: size was the sole gate — a session sitting at 270k never crosses
+;;;; 300k just by waiting, so it was never swept no matter how long it sat
+;;;; idle and uncompacted. Measured the same day: 12 waiting workers held
+;;;; ~2,489k tokens combined, all of them already safely compactable, and
+;;;; the automatic sweep caught zero because none had crossed the size
+;;;; threshold. A session is now a candidate on EITHER gate.
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-compact/idle-candidate-under-threshold-is-not-flagged ()
+  "Just under `cc-butler-compact-idle-candidate-threshold' is not a candidate."
+  (let ((cc-butler-compact-idle-candidate-threshold 7200))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (- (float-time) 7199)))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 90000)))
+      (should-not (cc-butler-compact--idle-candidate-p "/d/")))))
+
+(ert-deftest cc-butler-compact/idle-candidate-at-boundary-is-flagged ()
+  "AT the idle threshold (not just past it) is a candidate -- at/above, not
+strictly above, matching `cc-butler-compact--over-threshold-p''s convention."
+  (let ((cc-butler-compact-idle-candidate-threshold 7200))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (- (float-time) 7200)))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 90000)))
+      (should (cc-butler-compact--idle-candidate-p "/d/")))))
+
+(ert-deftest cc-butler-compact/idle-candidate-well-past-and-well-under-size-is-flagged ()
+  "The exact gap this closes: 90k tokens (nowhere near 300k) but idle 3
+hours -- must now be a candidate."
+  (let ((cc-butler-compact-idle-candidate-threshold 7200))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (- (float-time) 10800)))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 90000)))
+      (should (cc-butler-compact--idle-candidate-p "/d/")))))
+
+(ert-deftest cc-butler-compact/idle-candidate-unknown-last-activity-not-flagged ()
+  "No known transcript activity (`cc-butler--session-last-activity' nil) is
+\"cannot confirm\", never treated as \"idle forever\"."
+  (let ((cc-butler-compact-idle-candidate-threshold 7200))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity) (lambda (_d) nil))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 90000)))
+      (should-not (cc-butler-compact--idle-candidate-p "/d/")))))
+
+(ert-deftest cc-butler-compact/idle-candidate-unknown-size-not-flagged ()
+  "An unreadable context size is never a candidate either, even if idle a
+long time -- same 'unknown is not a guess' principle as the size gate."
+  (let ((cc-butler-compact-idle-candidate-threshold 7200))
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (- (float-time) 10800)))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) nil)))
+      (should-not (cc-butler-compact--idle-candidate-p "/d/")))))
+
+(ert-deftest cc-butler-compact/candidates-include-idle-sessions-well-under-size-threshold ()
+  "`cc-butler-compact-candidates' must pick up an idle-but-small session
+that `cc-butler-compact--over-threshold-p' alone would miss entirely --
+the actual regression this closes, at the level the sweep calls."
+  (let ((cc-butler-compact-threshold 300000)
+        (cc-butler-compact-idle-candidate-threshold 7200))
+    (cl-letf (((symbol-function 'cc-butler--sessions)
+               (lambda () '((:dir "/idle-small/") (:dir "/busy-small/"))))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 90000))
+              ((symbol-function 'cc-butler--session-last-activity)
+               (lambda (d) (if (equal d "/idle-small/")
+                               (- (float-time) 10800)
+                             (float-time)))))
+      (should (equal (cc-butler-compact-candidates) '("/idle-small/"))))))
+
+(ert-deftest cc-butler-compact/candidates-still-include-oversized-even-if-freshly-active ()
+  "The size gate must still work standalone -- an oversized session that is
+NOT idle (last activity just now) is still a candidate on size alone."
+  (let ((cc-butler-compact-threshold 300000)
+        (cc-butler-compact-idle-candidate-threshold 7200))
+    (cl-letf (((symbol-function 'cc-butler--sessions) (lambda () '((:dir "/big/"))))
+              ((symbol-function 'cc-butler-cleanup-context-for) (lambda (_d) 350000))
+              ((symbol-function 'cc-butler--session-last-activity) (lambda (_d) (float-time))))
+      (should (equal (cc-butler-compact-candidates) '("/big/"))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; cc-butler#125: --display-pct must never reconstruct a percentage from
 ;;;; the stale `cc-butler-cleanup-context-window' constant.  Nil, not a
 ;;;; guess, when the fresh statusline pct is unavailable.

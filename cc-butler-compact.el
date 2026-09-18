@@ -99,6 +99,26 @@ calls it. This variable is otherwise unused; changing it affects no
 behavior."
   :type 'number :group 'cc-butler)
 
+(defcustom cc-butler-compact-idle-candidate-threshold 7200
+  "Seconds a session may sit idle before it becomes a compaction candidate
+on its own, even while under `cc-butler-compact-threshold' (the size
+gate). See `cc-butler-compact--idle-candidate-p'.
+
+REGRESSION-SHAPED GAP closed 2026-09-08 (butler, 정수님 배차): size was
+the SOLE gate — a session sitting at 270k never crosses 300k just by
+waiting, so it never got swept no matter how long it sat idle and
+uncompacted. Measured the same day: 12 waiting workers held ~2,489k
+tokens combined, every one of them already safely compactable (idle), and
+the automatic sweep caught zero of them because none had crossed the size
+threshold. A session only ever compacts on ONE of two conditions now:
+oversized, or idle this long.
+
+7200 (2h) is a starting guess (butler, 2026-09-08) — not a measurement of
+how long is actually \"too long\" to sit idle and uncompacted, the way
+`cc-butler-governance-max-note-bytes' at least has a measured distribution
+behind it. Adjust if it fires too eagerly or too rarely."
+  :type 'number :group 'cc-butler)
+
 (defcustom cc-butler-compact-model "sonnet"
   "Model to switch a session to before compacting it.
 Compaction re-reads the whole transcript, so it is the single most expensive
@@ -547,6 +567,21 @@ read to be honest, so this reads the cached `cc-butler-cleanup-context-for'
 directly, same accessor `cc-butler-compact--severity-for' below uses."
   (let ((ctx (cc-butler-cleanup-context-for dir)))
     (and (integerp ctx) (>= ctx cc-butler-compact-threshold))))
+
+(defun cc-butler-compact--idle-candidate-p (dir)
+  "Non-nil when DIR qualifies as a compaction candidate purely by having sat
+idle at least `cc-butler-compact-idle-candidate-threshold' seconds —
+independent of `cc-butler-compact--over-threshold-p', the size gate. A
+session can be swept for EITHER reason; see `cc-butler-compact-candidates'.
+
+Requires a KNOWN last-activity time (`cc-butler--session-last-activity')
+and a KNOWN context size — same principle as the size gate: an unreadable
+statusline or a session with no transcript yet is \"cannot confirm\", not
+\"go ahead and compact it\"."
+  (let ((last (cc-butler--session-last-activity dir))
+        (ctx (cc-butler-cleanup-context-for dir)))
+    (and last (integerp ctx)
+         (>= (- (float-time) last) cc-butler-compact-idle-candidate-threshold))))
 
 (defun cc-butler-compact--severity-for (dir)
   "Visual escalation tier for DIR's current context, or nil.
@@ -1377,22 +1412,29 @@ any modal that is already up while it waits."
 ;;;; ------------------------------------------------------------------
 
 (defun cc-butler-compact-candidates ()
-  "Return dirs of sessions over the compaction threshold, largest first.
-Candidacy is `cc-butler-compact--over-threshold-p' (absolute-token gate);
-ordering is by context-token size so an interrupted sweep did the most
-important work first.  Includes the butler and the steward by design."
+  "Return dirs of sessions worth compacting now, largest first.
+A session qualifies on EITHER of two independent gates — oversized
+(`cc-butler-compact--over-threshold-p') or idle too long
+(`cc-butler-compact--idle-candidate-p', 2026-09-08): a session well under
+the size gate that has simply sat idle for hours was previously invisible
+to this sweep, since it never grows into the threshold just by waiting.
+Ordering is by context-token size so an interrupted sweep did the most
+important (biggest) work first regardless of which gate admitted it.
+Includes the butler and the steward by design."
   (let (out)
     (dolist (s (cc-butler--sessions))
       (let* ((dir (plist-get s :dir))
              (ctx (cc-butler-cleanup-context-for dir)))
-        (when (cc-butler-compact--over-threshold-p dir)
+        (when (or (cc-butler-compact--over-threshold-p dir)
+                  (cc-butler-compact--idle-candidate-p dir))
           (push (cons dir (or ctx 0)) out))))
     (mapcar #'car (sort out (lambda (a b) (> (cdr a) (cdr b)))))))
 
 ;;;###autoload
 (defun cc-butler-compact-large-sessions ()
-  "Compact every session at/above `cc-butler-compact-threshold' (absolute
-tokens; see `cc-butler-compact--over-threshold-p').
+  "Compact every session that is oversized OR idle too long — see
+`cc-butler-compact-candidates' for the two independent gates
+(`cc-butler-compact--over-threshold-p', `cc-butler-compact--idle-candidate-p').
 
 The butler and the steward are included — they are the long-lived sessions
 that grow without bound, and excluding them would leave the biggest context
@@ -1400,13 +1442,14 @@ in the fleet as the one nobody may touch.
 
 Each candidate is guarded independently, so a menu-blocked session or one
 with unsubmitted input is skipped with a reason rather than blocking the
-sweep.  Busy is NOT a reason to skip here: every dir in this sweep is
-already over the compaction threshold by construction
-(`cc-butler-compact-candidates'), so waiting for it to go idle does not
-make it safer — a session that never idles (an attention hook resetting
-its idle window every turn) simply never gets compacted and eventually
-dies of its own context size regardless.  Returns the list of dirs
-actually started."
+sweep.  Busy is NOT re-checked as a reason to skip here: an oversized
+candidate does not get safer by waiting for it to idle (an attention hook
+resetting its idle window every turn would then never get compacted at
+all), and an idle-candidate was, BY CONSTRUCTION, already confirmed idle
+moments ago when `cc-butler-compact-candidates' selected it — checking
+again here would only reopen the same narrow race every other guard below
+already accepts (menu state, pending input) between selection and send.
+Returns the list of dirs actually started."
   (interactive)
   (let (started skipped)
     (dolist (dir (cc-butler-compact-candidates))
@@ -1866,13 +1909,13 @@ waiting is the wrong answer when nothing is ever going to make it idle
                    '("session_status" "compact_session" "compact_large_sessions")))
          claude-code-ide-mcp-server-tools))
 
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-session-status
    :name "session_status"
    :description "Show every live session's CONTEXT SIZE alongside its model, whether it is waiting for input, and whether it can be compacted right now. Use this to decide what needs compacting — list_claude_sessions gives the model but not the context size, and scraping the terminal for it is unreliable. Includes the butler and steward, which are usually the largest."
    :args nil)
 
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-compact-session
    :name "compact_session"
    :description "Compact one session's context: switches it to a cheap model, answers the prompt-cache confirmation, runs /compact, and restores the original model. Driven entirely from elisp — do NOT try to type these commands into a session yourself; each step needs its own submission and the confirmation is a modal. You MAY target the butler, the steward, and YOURSELF: if the target is mid-turn the compaction is queued and starts by itself once that turn ends, so calling this on yourself works — queue it and finish your turn normally. It still refuses outright if a menu is open or someone has genuinely typed something into the input box, since waiting does not fix those. Pass force=true ONLY when an operator has explicitly said to compact this session right now, not for the routine case — it ignores busy and starts immediately instead of queuing, which matters for a session whose idle window keeps getting reset by something other than itself (e.g. a notification hook) and so would otherwise never idle."
@@ -1882,7 +1925,7 @@ waiting is the wrong answer when nothing is ever going to make it idle
                   :description "Ignore busy and start immediately, even mid-turn. Only for an operator's explicit \"do it now\" — every other guard (open menu, unsubmitted input, unrestorable model) still refuses outright."
                   :optional t)))
 
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-compact-large-sessions
    :name "compact_large_sessions"
    :description "Compact every session whose context is over the threshold, largest first — the routine fleet-wide sweep. The butler and steward are included by design; they are the sessions that grow without bound. Sessions that are busy or have something open are skipped with a reason rather than blocking the sweep."
