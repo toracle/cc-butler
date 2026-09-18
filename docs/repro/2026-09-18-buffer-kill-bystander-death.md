@@ -1489,3 +1489,185 @@ the reasoning trail stays intact; this section is the authoritative
 statement that it no longer reflects the current best understanding of
 the mechanism. Any future upstream report should be written fresh, from
 whatever Round 5+ establishes, not by patching the withdrawn draft.
+
+---
+
+# Round 5 pre-registration: inherited event-channel fd leak
+
+Written before any Round 5 run. Frozen once committed; results appended
+below it, never edited into it. One round, per steward's instruction.
+Isolated daemon only; the live daemon is never touched — no kills, and
+no `lsof` beyond what was already relayed read-only by butler.
+
+## The lead (relayed, not yet measured by me)
+
+Butler relayed a read-only `ps`+`lsof` measurement on the live fleet:
+every `claude` child process holds inherited copies of OTHER sessions'
+Emacs event-channel pipe ends. Example: child `57310` (`ttys006`) holds
+fds `17, 28, 38, 48, 58, 78` — the same pipe ends as Emacs fds `16/17,
+27/28, 37/38, 47/48, 57/58, 77/78`, i.e. the dup'd event-channel pairs
+immediately preceding each earlier session's ptmx (the same block shape
+Round 3/4 already mapped). Source fact, independently checkable in the
+Emacs 30 source already read in Round 3: `process.c:8604`'s
+`open_channel_for_module` calls plain `dup()`, which does not set
+`FD_CLOEXEC` — `[추론]`: the module's event-writer fd survives every
+later child's `fork()`+`exec()`, landing in each subsequently-spawned
+session's own child process.
+
+**Correction to the lead, folded in before any run** (butler/x600, the
+original per-tty count list was in tty order, not creation order;
+re-measured by `ps lstart` on m1, and independently by x600 on Linux):
+the real shape is four specific, separately-testable properties, not
+just "grows with creation order":
+
+1. **Monotone**: per-child inherited-fd count n = 1..10 is strictly
+   monotone in CREATION order (not tty/device order, which the original
+   relay was sorted by and which obscured this).
+2. **Nested**: each child holds the immediately-earlier child's entire
+   inherited set, PLUS exactly one more (its own set is a strict
+   superset of size |earlier|+1, not just the same count).
+3. **ptmx-1**: every inherited fd number equals SOME earlier session's
+   `(ptmx fd) - 1` — i.e. the SECOND member of that session's dup'd pair
+   (matching the block shape: pipe-pair immediately followed by ptmx, so
+   `ptmx-1` is the pair's higher-numbered fd), not the first member.
+4. **Own write end**: each child ALSO holds its OWN session's event
+   write end (so the very first/oldest child, with nothing earlier to
+   inherit, still holds exactly one such fd — its own — not zero); x600
+   confirmed a negative control of 0 for a process with no ghostel event
+   fd at all, so "own write end" is a real, present fd, not an artifact
+   of the counting method.
+
+This is a plausible mechanism distinct from everything Rounds 1-4 ruled
+out: it is a cross-session link held by a DIFFERENT PROCESS (the
+bystander's own child), not by elisp or by ghostel's reaper thread in
+the killed session's own process — exactly the kind of thing neither of
+Round 4's instrumentation layers could have seen.
+
+## Item (a): reproduce the inheritance, isolated daemon
+
+Spawn 5-6 stub sessions in sequence (S1..S6). For each newly-spawned
+child's own pid, `lsof -p <child-pid>` its fd table. For every
+EARLIER session Si (i < current), build its event-channel pair + ptmx
+block the same way Round 3/4 did (pipe-pair fds immediately preceding
+Si's ptmx fd, read from the Emacs daemon's own `lsof -p <daemon-pid>`
+at Si's spawn time). Check whether the newest child's fd table contains
+an fd whose **device+inode** (not just fd number — `lsof`'s `TYPE`/
+`DEVICE`/`NODE` columns, matched against the daemon's own entry for that
+fd number, not assumed from numeric coincidence alone) matches Si's
+event-channel pipe.
+
+**Prediction**: for S1..S6 spawned in creation order, test each of the
+four corrected properties directly, per child (device+inode match, not
+numeric coincidence, per fd claimed):
+1. Monotone — child Si's inherited-fd count strictly increases with i.
+2. Nested — Si's inherited set ⊇ S(i-1)'s inherited set, plus exactly
+   one new fd.
+3. ptmx-1 — every inherited fd in Si equals some earlier Sj's
+   `(ptmx fd) - 1`.
+4. Own write end — every Si (including S1, the oldest, with nothing
+   earlier to inherit) holds exactly one fd that is ITS OWN `ptmx-1`,
+   so S1's total is 1 (its own), not 0.
+
+**Falsification**: reported PER PROPERTY, not as one pass/fail — e.g. if
+monotone+nested+own-write-end hold but some inherited fd is NOT at
+`ptmx-1`, that is stated as "3 of 4 properties confirmed, ptmx-1
+falsified," not rounded to a single verdict. If ALL FOUR properties fail
+(zero inheritance of any kind, across all 5-6 spawns), this FALSIFIES
+"the leak reproduces on this build" outright — reported as a real
+discrepancy against the live fleet's own relayed (and now twice
+independently re-measured, on two OSes) measurement, not smoothed over,
+and item (b)'s treatment/control rows do not proceed (nothing to treat);
+the round instead reports the discrepancy and stops there.
+
+## Item (b): treatment vs. control
+
+**Only if item (a) reproduces the leak.** Build TWO instrumented copies
+of the native module from the Round 4 item-2 scratchpad base (or a
+fresh copy of the same source, if that scratchpad was cleaned up —
+`zig` itself, once installed via `brew`, does not need reinstalling):
+
+- **Control**: the Round 4 item-2 instrumented copy as-is (close()/
+  reaper logging only, no fd-leak fix) — or the plain, unmodified
+  0.51.0 module if rebuilding the exact item-2 copy is not practical;
+  whichever is used is stated explicitly in the results.
+- **Treatment**: the same copy, PLUS a fix for the leak: immediately
+  after the module receives the event-channel fd from Emacs (wherever
+  `NativeProcess.zig`/`module.zig` stores it — read the actual call
+  site before patching, don't guess), call `fcntl(fd, F_SETFD,
+  FD_CLOEXEC)` on it. **If that specific fd is not reachable/settable
+  from the module's own code** (e.g. Emacs owns it before the module
+  ever sees it, or the API doesn't expose a raw fd), fall back to
+  closing all non-standard fds in the forked pty child, in
+  `PosixPtyProcess.zig`'s fork path, before its `execve()` — this is
+  the steward's own stated fallback. State plainly which of the two
+  approaches was used and why.
+
+Verify with `lsof` (same device+inode method as item (a)) that newly
+spawned children under the TREATMENT build no longer inherit earlier
+sessions' event-channel fds, before running any kill row.
+
+**Interpretation of "same session, same n" (stated explicitly since the
+literal instruction is ambiguous about whether one Emacs process can
+run both builds at once — it cannot, since only one native module can
+be loaded per Emacs process)**: "same session" is read as one
+back-to-back investigative run, same day/setup/stub shape, comparing a
+TREATMENT daemon (patched module loaded) against a CONTROL daemon
+(unpatched module loaded), not a literal single Emacs process running
+both. If this reading is wrong, that is exactly the kind of
+misinterpretation to flag back, not silently proceed past.
+
+Run the standard three rows (kill Z/newest, kill Y/before-newest, kill
+X/oldest — matching every prior round's F1/F2/F3 shape) on BOTH the
+treatment daemon and the control daemon, n=3 reps each (18 kills total).
+
+**Decision rule (amended by butler/x600 before any run, folded in here):
+record TWO outcomes SEPARATELY per row, not one aggregate verdict**:
+
+(i) Do bystander deaths STOP under treatment (0/3 or close, per row)
+    while the SAME row on the control daemon continues to show them at
+    the established rate (≥2/3, matching Rounds 1-4)?
+(ii) Does the NESTING property (item (a)'s property 2, checked the same
+     way, via `lsof` device+inode) DISAPPEAR under treatment — i.e. do
+     newly-spawned children under the treatment build no longer inherit
+     earlier sessions' event-channel fds at all?
+
+Read per row, using the pre-registered table (verbatim from butler/
+x600):
+- **Deaths stop AND nesting gone** ⇒ consistent with the leak BEING the
+  mechanism.
+- **Deaths stop but nesting remains** ⇒ the leak is NOT the mechanism;
+  the treatment changed something else, and that must be identified
+  before claiming anything about the leak itself.
+- **Nesting gone but deaths persist** ⇒ the leak is real but NOT
+  causal — reported plainly, not downplayed.
+- (A fourth, unlisted cell — deaths persist AND nesting remains — would
+  mean the treatment didn't actually take effect; reported as a failed
+  treatment attempt, not evidence about the hypothesis either way.)
+
+Each row's own (i)+(ii) pair is stated individually, never aggregated
+into one round-level verdict — a row can land in a different cell than
+another row, and that difference is itself reported, not averaged away.
+
+## Sample-size limits (stated now)
+
+Item (a): 5-6 spawns, one daemon, one machine, one day — enough to show
+presence/absence of the qualitative inheritance pattern on this build,
+not to reproduce the live fleet's exact per-tty counts. Item (b): up to
+18 kill trials (2 builds × 3 rows × n=3) IF item (a) reproduces; 0 if it
+doesn't (reported, not padded). Building an instrumented module is the
+same one-attempt-then-report-blocked discipline as Round 4 item 2: a
+genuine, reasonable attempt at the CLOEXEC fix or the fallback, not an
+open-ended toolchain fight. Discards (setup failure, ambiguous lsof
+read, non-attach of a daemon) are counted and reported with reasons.
+
+## Safety boundary (restated, unchanged)
+
+Isolated daemon(s) only, distinct socket names for treatment vs.
+control to avoid confusion. No bare `emacsclient`. No kill-buffer /
+delete-process / signal / `lsof` beyond what butler already relayed
+read-only aimed at the live daemon. The live-loaded ghostel module and
+`~/.emacs.d/elpa/ghostel-20260823.1350` are never edited, rebuilt in
+place, or pointed to by the live daemon's load-path. No upstream filing
+this round regardless of outcome — steward routes that decision. All
+daemons and build/toolchain processes started for this round are
+stopped/cleaned up when done.
