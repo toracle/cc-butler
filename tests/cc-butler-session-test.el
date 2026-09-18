@@ -2902,6 +2902,26 @@ match and wrongly treat an uppercase secret as a lowercase SHA."
       (should-not (string-match-p (regexp-quote secret) logged))
       (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
 
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-aws-secret-access-key ()
+  "AWS's documented example secret contains `/', so it splits into short
+runs under the generic pattern; the dedicated shape must still mask it."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+           (logged (cc-butler-session-test--logged-body
+                    (format "secret %s end" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p "<redacted:40>" logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-40-char-paths-alone ()
+  "Adversarial path-like strings of exactly 40 chars must survive."
+  (cc-butler-session-test--with-ops-log
+    (dolist (s '("src/components/some/deeply/nested/path/file1"
+                 "src/Components/some/deeply/nested/File1xyz"
+                 "/Users/Foo/Projects/Bar2/src/components/x"
+                 "docs/Design/notes/2026/September/Report1"
+                 "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t9"))
+      (should (equal s (cc-butler--mask-secret-shapes s))))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; forward-only ops/msg log rotation
 ;;;; ------------------------------------------------------------------

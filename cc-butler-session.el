@@ -685,6 +685,27 @@ secret of the same length is still masked."
   (let ((case-fold-search nil))
     (string-match-p "\\`[0-9a-f]+\\'" s)))
 
+(defconst cc-butler--aws-secret-run-pattern "[A-Za-z0-9/+=]+"
+  "Maximal run of base64 characters, the unit `cc-butler--aws-secret-shape-p'
+judges.  Taking the whole run (not a 40-char slice) is the strict boundary:
+a slice of a longer path or base64 blob is never examined.")
+
+(defun cc-butler--aws-secret-shape-p (run)
+  "Non-nil if RUN looks like an AWS Secret Access Key that contains `/' or `+'.
+Exactly 40 chars, no `=', at least one `/' or `+', a digit and a lower->UPPER
+case transition (implies a mix of upper and lower).  Keys with neither `/' nor `+' are already caught by
+`cc-butler--secret-shape-generic-pattern'.  Also rejects a leading `/' or a
+`//' -- absolute paths and URL remnants, not keys -- so ordinary
+path-like text of this length is not over-redacted."
+  (let ((case-fold-search nil))
+    (and (= (length run) 40)
+         (string-match-p "[/+]" run)
+         (not (string-match-p "=\\|\\`/\\|//" run))
+         ;; A lower->UPPER transition inside a word: random keys have them,
+         ;; path segments (`Design', `September', `Report1') do not.
+         (string-match-p "[a-z][A-Z]" run)
+         (string-match-p "[0-9]" run))))
+
 (defun cc-butler--mask-secret-shapes (body)
   "Replace token/key-shaped runs in BODY with <redacted:LEN>, LEN the
 length of what was there. Everything else in BODY is left untouched --
@@ -697,11 +718,18 @@ here, never anything around it."
       (setq out (replace-regexp-in-string
                  pat (lambda (m) (format "<redacted:%d>" (length m)))
                  out t t)))
+    (setq out (replace-regexp-in-string
+               cc-butler--secret-shape-generic-pattern
+               (lambda (m)
+                 (if (cc-butler--looks-like-hex-only m) m
+                   (format "<redacted:%d>" (length m))))
+               out t t))
     (replace-regexp-in-string
-     cc-butler--secret-shape-generic-pattern
+     cc-butler--aws-secret-run-pattern
      (lambda (m)
-       (if (cc-butler--looks-like-hex-only m) m
-         (format "<redacted:%d>" (length m))))
+       (if (cc-butler--aws-secret-shape-p m)
+           (format "<redacted:%d>" (length m))
+         m))
      out t t)))
 
 (defcustom cc-butler-ops-log-retention-days 14
