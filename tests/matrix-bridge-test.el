@@ -341,28 +341,30 @@ its callback with (DATA ERR), ignoring the mxc url given to it."
      ,@body))
 
 (ert-deftest matrix-bridge/handle-audio-download-failure-has-no-attachment ()
-  (matrix-bridge-test--with-media-dir
-    (matrix-bridge-test--stub-download nil "(error connection-refused)"
-      (matrix-bridge-test--capture-delivery delivered
-        (matrix-bridge--handle-audio
-         '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
-           (event_id . "$abc") (content . ((msgtype . "m.audio") (body . "voice.ogg")
-                                           (url . "mxc://server/x")))))
-        (should (= 1 (length delivered)))
-        (should (string-match-p "다운로드 실패" (car delivered)))
-        (should-not (string-match-p "첨부:" (car delivered)))))))
+  (let ((matrix-bridge-human-user-id "@fake-human:example.org"))
+    (matrix-bridge-test--with-media-dir
+      (matrix-bridge-test--stub-download nil "(error connection-refused)"
+        (matrix-bridge-test--capture-delivery delivered
+          (matrix-bridge--handle-audio
+           `((type . "m.room.message") (sender . ,matrix-bridge-human-user-id)
+             (event_id . "$abc") (content . ((msgtype . "m.audio") (body . "voice.ogg")
+                                             (url . "mxc://server/x")))))
+          (should (= 1 (length delivered)))
+          (should (string-match-p "다운로드 실패" (car delivered)))
+          (should-not (string-match-p "첨부:" (car delivered))))))))
 
 (ert-deftest matrix-bridge/handle-audio-bad-url-has-no-attachment ()
-  (matrix-bridge-test--with-media-dir
-    (matrix-bridge-test--stub-download nil nil
-      (matrix-bridge-test--capture-delivery delivered
-        (matrix-bridge--handle-audio
-         '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
-           (event_id . "$abc") (content . ((msgtype . "m.audio") (body . "voice.ogg")
-                                           (url . "not-mxc")))))
-        (should (= 1 (length delivered)))
-        (should (string-match-p "url 형식 이상" (car delivered)))
-        (should-not (string-match-p "첨부:" (car delivered)))))))
+  (let ((matrix-bridge-human-user-id "@fake-human:example.org"))
+    (matrix-bridge-test--with-media-dir
+      (matrix-bridge-test--stub-download nil nil
+        (matrix-bridge-test--capture-delivery delivered
+          (matrix-bridge--handle-audio
+           `((type . "m.room.message") (sender . ,matrix-bridge-human-user-id)
+             (event_id . "$abc") (content . ((msgtype . "m.audio") (body . "voice.ogg")
+                                             (url . "not-mxc")))))
+          (should (= 1 (length delivered)))
+          (should (string-match-p "url 형식 이상" (car delivered)))
+          (should-not (string-match-p "첨부:" (car delivered))))))))
 
 ;;;;; invariant #2: write-before-invoke ordering ---------------------------
 
@@ -379,30 +381,31 @@ since by the time a synchronous test resumes control, both steps have long
 since happened either way.  Checking at the moment of the call is what makes
 this test FAIL if the write is ever reordered to after the monocle call, or
 skipped on this path."
-  (matrix-bridge-test--with-media-dir
-    (let* ((path (expand-file-name "$evt1-voice.ogg" matrix-bridge-media-dir))
-           file-existed-at-invoke-time)
-      (matrix-bridge-test--stub-download "raw-audio-bytes" nil
-        (cl-letf (((symbol-function 'make-process)
-                   (lambda (&rest _)
-                     (setq file-existed-at-invoke-time (file-exists-p path))
-                     (error "monocle binary not found"))))
-          (matrix-bridge-test--capture-delivery delivered
-            (matrix-bridge--handle-audio
-             '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
-               (event_id . "$evt1") (content . ((msgtype . "m.audio") (body . "voice.ogg")
-                                                (url . "mxc://server/x")))))
-            ;; The write must have already happened BEFORE make-process ran.
-            (should (eq file-existed-at-invoke-time t))
-            (should (equal (with-temp-buffer
-                              (insert-file-contents-literally path)
-                              (buffer-string))
-                            "raw-audio-bytes"))
-            ;; ... and the failure message still names that same file.
-            (should (= 1 (length delivered)))
-            (should (string-match-p "텍스트 변환 시작 실패" (car delivered)))
-            (should (string-match-p (regexp-quote (format "첨부: %s" path))
-                                    (car delivered)))))))))
+  (let ((matrix-bridge-human-user-id "@fake-human:example.org"))
+    (matrix-bridge-test--with-media-dir
+      (let* ((path (expand-file-name "$evt1-voice.ogg" matrix-bridge-media-dir))
+             file-existed-at-invoke-time)
+        (matrix-bridge-test--stub-download "raw-audio-bytes" nil
+          (cl-letf (((symbol-function 'make-process)
+                     (lambda (&rest _)
+                       (setq file-existed-at-invoke-time (file-exists-p path))
+                       (error "monocle binary not found"))))
+            (matrix-bridge-test--capture-delivery delivered
+              (matrix-bridge--handle-audio
+               `((type . "m.room.message") (sender . ,matrix-bridge-human-user-id)
+                 (event_id . "$evt1") (content . ((msgtype . "m.audio") (body . "voice.ogg")
+                                                  (url . "mxc://server/x")))))
+              ;; The write must have already happened BEFORE make-process ran.
+              (should (eq file-existed-at-invoke-time t))
+              (should (equal (with-temp-buffer
+                                (insert-file-contents-literally path)
+                                (buffer-string))
+                              "raw-audio-bytes"))
+              ;; ... and the failure message still names that same file.
+              (should (= 1 (length delivered)))
+              (should (string-match-p "텍스트 변환 시작 실패" (car delivered)))
+              (should (string-match-p (regexp-quote (format "첨부: %s" path))
+                                      (car delivered))))))))))
 
 ;;;;; invariant #1: HOME is scoped to the one make-process call ------------
 
@@ -412,6 +415,7 @@ was built for, and gone the instant that call returns -- never a global
 `setenv'.  This test FAILS if the implementation switches to
 `(setenv \"HOME\" ...)' instead of `let'-binding `process-environment'."
   (let* ((matrix-bridge-monocle-home "/fake/monocle/home")
+         (matrix-bridge-human-user-id "@fake-human:example.org")
          (home-before (getenv "HOME"))
          (process-environment-before process-environment)
          env-seen-inside-call)
@@ -419,7 +423,7 @@ was built for, and gone the instant that call returns -- never a global
                (lambda (&rest _)
                  (setq env-seen-inside-call process-environment)
                  nil)))
-      (matrix-bridge--transcribe-audio "/tmp/some-audio.ogg" "@jeongsoo:warmblood-lounge"
+      (matrix-bridge--transcribe-audio "/tmp/some-audio.ogg" matrix-bridge-human-user-id
                                        "$abc" nil))
     ;; Inside the call, the override was present ...
     (should (member "HOME=/fake/monocle/home" env-seen-inside-call))
@@ -431,44 +435,48 @@ was built for, and gone the instant that call returns -- never a global
 (ert-deftest matrix-bridge/monocle-start-failure-message-has-attachment ()
   "Branch 3: monocle fails to start -- the message must still name the file
 that (by invariant #2) is already on disk by this point."
-  (matrix-bridge-test--capture-delivery delivered
-    (cl-letf (((symbol-function 'make-process)
-               (lambda (&rest _) (error "no such file"))))
-      (matrix-bridge--transcribe-audio "/tmp/audio-path.ogg" "@jeongsoo:warmblood-lounge"
-                                       "$abc" nil))
-    (should (= 1 (length delivered)))
-    (should (string-match-p "텍스트 변환 시작 실패" (car delivered)))
-    (should (string-match-p "첨부: /tmp/audio-path.ogg" (car delivered)))))
+  (let ((matrix-bridge-human-user-id "@fake-human:example.org"))
+    (matrix-bridge-test--capture-delivery delivered
+      (cl-letf (((symbol-function 'make-process)
+                 (lambda (&rest _) (error "no such file"))))
+        (matrix-bridge--transcribe-audio "/tmp/audio-path.ogg" matrix-bridge-human-user-id
+                                         "$abc" nil))
+      (should (= 1 (length delivered)))
+      (should (string-match-p "텍스트 변환 시작 실패" (car delivered)))
+      (should (string-match-p "첨부: /tmp/audio-path.ogg" (car delivered))))))
 
 ;;;;; finish-transcription: branches 4, 5, 6 --------------------------------
 
 (ert-deftest matrix-bridge/finish-transcription-nonzero-rc-has-attachment ()
-  (matrix-bridge-test--capture-delivery delivered
-    (matrix-bridge--finish-transcription
-     "/tmp/a.ogg" "@jeongsoo:warmblood-lounge" "$abc" nil
-     1 "" "credentials not found")
-    (should (= 1 (length delivered)))
-    (should (string-match-p "텍스트 변환 실패: rc=1" (car delivered)))
-    (should (string-match-p "credentials not found" (car delivered)))
-    (should (string-match-p "첨부: /tmp/a.ogg" (car delivered)))))
+  (let ((matrix-bridge-human-user-id "@fake-human:example.org"))
+    (matrix-bridge-test--capture-delivery delivered
+      (matrix-bridge--finish-transcription
+       "/tmp/a.ogg" matrix-bridge-human-user-id "$abc" nil
+       1 "" "credentials not found")
+      (should (= 1 (length delivered)))
+      (should (string-match-p "텍스트 변환 실패: rc=1" (car delivered)))
+      (should (string-match-p "credentials not found" (car delivered)))
+      (should (string-match-p "첨부: /tmp/a.ogg" (car delivered))))))
 
 (ert-deftest matrix-bridge/finish-transcription-empty-text-has-attachment ()
-  (matrix-bridge-test--capture-delivery delivered
-    (matrix-bridge--finish-transcription
-     "/tmp/a.ogg" "@jeongsoo:warmblood-lounge" "$abc" nil
-     0 "{\"text\": \"\"}" "")
-    (should (= 1 (length delivered)))
-    (should (string-match-p "변환 결과 비어있음" (car delivered)))
-    (should (string-match-p "첨부: /tmp/a.ogg" (car delivered)))))
+  (let ((matrix-bridge-human-user-id "@fake-human:example.org"))
+    (matrix-bridge-test--capture-delivery delivered
+      (matrix-bridge--finish-transcription
+       "/tmp/a.ogg" matrix-bridge-human-user-id "$abc" nil
+       0 "{\"text\": \"\"}" "")
+      (should (= 1 (length delivered)))
+      (should (string-match-p "변환 결과 비어있음" (car delivered)))
+      (should (string-match-p "첨부: /tmp/a.ogg" (car delivered))))))
 
 (ert-deftest matrix-bridge/finish-transcription-success-delivers-text-and-attachment ()
-  (matrix-bridge-test--capture-delivery delivered
-    (matrix-bridge--finish-transcription
-     "/tmp/a.ogg" "@jeongsoo:warmblood-lounge" "$abc" nil
-     0 "{\"text\": \"안녕하세요\"}" "")
-    (should (= 1 (length delivered)))
-    (should (string-match-p "안녕하세요" (car delivered)))
-    (should (string-match-p "첨부: /tmp/a.ogg" (car delivered)))))
+  (let ((matrix-bridge-human-user-id "@fake-human:example.org"))
+    (matrix-bridge-test--capture-delivery delivered
+      (matrix-bridge--finish-transcription
+       "/tmp/a.ogg" matrix-bridge-human-user-id "$abc" nil
+       0 "{\"text\": \"안녕하세요\"}" "")
+      (should (= 1 (length delivered)))
+      (should (string-match-p "안녕하세요" (car delivered)))
+      (should (string-match-p "첨부: /tmp/a.ogg" (car delivered))))))
 
 (ert-deftest matrix-bridge/finish-transcription-appends-human-reminder-only-for-human ()
   "The human-reminder suffix now comes from `matrix-bridge--format-line',
@@ -476,18 +484,20 @@ derived from SENDER -- no longer a param `--finish-transcription' is handed
 directly.  Covered as a positive/negative pair, same pattern as
 `matrix-bridge/event-line-human-sender-shows-attribution' /
 `-fleet-sender-shows-short-name'."
-  (matrix-bridge-test--capture-delivery delivered
-    (matrix-bridge--finish-transcription
-     "/tmp/a.ogg" "@jeongsoo:warmblood-lounge" "$abc" nil
-     0 "{\"text\": \"hi\"}" "")
-    (should (string-suffix-p matrix-bridge-human-reminder (car delivered)))))
+  (let ((matrix-bridge-human-user-id "@fake-human:example.org"))
+    (matrix-bridge-test--capture-delivery delivered
+      (matrix-bridge--finish-transcription
+       "/tmp/a.ogg" matrix-bridge-human-user-id "$abc" nil
+       0 "{\"text\": \"hi\"}" "")
+      (should (string-suffix-p matrix-bridge-human-reminder (car delivered))))))
 
 (ert-deftest matrix-bridge/finish-transcription-no-reminder-for-non-human-sender ()
-  (matrix-bridge-test--capture-delivery delivered
-    (matrix-bridge--finish-transcription
-     "/tmp/a.ogg" "@butler-macbook-m1-max:warmblood-lounge" "$abc" nil
-     0 "{\"text\": \"hi\"}" "")
-    (should-not (string-suffix-p matrix-bridge-human-reminder (car delivered)))))
+  (let ((matrix-bridge-human-user-id "@fake-human:example.org"))
+    (matrix-bridge-test--capture-delivery delivered
+      (matrix-bridge--finish-transcription
+       "/tmp/a.ogg" "@fake-peer:example.org" "$abc" nil
+       0 "{\"text\": \"hi\"}" "")
+      (should-not (string-suffix-p matrix-bridge-human-reminder (car delivered))))))
 
 ;;;; --- media (m.image/m.file axis) -- ported from m1's independent branch --
 
@@ -507,21 +517,21 @@ directly.  Covered as a positive/negative pair, same pattern as
 
 (ert-deftest matrix-bridge/media-event-p-true-for-image ()
   (should (matrix-bridge--media-event-p
-           '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+           '((type . "m.room.message") (sender . "@fake-human:example.org")
              (content . ((msgtype . "m.image")))))))
 
 (ert-deftest matrix-bridge/media-event-p-true-for-file ()
   (should (matrix-bridge--media-event-p
-           '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+           '((type . "m.room.message") (sender . "@fake-human:example.org")
              (content . ((msgtype . "m.file")))))))
 
 (ert-deftest matrix-bridge/media-event-p-false-for-text ()
   (should-not (matrix-bridge--media-event-p
-               '((type . "m.room.message") (sender . "@jeongsoo:warmblood-lounge")
+               '((type . "m.room.message") (sender . "@fake-human:example.org")
                  (content . ((msgtype . "m.text")))))))
 
 (ert-deftest matrix-bridge/media-event-p-false-for-own-outgoing ()
-  (let ((matrix-bridge-self-user-id "@butler-x600:warmblood-lounge"))
+  (let ((matrix-bridge-self-user-id "@fake-self:example.org"))
     (should-not (matrix-bridge--media-event-p
                  `((type . "m.room.message") (sender . ,matrix-bridge-self-user-id)
                    (content . ((msgtype . "m.image"))))))))
