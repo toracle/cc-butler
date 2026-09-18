@@ -2845,11 +2845,27 @@ must set the mode explicitly at creation time, same precedent as
           (should (= #o600 (file-modes cc-butler-inbox-queue-file))))
       (delete-directory tmpdir t))))
 
-(ert-deftest cc-butler-session/inbox-queue-warn-threshold-matches-drained-keep-precedent ()
-  "Decision lock (2026-09-04): the backlog-warning threshold reuses
-`cc-butler-drained-keep' as its number -- this fleet's existing precedent
-for a small bounded event window -- rather than an arbitrary new one."
-  (should (= cc-butler-inbox-queue-warn-threshold cc-butler-drained-keep)))
+(ert-deftest cc-butler-session/inbox-queue-save-warns-past-the-backlog-threshold ()
+  "`cc-butler-inbox-queue-warn-threshold' is not just a number sitting next
+to the code -- crossing it must actually produce the ops-log backlog
+signal `cc-butler--inbox-queue-save' promises, and staying at or under it
+must stay silent.  (Replaces a prior version of this test that only
+compared this defcustom's default to `cc-butler-drained-keep''s, which
+caught neither value drifting from the real backlog behavior below.)"
+  (let* ((cc-butler-inbox-queue-file
+          (make-temp-file "cc-butler-inbox-queue-test-" nil ".eld"))
+         (cc-butler-inbox-queue-warn-threshold 2)
+         logged)
+    (unwind-protect
+        (cl-letf (((symbol-function 'cc-butler--log)
+                   (lambda (fmt &rest args) (push (apply #'format fmt args) logged))))
+          (let ((cc-butler--inbox '(:a :b)))    ; at threshold: silent
+            (cc-butler--inbox-queue-save))
+          (should-not (cl-some (lambda (l) (string-match-p "backlog" l)) logged))
+          (let ((cc-butler--inbox '(:a :b :c))) ; over threshold: warns
+            (cc-butler--inbox-queue-save))
+          (should (cl-some (lambda (l) (string-match-p "backlog" l)) logged)))
+      (delete-file cc-butler-inbox-queue-file))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; forward-only ops/msg log rotation
