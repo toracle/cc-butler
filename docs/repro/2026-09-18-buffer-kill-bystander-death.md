@@ -1950,3 +1950,89 @@ confirm `claude-code-ide-cli-path` is pointed at the stub before
 spawning anything, per the standing hazard noted in every prior round.
 All daemon and any build/toolchain processes stopped and confirmed via
 `ps` when done.
+
+## Addendum (butler adopts x600's two points, before any Round 6 run)
+
+Written before any Round 6 row was run — the pre-registration above is
+already committed/pushed (`9cf2552`), so per standing practice this is a
+separate, clearly-labelled addendum, not an edit into the frozen text
+above. Still ONE round, still an isolated daemon, still after Task 1.
+
+### Point 1: N≈10, paired negative control (not N=3, not unpaired)
+
+The N=3 design above is **superseded** by this addendum on two points:
+
+- **N≈10, not 3.** The victim rule is creation-order-dependent, and
+  Round 4 item 3 already showed the naive "predecessor dies" rule does
+  NOT simply extend past N=3 (killing position 2 of 4 hit the
+  *successor*, position 3, not position 1). Assuming "self-exit the
+  newest ⇒ check the before-newest" at N≈10 would be extending an
+  already-falsified extrapolation. Instead: spawn N≈10 sessions, trigger
+  the event (kill or self-exit) on the newest, and **observe which
+  session(s), if any, show the signature — do not assume the position
+  in advance.**
+- **Paired negative control, same N, same daemon, mandatory.** Before
+  any self-exit row is read as meaning anything: on a fresh N≈10 spawn
+  in the SAME daemon, `kill-buffer` the newest and confirm a bystander
+  death occurs somewhere in the set. **If kill-buffer does NOT reproduce
+  a bystander death at N≈10, the self-exit row is uninformative and is
+  reported as such — it does NOT get read as "self-exit is safe."**
+  Interpretation rule, exact: **"/exit safe" holds ONLY IF (kill-buffer
+  kills a bystander at this N, this daemon) AND (self-exit, same N, same
+  daemon, does not)**. Any other combination (kill doesn't reproduce;
+  both reproduce; neither reproduces) is reported as its own outcome,
+  not forced into "safe" or "unsafe."
+- **Daemon age is an explicit, untested axis.** The real fleet daemon is
+  long-lived (days); a freshly-spawned `ccb-repro-r6` daemon cannot
+  cheaply reproduce that. This round's result applies to a
+  freshly-started daemon only — age-dependence is neither confirmed nor
+  ruled out, stated plainly as scope, not silently assumed away.
+
+### Point 2: state-of-receiving-session rows
+
+Record the STATE of the session that receives the self-exit-equivalent
+action, one row per state, self-exit still targeting the newest session
+in a fresh N≈10 spawn each time:
+
+1. **idle** (0k context, blocked on read — the baseline shape used in
+   every prior round and in this addendum's Point-1 rows).
+2. **mid-turn** (approximated with a stub: actively writing to stdout in
+   a loop at the moment EOF/exit is attempted, rather than blocked on
+   read).
+3. **unsubmitted text in the input box** (approximated at the pty layer:
+   characters written into the pty's canonical-mode input queue with NO
+   trailing newline before the exit-equivalent action is sent — this
+   tests whether a pending, unterminated line changes whether the
+   process-level EOF is delivered/accepted, which is a real pty-line-
+   discipline property, not specific to the real CLI's own line editor).
+4. **open menu or wizard** (approximated with a stub placed into raw/
+   non-canonical terminal mode via `stty raw` before the exit-equivalent
+   action, as the closest available proxy for a TUI alternate-screen/
+   input-capture mode — stated plainly as an approximation, not the real
+   CLI's actual menu code).
+5. **unresponsive / long subagent** (approximated with a stub that is
+   busy — e.g. a tight sleep loop not reading its own stdin at all — for
+   several seconds spanning the exit-equivalent attempt).
+
+**"Does not accept the exit-equivalent action" (e.g. EOF sent but the
+stub does not terminate within the poll window) is itself a valid,
+reportable boundary outcome for that state row — not a failure of the
+round, and not silently retried into a different state.** Where a state
+cannot be triggered without deviating from the stub-only / no-real-
+`claude`-binary safety boundary, that row is reported as "not testable
+under this round's safety boundaries," not approximated by relaxing the
+boundary.
+
+n=1 rep per state (5 states) — this is explicitly a boundary-mapping
+pass, not a statistical claim; only the Point-1 paired design carries
+n=3 and a "safe"/"unsafe" read.
+
+### Cost note (told to the steward before starting, per instruction)
+
+All sessions in this addendum, both arms and all state rows, are the
+same cheap stub CLI every prior round has used (`trap ... HUP TERM;
+cat`, or a lightly extended variant for states 2-5 above) — not the real
+`claude` binary, zero API token cost, running inside the isolated
+`ccb-repro-r6` Emacs daemon, which the live fleet's session cap does not
+track. Reported to the steward before spinning up anything; proceeding
+only after acknowledgement.
