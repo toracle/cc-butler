@@ -375,10 +375,16 @@ window blinded us to a session's size as well as its model.  Read each field
 independently and let a missing one be nil on its own.")
 
 (defconst cc-butler-cleanup--statusline-model-re
-  "MODEL:\\([A-Za-z0-9_.-]+\\)"
+  "MODEL:\\([A-Za-z0-9_.-]+\\)\\(?:[ \t]\\|$\\)"
   "The model field, matched independently of CTX and of field order.
 `MODEL:?' does not match: `?' is outside the class, so the statusline's own
-\"unknown\" sentinel stays honestly nil rather than becoming the string \"?\".")
+\"unknown\" sentinel stays honestly nil rather than becoming the string \"?\".
+The tag must be followed by whitespace or end the line, for the same reason
+the CTX number must (see `cc-butler-cleanup--statusline-re'): a narrow window
+cuts on a character count and leaves `MODEL:Fab…' for `Fable-5.1' (the butler,
+2026-09-15, #254).  Without the guard that scraped as `Fab' — a tag that names
+no restorable model — and compaction refused.  Interrupted means nil, and the
+transcript answers instead.")
 
 (defun cc-butler-cleanup--statusline-fields (out)
   "Parse the session's OWN statusline out of terminal text OUT.
@@ -455,6 +461,18 @@ tag cheap so a redraw does not re-scrape every terminal.  TOKENS is the
 LAST-KNOWN size: a later read of nil (no indicator on screen right now) does not
 erase it, so the tag persists instead of flickering out.")
 
+(defvar cc-butler-cleanup--context-fresh-cache (make-hash-table :test 'equal)
+  "Map a session dir -> FRESH-P, kept in lockstep with
+`cc-butler-cleanup--context-cache' but as a SEPARATE table, mirroring
+`cc-butler-cleanup--model-fresh-cache' (see its docstring for why separate).
+Non-nil means the token count currently cached for DIR came from a live
+read this cycle; nil means it was carried forward unchanged after the
+current read came back empty (e.g. an open dialog hides the statusline —
+session_status's OVER THRESHOLD/severity still fire on this carried-forward
+number, per cc-butler#8 follow-up, but a caller can now tell the two apart
+via `cc-butler-cleanup-context-fresh-p' instead of trusting every cached
+figure equally.")
+
 (defun cc-butler-cleanup-context-for (dir)
   "Return DIR's context size in input tokens, cached for a short TTL.
 The TTL is `cc-butler-cleanup-context-ttl'; the value comes from
@@ -477,12 +495,23 @@ when no size has ever been read for DIR."
         (if (integerp tok)
             ;; A real reading: refresh both the value and its timestamp.
             (progn (puthash dir (cons now tok) cc-butler-cleanup--context-cache)
+                   (puthash dir t cc-butler-cleanup--context-fresh-cache)
                    tok)
           ;; No reading now: keep the last-known value (nil if we never had one),
           ;; refreshing only the timestamp so we retry after the TTL.
           (let ((last (and cached (cdr cached))))
             (puthash dir (cons now last) cc-butler-cleanup--context-cache)
+            (puthash dir nil cc-butler-cleanup--context-fresh-cache)
             last))))))
+
+(defun cc-butler-cleanup-context-fresh-p (dir)
+  "Non-nil when DIR's currently-cached context size (per
+`cc-butler-cleanup--context-cache') came from a live read this cycle,
+rather than being carried forward unchanged from a prior cycle. Mirrors
+`cc-butler-cleanup-model-fresh-p'. Call `cc-butler-cleanup-context-for'
+first so the entry reflects the current cycle; this only reads
+`cc-butler-cleanup--context-fresh-cache'."
+  (gethash dir cc-butler-cleanup--context-fresh-cache))
 
 (defun cc-butler-cleanup--default-model (session)
   "Default: read SESSION's current model name from its terminal.
@@ -1042,7 +1071,11 @@ close_topic only tears down ordinary workers." name))
              ;; Guard 2: git-safety audit — refuse a workspace with local work.
              (bad (cc-butler--close-topic-audit topic)))
         (if bad
-            (format "Refused: %s has unsafe git state, NOT deleted —\n%s"
+            (format "Refused: %s has unsafe git state, NOT deleted —\n%s\n\n\
+To retire this topic WITHOUT deleting it (its work predates git, or \
+lives elsewhere), kill its session buffers/process yourself, then drop \
+it from the roster with (cc-butler--roster-forget %S) — close_topic will \
+not do either of those for you."
                     name
                     (mapconcat
                      (lambda (cell)
@@ -1050,7 +1083,8 @@ close_topic only tears down ordinary workers." name))
                                (file-name-nondirectory
                                 (directory-file-name (car cell)))
                                (string-join (cdr cell) ", ")))
-                     bad "\n"))
+                     bad "\n")
+                    topic)
           ;; Guard 3: kill + delete via the shared irreversible tail (no FORCE,
           ;; so it re-checks git safety immediately before removing the dir).
           (let* ((res (cc-butler--teardown-workspace dir topic))
@@ -1078,10 +1112,10 @@ was NOT deleted." name bufs topic))))))))))
                 (plist-get (claude-code-ide--normalize-tool-spec spec) :name)))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-close-topic
  :name "close_topic"
- :description "DESTRUCTIVE, IRREVERSIBLE: kill a finished worker's Claude session and permanently DELETE its topic workspace directory — its git clone(s) and every local file — from disk.  This cannot be undone.  Use it to tear a worker down once its work is safely committed/pushed and you no longer need its workspace.  Safety gates enforced by the tool, in order: (1) refuses unless the target is an ordinary WORKER — it can NEVER close the butler or the steward; (2) runs a git-safety audit and REFUSES, deleting nothing, if any repo in the workspace has local-only commits, uncommitted changes, or stashes; (3) only then kills the session and deletes the directory, re-checking git safety one last time immediately before removal.  Identify the target by its session NAME (from list_claude_sessions).  Returns whether the workspace was deleted, or the reason it was refused.  Because it is irreversible, the operator is asked to approve each call."
+ :description "DESTRUCTIVE, IRREVERSIBLE: kill a finished worker's Claude session and permanently DELETE its topic workspace directory — its git clone(s) and every local file — from disk.  This cannot be undone.  Use it to tear a worker down once its work is safely committed/pushed and you no longer need its workspace.  Safety gates enforced by the tool, in order: (1) refuses unless the target is an ordinary WORKER — it can NEVER close the butler or the steward; (2) runs a git-safety audit and REFUSES, deleting nothing, if any repo in the workspace has local-only commits, uncommitted changes, or stashes — including refusing when the workspace's top level is not a git repo and no child repo can be found to check either, since \"nothing to verify\" is never treated as \"safe to delete\"; (3) only then kills the session and deletes the directory, re-checking git safety one last time immediately before removal.  Identify the target by its session NAME (from list_claude_sessions).  Returns whether the workspace was deleted, or the reason it was refused, including how to retire a non-git workspace by hand instead.  Because it is irreversible, the operator is asked to approve each call."
  :args '((:name "name"
                 :type string
                 :description "Session name of the WORKER to close, from list_claude_sessions (e.g. 'app-billing').  Must be a worker — never the butler or steward.")))

@@ -104,8 +104,25 @@
     cc-butler-doc-panel cc-butler-docs cc-butler-persist
     cc-butler-mail cc-butler-decision cc-butler-inbox cc-butler-governance
     cc-butler-provenance cc-butler-cleanup cc-butler-compact
-    cc-butler-north-star cc-butler-self-check)
+    cc-butler-north-star matrix-bridge cc-butler-self-check)
   "cc-butler modules, in dependency order.")
+
+(defconst cc-butler--modules-directory-exceptions
+  '()
+  "Root `.el' files deliberately excluded from `cc-butler--modules'.
+
+Empty on purpose.  Every `.el' file at the repo root is expected to be a
+real module: `cc-butler-reload' loads exactly `cc-butler--modules' (plus
+`cc-butler' itself), and self-checks 5/7 walk the same list for
+defcustom drift -- a file outside it is invisible to both, and both keep
+reporting success regardless (`matrix-bridge.el' sat in exactly this gap
+for weeks; see the \"an upstream list walk is blind to what is not on the
+list\" governance note, 2026-09-10).
+
+Adding a symbol here is a DELIBERATE act, not a convenience: it turns off
+the parity test in `cc-butler-reload-test.el' for that one file.  State
+the reason on the line you add, e.g. why the file must never be `load'ed
+as a module (a build script, a one-off migration, ...).")
 
 (defconst cc-butler--dir
   (file-name-directory (or load-file-name buffer-file-name default-directory))
@@ -256,6 +273,24 @@ Callers must degrade (drop the line, show nothing), never probe harder."
            ((string-match "\\`[0-9a-f]\\{40,\\}\\'" head)
             (format "%s (detached)" (substring head 0 7)))))))))
 
+(defun cc-butler--git-head-sha (dir)
+  "DIR's git HEAD as a full SHA, or nil — same no-subprocess file reads as
+`cc-butler--git-head' (see its docstring for why this never shells out),
+without the short/formatted presentation `cc-butler--git-head' builds for
+display. Exists so a caller that needs an exact hash for equality
+comparison — `cc-butler-tool-runtime-source', comparing the checkout's
+CURRENT head against what is actually loaded — is not forced to re-parse
+a truncated, human-formatted string back into a hash."
+  (ignore-errors
+    (let ((gitdir (cc-butler--git-dir dir)))
+      (when gitdir
+        (let ((head (cc-butler--file-head-line (expand-file-name "HEAD" gitdir))))
+          (cond
+           ((null head) nil)
+           ((string-match "\\`ref:[ \t]*\\(refs/[^ \t]+\\)\\'" head)
+            (cc-butler--git-ref-hash gitdir (match-string 1 head)))
+           ((string-match "\\`[0-9a-f]\\{40,\\}\\'" head) head)))))))
+
 (defun cc-butler--source-revision (dir)
   "One-line description of the commit DIR is on, or nil if not determinable.
 The only trustworthy version signal for a source directory: the `Version:'
@@ -362,6 +397,330 @@ and quietly undoes whatever a reload just did."
           (push (file-name-nondirectory elc) out))))
     (nreverse out)))
 
+(defun cc-butler--defcustom-forms-in-string (text)
+  "Alist of (SYMBOL . DEFAULT-FORM) for every top-level `defcustom' or
+`defvar'-with-a-value form in TEXT, read without loading or evaluating it.
+Shared by `cc-butler--defcustom-forms-in-file' (the current file on disk)
+and `cc-butler--defcustom-history-defaults' (past revisions read from git
+history) — both need the identical read-don't-eval parse, just fed
+different source text."
+  (let (out)
+    (with-temp-buffer
+      (insert text)
+      (goto-char (point-min))
+      (condition-case nil
+          (while t
+            (let ((form (read (current-buffer))))
+              (when (and (consp form)
+                         (memq (car form) '(defcustom defvar))
+                         (symbolp (nth 1 form))
+                         (>= (safe-length form) 3))
+                (push (cons (nth 1 form) (nth 2 form)) out))))
+        (end-of-file nil)))
+    (nreverse out)))
+
+(defun cc-butler--defcustom-forms-in-file (file)
+  "Alist of (SYMBOL . DEFAULT-FORM) for every top-level `defcustom' or
+`defvar'-with-a-value form in FILE, read from its source text without
+loading or evaluating it. See `cc-butler--defcustom-drift'."
+  (when (file-readable-p file)
+    (with-temp-buffer
+      (insert-file-contents file)
+      (cc-butler--defcustom-forms-in-string (buffer-string)))))
+
+(defun cc-butler--defcustom-drift-internal-p (sym)
+  "Non-nil if SYM's name marks it elisp-private — `--' anywhere in the name,
+the convention this codebase actually uses (not just a `cc-butler--' prefix:
+`cc-butler-cleanup--context-cache' is private too). These are runtime
+accumulators (queues, caches, inboxes), not customization points: they are
+SUPPOSED to differ from an empty/nil `defvar' default the moment anything
+runs, so reporting them as \"drift\" is always true and carries no signal.
+
+2026-09-05 (steward, live): the first version of `cc-butler--defcustom-drift'
+had no such filter and both (a) buried the 4 real drifts in 54 total, and
+(b) printed the LIVE VALUES of these accumulators in full — which are
+exactly the fields liable to hold worker-report bodies, session status
+text, and other content that should not appear whole in an escalation
+surface. Filtering by name here fixes both at once."
+  (string-match-p "--" (symbol-name sym)))
+
+(defun cc-butler--defcustom-drift-noise-p (sym)
+  "Non-nil if SYM is a hook list or a keymap. Both are designed to differ
+from their `defvar' default as soon as anything `add-hook's or
+`define-key's onto them — that is normal operation, not a stuck reload, so
+reporting it as drift is always true and never informative."
+  (or (string-match-p "-\\(hook\\|functions\\)\\'" (symbol-name sym))
+      (and (string-match-p "-map\\'" (symbol-name sym))
+           (boundp sym)
+           (keymapp (symbol-value sym)))))
+
+(defun cc-butler--defcustom-drift-externally-configured-p (sym)
+  "Non-nil if SYM is deliberately supplied by per-machine config outside
+this repo, so its in-repo default is a placeholder, not a value the live
+symbol is ever meant to hold — differing from that placeholder is the
+permanent, correct state, not a stuck reload.
+
+`matrix-bridge-self-user-id' and `matrix-bridge-human-user-id' are the two
+known cases: both ship nil in source (see either defvar's own docstring —
+\"set it in per-machine config, not here\") specifically because a
+same-repo default belonging to one fleet would silently misfile another
+fleet's messages. `matrix-bridge-self-user-id' was born nil and never
+collided with its own git history, so this gap stayed latent; changing
+`matrix-bridge-human-user-id''s default from a real hardcoded id to nil
+(2026-09-10, the same commit that added this predicate) is what surfaced
+it — the live value on any already-configured fleet will forever match
+THAT past shipped default, which `cc-butler--defcustom-drift-label' would
+otherwise call \"(likely stuck reload)\" on every single run, asking a
+human to chase a restart that fixes nothing. Filtering it out here, at the
+one shared walker both check 5 and check 7 call, is what keeps that false
+label from ever being computed in the first place — same precedent as
+`cc-butler--defcustom-drift-internal-p'/`-noise-p' just above, a third
+category of \"drift here is always expected, never a signal\"."
+  (memq sym '(matrix-bridge-self-user-id matrix-bridge-human-user-id)))
+
+(defun cc-butler--defcustom-drift (file)
+  "For every defcustom/defvar-with-default in FILE, compare its CURRENT
+live value to what evaluating its default form fresh would give. A
+mismatch means the code's own stated default no longer matches what is
+actually running — either a human deliberately customized it away from
+the default (expected, harmless), or a reload changed the default in
+source but could not apply it, because `defcustom'/`defvar' never
+overwrite an already-bound symbol (2026-09-05: `cc-butler-launch-ready-timeout'
+raised 5->8 in source stayed live at 5 across a reload — the exact live
+regression that motivated this).
+
+Returns a list of (SYMBOL LIVE-VALUE CODE-DEFAULT). This cannot tell the
+two causes apart — it is a loud, honest list to check by hand, not a
+verdict. Skips symbols not currently `boundp' (the next load sets them
+fresh, so they cannot have drifted), private accumulators (see
+`cc-butler--defcustom-drift-internal-p' — always drift, and their live
+value is exactly the sensitive content this report must not leak),
+hook/keymap noise (see `cc-butler--defcustom-drift-noise-p'), and
+externally-configured identity variables (see
+`cc-butler--defcustom-drift-externally-configured-p' — always drift on any
+already-configured fleet, by design, not a stuck reload).
+
+This is not \"nice to have\" — it is the ONLY thing that can catch this
+class of bug at all. An ERT suite always loads its files fresh into an
+unbound symbol, so `defcustom'/`defvar' always apply the new default
+there; a test asserting behavior against a changed default (e.g.
+`cc-butler-session/launch-ready-timeout-covers-detection-margin-plus-settle-worst-case')
+stays green in the suite forever and can still be wrong on a live daemon whose
+symbol was already bound at the OLD default before the reload. Do not
+remove this call from `cc-butler-reload' on the reasoning \"we have a
+test for that now\" — the test and this check verify different things,
+and removing this leaves the live case with no detector, silently, since
+every test would keep passing."
+  (let (drift)
+    (dolist (pair (cc-butler--defcustom-forms-in-file file))
+      (let ((sym (car pair)))
+        (when (and (boundp sym)
+                   (not (cc-butler--defcustom-drift-internal-p sym))
+                   (not (cc-butler--defcustom-drift-noise-p sym))
+                   (not (cc-butler--defcustom-drift-externally-configured-p sym)))
+          (let ((code-default (ignore-errors (eval (cdr pair) t))))
+            (unless (equal (symbol-value sym) code-default)
+              (push (list sym (symbol-value sym) code-default) drift))))))
+    (nreverse drift)))
+
+(defun cc-butler--defcustom-drift-all (&optional dir)
+  "All (SYMBOL LIVE-VALUE CODE-DEFAULT) drift triples across cc-butler.el and
+every module in `cc-butler--modules', read from DIR (default
+`cc-butler-source-dir').  The single shared enumeration `cc-butler-reload'
+and `cc-butler-self-check' both call, so \"which defcustoms count\" and
+\"what counts as drifted\" can never disagree between the two call sites —
+same one-shared-place precedent as `cc-butler--checkout-dirty-p' (PR #223)."
+  (let ((dir (or dir (cc-butler-source-dir))))
+    (cl-loop for m in (cons 'cc-butler cc-butler--modules)
+             append (cc-butler--defcustom-drift
+                     (expand-file-name (concat (symbol-name m) ".el") dir)))))
+
+(defun cc-butler--defcustom-symbols-all (&optional dir)
+  "Every trackable defcustom/defvar SYMBOL across cc-butler.el and
+`cc-butler--modules' — bound, non-noise (see
+`cc-butler--defcustom-drift-internal-p'/`-noise-p') — read from DIR's
+source text (default `cc-butler-source-dir'), regardless of whether it
+currently drifts.  The population check 5 (persisted-vs-live) auto-scans
+instead of a hand-maintained list, so it cannot silently narrow as the
+codebase grows (2026-09-10: the hand list tracked 2 of ~8 variables that
+actually mattered).
+
+This only inspects top-level `defcustom'/`defvar' forms (see
+`cc-butler--defcustom-forms-in-string') and skips private accumulators
+by name (`cc-butler--defcustom-drift-internal-p' — a deliberate exclusion,
+not scanner blindness: it protects sensitive accumulator content from
+leaking into drift reports, see that function's docstring). A symbol that
+must always resync with source on every reload — a static dispatch or
+registry table, not a genuine customization point — belongs to neither
+category: it should be declared with `defconst', not `defvar'. `defconst'
+is structurally outside what this scanner (and check 5/7, which call it)
+even looks at, so a `defconst' registry cannot go stale in the first
+place, unlike a `defvar' registry — see `cc-butler-self-check--checks' in
+cc-butler-self-check.el, fixed from `defvar' to `defconst' for exactly
+this reason on 2026-09-10."
+  (let ((dir (or dir (cc-butler-source-dir))))
+    (cl-loop for m in (cons 'cc-butler cc-butler--modules)
+             append (cl-loop for pair in (cc-butler--defcustom-forms-in-file
+                                           (expand-file-name (concat (symbol-name m) ".el") dir))
+                              for sym = (car pair)
+                              when (and (boundp sym)
+                                        (not (cc-butler--defcustom-drift-internal-p sym))
+                                        (not (cc-butler--defcustom-drift-noise-p sym)))
+                              collect sym))))
+
+;;;; ------------------------------------------------------------------
+;;;; Drift labeling: is a stuck reload or a deliberate customization more
+;;;; plausible, given the file's OWN git history? Read-only, additive,
+;;;; never changes `cc-butler--defcustom-drift's return shape (existing
+;;;; tests assert that 3-tuple exactly) — this only feeds extra text into
+;;;; `cc-butler-tool-reload-code's rendering.
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler--defcustom-history-defaults (file symbol)
+  "Alist of (SHA . DEFAULT-FORM), newest commit first, of every default form
+FILE's git history ever gave SYMBOL's top-level `defcustom'/`defvar' —
+walked via `git log --follow' over every commit `git' can find touching
+FILE, then `git show SHA:PATH' to read each revision's full text (parsed
+with `cc-butler--defcustom-forms-in-string' — never `load'ed or `eval'ed as
+a whole, so an old revision's unrelated code never runs).
+
+Nil whenever this cannot be answered at all — FILE is not inside a git
+checkout, `git' is unavailable, or FILE is not tracked. Nil here means
+\"undeterminable\", never \"no history\"; `cc-butler--defcustom-drift-label'
+must treat it as \"give no label\", not as evidence of anything.
+
+Uses `cc-butler--git' throughout — the same process-file-based subprocess
+call `cc-butler--git-head''s docstring explains this codebase never
+replaces with `shell-command-to-string' (a wedged .git/index.lock would
+freeze the whole single-threaded daemon)."
+  (let ((dir (file-name-directory (expand-file-name file))))
+    (when (cc-butler--git-dir dir)
+      ;; Relative to DIR itself, NOT `git rev-parse --show-toplevel' — that
+      ;; resolves symlinks (macOS puts /tmp under a /var -> /private/var
+      ;; symlink) and can answer a different, resolved path than the
+      ;; unresolved DIR every other call here uses as `default-directory',
+      ;; which broke this relative path silently in exactly that case.
+      ;; DIR having its own `.git' (checked above) is what already makes it
+      ;; the repo root for every other caller in this codebase.
+      (let* ((relfile (file-relative-name (expand-file-name file) dir))
+             (log (cc-butler--git dir "log" "--follow" "--format=%H"
+                                   "--" relfile)))
+        (when log
+          (let (out)
+            (dolist (sha (split-string log "\n" t))
+              (let* ((content (cc-butler--git dir "show" (concat sha ":" relfile)))
+                     (form (and content
+                                (cdr (assq symbol
+                                           (cc-butler--defcustom-forms-in-string content))))))
+                (when form (push (cons sha form) out))))
+            (nreverse out)))))))
+
+(defun cc-butler--defcustom-drift-label (file symbol live-value code-default)
+  "Evidence-based classification string for one drifted SYMBOL in FILE, or
+nil if undeterminable (no git history could be walked at all — see
+`cc-butler--defcustom-history-defaults').
+
+Ground truth is FILE's own git history: every past default form that
+symbol's line ever had, other than the current CODE-DEFAULT, gets
+evaluated and compared to LIVE-VALUE.
+
+- LIVE-VALUE matches one of those past defaults: \"(likely stuck reload)\"
+  — a reload plausibly never applied a later source change — naming the
+  commit, WITH an inline caveat that a human could have coincidentally
+  picked the same value, since this can never be proof.
+- LIVE-VALUE matches no past default in this file's history: \"(likely
+  deliberate customization)\" — WITH an inline caveat that only this one
+  file's history was checked, so a value set some other way (a different
+  package, a value predating this repo) is not thereby proven deliberate.
+
+The caveat text is embedded in the label STRING ITSELF, not only here in
+the docstring: a reader who only ever sees the rendered MCP tool output —
+never this source — must not mistake either label for a certain verdict."
+  (let ((history (cc-butler--defcustom-history-defaults file symbol)))
+    (when history
+      (let ((match (cl-find-if
+                    (lambda (pair)
+                      (let ((v (ignore-errors (eval (cdr pair) t))))
+                        (and (not (equal v code-default))
+                             (equal v live-value))))
+                    history)))
+        (if match
+            (format "(likely stuck reload) this value matches a past shipped default (commit %s) — cannot rule out a human coincidentally choosing the same value"
+                    (substring (car match) 0 7))
+          "(likely deliberate customization) this value never appears in this line's git history — only this file's own history was checked")))))
+
+(defun cc-butler--defcustom-file-for-symbol (dir symbol)
+  "Path of the module under DIR whose top-level `defcustom'/`defvar' defines
+SYMBOL, or nil if none of `cc-butler--modules' (plus cc-butler.el itself)
+does. `cc-butler--defcustom-drift's own (SYMBOL LIVE CODE-DEFAULT) triples
+do not carry the file they came from — by design, that return shape is
+asserted exactly by existing tests — so a caller that needs the file (to
+walk ITS git history for a label) re-derives it here instead."
+  (cl-loop for m in (cons 'cc-butler cc-butler--modules)
+           for file = (expand-file-name (concat (symbol-name m) ".el") dir)
+           when (assq symbol (cc-butler--defcustom-forms-in-file file))
+           return file))
+
+(defun cc-butler--modules-from-file (file)
+  "The literal list value of FILE's top-level `(defconst cc-butler--modules
+...)' form, read directly out of its text, or nil.
+
+Deliberately does NOT `load' FILE to get this: `load' would also execute
+every OTHER top-level form in FILE — including, in cc-butler.el, the MCP
+tool registrations that call into other modules (see `cc-butler-reload').
+Those calls must not run until this function's answer has been used to
+reload those modules first; reading just this one form, without evaluating
+anything else in the file, is what makes that possible.
+
+Nil on any trouble (unreadable file, form not found, malformed) — callers
+must fall back to the in-memory `cc-butler--modules' rather than treat nil
+as \"no modules\"."
+  (when (file-readable-p file)
+    (ignore-errors
+      (with-temp-buffer
+        (insert-file-contents file)
+        (goto-char (point-min))
+        (catch 'cc-butler--modules-from-file
+          (while t
+            (let ((form (condition-case nil
+                            (read (current-buffer))
+                          (end-of-file (throw 'cc-butler--modules-from-file nil)))))
+              (when (and (consp form)
+                         (eq (car form) 'defconst)
+                         (eq (cadr form) 'cc-butler--modules))
+                (throw 'cc-butler--modules-from-file (eval (nth 2 form) t))))))))))
+
+(defun cc-butler--reload-modules-and-self (dir modules self)
+  "Load MODULES (a list of symbols, dependency order) then SELF (a symbol)
+from DIR, in that order — modules first, self last.
+
+This order is the fix for a real hot-reload failure (2026-09-11): when
+cc-butler.el reloaded FIRST, its own top-level tool registrations ran
+against whatever OLD, still-resident version of a dependency module
+happened to be in memory, because a plain `(require ...)' of an
+already-`provide'd feature is a no-op and does not re-run that module's
+defuns.  A registration calling a function the reload was meant to ADD to
+that module (`cc-butler--make-guarded-tool', PR #249) hit
+\"Symbol's function definition is void\" and aborted the reload partway,
+leaving the daemon in the half-reloaded state that produced it.  Loading
+every dependency module fresh BEFORE self means self's top-level forms
+always run against current code, never stale code.
+
+Returns a plist `(:loaded (SYMBOL ...) :failed ((SYMBOL . ERROR-STRING) ...))'
+— SYMBOL for either a module or SELF — so a caller can tell a full reload
+from a partial one instead of only ever seeing an unqualified success or a
+mid-load exception.  A file that does not exist under DIR is treated as
+nothing to load (not a failure), matching this function's previous
+`file-exists-p' guard."
+  (let (loaded failed)
+    (dolist (m (append modules (list self)))
+      (let ((f (expand-file-name (concat (symbol-name m) ".el") dir)))
+        (when (file-exists-p f)
+          (condition-case err
+              (progn (load f nil t) (push m loaded))
+            (error (push (cons m (error-message-string err)) failed))))))
+    (list :loaded (nreverse loaded) :failed (nreverse failed))))
+
 ;;;###autoload
 (defun cc-butler-reload ()
   "Cleanly reload all cc-butler modules in dependency order — the hot-load
@@ -370,33 +729,77 @@ cleanly), not stray defuns that can leave old keymaps/hooks/modes layered
 underneath.  Loads by absolute path (not the load-path).  Never restarts Emacs
 \(the worker sessions are preserved).
 
-Reloads THIS file first.  `cc-butler--modules' and `cc-butler--dir' are
-defined here, so a reload driven by the old values cannot pick up a module
-that was added since this Emacs started — it would silently skip the new
-file and report success.  That happened on 2026-07-23 with
-`cc-butler-compact'.  Re-reading this file first makes the module list
-current before it is used.
+Reloads every dependency module BEFORE this file itself — see
+`cc-butler--reload-modules-and-self' for why that order, not the reverse, is
+what makes a top-level form in THIS file (e.g. an MCP tool registration) safe
+to call a function a module reload just added.  Which modules to load is
+still decided from THIS FILE'S OWN CURRENT TEXT ON DISK, not the in-memory
+`cc-butler--modules' — read via `cc-butler--modules-from-file', which parses
+just that one form without executing anything else in the file — so a module
+added since this Emacs started is still picked up, the same guarantee the
+old \"reload this file first\" order used to provide (2026-07-23,
+`cc-butler-compact').
 
 Loads from `cc-butler-source-dir' — where this file came from, unless
 `cc-butler-use-checkout' / `cc-butler-use-installed' deliberately pointed it
 elsewhere.
 
-Returns a plist describing what happened, for `cc-butler-tool-reload-code'."
+Returns a plist describing what happened, for `cc-butler-tool-reload-code'.
+`:failed-modules' names any module (or `cc-butler' itself, as `:self-error')
+that raised while loading — a non-nil value here means a PARTIAL reload:
+say so loudly, don't just report the modules that DID make it as if nothing
+went wrong.
+
+NOTE on this function's own drift detector (`cc-butler--defcustom-drift',
+called below): a fix that changes what THIS function does — including the
+drift detector itself — is, on the very first reload after it lands, run
+by the OLD in-memory `cc-butler-reload' one last time, because the fix
+only takes effect once ITS OWN load has completed. This is the same
+self-hosted-reload property as the module-list bug this docstring already
+describes above, not a new bug: the first reload after landing a change to
+this function reports using the PRE-change behavior; only the second
+reload runs the new code. (2026-09-05: PR #162's drift report showed
+nothing on the reload that installed it, then showed the real drift on the
+very next reload — `cc-butler-reload' loaded at that point was still the
+pre-#162 version with no drift check at all.)
+
+Does NOT refuse on a dirty source checkout — see `cc-butler-tool-reload-code's
+docstring for why (a human at the keyboard routinely reloads their own
+uncommitted work on purpose, and that must not be blocked).  But an
+unattended, non-interactive call to THIS function reaching a dirty checkout
+\(e.g. via an eval channel like `mcp__ide__executeCode') is exactly the case
+that guard exists to catch and cannot, so it is logged via `cc-butler--log'
+instead: the porcelain status, and this call's `called-interactively-p'
+result as a diagnostic breadcrumb (not a security signal — see PR #220 on
+why that predicate must never decide who an actor is; here it only records
+how this particular call arrived, for a human to weigh later)."
   (interactive)
-  (let ((self (expand-file-name "cc-butler.el" (cc-butler-source-dir))))
-    (when (file-exists-p self) (load self nil t)))
-  ;; Re-read the source directory AFTER the self-load: that load is what makes
-  ;; `cc-butler--modules' and `cc-butler--dir' current, and an override set by
-  ;; `cc-butler--switch-source' has to be the thing the modules follow.
-  (dolist (m cc-butler--modules)
-    (load (expand-file-name (concat (symbol-name m) ".el") (cc-butler-source-dir)) nil t))
-  (let ((stale (cc-butler--stale-elc))
-        (dir (cc-butler-source-dir)))
-    (when (called-interactively-p 'interactive)
-      (message "cc-butler: reloaded %d modules from %s%s"
-               (length cc-butler--modules) dir
-               (if stale (format " — WARNING: %d stale .elc" (length stale)) "")))
-    (list :count (length cc-butler--modules) :dir dir :stale stale)))
+  (let* ((dir (cc-butler-source-dir))
+         (dirty (cc-butler--checkout-dirty-p dir)))
+    (when dirty
+      (cc-butler--log "cc-butler-reload: reloading a dirty checkout at %s — called-interactively-p: %s (breadcrumb only, not a gate):\n%s"
+                       dir (called-interactively-p 'interactive) dirty)))
+  (let* ((dir (cc-butler-source-dir))
+         (self-file (expand-file-name "cc-butler.el" dir))
+         (modules (or (cc-butler--modules-from-file self-file) cc-butler--modules))
+         (result (cc-butler--reload-modules-and-self dir modules 'cc-butler))
+         (failed (plist-get result :failed))
+         (self-error (cdr (assq 'cc-butler failed)))
+         (failed-modules (assq-delete-all 'cc-butler (copy-alist failed))))
+    (when failed
+      (let ((summary (mapconcat (lambda (f) (format "%s: %s" (car f) (cdr f))) failed "; ")))
+        (cc-butler--log "cc-butler-reload: PARTIAL RELOAD — %d of %d file(s) failed: %s"
+                         (length failed) (1+ (length modules)) summary)))
+    (let* ((stale (cc-butler--stale-elc))
+           (drift (cc-butler--defcustom-drift-all dir)))
+      (when (called-interactively-p 'interactive)
+        (message "cc-butler: reloaded %d modules from %s%s%s"
+                 (length modules) dir
+                 (if stale (format " — WARNING: %d stale .elc" (length stale)) "")
+                 (if failed (format " — PARTIAL RELOAD: %d file(s) failed, see *Messages*" (length failed)) "")))
+      (list :count (length modules) :dir dir :stale stale :defcustom-drift drift
+            :self-error self-error
+            :failed-modules (mapcar #'car failed-modules)))))
 
 ;;;; ------------------------------------------------------------------
 ;;;; What commit is the live daemon actually running, right now?
@@ -488,6 +891,15 @@ dashboard).  Nil if the running commit is not determinable at all."
               ('unmerged "⚠ UNMERGED")
               (_ "ancestry unknown")))))
 
+(defun cc-butler--checkout-dirty-p (dir)
+  "Porcelain `git status' output for DIR, or nil if clean/not-a-checkout/unknown.
+The one detector for \"does this checkout have uncommitted changes\",
+shared by `cc-butler-tool-runtime-source' (reports it as a warning) and
+`cc-butler-tool-reload-code' (refuses on it by default) — see cc-butler
+CLAUDE.md's note on PR #136/#146 for why this must not become two
+independent implementations that only one of them keeps updated."
+  (and dir (cc-butler--git dir "status" "--porcelain")))
+
 (defun cc-butler-tool-runtime-source ()
   "MCP tool: report the exact commit the LIVE daemon is running cc-butler
 from right now, and whether that commit is merged into `origin/main'.
@@ -498,25 +910,52 @@ HEAD in its own return string, at the moment someone explicitly calls it.
 A daemon restart (crash, OOM kill, systemd) re-runs init.el's `require' and
 silently reloads cc-butler from whatever this machine's mutable dev
 checkout happens to be sitting on at that instant — with no error, even
-when that is not the code anyone intended running.  This tool can be asked
-at any time afterward, cheaply, from the snapshot
+when that is not the code anyone intended running.  The LOADED commit
+(what this tool has always reported) is the cheap snapshot
 `cc-butler--capture-runtime-source' took at load/reload time — it does not
 shell out on every call.
 
-The merged/unmerged check compares against the LOCALLY known `origin/main'
-only (no network fetch — see `cc-butler--commit-merged-p'), so a stale
-remote-tracking ref can only hide real drift, never invent fake drift."
-  (let ((dir cc-butler--runtime-source-dir)
-        (sha cc-butler--runtime-commit-sha)
-        (line cc-butler--runtime-commit-line))
-    (if (not sha)
+Also reads the CHECKOUT's current HEAD fresh, every call (via
+`cc-butler--git-head-sha', file reads only, never a subprocess) and warns,
+in the body of the result — not a footnote — when it differs from the
+loaded commit. This closes a real incident (steward, 2026-09-05): with
+cc-butler installed via `use-package :vc', the checkout on disk advances
+independently of the loaded image, which only changes on an explicit
+reload. Someone who reads the checkout's disk files to reason about
+\"current\" behavior — this tool's own earlier author included — silently
+answers a different question than \"what is actually running\" whenever
+the two have diverged; that is precisely how a `main'-only fix (already
+on disk) was mistaken for already being live, when the loaded image was
+still 3 commits behind and running the exact code the fix removed.
+Uncommitted changes in the checkout are also flagged, since that means
+even the disk does not match its own last commit.
+
+The merged/unmerged check is against the LOADED commit and the LOCALLY
+known `origin/main' only (no network fetch — see `cc-butler--commit-merged-p'),
+so a stale remote-tracking ref can only hide real drift, never invent
+fake drift."
+  (let* ((dir cc-butler--runtime-source-dir)
+         (loaded-sha cc-butler--runtime-commit-sha)
+         (loaded-line cc-butler--runtime-commit-line)
+         (checkout-sha (and dir (cc-butler--git-head-sha dir)))
+         (checkout-line (and dir (cc-butler--source-revision dir)))
+         (dirty (cc-butler--checkout-dirty-p dir)))
+    (if (not loaded-sha)
         (format "Cannot determine the running commit: %s is not a readable git checkout, or `git' failed there."
                 (or dir "<unknown directory>"))
       (concat
-       (format "Running cc-butler from: %s\nCommit: %s\n" dir (or line sha))
-       (pcase (cc-butler--commit-merged-p dir sha)
-         ('merged "Status: merged — this commit is reachable from origin/main.")
-         ('unmerged "⚠ UNMERGED — this commit is not reachable from origin/main. This is code that only ever lived on a branch (or was hot-loaded from one) and was never merged.")
+       (format "Running cc-butler from: %s\n" dir)
+       (format "Loaded commit (what is actually executing): %s\n" (or loaded-line loaded-sha))
+       (if checkout-sha
+           (format "Checkout HEAD (what is on disk right now): %s\n" (or checkout-line checkout-sha))
+         "Checkout HEAD: could not determine (not a readable git checkout, or unreadable ref files).\n")
+       (when (and checkout-sha (not (equal loaded-sha checkout-sha)))
+         "\n⚠️ LOADED COMMIT ≠ CHECKOUT HEAD — the checkout has moved since the last load/reload. Reading this checkout's files to reason about what cc-butler currently does answers a DIFFERENT question than what is actually running. Call reload_butler_code to bring the loaded image up to the checkout, or disregard if this divergence is expected (e.g. a deliberate pending update).\n")
+       (when dirty
+         (format "\n⚠️ Checkout has uncommitted changes — even the disk does not match its own last commit:\n%s\n" dirty))
+       (pcase (cc-butler--commit-merged-p dir loaded-sha)
+         ('merged "Status: merged — the loaded commit is reachable from origin/main.")
+         ('unmerged "⚠ UNMERGED — the loaded commit is not reachable from origin/main. This is code that only ever lived on a branch (or was hot-loaded from one) and was never merged.")
          (_ "Status: unknown — could not check ancestry against origin/main (no locally known origin/main ref, or a git error). This does NOT mean the commit is merged; it means the check could not run. Compared against whatever origin/main was last fetched locally — deliberately does not fetch, so this can be stale; that is a known, accepted limitation, not a bug."))))))
 
 ;; Idempotent registration.
@@ -527,27 +966,89 @@ remote-tracking ref can only hide real drift, never invent fake drift."
            (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                    '("runtime_source")))
          claude-code-ide-mcp-server-tools))
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-runtime-source
    :name "runtime_source"
-   :description "Report the exact git commit the LIVE daemon is running cc-butler from right now, and whether that commit is merged into origin/main (checked against locally-known state — no network fetch, so it is fast and never blocks). Answers a question nothing else answers except transiently: `reload_butler_code' only reports this in its own return value at the moment it is explicitly called, and a daemon restart (crash, OOM, systemd) silently reloads cc-butler from whatever a mutable dev checkout happens to be sitting on, with no error surfaced anywhere. Call this any time you need to verify what code is actually live — especially after suspecting a restart happened, or before trusting behavior that depends on recently-merged or recently-hot-loaded code."
+   :description "Report the exact git commit the LIVE daemon is running cc-butler from right now (the LOADED commit), separately from the checkout's current HEAD on disk, and warn loudly if they differ — reading a checkout's files never tells you what is actually running unless the two match, since :vc-installed cc-butler's checkout advances independently of the loaded image until an explicit reload. Also flags uncommitted changes in the checkout, and whether the loaded commit is merged into origin/main (checked against locally-known state — no network fetch, so it is fast and never blocks). Answers a question nothing else answers except transiently: `reload_butler_code' only reports this in its own return value at the moment it is explicitly called, and a daemon restart (crash, OOM, systemd) silently reloads cc-butler from whatever a mutable dev checkout happens to be sitting on, with no error surfaced anywhere. Call this any time you need to verify what code is actually live — especially after suspecting a restart happened, before trusting behavior inferred from reading the checkout's source files, or before trusting behavior that depends on recently-merged or recently-hot-loaded code."
    :args nil))
 
 ;;;; ------------------------------------------------------------------
 ;;;; MCP tool: hot-reload the control plane from disk
 ;;;; ------------------------------------------------------------------
 
-(defun cc-butler-tool-reload-code ()
+(defun cc-butler--truncate-for-report (value &optional limit)
+  "Render VALUE with `%S', cut to LIMIT characters (default 200) with a
+trailing ellipsis if longer. A drifted variable can legitimately be bound
+to a whole document; this report exists for a human to skim for the
+variable NAME and a rough shape, not to reproduce the value in full."
+  (let* ((limit (or limit 200))
+         (s (format "%S" value)))
+    (if (> (length s) limit)
+        (concat (substring s 0 limit) "…")
+      s)))
+
+(defun cc-butler-tool-reload-code (&optional allow-dirty)
   "MCP tool: reload cc-butler from disk, and report what was actually loaded.
 
 Reloading swaps CODE in a live Emacs.  It does not touch any session's
 conversation, and a 514k-token session is still 514k afterwards — that is
 the whole point of preserving sessions.  Reload and compaction are
 orthogonal: `cc-butler-compact-session' is the only thing here that reduces
-a context, and nothing in this path is a substitute for it."
+a context, and nothing in this path is a substitute for it.
+
+Refuses, and does NOT call `cc-butler-reload' at all, when the source
+checkout has uncommitted changes — unless ALLOW-DIRTY is non-nil.  This is
+the rule \"reviewed code only reaches the live daemon\" stated precisely: a
+dirty checkout is evidence that MIGHT be unreviewed work-in-progress
+sitting where a subagent left it, not proof either way, so it needs an
+explicit, logged override rather than silent pass-through.  Reuses
+`cc-butler--checkout-dirty-p' — the same detector `runtime_source' already
+reports this with — rather than a second, independent check.  An
+ALLOW-DIRTY override is logged via `cc-butler--log', porcelain status
+included, so the override itself leaves evidence.
+
+Deliberately guards only THIS MCP surface, not `cc-butler-reload' itself:
+that function is also called by `M-x cc-butler-reload' and by
+`cc-butler-use-checkout'/`cc-butler-use-installed' — a human already at the
+keyboard, routinely testing their own uncommitted local changes on
+purpose.  Blocking that legitimate interactive workflow the same way as an
+agent-driven MCP call would be the wrong call.
+
+That does NOT mean the risk this guards against — an agent silently
+hot-loading unreviewed code with no human in the loop — exists only at the
+MCP boundary.  A direct, non-interactive Elisp call to `cc-butler-reload'
+\(e.g. via an eval channel like `mcp__ide__executeCode', or any other
+future direct-call path\) is a plain function call, indistinguishable, from
+`cc-butler-reload's own perspective, from `M-x cc-butler-reload' typed by a
+human — and it is NOT blocked by this guard.  That gap is real; it is
+currently closed only by policy/operator discipline (a standing instruction
+not to route unreviewed code around this guard that way), not by any
+mechanism here.  `cc-butler-reload' now logs when it reloads a dirty
+checkout (see its docstring) so a call of that shape at least leaves a
+trace after the fact — but nothing refuses it."
+  (let* ((dir (cc-butler-source-dir))
+         (dirty (cc-butler--checkout-dirty-p dir)))
+    (if (and dirty (not allow-dirty))
+        (format "Refused: %s has uncommitted changes — NOT reloaded.  \
+reload_butler_code does not hot-load an unreviewed checkout into the live \
+daemon by default:\n%s\n\nReview and commit (or stash) first, or call again \
+with allow_dirty=true to deliberately override (the override is logged)."
+                dir dirty)
+      (when dirty
+        (cc-butler--log "reload_butler_code: allow_dirty override — reloading a dirty checkout at %s:\n%s"
+                         dir dirty))
+      (cc-butler--tool-reload-code-1))))
+
+(defun cc-butler--tool-reload-code-1 ()
+  "The actual reload-and-report body of `cc-butler-tool-reload-code',
+factored out so the dirty-checkout guard above can refuse before this ever
+runs."
   (let* ((res (cc-butler-reload))
          (dir (plist-get res :dir))
          (stale (plist-get res :stale))
+         (drift (plist-get res :defcustom-drift))
+         (self-error (plist-get res :self-error))
+         (failed-modules (plist-get res :failed-modules))
          ;; File reads only — `shell-command-to-string' here once put the
          ;; whole daemon one wedged .git/index.lock away from a total freeze
          ;; (single Lisp thread, no timeout, `with-timeout' can't interrupt
@@ -556,10 +1057,57 @@ a context, and nothing in this path is a substitute for it."
     (concat
      (format "Reloaded %d cc-butler modules from %s" (plist-get res :count) dir)
      (if head (format "\nSource is at: %s" head) "")
-     "\n\nThis loads whatever is ON DISK in that directory — it does not fetch. If you expected newer code, `git pull` there first and call this again. Note that directory is the one this Emacs actually loads from, which is not necessarily the checkout you have been editing."
+     "\n\nThis loads whatever is ON DISK in that directory — it does not fetch. If you expected newer code, `git pull' there first and call this again. Note that directory is the one this Emacs actually loads from, which is not necessarily the checkout you have been editing."
+     ;; A half-reloaded daemon must never read as a clean success: name
+     ;; exactly what failed rather than silently reporting only the modules
+     ;; that DID load, the way this used to abort partway with no trace
+     ;; beyond an uncaught error (2026-09-11).
+     (if (or self-error failed-modules)
+         (format "\n\n⚠ PARTIAL RELOAD — %s did NOT reload cleanly and %s still running its PREVIOUS in-memory code. Fix the error and reload again; see *Messages* for the full error text.%s"
+                 (mapconcat #'identity
+                             (delq nil (list (and failed-modules
+                                                   (mapconcat #'symbol-name failed-modules ", "))
+                                              (and self-error "cc-butler.el itself")))
+                             ", ")
+                 (if (and failed-modules self-error) "are" "is")
+                 (if self-error (format "\n  cc-butler.el: %s" self-error) ""))
+       "")
      (if stale
          (format "\n\n⚠ STALE BYTE-CODE: %s are older than their .el source. Emacs prefers .elc on startup, so these will silently undo this reload the next time Emacs restarts. Delete them (or byte-recompile) in %s."
                  (string-join stale ", ") dir)
+       "")
+     ;; This is the ONLY detector for this class of bug, not a nice-to-have:
+     ;; `defcustom'/`defvar' never overwrite an already-bound symbol, so a
+     ;; reload that changes a default in source can silently leave the live
+     ;; value stuck at the old one (2026-09-05: `cc-butler-launch-ready-timeout'
+     ;; raised 5->8 in source, stayed live at 5 across a reload). No ERT test
+     ;; can catch this — the test suite always loads into an unbound symbol,
+     ;; so the new default always applies there and the suite stays green
+     ;; regardless of what a live daemon does. See `cc-butler--defcustom-drift'.
+     (if drift
+         (format "\n\n⚠ %d variable(s) differ from their current code default after this reload — either a deliberate customization (harmless), or a changed default that could not apply because the symbol was already bound (this is exactly the failure class `cc-butler-launch-ready-timeout' hit 2026-09-05 — verify by hand, this is not something any test suite can catch):\n%s"
+                 (length drift)
+                 (mapconcat
+                  (lambda (d)
+                    (let* ((sym (nth 0 d))
+                           (live (nth 1 d))
+                           (code-default (nth 2 d))
+                           ;; Best-effort only: labeling walks git history, which
+                           ;; can fail in any number of ways (untracked file, no
+                           ;; git). A label that can't be determined is simply
+                           ;; omitted — never a reason to hide the drift line
+                           ;; itself, which is the one thing this report exists
+                           ;; to surface unconditionally.
+                           (file (ignore-errors (cc-butler--defcustom-file-for-symbol dir sym)))
+                           (label (and file (ignore-errors
+                                              (cc-butler--defcustom-drift-label
+                                               file sym live code-default)))))
+                      (format "  %s: live=%s code-default=%s%s"
+                              sym
+                              (cc-butler--truncate-for-report live)
+                              (cc-butler--truncate-for-report code-default)
+                              (if label (format "\n    %s" label) ""))))
+                  drift "\n"))
        "")
      ;; Same reason the stale .elc is spelled out: this caller cannot look at
      ;; the filesystem, and "which copy did I just reload, and is it behind"
@@ -579,11 +1127,14 @@ a context, and nothing in this path is a substitute for it."
            (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                    '("reload_butler_code")))
          claude-code-ide-mcp-server-tools))
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-reload-code
    :name "reload_butler_code"
-   :description "Hot-reload the cc-butler control plane from disk after its SOURCE CODE changed — new tools, fixes, new modules — without restarting Emacs and without losing any session. Reloads every module in dependency order, including this file first so a newly added module is not skipped. It loads what is on disk and does NOT git pull, so pull first if you want newer code; it reports the source directory and its git HEAD so you can tell what you actually got. This changes CODE ONLY and has no effect whatsoever on any session's context size — it is not a way to shrink a large session and is unrelated to compaction; use compact_session for that."
-   :args nil))
+   :description "Hot-reload the cc-butler control plane from disk after its SOURCE CODE changed — new tools, fixes, new modules — without restarting Emacs and without losing any session. Reloads every module in dependency order, including this file first so a newly added module is not skipped. It loads what is on disk and does NOT git pull, so pull first if you want newer code; it reports the source directory and its git HEAD so you can tell what you actually got. Also reports any defcustom/defvar whose live value now differs from its code default — `defcustom'/`defvar' never overwrite an already-bound symbol, so a changed default in source can silently fail to take effect live even though the reload itself reports success; no test suite can catch this (a test always loads into an unbound symbol), so this report is the only detector. This changes CODE ONLY and has no effect whatsoever on any session's context size — it is not a way to shrink a large session and is unrelated to compaction; use compact_session for that. REFUSES by default, without reloading anything, when the source checkout has uncommitted changes — reviewed code only reaches the live daemon; pass allow_dirty=true to deliberately override (logged)."
+   :args '((:name "allow_dirty"
+                  :type boolean
+                  :description "Override the default refusal to reload a checkout that has uncommitted changes. Only for a deliberate, already-reviewed exception — the override is logged with the checkout's dirty status. Omit for the normal case: the tool refuses on its own, before reloading anything, when the checkout is dirty."
+                  :optional t))))
 
 (provide 'cc-butler)
 ;;; cc-butler.el ends here

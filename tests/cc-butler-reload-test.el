@@ -11,22 +11,182 @@
 (require 'cl-lib)
 (require 'cc-butler)
 
-(ert-deftest cc-butler-reload/reloads-this-file-before-using-its-module-list ()
-  "REGRESSION (2026-07-23): `cc-butler--modules' is defined in cc-butler.el,
-so a reload driven by the OLD in-memory list silently skips a module added
-since Emacs started — and still reports success.  cc-butler.el must be
-re-read FIRST so the list is current before it is used."
+(ert-deftest cc-butler-reload/loads-every-module-before-loading-itself-last ()
+  "REGRESSION (2026-09-11): the reload used to load cc-butler.el FIRST, before
+any dependency module — see `cc-butler-reload/self-load-order-bug-void-
+function-shape' below for the real failure that caused.  Every module must
+load BEFORE cc-butler.el's own top-level forms run, not after."
   (let ((loaded nil))
     (cl-letf (((symbol-function 'load)
                (lambda (f &rest _) (push (file-name-nondirectory f) loaded) t))
               ((symbol-function 'cc-butler--stale-elc) (lambda () nil)))
       (cc-butler-reload))
     (setq loaded (nreverse loaded))
-    (should (equal (car loaded) "cc-butler.el"))
-    ;; and every module still follows, in order
-    (should (equal (cdr loaded)
-                   (mapcar (lambda (m) (concat (symbol-name m) ".el"))
-                           cc-butler--modules)))))
+    ;; every module, in order, all before cc-butler.el itself (loaded last)
+    (should (equal loaded
+                   (append (mapcar (lambda (m) (concat (symbol-name m) ".el"))
+                                    cc-butler--modules)
+                           '("cc-butler.el"))))))
+
+(ert-deftest cc-butler-reload/still-picks-up-a-module-added-since-emacs-started ()
+  "The old \"load cc-butler.el first\" order existed only to keep a newly
+added module (one not yet in the in-memory `cc-butler--modules') from being
+silently skipped (2026-07-23, `cc-butler-compact'). Loading modules before
+cc-butler.el must not lose that guarantee: the module list to load is read
+straight off cc-butler.el's OWN CURRENT TEXT ON DISK
+\(`cc-butler--modules-from-file'), not the in-memory list, so a module added
+to that file since this Emacs started is still picked up."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-newmod" t)))
+         (self-file (expand-file-name "cc-butler.el" dir)))
+    (write-region "(defconst cc-butler--modules '(cc-butler-brand-new))\n"
+                  nil self-file)
+    (write-region "" nil (expand-file-name "cc-butler-brand-new.el" dir))
+    (let (loaded)
+      (cl-letf (((symbol-function 'load)
+                 (lambda (f &rest _) (push (file-name-nondirectory f) loaded) t))
+                ((symbol-function 'cc-butler-source-dir) (lambda () dir))
+                ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil))
+                ((symbol-function 'cc-butler--stale-elc) (lambda () nil))
+                ((symbol-function 'cc-butler--defcustom-drift-all) (lambda (_) nil))
+                ;; the in-memory list deliberately does NOT know about the
+                ;; brand-new module yet -- that is the whole scenario
+                (cc-butler--modules '(cc-butler-some-old-module)))
+        (cc-butler-reload))
+      (should (member "cc-butler-brand-new.el" loaded)))))
+
+(defun cc-butler-test--write-reload-order-fixture (dir)
+  "Write the two-file fixture DIR needs for the reload load-order tests:
+a dependency module and a self file (named cc-butler.el, matching what
+`cc-butler-reload' always loads as self regardless of source tree) whose
+top-level form calls a function only the dependency's NEW on-disk version
+defines.  Also pre-loads an OLDER, already-`provide'd, function-less
+version of the dependency into THIS Emacs, matching the real state a
+long-running daemon is in right before a hot-reload: the module is already
+resident in memory, just not yet carrying the function the reload is about
+to add to it."
+  (let ((dep-file (expand-file-name "cc-butler-reload-fixture-dep.el" dir))
+        (self-file (expand-file-name "cc-butler.el" dir)))
+    (fmakunbound 'cc-butler-reload-fixture-fn)
+    (provide 'cc-butler-reload-fixture-dep)
+    (write-region "(defun cc-butler-reload-fixture-fn () :new)\n(provide 'cc-butler-reload-fixture-dep)\n"
+                  nil dep-file)
+    (write-region "(require 'cc-butler-reload-fixture-dep)\n(setq cc-butler-reload-fixture-result (cc-butler-reload-fixture-fn))\n"
+                  nil self-file)))
+
+(defvar cc-butler-reload-fixture-result nil
+  "Set by the fixture self file `cc-butler-test--write-reload-order-fixture'
+writes, if (and only if) its top-level call to the fixture dependency
+function actually ran without erroring.")
+
+(ert-deftest cc-butler-reload/self-load-order-bug-void-function-shape ()
+  "REGRESSION (2026-09-11, real production failure): after PR #249 merged
+and the live daemon reloaded, it failed with \"Symbol's function definition
+is void: cc-butler--make-guarded-tool\" and left `runtime_source' and
+`reload_butler_code' as \"Unknown tool\" — a silent half-reload, not a
+crash anyone saw.  Cause: `cc-butler-reload' loaded cc-butler.el FIRST.
+cc-butler.el's own top-level `(require 'cc-butler-session)' was a no-op
+\(the feature was already `provide'd by the OLD, still-resident module\),
+so cc-butler.el's later top-level tool-registration calls — which call a
+function PR #249 had just ADDED to cc-butler-session.el — ran against the
+stale module still in memory and hit void-function, aborting the reload
+before it ever reached the dolist that would have reloaded that module
+fresh.
+
+This fixture reproduces that exact shape without depending on the real
+cc-butler-session.el: a fixture \"dependency\" module is pre-loaded here in
+its OLDER, function-less form (mirroring the stale resident module); its
+NEWER on-disk form defines the function; a fixture \"self\" file (literally
+named cc-butler.el, since `cc-butler-reload' always loads self by that
+fixed name) requires the dependency (a no-op against the stale in-memory
+copy, exactly like the real `(require \\='cc-butler-session)') and then
+calls the function at its own top level, exactly like cc-butler.el's real
+MCP tool registrations calling `cc-butler--make-guarded-tool'.
+
+CONFIRMED to fail this way against the OLD (pre-2026-09-11) load order
+before this fix: shadowing `cc-butler-reload' with that order's defun body
+against this same fixture signals `(void-function
+cc-butler-reload-fixture-fn)' and leaves
+`cc-butler-reload-fixture-result' nil."
+  (let ((dir (file-name-as-directory (make-temp-file "cc-reload-order-bug" t)))
+        (cc-butler-reload-fixture-result nil))
+    (cc-butler-test--write-reload-order-fixture dir)
+    (cl-letf (((symbol-function 'cc-butler-source-dir) (lambda () dir))
+              ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil))
+              ((symbol-function 'cc-butler--stale-elc) (lambda () nil))
+              ((symbol-function 'cc-butler--defcustom-drift-all) (lambda (_) nil))
+              (cc-butler--modules '(cc-butler-reload-fixture-dep)))
+      (let ((res (cc-butler-reload)))
+        (should (eq cc-butler-reload-fixture-result :new))
+        (should-not (plist-get res :self-error))
+        (should-not (plist-get res :failed-modules))))))
+
+(ert-deftest cc-butler-reload/a-broken-module-is-named-not-swallowed ()
+  "A partial reload must never read as a silent half-state (steward
+requirement, 2026-09-11): a module that fails to load is named in the
+return value, and every OTHER module still loads — one broken file does
+not abort the whole reload the way a bare, uncaught `load' error used to."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-partial" t)))
+         (good-file (expand-file-name "cc-butler-good.el" dir))
+         (bad-file (expand-file-name "cc-butler-bad.el" dir))
+         (self-file (expand-file-name "cc-butler.el" dir)))
+    (write-region "(defvar cc-butler-reload-good-loaded t)\n" nil good-file)
+    (write-region "(this-function-does-not-exist)\n" nil bad-file)
+    (write-region "" nil self-file)
+    (cl-letf (((symbol-function 'cc-butler-source-dir) (lambda () dir))
+              ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil))
+              ((symbol-function 'cc-butler--stale-elc) (lambda () nil))
+              ((symbol-function 'cc-butler--defcustom-drift-all) (lambda (_) nil))
+              (cc-butler--modules '(cc-butler-good cc-butler-bad)))
+      (let ((res (cc-butler-reload)))
+        (should (equal (plist-get res :failed-modules) '(cc-butler-bad)))
+        (should-not (plist-get res :self-error))
+        (should (boundp 'cc-butler-reload-good-loaded))))))
+
+(ert-deftest cc-butler-reload/a-broken-module-failure-is-logged-loudly ()
+  "The partial failure must leave a trace, not just a quiet plist a caller
+might not inspect."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-partial-log" t)))
+         (bad-file (expand-file-name "cc-butler-bad.el" dir))
+         (self-file (expand-file-name "cc-butler.el" dir))
+         logged)
+    (write-region "(this-function-does-not-exist)\n" nil bad-file)
+    (write-region "" nil self-file)
+    (cl-letf (((symbol-function 'cc-butler-source-dir) (lambda () dir))
+              ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil))
+              ((symbol-function 'cc-butler--stale-elc) (lambda () nil))
+              ((symbol-function 'cc-butler--defcustom-drift-all) (lambda (_) nil))
+              ((symbol-function 'cc-butler--log)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) logged)))
+              (cc-butler--modules '(cc-butler-bad)))
+      (cc-butler-reload))
+    (should logged)
+    (should (string-match-p "PARTIAL" (car logged)))
+    (should (string-match-p "cc-butler-bad" (car logged)))))
+
+(ert-deftest cc-butler-reload/tool-output-names-a-partial-reload-loudly ()
+  "The MCP caller only ever sees `cc-butler-tool-reload-code's return text —
+a partial reload has to be spelled out there, the same way stale .elc and
+defcustom drift already are, or a half-reloaded daemon reads as a clean
+success to whoever asked."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 2 :dir "/x/" :stale nil :defcustom-drift nil
+                               :self-error nil :failed-modules '(cc-butler-bad))))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+            ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil)))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should (string-match-p "PARTIAL" out))
+      (should (string-match-p "cc-butler-bad" out)))))
+
+(ert-deftest cc-butler-reload/tool-output-quiet-when-reload-is-clean ()
+  "Protects against an overly broad partial-reload message: the ordinary
+clean case must not claim a partial failure."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 2 :dir "/x/" :stale nil :defcustom-drift nil
+                               :self-error nil :failed-modules nil)))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+            ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil)))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should-not (string-match-p "PARTIAL" out)))))
 
 (ert-deftest cc-butler-reload/reports-count-and-directory ()
   "The return value names what was loaded and from where — the directory is
@@ -36,6 +196,39 @@ the thing callers most often get wrong."
     (let ((res (cc-butler-reload)))
       (should (equal (plist-get res :count) (length cc-butler--modules)))
       (should (equal (plist-get res :dir) cc-butler--dir)))))
+
+(ert-deftest cc-butler-reload/logs-when-source-checkout-is-dirty ()
+  "REGRESSION GUARD: `cc-butler-tool-reload-code's dirty-checkout refusal
+guards only the MCP call path (see its docstring). A direct, non-interactive
+Elisp call to `cc-butler-reload' itself — e.g. via an eval channel like
+`mcp__ide__executeCode' — reaches a dirty checkout completely ungated and,
+before this fix, left zero trace. `cc-butler-reload' must log that case via
+`cc-butler--log', porcelain status included, so it is at least visible
+after the fact."
+  (let (logged)
+    (cl-letf (((symbol-function 'load) (lambda (&rest _) t))
+              ((symbol-function 'cc-butler--stale-elc) (lambda () nil))
+              ((symbol-function 'cc-butler-source-dir) (lambda () "/x/"))
+              ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) " M cc-butler.el"))
+              ((symbol-function 'cc-butler--log)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) logged))))
+      (cc-butler-reload))
+    (should logged)
+    (should (string-match-p "cc-butler.el" (car logged)))
+    (should (string-match-p "/x/" (car logged)))))
+
+(ert-deftest cc-butler-reload/does-not-log-when-checkout-is-clean ()
+  "Protects against an overly broad log call: the ordinary clean-checkout
+case must not spam the log."
+  (let (logged)
+    (cl-letf (((symbol-function 'load) (lambda (&rest _) t))
+              ((symbol-function 'cc-butler--stale-elc) (lambda () nil))
+              ((symbol-function 'cc-butler-source-dir) (lambda () "/x/"))
+              ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil))
+              ((symbol-function 'cc-butler--log)
+               (lambda (&rest _) (push t logged))))
+      (cc-butler-reload))
+    (should-not logged)))
 
 (ert-deftest cc-butler-reload/detects-stale-byte-code ()
   "A .elc newer-than-source wins on the next Emacs start and silently undoes
@@ -59,17 +252,359 @@ the reload, so it has to be surfaced rather than discovered later."
 out in the response rather than left as a silent trap."
   (cl-letf (((symbol-function 'cc-butler-reload)
              (lambda () (list :count 3 :dir "/x/" :stale '("cc-butler-mail.elc"))))
-            ((symbol-function 'cc-butler--git-head) (lambda (_) nil)))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+            ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil)))
     (let ((out (cc-butler-tool-reload-code)))
       (should (string-match-p "STALE" out))
       (should (string-match-p "cc-butler-mail.elc" out)))))
+
+;;;; ------------------------------------------------------------------
+;;;; defcustom/defvar drift — the only detector for a changed default
+;;;; that a reload could not apply, because `defcustom'/`defvar' never
+;;;; overwrite an already-bound symbol. No ERT test can substitute for
+;;;; this: a test always loads into a fresh, unbound symbol, so the new
+;;;; default always applies there regardless of what a live daemon does
+;;;; (2026-09-05: `cc-butler-launch-ready-timeout' raised 5->8 in source,
+;;;; stayed live at 5 across a real reload, while every test stayed
+;;;; green). These tests cover the DETECTOR itself, not that live case.
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-test--write-fixture-module (dir contents)
+  "Write CONTENTS to a fresh temp .el file under DIR; return its path."
+  (let ((file (make-temp-file (expand-file-name "cc-butler-drift-fixture-" dir) nil ".el")))
+    (write-region contents nil file)
+    file))
+
+(ert-deftest cc-butler-reload/defcustom-forms-in-file-finds-defcustom-and-defvar-with-value ()
+  "Only top-level `defcustom' and `defvar'-WITH-a-value forms count — a bare
+`(defvar x)' sets no default to drift from, and unrelated forms (defun,
+comments, defconst) must not be mistaken for one."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defcustom cc-butler-test-drift-a 1 \"doc\")
+(defvar cc-butler-test-drift-b 2 \"doc\")
+(defvar cc-butler-test-drift-c)
+(defconst cc-butler-test-drift-d 4)
+(defun cc-butler-test-drift-fn () nil)
+")))
+    (should (equal (cc-butler--defcustom-forms-in-file file)
+                   '((cc-butler-test-drift-a . 1)
+                     (cc-butler-test-drift-b . 2))))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-empty-when-live-matches-code-default ()
+  "No drift when the live value equals what the file's default form
+evaluates to — the common, healthy case."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defcustom cc-butler-test-drift-match 8 \"doc\")\n")))
+    (defvar cc-butler-test-drift-match)
+    (setq cc-butler-test-drift-match 8)
+    (unwind-protect
+        (should-not (cc-butler--defcustom-drift file))
+      (makunbound 'cc-butler-test-drift-match))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-catches-the-launch-ready-timeout-shape ()
+  "The exact live regression this detector exists for: source now says one
+default, but the live symbol is still bound to the OLD one (as happens
+when `defcustom' sees an already-bound symbol and leaves it alone).
+Modeled directly on `cc-butler-launch-ready-timeout' raised 5->8 while a
+prior reload's binding stayed at 5."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defcustom cc-butler-test-drift-stuck 8 \"doc\")\n")))
+    (defvar cc-butler-test-drift-stuck)
+    (setq cc-butler-test-drift-stuck 5)
+    (unwind-protect
+        (should (equal (cc-butler--defcustom-drift file)
+                        '((cc-butler-test-drift-stuck 5 8))))
+      (makunbound 'cc-butler-test-drift-stuck))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-skips-unbound-symbols ()
+  "A symbol not yet `boundp' cannot have drifted — the next load sets it
+fresh from the file's own default, so it needs no reporting."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defcustom cc-butler-test-drift-never-loaded 8 \"doc\")\n")))
+    (should-not (boundp 'cc-butler-test-drift-never-loaded))
+    (should-not (cc-butler--defcustom-drift file))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-skips-private-double-dash-symbols ()
+  "REGRESSION (2026-09-05, steward live): a symbol with `--' anywhere in its
+name is an elisp-private runtime accumulator (queue, cache, inbox) — it is
+SUPPOSED to differ from its empty `defvar' default the instant anything
+runs, so reporting it is always-true noise. Worse, printing its live value
+leaked real content (worker-report bodies, session status text) into the
+reload report. Must be excluded even though it technically \"differs\"."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defvar cc-butler-test--drift-private-cache nil \"doc\")\n")))
+    (defvar cc-butler-test--drift-private-cache)
+    (setq cc-butler-test--drift-private-cache "sensitive worker report body")
+    (unwind-protect
+        (should-not (cc-butler--defcustom-drift file))
+      (makunbound 'cc-butler-test--drift-private-cache))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-skips-hook-and-keymap-noise ()
+  "A hook list or keymap differs from its `defvar' default as soon as
+anything `add-hook's or `define-key's onto it — normal operation, not a
+stuck reload. Reporting it as drift is always true and never actionable."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defvar cc-butler-test-drift-functions nil \"doc\")
+(defvar cc-butler-test-drift-map (make-sparse-keymap) \"doc\")\n")))
+    (defvar cc-butler-test-drift-functions)
+    (defvar cc-butler-test-drift-map)
+    (setq cc-butler-test-drift-functions '(some-added-hook-fn))
+    (let ((km (make-sparse-keymap)))
+      (define-key km (kbd "C-c C-c") 'ignore)
+      (setq cc-butler-test-drift-map km))
+    (unwind-protect
+        (should-not (cc-butler--defcustom-drift file))
+      (makunbound 'cc-butler-test-drift-functions)
+      (makunbound 'cc-butler-test-drift-map))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-skips-externally-configured-identity-vars ()
+  "REGRESSION GUARD (2026-09-10): `matrix-bridge-self-user-id' and
+`matrix-bridge-human-user-id' both ship nil in source and are meant to be
+set by per-machine config forever after, so their live value differing
+from the in-repo nil default is the PERMANENT, correct state -- not a
+stuck reload. Without this filter, check 5/7 (both built on
+`cc-butler--defcustom-drift-all', which walks this function) would flag
+every already-configured fleet's human-user-id as \"(likely stuck
+reload)\" on every single run, because the real id it is correctly set to
+also happens to be this line's own past shipped default before this
+commit changed it to nil -- a permanent false positive, not a transient
+one that a restart would clear."
+  ;; `let'-bound, NOT `setq'+`makunbound': both symbols are real,
+  ;; already-loaded module variables shared with the rest of this suite
+  ;; (`matrix-bridge.el' is required elsewhere), not fresh test-local
+  ;; symbols -- `makunbound' would leave them permanently VOID for every
+  ;; later test in the same batch run, not merely reset to nil.
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defvar matrix-bridge-self-user-id nil \"doc\")
+(defvar matrix-bridge-human-user-id nil \"doc\")\n"))
+         (matrix-bridge-self-user-id "@fake-self:example.org")
+         (matrix-bridge-human-user-id "@fake-human:example.org"))
+    (should-not (cc-butler--defcustom-drift file))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-externally-configured-filter-is-narrow ()
+  "The filter above must not swallow an unrelated symbol that merely LOOKS
+like an identity variable (a `-user-id' name) but isn't one of the two
+known cases -- only the two named symbols are exempt, nothing broader."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defvar cc-butler-test-drift-other-user-id nil \"doc\")\n")))
+    (defvar cc-butler-test-drift-other-user-id)
+    (setq cc-butler-test-drift-other-user-id "@someone:example.org")
+    (unwind-protect
+        (should (equal (cc-butler--defcustom-drift file)
+                       '((cc-butler-test-drift-other-user-id "@someone:example.org" nil))))
+      (makunbound 'cc-butler-test-drift-other-user-id))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-still-reports-a-real-non-private-drift ()
+  "The filters above must not swallow the actual signal — a plain,
+non-private, non-hook, non-keymap defcustom that genuinely drifted still
+has to show up."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defcustom cc-butler-test-drift-real 8 \"doc\")\n")))
+    (defvar cc-butler-test-drift-real)
+    (setq cc-butler-test-drift-real 5)
+    (unwind-protect
+        (should (equal (cc-butler--defcustom-drift file)
+                        '((cc-butler-test-drift-real 5 8))))
+      (makunbound 'cc-butler-test-drift-real))))
+
+(ert-deftest cc-butler-reload/tool-output-truncates-long-drift-values ()
+  "A drifted variable can legitimately hold a whole document; the tool
+output must cap what it prints so one long value cannot dominate — or
+leak the bulk of — the report."
+  (let ((long (make-string 500 ?x)))
+    (cl-letf (((symbol-function 'cc-butler-reload)
+               (lambda () (list :count 3 :dir "/x/" :stale nil
+                                 :defcustom-drift (list (list 'cc-butler-test-drift-long long 8)))))
+              ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+              ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil)))
+      (let ((out (cc-butler-tool-reload-code)))
+        (should (string-match-p "…" out))
+        (should-not (string-match-p (regexp-quote long) out))))))
+
+(ert-deftest cc-butler-reload/tool-output-surfaces-defcustom-drift-loudly ()
+  "The MCP caller cannot inspect live variable bindings itself — a drift
+must be spelled out in the reload response, the same way a stale .elc
+already is, not left for someone to discover independently."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 3 :dir "/x/" :stale nil
+                               :defcustom-drift '((cc-butler-launch-ready-timeout 5 8)))))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+            ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil)))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should (string-match-p "cc-butler-launch-ready-timeout" out))
+      (should (string-match-p "live=5" out))
+      (should (string-match-p "code-default=8" out)))))
+
+(ert-deftest cc-butler-reload/tool-output-quiet-when-no-defcustom-drift ()
+  "No drift, no warning — an always-on warning is one nobody reads (the
+2026-09-05 lesson from #156's uncommitted-checkout warning firing on
+build-artifact noise every call)."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 3 :dir "/x/" :stale nil :defcustom-drift nil)))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+            ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil)))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should-not (string-match-p "code-default" out)))))
+
+;;;; ------------------------------------------------------------------
+;;;; Drift labeling: git-history-based (ㄴ) stuck-reload vs (ㄱ) deliberate
+;;;; classification. Read-only, additive — `cc-butler--defcustom-drift's own
+;;;; return shape is untouched (asserted exactly by the tests above).
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-test--make-multi-commit-git-repo (symbol-name defaults)
+  "Fixture git repo (a fresh temp dir) with one file holding a single
+`defcustom' for SYMBOL-NAME, committed once per value in DEFAULTS (Lisp
+default forms, oldest first — the last entry is HEAD's current default).
+Returns (DIR FILE SHAS): FILE is the fixture file's absolute path, SHAS is
+the list of commit SHAs in the same oldest-first order as DEFAULTS, so a
+test can say \"value (nth N defaults) shipped in commit (nth N shas)\"."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-drift-history" t)))
+         (relfile "cc-butler-drift-history-fixture.el")
+         (file (expand-file-name relfile dir))
+         shas)
+    (cc-butler-test--git dir "init" "-q")
+    (cc-butler-test--git dir "config" "user.email" "test@test")
+    (cc-butler-test--git dir "config" "user.name" "test")
+    (dolist (default defaults)
+      (write-region (format "(defcustom %s %S \"doc\")\n" symbol-name default)
+                     nil file)
+      (cc-butler-test--git dir "add" relfile)
+      (cc-butler-test--git dir "commit" "-q" "-m" (format "set default to %S" default))
+      (push (let ((default-directory dir))
+              (with-temp-buffer
+                (call-process "git" nil t nil "rev-parse" "HEAD")
+                (string-trim (buffer-string))))
+            shas))
+    (list dir file (nreverse shas))))
+
+(ert-deftest cc-butler-reload/drift-label-marks-stuck-reload-when-live-matches-a-past-default ()
+  "A live value that matches a REAL past shipped default (not the current
+one) is the (ㄴ) shape: name the commit, and say so with the caveat that
+this can never be certainty — a human could have coincidentally chosen the
+same value as some past default."
+  (skip-unless (executable-find "git"))
+  (cl-destructuring-bind (_dir file shas)
+      (cc-butler-test--make-multi-commit-git-repo "cc-butler-test-drift-hist-a" '(3 5 8))
+    (let ((label (cc-butler--defcustom-drift-label
+                  file 'cc-butler-test-drift-hist-a 3 8)))
+      (should label)
+      (should (string-match-p "likely stuck reload" label))
+      (should (string-match-p (regexp-quote (substring (nth 0 shas) 0 7)) label))
+      (should (string-match-p
+               "cannot rule out a human coincidentally choosing the same value"
+               label)))))
+
+(ert-deftest cc-butler-reload/drift-label-marks-deliberate-customization-when-live-value-never-shipped ()
+  "A live value that never appears anywhere in the file's git history for
+that line is the (ㄱ) shape — WITH the caveat that only this one file's
+history was checked, so this cannot prove the value was chosen deliberately
+by a human rather than set some other way this check cannot see."
+  (skip-unless (executable-find "git"))
+  (cl-destructuring-bind (_dir file _shas)
+      (cc-butler-test--make-multi-commit-git-repo "cc-butler-test-drift-hist-b" '(3 5 8))
+    (let ((label (cc-butler--defcustom-drift-label
+                  file 'cc-butler-test-drift-hist-b 999 8)))
+      (should label)
+      (should (string-match-p "likely deliberate customization" label))
+      (should (string-match-p
+               "only this file's own history was checked" label)))))
+
+(ert-deftest cc-butler-reload/defcustom-drift-unaffected-by-labeling-when-live-matches-current-default ()
+  "REGRESSION GUARD: a symbol whose live value equals the CURRENT code
+default must never even reach labeling — `cc-butler--defcustom-drift'
+already excludes it from its return value, and that contract must still
+hold with history-based labeling added alongside it."
+  (skip-unless (executable-find "git"))
+  (cl-destructuring-bind (_dir file _shas)
+      (cc-butler-test--make-multi-commit-git-repo "cc-butler-test-drift-hist-c" '(3 5 8))
+    (defvar cc-butler-test-drift-hist-c)
+    (setq cc-butler-test-drift-hist-c 8)
+    (unwind-protect
+        (should-not (cc-butler--defcustom-drift file))
+      (makunbound 'cc-butler-test-drift-hist-c))))
+
+(ert-deftest cc-butler-reload/drift-label-nil-when-file-has-no-git-history ()
+  "A plain fixture file with no `.git' anywhere above it must degrade to
+nil — never error, never guess a classification."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (file (cc-butler-test--write-fixture-module
+                dir "(defcustom cc-butler-test-drift-hist-nogit 8 \"doc\")\n")))
+    (should-not (cc-butler--defcustom-drift-label
+                 file 'cc-butler-test-drift-hist-nogit 5 8))))
+
+(ert-deftest cc-butler-reload/defcustom-file-for-symbol-finds-the-defining-module ()
+  "The tool-rendering wiring needs to know which file a drifted symbol came
+from — `cc-butler--defcustom-drift's own triples deliberately do not carry
+it (existing tests assert that return shape exactly), so this re-derives it
+by re-scanning the modules, the same way the drift check itself did."
+  (let* ((dir (file-name-as-directory (make-temp-file "cc-reload-drift" t)))
+         (cc-butler--modules '(cc-butler-fixture-mod-a cc-butler-fixture-mod-b)))
+    (write-region "" nil (expand-file-name "cc-butler.el" dir))
+    (write-region "" nil (expand-file-name "cc-butler-fixture-mod-a.el" dir))
+    (write-region "(defvar cc-butler-test-drift-locate-me 1 \"doc\")\n" nil
+                  (expand-file-name "cc-butler-fixture-mod-b.el" dir))
+    (should (equal (cc-butler--defcustom-file-for-symbol dir 'cc-butler-test-drift-locate-me)
+                   (expand-file-name "cc-butler-fixture-mod-b.el" dir)))
+    (should-not (cc-butler--defcustom-file-for-symbol dir 'cc-butler-test-drift-unknown-symbol))))
+
+(ert-deftest cc-butler-reload/tool-output-includes-history-label-when-determinable ()
+  "The label has to actually reach the MCP tool's rendered string end to
+end, appended after the existing live=/code-default= line — not just exist
+as an internal function nothing calls."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 3 :dir "/x/" :stale nil
+                               :defcustom-drift '((cc-butler-test-drift-hist-tool 5 8)))))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+            ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil))
+            ((symbol-function 'cc-butler--defcustom-file-for-symbol)
+             (lambda (dir sym)
+               (should (equal dir "/x/"))
+               (should (eq sym 'cc-butler-test-drift-hist-tool))
+               "/fake/file.el"))
+            ((symbol-function 'cc-butler--defcustom-drift-label)
+             (lambda (file sym live code-default)
+               (should (equal file "/fake/file.el"))
+               (should (eq sym 'cc-butler-test-drift-hist-tool))
+               (should (equal live 5))
+               (should (equal code-default 8))
+               "(likely stuck reload) LABEL-MARKER")))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should (string-match-p "live=5" out))
+      (should (string-match-p "code-default=8" out))
+      (should (string-match-p "LABEL-MARKER" out)))))
+
+(ert-deftest cc-butler-reload/tool-output-renders-drift-normally-when-label-undeterminable ()
+  "No determinable label (e.g. the drifted file has no git history) must
+not crash the tool and must not print a false classification — the drift
+line itself still renders exactly as before."
+  (cl-letf (((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 3 :dir "/x/" :stale nil
+                               :defcustom-drift '((cc-butler-test-drift-hist-nolabel 5 8)))))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+            ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil))
+            ((symbol-function 'cc-butler--defcustom-file-for-symbol) (lambda (&rest _) nil)))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should (string-match-p "live=5" out))
+      (should (string-match-p "code-default=8" out))
+      (should-not (string-match-p "likely" out)))))
 
 (ert-deftest cc-butler-reload/tool-says-it-does-not-fetch ()
   "`reload_butler' loads what is on disk.  Saying so prevents the caller
 concluding a merge reached the fleet when nothing was pulled."
   (cl-letf (((symbol-function 'cc-butler-reload)
              (lambda () (list :count 3 :dir "/x/" :stale nil)))
-            ((symbol-function 'cc-butler--git-head) (lambda (_) "abc123f (main)")))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) "abc123f (main)"))
+            ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil)))
     (let ((out (cc-butler-tool-reload-code)))
       (should (string-match-p "does not fetch" out))
       (should (string-match-p "abc123f" out))
@@ -148,6 +683,26 @@ is not an edge case here."
     (should (equal (cc-butler--git-head wt)
                    (format "%s (side)" (substring hash 0 7))))))
 
+(ert-deftest cc-butler-git-head-sha/reads-the-full-hash-not-the-short-form ()
+  "Unlike `cc-butler--git-head', this returns the exact full SHA — what
+`cc-butler-tool-runtime-source' needs for an equality check against the
+loaded commit, not a truncated string a caller would have to re-parse."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (hash (cdr fix)))
+    (should (equal (cc-butler--git-head-sha dir) hash))))
+
+(ert-deftest cc-butler-git-head-sha/resolves-a-packed-ref ()
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (hash (cdr fix)))
+    (cc-butler-test--git dir "pack-refs" "--all")
+    (should (equal (cc-butler--git-head-sha dir) hash))))
+
+(ert-deftest cc-butler-git-head-sha/not-a-repo-degrades-to-nil-not-an-error ()
+  (let ((dir (file-name-as-directory (make-temp-file "cc-no-repo" t))))
+    (should-not (cc-butler--git-head-sha dir))))
+
 (ert-deftest cc-butler-git-head/not-a-repo-degrades-to-nil-not-an-error ()
   "Nil means \"cannot determine\"; the reload report drops the line and goes
 on.  Blocking or erroring while trying harder is the failure this replaced."
@@ -160,7 +715,8 @@ on.  Blocking or erroring while trying harder is the failure this replaced."
 never a probe that can hang the daemon."
   (cl-letf (((symbol-function 'cc-butler-reload)
              (lambda () (list :count 3 :dir "/x/" :stale nil)))
-            ((symbol-function 'cc-butler--git-head) (lambda (_) nil)))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+            ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil)))
     (let ((out (cc-butler-tool-reload-code)))
       (should (string-match-p "Reloaded 3 cc-butler modules" out))
       (should-not (string-match-p "Source is at:" out)))))
@@ -251,6 +807,7 @@ the thing that caller is least able to find out for itself."
   (cl-letf (((symbol-function 'cc-butler-reload)
              (lambda () (list :count 3 :dir "/x/" :stale nil)))
             ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+            ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil))
             ((symbol-function 'cc-butler--source-diagnostics)
              (lambda () '((warn . "SOURCE-STATE-MARKER")))))
     (should (string-match-p "SOURCE-STATE-MARKER" (cc-butler-tool-reload-code)))))
@@ -458,6 +1015,77 @@ not check\", never as a silent pass."
     (let ((out (cc-butler-tool-runtime-source)))
       (should (string-match-p "Cannot determine" out)))))
 
+;;;; ---- checkout HEAD vs loaded commit (steward incident, 2026-09-05) --
+;;;; Reading a :vc checkout's disk files was mistaken for reading the LIVE
+;;;; behavior, because the checkout had advanced 3 commits past the loaded
+;;;; image since the last reload — the exact fix a diagnosis relied on was
+;;;; on disk but not yet running. The tool must report both values and warn
+;;;; in its own body, not a footnote, whenever they diverge.
+
+(ert-deftest cc-butler-runtime-source/tool-warns-when-checkout-outran-the-loaded-commit ()
+  "The exact incident this half of the tool exists for: the checkout has
+moved past what is actually loaded. The warning must be in the result
+body, not require a separate lookup to notice."
+  (let ((cc-butler--runtime-source-dir "/src/")
+        (cc-butler--runtime-commit-sha "424dbeb")
+        (cc-butler--runtime-commit-line "424dbeb old behavior"))
+    (cl-letf (((symbol-function 'cc-butler--commit-merged-p) (lambda (&rest _) 'merged))
+              ((symbol-function 'cc-butler--git-head-sha) (lambda (_dir) "fc7f775"))
+              ((symbol-function 'cc-butler--source-revision) (lambda (_dir) "fc7f775 newer fix"))
+              ((symbol-function 'cc-butler--git) (lambda (&rest _) nil)))
+      (let ((out (cc-butler-tool-runtime-source)))
+        (should (string-match-p "424dbeb" out))
+        (should (string-match-p "fc7f775" out))
+        (should (string-match-p "LOADED COMMIT ≠ CHECKOUT HEAD" out))
+        (should (string-match-p "reload_butler_code" out))))))
+
+(ert-deftest cc-butler-runtime-source/tool-is-quiet-when-checkout-matches-loaded ()
+  "The ordinary case — checkout HEAD equals what is actually loaded — must
+NOT show the divergence warning; a tool that always warns is as useless
+as one that never does."
+  (let ((cc-butler--runtime-source-dir "/src/")
+        (cc-butler--runtime-commit-sha "deadbeef")
+        (cc-butler--runtime-commit-line "deadbee fix the thing"))
+    (cl-letf (((symbol-function 'cc-butler--commit-merged-p) (lambda (&rest _) 'merged))
+              ((symbol-function 'cc-butler--git-head-sha) (lambda (_dir) "deadbeef"))
+              ((symbol-function 'cc-butler--source-revision) (lambda (_dir) "deadbee fix the thing"))
+              ((symbol-function 'cc-butler--git) (lambda (&rest _) nil)))
+      (let ((out (cc-butler-tool-runtime-source)))
+        (should-not (string-match-p "LOADED COMMIT ≠ CHECKOUT HEAD" out))
+        (should-not (string-match-p "⚠️" out))))))
+
+(ert-deftest cc-butler-runtime-source/tool-flags-uncommitted-checkout-changes ()
+  "Even the disk not matching its own last commit is worth surfacing —
+someone reading source to reason about behavior should know the file
+they are looking at might not be committed anywhere at all."
+  (let ((cc-butler--runtime-source-dir "/src/")
+        (cc-butler--runtime-commit-sha "deadbeef")
+        (cc-butler--runtime-commit-line "deadbee fix the thing"))
+    (cl-letf (((symbol-function 'cc-butler--commit-merged-p) (lambda (&rest _) 'merged))
+              ((symbol-function 'cc-butler--git-head-sha) (lambda (_dir) "deadbeef"))
+              ((symbol-function 'cc-butler--source-revision) (lambda (_dir) "deadbee fix the thing"))
+              ((symbol-function 'cc-butler--git)
+               (lambda (_dir &rest args)
+                 (when (equal args '("status" "--porcelain")) " M cc-butler.el"))))
+      (let ((out (cc-butler-tool-runtime-source)))
+        (should (string-match-p "uncommitted changes" out))
+        (should (string-match-p "cc-butler.el" out))))))
+
+(ert-deftest cc-butler-runtime-source/tool-degrades-when-checkout-head-undeterminable ()
+  "When the checkout's HEAD cannot be read at all, say so plainly rather
+than silently omitting the line or claiming a match that was never
+checked."
+  (let ((cc-butler--runtime-source-dir "/src/")
+        (cc-butler--runtime-commit-sha "deadbeef")
+        (cc-butler--runtime-commit-line "deadbee fix the thing"))
+    (cl-letf (((symbol-function 'cc-butler--commit-merged-p) (lambda (&rest _) 'merged))
+              ((symbol-function 'cc-butler--git-head-sha) (lambda (_dir) nil))
+              ((symbol-function 'cc-butler--source-revision) (lambda (_dir) nil))
+              ((symbol-function 'cc-butler--git) (lambda (&rest _) nil)))
+      (let ((out (cc-butler-tool-runtime-source)))
+        (should (string-match-p "could not determine" out))
+        (should-not (string-match-p "LOADED COMMIT ≠ CHECKOUT HEAD" out))))))
+
 (ert-deftest cc-butler-runtime-source/oneline-is-nil-when-not-determinable ()
   (let (cc-butler--runtime-source-dir
         cc-butler--runtime-commit-sha
@@ -473,6 +1101,92 @@ not check\", never as a silent pass."
         (should (string-match-p "deadbee fix the thing" line))
         (should (string-match-p "UNMERGED" line))))))
 
+;;;; ------------------------------------------------------------------
+;;;; reload_butler_code refuses a dirty checkout by default
+;;;; ------------------------------------------------------------------
+;;
+;; Near-miss: a coordinator caught, by chance, unreviewed work-in-progress
+;; sitting uncommitted in the primary checkout right before calling
+;; reload_butler_code — which would have hot-loaded it straight into the
+;; live daemon with no check at all.  `runtime_source' already detects a
+;; dirty checkout (as a warning, in its own report, via
+;; `cc-butler--checkout-dirty-p'); these tests cover reusing that exact
+;; detector as a REFUSAL for the one path that actually pushes code live.
+
+(ert-deftest cc-butler-checkout-dirty-p/wraps-git-status-porcelain ()
+  (cl-letf (((symbol-function 'cc-butler--git)
+             (lambda (dir &rest args)
+               (should (equal dir "/x/"))
+               (should (equal args '("status" "--porcelain")))
+               " M f.el")))
+    (should (equal (cc-butler--checkout-dirty-p "/x/") " M f.el"))))
+
+(ert-deftest cc-butler-checkout-dirty-p/nil-when-clean-unknown-or-no-dir ()
+  (cl-letf (((symbol-function 'cc-butler--git) (lambda (&rest _) nil)))
+    (should-not (cc-butler--checkout-dirty-p "/x/")))
+  (should-not (cc-butler--checkout-dirty-p nil)))
+
+(ert-deftest cc-butler-reload/tool-refuses-a-dirty-checkout-by-default ()
+  (cl-letf (((symbol-function 'cc-butler-source-dir) (lambda () "/x/"))
+            ((symbol-function 'cc-butler--checkout-dirty-p)
+             (lambda (dir) (should (equal dir "/x/")) " M cc-butler.el"))
+            ((symbol-function 'cc-butler-reload)
+             (lambda () (error "must not reload a dirty checkout without allow-dirty"))))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should (string-match-p "Refused" out))
+      (should (string-match-p "uncommitted changes" out))
+      (should (string-match-p "cc-butler.el" out)))))
+
+(ert-deftest cc-butler-reload/tool-still-reloads-a-clean-checkout ()
+  "Protects against an overly broad guard: the ordinary, clean case must
+still reload exactly as before."
+  (cl-letf (((symbol-function 'cc-butler-source-dir) (lambda () "/x/"))
+            ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) nil))
+            ((symbol-function 'cc-butler-reload)
+             (lambda () (list :count 3 :dir "/x/" :stale nil)))
+            ((symbol-function 'cc-butler--git-head) (lambda (_) nil)))
+    (let ((out (cc-butler-tool-reload-code)))
+      (should (string-match-p "Reloaded 3 cc-butler modules" out))
+      (should-not (string-match-p "Refused" out)))))
+
+(ert-deftest cc-butler-reload/tool-allow-dirty-overrides-and-logs ()
+  (let (logged)
+    (cl-letf (((symbol-function 'cc-butler-source-dir) (lambda () "/x/"))
+              ((symbol-function 'cc-butler--checkout-dirty-p) (lambda (_) " M cc-butler.el"))
+              ((symbol-function 'cc-butler-reload)
+               (lambda () (list :count 3 :dir "/x/" :stale nil)))
+              ((symbol-function 'cc-butler--git-head) (lambda (_) nil))
+              ((symbol-function 'cc-butler--log)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) logged))))
+      (let ((out (cc-butler-tool-reload-code t)))
+        (should (string-match-p "Reloaded 3 cc-butler modules" out))
+        (should-not (string-match-p "Refused" out))
+        (should logged)
+        (should (string-match-p "allow_dirty" (car logged)))
+        (should (string-match-p "cc-butler.el" (car logged)))))))
+
+(ert-deftest cc-butler-reload/checkout-dirty-p-shared-by-runtime-source-and-reload-guard ()
+  "REGRESSION GUARD against the exact failure class this project has hit
+before (independent duplicate detectors, only one of which ever gets
+updated later): both `runtime_source' and `reload_butler_code' must route
+through the same `cc-butler--checkout-dirty-p', not two separate checks."
+  (let (calls)
+    (cl-letf (((symbol-function 'cc-butler--checkout-dirty-p)
+               (lambda (dir) (push dir calls) nil))
+              ((symbol-function 'cc-butler--commit-merged-p) (lambda (&rest _) 'merged))
+              ((symbol-function 'cc-butler--git-head-sha) (lambda (_) nil))
+              ((symbol-function 'cc-butler--source-revision) (lambda (_) nil))
+              ((symbol-function 'cc-butler-source-dir) (lambda () "/x/"))
+              ((symbol-function 'cc-butler-reload) (lambda () (list :count 3 :dir "/x/" :stale nil)))
+              ((symbol-function 'cc-butler--git-head) (lambda (_) nil)))
+      (let ((cc-butler--runtime-source-dir "/x/")
+            (cc-butler--runtime-commit-sha "deadbeef")
+            (cc-butler--runtime-commit-line "deadbee x"))
+        (cc-butler-tool-runtime-source)
+        (cc-butler-tool-reload-code))
+      (should (equal (length calls) 2))
+      (should (cl-every (lambda (d) (equal d "/x/")) calls)))))
+
 (ert-deftest cc-butler-runtime-source/tool-is-registered-with-no-arguments ()
   "Matches the pattern other read-only status tools (`pending_decisions',
 `list_claude_sessions') follow: no caller-supplied argument, because there
@@ -484,8 +1198,42 @@ one thing that is actually running."
                         (bound-and-true-p claude-code-ide-mcp-server-tools))))
     (when spec   ; only when claude-code-ide is present to register against
       (let ((norm (claude-code-ide--normalize-tool-spec spec)))
-        (should (eq (plist-get norm :function) #'cc-butler-tool-runtime-source))
+        ;; :function is `cc-butler--mcp-tool-guard''s wrapper closure now,
+        ;; not `cc-butler-tool-runtime-source' itself directly -- every
+        ;; registration goes through the shared MCP error guard (2026-09-11,
+        ;; the leaked-buffer-text incident). `eq' no longer holds; prove
+        ;; delegation instead by calling it and checking the real function
+        ;; actually ran.
+        (let (called)
+          (cl-letf (((symbol-function 'cc-butler-tool-runtime-source)
+                     (lambda () (setq called t) "ok")))
+            (funcall (plist-get norm :function))
+            (should called)))
         (should-not (plist-get norm :args))))))
+
+(ert-deftest cc-butler-modules/matches-every-el-file-in-the-directory ()
+  "REGRESSION GUARD (2026-09-10): `cc-butler--modules' is a hand-maintained
+list, not a directory scan -- a new root `.el' file nobody adds to it is
+invisible to `cc-butler-reload' (never loaded) AND to self-checks 5/7 (both
+walk this same list for defcustom drift), and both keep reporting success.
+`matrix-bridge.el' sat in exactly this gap for weeks before this test
+existed (see the `an-upstream-list-walk-is-blind-to-what-is-not-on-the-list'
+governance note). This is the parity contract: every `.el' file at the repo
+root is either `cc-butler' itself, a tracked module, or named in
+`cc-butler--modules-directory-exceptions' with a reason -- there is no
+fourth, silent option."
+  (let* ((on-disk (sort (mapcar #'file-name-base
+                                 (directory-files cc-butler--dir nil "\\`[^.].*\\.el\\'"))
+                         #'string<))
+         (tracked (sort (mapcar #'symbol-name
+                                 (append (list 'cc-butler)
+                                         cc-butler--modules
+                                         cc-butler--modules-directory-exceptions))
+                         #'string<))
+         (only-on-disk (cl-set-difference on-disk tracked :test #'string=))
+         (only-tracked (cl-set-difference tracked on-disk :test #'string=)))
+    (should (equal (list :only-on-disk only-on-disk :only-tracked only-tracked)
+                   (list :only-on-disk nil :only-tracked nil)))))
 
 (provide 'cc-butler-reload-test)
 ;;; cc-butler-reload-test.el ends here

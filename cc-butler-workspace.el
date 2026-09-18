@@ -135,12 +135,47 @@ Runs `cc-butler-scaffold-functions' with (TOPIC-DIR TEMPLATE) at the end."
 (defun cc-butler--start-session-in (dir)
   "Start a Claude session with DIR as the working directory.
 Routes through `cc-butler--launch-session' — the single launch+config path all
-roles share — so worker, butler, and steward ghostel config cannot diverge."
-  (cc-butler--launch-session dir))
+roles share — so worker, butler, and steward ghostel config cannot diverge.
+Every caller of this function launches a worker (butler/steward launch via
+their own fixed home directories, never through here), so the worker model
+is pinned unconditionally — see `cc-butler--with-worker-model'."
+  (cc-butler--with-worker-model (cc-butler--launch-session dir)))
+
+(defun cc-butler--ensure-repo-hooks (dest)
+  "Point DEST's core.hooksPath at its scripts/git-hooks, if it ships one.
+A repo shipping its own hooks (e.g. a pre-commit gate) only runs them once
+core.hooksPath points there.  The write is read back, and a mismatch or a
+non-executable pre-commit raises an error-level `cc-butler' warning.
+Never signals: a hooks failure must not fail the clone chain."
+  (when (file-directory-p (expand-file-name "scripts/git-hooks" dest))
+    (ignore-errors
+      (call-process "git" nil nil nil "-C" dest "config" "--local"
+                    "core.hooksPath" "scripts/git-hooks"))
+    (unless (equal (ignore-errors
+                     (with-temp-buffer
+                       (and (eq 0 (call-process "git" nil t nil "-C" dest "config"
+                                                "--local" "--get" "core.hooksPath"))
+                            (string-trim (buffer-string)))))
+                   "scripts/git-hooks")
+      (display-warning
+       'cc-butler
+       (format "%s: could not set core.hooksPath to scripts/git-hooks — the repo's hooks are INACTIVE"
+               dest)
+       :error))
+    ;; The config alone is not a guard: without an executable
+    ;; pre-commit git silently runs nothing.
+    (unless (file-executable-p
+             (expand-file-name "scripts/git-hooks/pre-commit" dest))
+      (display-warning
+       'cc-butler
+       (format "%s: scripts/git-hooks/pre-commit is missing or not executable — the pre-commit gate is INACTIVE"
+               dest)
+       :error))))
 
 (defun cc-butler--clone-repos (topic-dir repos done-fn)
   "Clone REPOS into TOPIC-DIR sequentially and asynchronously.
-Each already-present repo is skipped.  On completion DONE-FN is called
+Each already-present repo is not re-cloned, but it and every fresh clone
+get `cc-butler--ensure-repo-hooks'.  On completion DONE-FN is called
 with t (all succeeded) or nil (a clone failed)."
   (if (null repos)
       (funcall done-fn t)
@@ -149,7 +184,10 @@ with t (all succeeded) or nil (a clone failed)."
            (name (cc-butler--repo-local-name url))
            (dest (expand-file-name name topic-dir)))
       (if (file-directory-p dest)
-          (cc-butler--clone-repos topic-dir rest done-fn)
+          (progn
+            (when (file-exists-p (expand-file-name ".git" dest))
+              (cc-butler--ensure-repo-hooks dest))
+            (cc-butler--clone-repos topic-dir rest done-fn))
         (let ((default-directory (file-name-as-directory topic-dir))
               (buf (generate-new-buffer (format " *cc-butler-clone:%s*" name))))
           (message "cc-butler: cloning %s ..." url)
@@ -164,6 +202,7 @@ with t (all succeeded) or nil (a clone failed)."
                (if (eq 0 (process-exit-status proc))
                    (progn
                      (when (buffer-live-p buf) (kill-buffer buf))
+                     (cc-butler--ensure-repo-hooks dest)
                      (cc-butler--clone-repos topic-dir rest done-fn))
                  (message "cc-butler: `git clone %s' failed — see %s"
                           url (buffer-name buf))
@@ -315,14 +354,27 @@ The nearest ancestor holding `cc-butler-project-marker', else SESSION-DIR."
     (or (locate-dominating-file session-dir cc-butler-project-marker)
         session-dir))))
 
+(defun cc-butler--git-checkout-p (dir)
+  "Non-nil when DIR is a git working tree.
+
+`.git' is a DIRECTORY in an ordinary clone but a FILE in a worktree or a
+submodule gitlink, so the probe must be `file-exists-p' — `file-directory-p'
+silently answers no for every worktree.  Single-sourced here because this
+file already disagreed with itself: `cc-butler--close-topic-deletable-p'
+probed with `file-exists-p' (correct — it refuses to scaffold over any
+working tree) while the close-topic audit probed with `file-directory-p',
+so the same directory could count as a repo to one and not to the other.
+One predicate, one answer."
+  (file-exists-p (expand-file-name ".git" dir)))
+
 (defun cc-butler--close-topic-repos (topic-dir)
   "Return the git clones to vet before removing TOPIC-DIR.
 TOPIC-DIR itself when it is a repo, else its immediate child repos."
-  (if (file-directory-p (expand-file-name ".git" topic-dir))
+  (if (cc-butler--git-checkout-p topic-dir)
       (list (file-name-as-directory topic-dir))
     (seq-filter
      (lambda (p) (and (file-directory-p p)
-                      (file-directory-p (expand-file-name ".git" p))))
+                      (cc-butler--git-checkout-p p)))
      (ignore-errors (directory-files topic-dir t "\\`[^.]")))))
 
 (defun cc-butler--git-run (dir args)
@@ -350,17 +402,117 @@ invocation is itself unsafe (we could not verify)."
           (push label reasons)))))
     (nreverse reasons)))
 
+(defconst cc-butler--close-topic-loose-entry-allowlist
+  (list ".DS_Store" cc-butler-project-marker "CLAUDE.md")
+  "Top-level entries `cc-butler--close-topic-loose-entries' never flags,
+because none of them can hold work worth losing: OS noise (`.DS_Store')
+and cc-butler's own generated scaffold files — the topic marker
+\(`cc-butler-project-marker', referenced by variable rather than its
+current literal value in case it is ever customized to a non-dot name)
+and its boilerplate `CLAUDE.md'. Both are wholly regenerable and would be
+deleted along with the topic either way. Kept short and explicit on
+purpose (cc-butler#8 follow-up, steward review): a long or pattern-based
+allowlist is exactly how a real loose file — a handoff doc, recovered
+notes — would quietly stop being checked again.")
+
+(defun cc-butler--close-topic-loose-entries (topic-dir)
+  "Return TOPIC-DIR's top-level entries that belong to no child git repo
+vetted by `cc-butler--close-topic-repos' and are not on
+`cc-butler--close-topic-loose-entry-allowlist' — real, possibly
+unversioned content sitting directly in a multi-repo container, which
+`cc-butler--close-topic-unsafe' can never see since it only vets the
+child repos it is told about.
+
+This is the exact shape of the 2026-09-05 incident that motivated this
+whole audit: a container with 14 clean nested repos ALSO held
+`recovered-notes-20260809/', `RESUME-817.md', and
+`handover-image-editing-20260810.md' sitting loose at its root — none of
+them inside any child repo, all invisible to a check that only walks
+into repos. \"Every child repo is clean\" was never \"safe to delete\";
+this closes that gap without touching the per-repo check itself.
+
+Empty when TOPIC-DIR is itself a repo — there is no \"top level besides
+the repo\" in that shape; the repo IS the whole audited unit."
+  (unless (cc-butler--git-checkout-p topic-dir)
+    (let ((repos (cc-butler--close-topic-repos topic-dir)))
+      (seq-remove
+       (lambda (p)
+         (or (member p repos)
+             (member (file-name-nondirectory (directory-file-name p))
+                     cc-butler--close-topic-loose-entry-allowlist)))
+       (ignore-errors (directory-files topic-dir t "\\`[^.]"))))))
+
 (defun cc-butler--close-topic-audit (topic-dir)
-  "Return an alist (REPO . REASONS) for every unsafe repo under TOPIC-DIR."
-  (let (bad)
-    (dolist (repo (cc-butler--close-topic-repos topic-dir))
+  "Return an alist (PATH . REASONS) covering everything that must block
+deleting TOPIC-DIR: every child repo with local-only commits, uncommitted
+changes, or stashes (`cc-butler--close-topic-unsafe'); every top-level
+item outside all child repos and not on the tiny allowlist
+(`cc-butler--close-topic-loose-entries'); and, only when NEITHER of those
+found anything at all — TOPIC-DIR is not itself a repo and has no child
+repo and no loose item either — TOPIC-DIR itself, since \"nothing found
+to check\" must never read as \"safe to delete\" (a real fleet audit,
+2026-09-05, found 26 of 27 roster entries have a non-git top level;
+before this, `cc-butler--close-topic-repos' returning nil for one of
+those meant this audit checked literally nothing for it — cc-butler#8
+follow-up)."
+  (let* ((repos (cc-butler--close-topic-repos topic-dir))
+         (loose (cc-butler--close-topic-loose-entries topic-dir))
+         bad)
+    (dolist (repo repos)
       (when-let ((reasons (cc-butler--close-topic-unsafe repo)))
         (push (cons repo reasons) bad)))
+    (when loose
+      (push (cons (file-name-as-directory topic-dir)
+                  (list (format "top-level item(s) outside any child repo, unaccounted for: %s"
+                                (string-join (mapcar #'file-name-nondirectory loose) ", "))))
+            bad))
+    (when (and (null repos) (null loose) (null bad))
+      (push (cons (file-name-as-directory topic-dir)
+                  (list (format "not a git repository, and no child repo or loose item found either — cannot verify no local-only work would be lost (%s)"
+                                (directory-file-name (expand-file-name topic-dir)))))
+            bad))
     (nreverse bad)))
+
+(defcustom cc-butler-close-topic-refuse-concurrent-ghostel t
+  "When non-nil, refuse to kill a ghostel-backed session's buffer while
+another ghostel-backed `claude-code-ide' session is concurrently alive.
+
+Reproduced 2026-09-18 (see
+docs/repro/2026-09-18-buffer-kill-bystander-death.md, ccb-repro, 5+
+independent runs): killing one ghostel-backed terminal buffer while
+another is alive can send a real SIGHUP to the OTHER, untouched session
+and end it — a genuine cross-session defect traced into ghostel's native
+pty module (a vendored dylib; the double `cleanup-on-exit' call
+originally suspected was tested and ruled out). That module cannot be
+fixed here, so this guard only prevents cc-butler from ever triggering
+it through `cc-butler-close-topic' / the `close_topic' MCP tool.
+
+This guard does NOT cover a plain `kill-buffer' done outside cc-butler
+\(e.g. interactively, or from any other code path\) on a ghostel session's
+buffer: that carries the identical bystander-death risk, unguarded. That
+gap is closed by operational rule only \(the live-fleet freeze\), not by
+code.
+
+The one legitimate reason to set this to nil is complying with the
+fleet's worker session cap \(2026-09-16: 10 workers + butler + steward,
+max 12, adjusted up and down as needed\) when it collides with this
+guard's refusal. This is a known collision between the cap and the
+guard, not a fix: disabling the option accepts the bystander-death risk
+until the upstream root cause is fixed."
+  :type 'boolean
+  :group 'cc-butler)
+
+(defun cc-butler--concurrent-ghostel-sessions-p ()
+  "Non-nil when >1 ghostel-backed `claude-code-ide' session is tracked live."
+  (and (eq claude-code-ide-terminal-backend 'ghostel)
+       (> (hash-table-count claude-code-ide--processes) 1)))
 
 (defun cc-butler--close-topic-kill-session (dir)
   "Terminate the Claude session for DIR (process, buffers, state).
 Returns the list of buffer names killed."
+  (when (and cc-butler-close-topic-refuse-concurrent-ghostel
+             (cc-butler--concurrent-ghostel-sessions-p))
+    (user-error "cc-butler: refusing to kill session for %s — another ghostel session is alive (buffer-kill bystander-death bug, docs/repro/2026-09-18-buffer-kill-bystander-death.md); close the other sessions first, or set cc-butler-close-topic-refuse-concurrent-ghostel to nil once upstream is fixed" dir))
   (let* ((name (cc-butler--display-name dir))
          (bufname (claude-code-ide--get-buffer-name dir))
          (buf (get-buffer bufname))
@@ -422,7 +574,7 @@ The git-clean commit-safety gate remains a separate, independent guarantee."
          ;; Blocklist: an existing project's root is a git working tree.
          ;; `.git' may be a directory (normal repo) or a file (worktree /
          ;; submodule gitlink); refuse either.  A scaffold root never has one.
-         (not (file-exists-p (expand-file-name ".git" dslash)))
+         (not (cc-butler--git-checkout-p dslash))
          ;; Allowlist: only a cc-butler-scaffolded topic carries this marker.
          (file-exists-p (expand-file-name cc-butler-project-marker dslash)))))
 
@@ -539,7 +691,7 @@ state is out of scope."
            (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                    '("new_topic")))
          claude-code-ide-mcp-server-tools))
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-new-topic
    :name "new_topic"
    :description "Create a new topic workspace from a template and launch a Claude session in it — the way you grow the fleet. The workspace is scaffolded (.projectile, CLAUDE.md, and the statusLine that makes its context size readable) and the session is launched through the shared path every role uses. Pass template=\"arbitrary\" to start a session in an existing directory instead, giving that directory's absolute path as topic."

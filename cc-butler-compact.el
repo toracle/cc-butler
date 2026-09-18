@@ -87,14 +87,36 @@ See `cc-butler-compact--severity-for'."
   :type 'integer :group 'cc-butler)
 
 (defcustom cc-butler-compact-threshold-fraction 0.60
-  "Fraction of the model context window used for the INFORMATIONAL percentage
-shown alongside a session's context figure (`cc-butler-compact--display-pct',
-`cc-butler-compact--threshold-pct') — never for gating.
+  "Formerly the sole compaction gate, retired 2026-09-02 in favor of the
+absolute `cc-butler-compact-threshold' (see its docstring for why).
 
-Until 2026-09-02 this fraction was the sole compaction gate; the gate is
-now the absolute `cc-butler-compact-threshold' (see its docstring for
-why). This variable survives only to render a human-readable percentage
-next to the token figure; changing it affects no behavior."
+`cc-butler-compact--display-pct' does NOT use this fraction — it only
+ever echoes a session's own live statusline percentage, or nil (\"?\")
+when that is unknown (cc-butler#125: a percentage is never reconstructed
+from CTX against a guessed window). `cc-butler-compact--threshold-pct'
+still formats this into a whole-percent number, but nothing currently
+calls it. This variable is otherwise unused; changing it affects no
+behavior."
+  :type 'number :group 'cc-butler)
+
+(defcustom cc-butler-compact-idle-candidate-threshold 7200
+  "Seconds a session may sit idle before it becomes a compaction candidate
+on its own, even while under `cc-butler-compact-threshold' (the size
+gate). See `cc-butler-compact--idle-candidate-p'.
+
+REGRESSION-SHAPED GAP closed 2026-09-08 (butler, 정수님 배차): size was
+the SOLE gate — a session sitting at 270k never crosses 300k just by
+waiting, so it never got swept no matter how long it sat idle and
+uncompacted. Measured the same day: 12 waiting workers held ~2,489k
+tokens combined, every one of them already safely compactable (idle), and
+the automatic sweep caught zero of them because none had crossed the size
+threshold. A session only ever compacts on ONE of two conditions now:
+oversized, or idle this long.
+
+7200 (2h) is a starting guess (butler, 2026-09-08) — not a measurement of
+how long is actually \"too long\" to sit idle and uncompacted, the way
+`cc-butler-governance-max-note-bytes' at least has a measured distribution
+behind it. Adjust if it fires too eagerly or too rarely."
   :type 'number :group 'cc-butler)
 
 (defcustom cc-butler-compact-model "sonnet"
@@ -191,7 +213,10 @@ lists that Claude wrote; only the bottom of the screen is a live dialog."
   :type 'integer :group 'cc-butler)
 
 (defun cc-butler-compact--menu-p (screen)
-  "Non-nil when SCREEN shows an open numbered choice menu awaiting a key.
+  "Non-nil when SCREEN shows an open numbered choice menu awaiting a key,
+OR the folder-trust dialog in either shape (see the trailing OR-clause
+below) — both must hold the restore gate
+(`cc-butler-compact--restore-block-reason').
 
 Anchored on the selection marker sitting on a numbered option (`❯ 1.') plus
 at least one sibling option row — the same structural signature
@@ -203,8 +228,23 @@ has been burned three separate times by color-anchored terminal detection
 Requiring the marker is what keeps prose out.  Claude writes numbered lists
 constantly; none of them carry a selection caret.
 
-Used two ways: as a pre-flight refusal, and — after `/model' — as the
-signal that the prompt-cache confirmation is up and waiting for a choice."
+Claude Code v2.1.260 dropped the numbering from the trust dialog
+specifically (`cc-butler--trust-dialog-new-shape-p', cc-butler-session.el),
+so that shape cannot match the numbered-option signature above at all —
+this gate missing it is what let a restore type into an unanswered trust
+dialog (cc-butler#8 follow-up).  Rather than loosening the numbered regex
+(which would let plain indented prose start tripping this gate), the
+trailing `or' clause below reuses the trust dialog's own unique,
+already-load-bearing anchor instead: `cc-butler--trust-dialog-marker'
+(\"Quick safety check:\"), true of both dialog shapes.  Read via a soft
+(`boundp'-guarded) reference to cc-butler-session.el — the same
+cross-module pattern this file's sibling `cc-butler--live-screen-tail-lines'
+now uses in the other direction — since neither module `require's the
+other and neither is reliably loaded first.
+
+Used three ways: as a pre-flight refusal, as the signal — after `/model'
+— that the prompt-cache confirmation is up and waiting for a choice, and
+as one leg of the restore gate above."
   (let* ((all (split-string (or screen "") "\n"))
          (lines (last all (min (length all) cc-butler-compact-menu-lines)))
          (marked (concat "\\`" cc-butler--input-pad "*❯"
@@ -212,9 +252,12 @@ signal that the prompt-cache confirmation is up and waiting for a choice."
                          cc-butler--input-pad "*[^ \t ]"))
          (option (concat "\\`" cc-butler--input-pad "*[0-9]+\\."
                          cc-butler--input-pad "*[^ \t ]")))
-    (and (cl-some (lambda (l) (string-match-p marked l)) lines)
-         (cl-some (lambda (l) (string-match-p option l)) lines)
-         t)))
+    (or (and (cl-some (lambda (l) (string-match-p marked l)) lines)
+             (cl-some (lambda (l) (string-match-p option l)) lines)
+             t)
+        (and (boundp 'cc-butler--trust-dialog-marker)
+             (cl-some (lambda (l) (string-search cc-butler--trust-dialog-marker l)) lines)
+             t))))
 
 (defun cc-butler-compact--input-box-row (screen)
   "Return the raw input-box row drawn on SCREEN, or nil when no box is drawn.
@@ -524,6 +567,21 @@ read to be honest, so this reads the cached `cc-butler-cleanup-context-for'
 directly, same accessor `cc-butler-compact--severity-for' below uses."
   (let ((ctx (cc-butler-cleanup-context-for dir)))
     (and (integerp ctx) (>= ctx cc-butler-compact-threshold))))
+
+(defun cc-butler-compact--idle-candidate-p (dir)
+  "Non-nil when DIR qualifies as a compaction candidate purely by having sat
+idle at least `cc-butler-compact-idle-candidate-threshold' seconds —
+independent of `cc-butler-compact--over-threshold-p', the size gate. A
+session can be swept for EITHER reason; see `cc-butler-compact-candidates'.
+
+Requires a KNOWN last-activity time (`cc-butler--session-last-activity')
+and a KNOWN context size — same principle as the size gate: an unreadable
+statusline or a session with no transcript yet is \"cannot confirm\", not
+\"go ahead and compact it\"."
+  (let ((last (cc-butler--session-last-activity dir))
+        (ctx (cc-butler-cleanup-context-for dir)))
+    (and last (integerp ctx)
+         (>= (- (float-time) last) cc-butler-compact-idle-candidate-threshold))))
 
 (defun cc-butler-compact--severity-for (dir)
   "Visual escalation tier for DIR's current context, or nil.
@@ -1354,22 +1412,29 @@ any modal that is already up while it waits."
 ;;;; ------------------------------------------------------------------
 
 (defun cc-butler-compact-candidates ()
-  "Return dirs of sessions over the compaction threshold, largest first.
-Candidacy is `cc-butler-compact--over-threshold-p' (absolute-token gate);
-ordering is by context-token size so an interrupted sweep did the most
-important work first.  Includes the butler and the steward by design."
+  "Return dirs of sessions worth compacting now, largest first.
+A session qualifies on EITHER of two independent gates — oversized
+(`cc-butler-compact--over-threshold-p') or idle too long
+(`cc-butler-compact--idle-candidate-p', 2026-09-08): a session well under
+the size gate that has simply sat idle for hours was previously invisible
+to this sweep, since it never grows into the threshold just by waiting.
+Ordering is by context-token size so an interrupted sweep did the most
+important (biggest) work first regardless of which gate admitted it.
+Includes the butler and the steward by design."
   (let (out)
     (dolist (s (cc-butler--sessions))
       (let* ((dir (plist-get s :dir))
              (ctx (cc-butler-cleanup-context-for dir)))
-        (when (cc-butler-compact--over-threshold-p dir)
+        (when (or (cc-butler-compact--over-threshold-p dir)
+                  (cc-butler-compact--idle-candidate-p dir))
           (push (cons dir (or ctx 0)) out))))
     (mapcar #'car (sort out (lambda (a b) (> (cdr a) (cdr b)))))))
 
 ;;;###autoload
 (defun cc-butler-compact-large-sessions ()
-  "Compact every session at/above `cc-butler-compact-threshold' (absolute
-tokens; see `cc-butler-compact--over-threshold-p').
+  "Compact every session that is oversized OR idle too long — see
+`cc-butler-compact-candidates' for the two independent gates
+(`cc-butler-compact--over-threshold-p', `cc-butler-compact--idle-candidate-p').
 
 The butler and the steward are included — they are the long-lived sessions
 that grow without bound, and excluding them would leave the biggest context
@@ -1377,13 +1442,14 @@ in the fleet as the one nobody may touch.
 
 Each candidate is guarded independently, so a menu-blocked session or one
 with unsubmitted input is skipped with a reason rather than blocking the
-sweep.  Busy is NOT a reason to skip here: every dir in this sweep is
-already over the compaction threshold by construction
-(`cc-butler-compact-candidates'), so waiting for it to go idle does not
-make it safer — a session that never idles (an attention hook resetting
-its idle window every turn) simply never gets compacted and eventually
-dies of its own context size regardless.  Returns the list of dirs
-actually started."
+sweep.  Busy is NOT re-checked as a reason to skip here: an oversized
+candidate does not get safer by waiting for it to idle (an attention hook
+resetting its idle window every turn would then never get compacted at
+all), and an idle-candidate was, BY CONSTRUCTION, already confirmed idle
+moments ago when `cc-butler-compact-candidates' selected it — checking
+again here would only reopen the same narrow race every other guard below
+already accepts (menu state, pending input) between selection and send.
+Returns the list of dirs actually started."
   (interactive)
   (let (started skipped)
     (dolist (dir (cc-butler-compact-candidates))
@@ -1743,9 +1809,26 @@ The COMPACTION field is prefixed WARNING/CRITICAL (see
 `cc-butler-compact--severity-for') when a session is still over threshold
 and uncompacted at 400k/700k — a display escalation for a sweep that
 failed to catch it, layered on top of the base OVER THRESHOLD/blocked/ok
-text, never a second gate."
+text, never a second gate.
+
+CONTEXT gets a trailing `~' when `cc-butler-cleanup-context-fresh-p' says
+the cached figure was carried forward, not read this cycle (mirrors the
+same mark on MODEL) — e.g. an open dialog hides the statusline, as in the
+cc-butler#8 incident where a session read 314k/157%/OVER THRESHOLD for
+6.5 hours while a trust dialog blocked it, then 326k/33%/ok the moment it
+cleared. `cc-butler-compact--display-pct' already refuses to turn a stale
+CTX into a fabricated percentage (cc-butler#125: it is nil/\"?\" whenever
+the live statusline pct itself is unknown, never CTX divided by a guessed
+window). OVER THRESHOLD/severity, deliberately, are NOT suppressed just
+because CTX is stale — see `cc-butler-cleanup-context-for''s own
+no-flicker rationale: a session that was over threshold before a dialog
+covered its screen does not become an acceptable risk merely because we
+have not re-confirmed it yet. The `~' is what keeps that choice honest:
+the row still warns, but no longer lets a carried-forward number pass for
+a fresh one."
   (let* ((name (cc-butler--display-name dir))
          (ctx (cc-butler-cleanup-context-for dir))
+         (ctx-fresh (cc-butler-cleanup-context-fresh-p dir))
          (pct (cc-butler-compact--display-pct dir))
          (model (cc-butler-compact--model-for-status-line dir))
          (why (cc-butler-compact--blocked-reason dir))
@@ -1757,7 +1840,9 @@ text, never a second gate."
                      (t "ok"))))
     (format "%-36s %9s %6s  %-10s  %-13s  %s"
             name
-            (if (integerp ctx) (format "%.0fk" (/ ctx 1000.0)) "?")
+            (if (integerp ctx)
+                (format "%.0fk%s" (/ ctx 1000.0) (if ctx-fresh "" "~"))
+              "?")
             (if (integerp pct) (format "%d%%" pct) "?")
             (or model "?")
             (if (cc-butler--waiting-p dir) "WAITING" "running")
@@ -1775,7 +1860,7 @@ text, never a second gate."
         (concat "No live sessions.\n\n" monitor)
       (concat (format "%-36s %9s %6s  %-10s  %-13s  %s\n" "SESSION" "CONTEXT" "PCT" "MODEL" "STATE" "COMPACTION")
               (string-join rows "\n")
-              (format "\n\nThreshold: %dk tokens (`cc-butler-compact-threshold') — the compaction gate, an absolute figure since every fleet session currently runs the same context window. PCT is informational only (used-percentage of the assumed window, `cc-butler-compact-threshold-fraction'), never the gate. COMPACTION is prefixed WARNING/CRITICAL at %dk/%dk tokens when a session is still over threshold and uncompacted — a display escalation for a sweep that missed it, not a second gate. A context/PCT figure is what the session's statusline last reported, not a live measurement; \"?\" means it is not known there — never a computed-looking guess.\n%s"
+              (format "\n\nThreshold: %dk tokens (`cc-butler-compact-threshold') — the compaction gate, an absolute figure since every fleet session currently runs the same context window. PCT is informational only, the session's own live-reported percentage, never the gate and never reconstructed from a guessed window; \"?\" means it is not currently known, not a computed-looking guess. A CONTEXT figure with a trailing `~' is carried forward from a prior read, not confirmed this cycle (e.g. an open dialog is hiding the statusline) — OVER THRESHOLD/COMPACTION still fire on it, since a session that was over threshold does not become safe merely because it went unconfirmed; the `~' says only that the number, not the risk, is unconfirmed. COMPACTION is prefixed WARNING/CRITICAL at %dk/%dk tokens when a session is still over threshold and uncompacted — a display escalation for a sweep that missed it, not a second gate.\n%s"
                       (/ cc-butler-compact-threshold 1000)
                       (/ cc-butler-compact-warning-threshold 1000)
                       (/ cc-butler-compact-critical-threshold 1000)
@@ -1824,13 +1909,13 @@ waiting is the wrong answer when nothing is ever going to make it idle
                    '("session_status" "compact_session" "compact_large_sessions")))
          claude-code-ide-mcp-server-tools))
 
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-session-status
    :name "session_status"
    :description "Show every live session's CONTEXT SIZE alongside its model, whether it is waiting for input, and whether it can be compacted right now. Use this to decide what needs compacting — list_claude_sessions gives the model but not the context size, and scraping the terminal for it is unreliable. Includes the butler and steward, which are usually the largest."
    :args nil)
 
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-compact-session
    :name "compact_session"
    :description "Compact one session's context: switches it to a cheap model, answers the prompt-cache confirmation, runs /compact, and restores the original model. Driven entirely from elisp — do NOT try to type these commands into a session yourself; each step needs its own submission and the confirmation is a modal. You MAY target the butler, the steward, and YOURSELF: if the target is mid-turn the compaction is queued and starts by itself once that turn ends, so calling this on yourself works — queue it and finish your turn normally. It still refuses outright if a menu is open or someone has genuinely typed something into the input box, since waiting does not fix those. Pass force=true ONLY when an operator has explicitly said to compact this session right now, not for the routine case — it ignores busy and starts immediately instead of queuing, which matters for a session whose idle window keeps getting reset by something other than itself (e.g. a notification hook) and so would otherwise never idle."
@@ -1840,7 +1925,7 @@ waiting is the wrong answer when nothing is ever going to make it idle
                   :description "Ignore busy and start immediately, even mid-turn. Only for an operator's explicit \"do it now\" — every other guard (open menu, unsubmitted input, unrestorable model) still refuses outright."
                   :optional t)))
 
-  (claude-code-ide-make-tool
+  (cc-butler--make-guarded-tool
    :function #'cc-butler-tool-compact-large-sessions
    :name "compact_large_sessions"
    :description "Compact every session whose context is over the threshold, largest first — the routine fleet-wide sweep. The butler and steward are included by design; they are the sessions that grow without bound. Sessions that are busy or have something open are skipped with a reason rather than blocking the sweep."
