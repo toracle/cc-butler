@@ -2001,6 +2001,25 @@ and submitted, and also queued so it survives if typing was refused."
         (should (nth 2 (car sent)))
         (should (string-match-p "/butler/" (nth 1 (car sent))))))))
 
+(ert-deftest cc-butler-compact/monitor-report-survives-a-simulated-restart ()
+  "A fleet-monitor report must go through `cc-butler--inbox-push', not a raw
+push onto `cc-butler--inbox' -- otherwise it bypasses the inbox-queue
+persistence advice entirely and is silently lost on an Emacs restart, same
+as any other undrained event.  Simulate the restart the same way the
+session-test suite does: wipe the in-memory queue and reload from disk."
+  (cc-butler-compact-test--with-fleet '(("/butler/" . 514000))
+    (let ((cc-butler-inbox-queue-file
+           (make-temp-file "cc-butler-compact-inbox-queue-test-" nil ".eld")))
+      (unwind-protect
+          (progn
+            (cc-butler-compact--monitor-scan)
+            (should cc-butler--inbox)
+            (setq cc-butler--inbox nil)
+            (cc-butler--inbox-queue-load)
+            (should (= 1 (length cc-butler--inbox)))
+            (should (string-match-p "/butler/" (plist-get (car cc-butler--inbox) :body))))
+        (delete-file cc-butler-inbox-queue-file)))))
+
 (ert-deftest cc-butler-compact/monitor-report-carries-the-remedies ()
   "A report that says only \"this is too big\" leaves the reader to remember
 what may be done — including that a FINISHED worker should be closed rather
