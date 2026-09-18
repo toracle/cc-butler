@@ -642,6 +642,57 @@ LOUDLY rather than silently falling back to insertion order."
                       (cons nil "git log returned nothing usable")
                     (cons map nil))))))))))))
 
+(defun cc-butler-governance--band-order (slugs recency-map citation-map &optional now)
+  "Two-band ordering of SLUGS for MEMORY.md's index.
+
+RECENCY-MAP is `cc-butler-governance--commit-recency-map''s MAP (store
+filename -> unix-epoch of its latest commit); CITATION-MAP is
+`cc-butler-governance--citation-count-map''s MAP (bare slug -> inbound
+`[[wikilink]]' count across the vault). NOW defaults to the real current
+time (a unix-epoch integer) -- overridable only so a test can pin \"now\"
+without waiting on the clock.
+
+Band A: every slug whose latest commit is within
+`cc-butler-governance-band-a-days' of NOW, grouped by that commit's exact
+timestamp (every file one commit touches shares its timestamp verbatim, the
+proxy this uses for \"the same commit\") and capped at
+`cc-butler-governance-band-a-commit-cap' (K) members per group -- an
+oversized group keeps only its top-K by CITATION-MAP, the rest fall through
+to Band B. This cap is the ONLY thing standing between Band A and a single
+bulk mechanical commit swallowing it whole. The groups (and ties within one)
+are then ordered by commit recency descending, most-recently-committed
+first -- the same \"still being revised = still alive\" intuition the
+straight recency sort had, just no longer swampable by one bulk commit.
+
+Band B: everything else -- not committed inside the window, or a bulk-commit
+member the cap dropped -- ordered by CITATION-MAP descending, ties broken by
+slug (deterministic).
+
+A slug with no commit history never qualifies for Band A; a slug with no
+citations sorts as citation 0 in Band B. Neither ever errors."
+  (let* ((now (or now (floor (float-time))))
+         (window (* cc-butler-governance-band-a-days 86400))
+         (cite (lambda (slug) (or (gethash slug citation-map) 0)))
+         (groups (make-hash-table :test 'eql)))
+    (dolist (slug slugs)
+      (let ((ts (gethash (concat slug ".md") recency-map)))
+        (when (and ts (<= (- now ts) window))
+          (puthash ts (cons slug (gethash ts groups)) groups))))
+    (let (band-a (in-band-a (make-hash-table :test 'equal)))
+      (dolist (ts (sort (hash-table-keys groups) #'>))
+        (let* ((ranked (sort (copy-sequence (gethash ts groups))
+                              (lambda (a b) (> (funcall cite a) (funcall cite b)))))
+               (kept (seq-take ranked cc-butler-governance-band-a-commit-cap)))
+          (dolist (slug kept)
+            (push slug band-a)
+            (puthash slug t in-band-a))))
+      (setq band-a (nreverse band-a))
+      (let ((band-b (sort (seq-remove (lambda (s) (gethash s in-band-a)) slugs)
+                           (lambda (a b)
+                             (let ((ca (funcall cite a)) (cb (funcall cite b)))
+                               (if (= ca cb) (string< a b) (> ca cb)))))))
+        (append band-a band-b)))))
+
 (defun cc-butler-governance--rewrite-sorted-index (slugs recency-map)
   "Rewrite `MEMORY.md's block of this store's own generated lines (see
 `cc-butler-governance--index-line-regexp') so SLUGS appear as one

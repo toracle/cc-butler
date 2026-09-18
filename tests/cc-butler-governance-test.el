@@ -2306,6 +2306,88 @@ stamp.  It must be kept, not silently treated as a duplicate to strip."
 ;;;; (everything else, by inbound-citation count) is the fix.
 ;;;; ------------------------------------------------------------------
 
+;;;; --- cc-butler-governance--band-order: pure-function unit tests ---
+
+(ert-deftest cc-butler-governance/band-order-caps-a-single-commit-timestamp ()
+  "A commit touching more than K notes (K = `cc-butler-governance-band-a-commit-cap')
+contributes only its top-K, by citation count, to Band A -- the rest fall to
+Band B. This cap is the ONLY thing stopping one bulk commit from swallowing
+Band A whole."
+  (let* ((cc-butler-governance-band-a-commit-cap 2)
+         (cc-butler-governance-band-a-days 7)
+         (now 1000000)
+         (recency (make-hash-table :test 'equal))
+         (citation (make-hash-table :test 'equal)))
+    ;; four notes share ONE commit timestamp -- a stand-in bulk commit
+    (dolist (s '("bulk-1" "bulk-2" "bulk-3" "bulk-4"))
+      (puthash (concat s ".md") (- now 100) recency))
+    ;; a fifth note has its own, slightly older but still-recent commit
+    (puthash "solo.md" (- now 200) recency)
+    (puthash "bulk-2" 50 citation)   ; highest-cited bulk member
+    (puthash "bulk-4" 30 citation)   ; second highest
+    (puthash "bulk-1" 5 citation)
+    (puthash "bulk-3" 1 citation)
+    (let ((ordered (cc-butler-governance--band-order
+                    '("bulk-1" "bulk-2" "bulk-3" "bulk-4" "solo")
+                    recency citation now)))
+      ;; only the top-2 by citation from the bulk commit reach Band A, ahead
+      ;; of `solo' (an older, but still within-window, commit)
+      (should (equal (seq-take ordered 3) '("bulk-2" "bulk-4" "solo")))
+      ;; the rest of the bulk commit falls through to Band B, in the tail
+      (should (equal (last ordered 2) '("bulk-1" "bulk-3"))))))
+
+(ert-deftest cc-butler-governance/band-order-old-commit-falls-to-band-b ()
+  "A commit older than `cc-butler-governance-band-a-days' does not qualify for
+Band A no matter how heavily cited -- it is ordered into Band B like
+everything else outside the window, behind anything genuinely recent."
+  (let* ((cc-butler-governance-band-a-days 7)
+         (cc-butler-governance-band-a-commit-cap 5)
+         (now 1000000)
+         (recency (make-hash-table :test 'equal))
+         (citation (make-hash-table :test 'equal)))
+    (puthash "fresh.md" (- now 3600) recency)          ; 1 hour ago
+    (puthash "stale.md" (- now (* 8 86400)) recency)    ; 8 days ago -- outside
+    (puthash "stale" 100 citation)                      ; very cited, still too old
+    (puthash "fresh" 1 citation)
+    (should (equal (cc-butler-governance--band-order '("fresh" "stale") recency citation now)
+                   '("fresh" "stale")))))
+
+(ert-deftest cc-butler-governance/band-order-window-boundary-is-inclusive ()
+  "Exactly `cc-butler-governance-band-a-days' days ago still qualifies for
+Band A -- the window comparison is <=, not <."
+  (let* ((cc-butler-governance-band-a-days 7)
+         (cc-butler-governance-band-a-commit-cap 5)
+         (now 1000000)
+         (recency (make-hash-table :test 'equal))
+         (citation (make-hash-table :test 'equal)))
+    (puthash "edge.md" (- now (* 7 86400)) recency)
+    (should (equal (car (cc-butler-governance--band-order '("other" "edge") recency citation now))
+                   "edge"))))
+
+(ert-deftest cc-butler-governance/band-order-band-b-by-citation-then-slug ()
+  "Band B (no qualifying recent commit) is ordered by citation count
+descending; equal counts break by slug so the order is deterministic run to
+run, not an accident of hash-table iteration order."
+  (let* ((cc-butler-governance-band-a-days 7)
+         (now 1000000)
+         (recency (make-hash-table :test 'equal))
+         (citation (make-hash-table :test 'equal)))
+    (puthash "b" 5 citation)
+    (puthash "a" 5 citation)
+    (puthash "c" 9 citation)
+    (should (equal (cc-butler-governance--band-order '("a" "b" "c") recency citation now)
+                   '("c" "a" "b")))))
+
+(ert-deftest cc-butler-governance/band-order-slug-with-no-data-never-errors ()
+  "A slug absent from both maps (no git history, no citations) still sorts
+in -- as the least-favored Band B member -- rather than signalling an error."
+  (let ((recency (make-hash-table :test 'equal))
+        (citation (make-hash-table :test 'equal)))
+    (should (equal (cc-butler-governance--band-order '("nobody-knows-this-one") recency citation 1000000)
+                   '("nobody-knows-this-one")))))
+
+;;;; --- cc-butler-governance--citation-count-map ---
+
 (ert-deftest cc-butler-governance/citation-count-map-counts-across-the-vault ()
   "One recursive grep over the vault, counted per exact `[[wikilink]]' target
 text -- `[[a]]' and `[[a|display text]]' both count toward `a'; a distinct
