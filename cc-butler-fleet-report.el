@@ -512,7 +512,7 @@ today's own new snapshot file."
                 (plist-get (claude-code-ide--normalize-tool-spec spec) :name)))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-fleet-utilization-report
  :name "fleet_utilization_report"
  :description "Generate today's fleet-utilization report (design-fleet-utilization-2026-09-08.md): North Star goal counts (from the org file's own :STATUS: active / :OWNER: / :DOD: properties, never self-reported), live worker fleet-status counts (butler/steward excluded), a machine diff against the most recent prior daily snapshot, and two fixed caveat paragraphs that never disappear. Writes today's own snapshot as a side effect (tomorrow's diff needs it) but never writes the North Star file or any prior snapshot. The one number this tool cannot compute itself is \"오늘 실제로 전진한 것\" (goals that actually progressed by DoD observation today, not by label) -- supply it yourself after checking the North Star file, or omit it to render 0."
