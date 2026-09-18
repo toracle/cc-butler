@@ -272,12 +272,34 @@ exactly the events text, with no stray separators."
       "- [12:00] worker-a: done: PR #42" nil
     (should (equal "- [12:00] worker-a: done: PR #42" (cc-butler--pending-events-hook-payload)))))
 
+(ert-deftest cc-butler-orchestrator/pending-events-drain-persists-the-empty-queue ()
+  "The REAL drain must rewrite the on-disk queue empty, else a drained event
+reappears (and is redelivered) after an Emacs restart."
+  (let* ((cc-butler-inbox-queue-file (make-temp-file "cc-butler-orch-iq-" nil ".eld"))
+         (cc-butler-message-transport 'in-memory)
+         (cc-butler--butler "/ops/")
+         (cc-butler--steward nil)
+         (cc-butler--inbox-drained nil)
+         (cc-butler--inbox nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'cc-butler--inbox-urgent-block) (lambda (_a) nil))
+                  ((symbol-function 'cc-butler--fleet-dialog-summary) (lambda () nil))
+                  ((symbol-function 'cc-butler-compact-fleet-summary) (lambda () nil))
+                  ((symbol-function 'cc-butler--compact-monitor-watchdog-check) (lambda () nil)))
+          (cc-butler--inbox-push "/worker/" "to be drained")
+          (cc-butler--pending-events-hook-payload)
+          (setq cc-butler--inbox nil)
+          (cc-butler--inbox-queue-load)
+          (should-not cc-butler--inbox))
+      (ignore-errors (delete-file cc-butler-inbox-queue-file)))))
+
 (ert-deftest cc-butler-orchestrator/pending-events-payload-drains-inbox-only-after-slow-steps ()
   "The destructive drain must run LAST, after the slow fleet-wide checks —
 otherwise a caller-side hook timeout during the slow dialog scan strands
 an already-cleared, undelivered report. Proven structurally: the slow
 step must observe the inbox still populated when it runs."
-  (let ((cc-butler-message-transport 'in-memory)
+  (let ((cc-butler-inbox-queue-file (make-temp-file "cc-butler-orch-iq-" nil ".eld"))
+        (cc-butler-message-transport 'in-memory)
         (cc-butler--butler "/ops/")
         (cc-butler--steward nil)
         (cc-butler--inbox-drained nil)
@@ -881,6 +903,114 @@ do not know what the screen says."
       (let ((out (cc-butler-tool-read-session "s")))
         (should-not (equal out "(no output)"))
         (should (string-match-p "refresh\\|stale\\|could not" out))))))
+;;;; accept_trust_dialog tool: dispatch on the core function's result, never
+;;;; the screen itself -- these stub `cc-butler--accept-trust-dialog' directly
+;;;; since its own screen-reading logic already has dedicated coverage above.
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-no-session-named ()
+  "Unknown session name: refuses with a specific message, and never even
+calls `cc-butler--accept-trust-dialog'."
+  (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) nil))
+            ((symbol-function 'cc-butler--accept-trust-dialog)
+             (lambda (_d) (error "must not be called"))))
+    (should (string-match-p "No session named" (cc-butler-tool-accept-trust-dialog "ghost")))))
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-reports-accepted ()
+  (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+            ((symbol-function 'cc-butler--accept-trust-dialog) (lambda (_d) 'accepted)))
+    (should (string-match-p "accepted" (cc-butler-tool-accept-trust-dialog "s")))))
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-reports-no-dialog-refused ()
+  (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+            ((symbol-function 'cc-butler--accept-trust-dialog) (lambda (_d) 'no-dialog)))
+    (let ((out (cc-butler-tool-accept-trust-dialog "s")))
+      (should (string-match-p "No trust dialog" out))
+      (should (string-match-p "refused" out)))))
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-reports-still-showing ()
+  (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+            ((symbol-function 'cc-butler--accept-trust-dialog) (lambda (_d) 'still-showing)))
+    (should (string-match-p "still on screen" (cc-butler-tool-accept-trust-dialog "s")))))
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-surfaces-errors ()
+  "An error from the core function must reach the caller as a readable,
+fact-based message — not an uncaught elisp error, and not the raw error
+text verbatim (that text can embed a whole terminal buffer for other
+error paths; see the sentinel tests below). An unclassified error still
+names the session and says \"other\"."
+  (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+            ((symbol-function 'claude-code-ide--get-buffer-name) (lambda (_d) " *cc-butler-orch-test-boom-nonexistent*"))
+            ((symbol-function 'cc-butler--accept-trust-dialog) (lambda (_d) (error "boom"))))
+    (let ((out (cc-butler-tool-accept-trust-dialog "s")))
+      (should-not (string-match-p "boom" out))
+      (should (string-match-p "\\bs\\b" out))
+      (should (string-match-p "other" out)))))
+
+;; The MCP tool's return value lands in the CALLING session's own transcript
+;; on disk — the two error paths inside `cc-butler--accept-trust-dialog-new-shape'
+;; embed the WHOLE terminal buffer in their (LOCAL-only) error message, so the
+;; tool's returned text must carry facts about that buffer, never the buffer
+;; itself. Each fixture below plants a sentinel string nowhere but in the raw
+;; buffer text, drives a real (unmocked) error path through the actual
+;; predicates, and asserts the sentinel never reaches the tool's return value
+;; while the facts (session name, which step failed) do.
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-never-leaks-buffer-text-on-settle-timeout ()
+  (let ((term-buf (get-buffer-create " *cc-butler-orch-test-sentinel-timeout*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (insert "SENTINEL-DO-NOT-LEAK-7f3a\n")
+            (cc-butler-session-test--insert-trust-dialog-new-shape))
+          (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+                    ((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down) (lambda (&optional _buf) nil))
+                    ((symbol-function 'claude-code-ide--terminal-send-return) (lambda () nil))
+                    (cc-butler-trust-dialog-settle-timeout 0.2))
+            (let ((out (cc-butler-tool-accept-trust-dialog "acceptor-session")))
+              (should-not (string-match-p "SENTINEL-DO-NOT-LEAK" out))
+              (should (string-match-p "acceptor-session" out))
+              (should (string-match-p "settle timeout" out)))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-never-leaks-buffer-text-on-unrecognized-shape ()
+  "The marker-present-but-unrecognized-shape branch is unreachable through
+this handle's own outer gating in ordinary operation (it only delegates to
+the new-shape acceptor once the exact new shape is already confirmed) —
+but the screen can still change between that outer check and the
+acceptor's own re-check, so this models exactly that race: the outer
+check sees the new shape, the acceptor's re-check does not."
+  (let ((term-buf (get-buffer-create " *cc-butler-orch-test-sentinel-unrecognized*"))
+        (calls 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (insert (make-string 24 cc-butler--border-rule-char) "\n")
+            (insert " SENTINEL-DO-NOT-LEAK-7f3a\n")
+            (insert " Quick safety check: some future, unrecognized shape\n\n")
+            (insert "❯ Something else entirely\n   Yes, I trust this folder\n"))
+          (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+                    ((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--trust-dialog-new-shape-p)
+                     (lambda (_buf) (cl-incf calls) (= calls 1))))
+            (let ((out (cc-butler-tool-accept-trust-dialog "acceptor-session")))
+              (should-not (string-match-p "SENTINEL-DO-NOT-LEAK" out))
+              (should (string-match-p "acceptor-session" out))
+              (should (string-match-p "shape unrecognized" out)))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-orchestrator/accept-trust-dialog-tool-facts-on-no-live-buffer ()
+  (cl-letf (((symbol-function 'cc-butler--dir-by-name) (lambda (_n) "/d/"))
+            ((symbol-function 'claude-code-ide--get-buffer-name)
+             (lambda (_d) " *cc-butler-orch-test-sentinel-nonexistent*")))
+    (let ((out (cc-butler-tool-accept-trust-dialog "acceptor-session")))
+      (should (string-match-p "acceptor-session" out))
+      (should (string-match-p "no live terminal buffer" out)))))
+
 ;;;; Attribution: the code says who is speaking, not the model
 ;;;; ------------------------------------------------------------------
 
@@ -1728,6 +1858,21 @@ that ambiguity, it does not resolve it)."
       (should (= 1 (length sent)))
       (should (string-match-p "no progress" (car sent))))
     (should (null (gethash "/worker/" cc-butler--forward-deferred)))))
+
+(ert-deftest cc-butler-orchestrator/forward-butler-idle-never-escalates ()
+  "The butler waiting on the human is the healthy resting state, not a
+stall — a static butler must never escalate to `--forward-wake', no
+matter how long it stays static past the window (regression guard for
+the empty-wake-every-5-minutes loop, 2026-09-12)."
+  (cc-butler-orchestrator-test--with-forward-fixture
+    (let ((cc-butler--butler "/worker/"))
+      (puthash "/ops/" (- (float-time) 120) activity)
+      (puthash "/worker/" (- (float-time) 3600) activity) ; static long past the window
+      (cc-butler--forward-to-ops
+       (cc-butler-orchestrator-test--event "Claude is waiting for your input"))
+      (cc-butler--forward-defer-check "/ops/" "/worker/")
+      (should (null (cc-butler-orchestrator-test--recorded-writes)))
+      (should (null (gethash "/worker/" cc-butler--forward-deferred))))))
 
 (ert-deftest cc-butler-orchestrator/forward-backstop-pushes-once-per-interval ()
   "Given undrained events and a free ops session, the backstop fires ONE

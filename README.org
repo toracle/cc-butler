@@ -119,7 +119,7 @@ manager is needed. Make sure MELPA is registered (for ~hydra~):
 
 ;; 2. then cc-butler
 (use-package cc-butler
-  :vc (:url "https://github.com/toracle/cc-butler" :rev :newest)
+  :vc (:url "git@github.com:toracle/cc-butler.git" :rev :newest)
   :after claude-code-ide)
 #+end_src
 
@@ -134,7 +134,7 @@ once), then configure with plain ~use-package~:
 (unless (package-installed-p 'claude-code-ide)
   (package-vc-install "https://github.com/manzaltu/claude-code-ide.el"))
 (unless (package-installed-p 'cc-butler)
-  (package-vc-install "https://github.com/toracle/cc-butler"))
+  (package-vc-install "git@github.com:toracle/cc-butler.git"))
 
 (use-package cc-butler
   :after claude-code-ide)

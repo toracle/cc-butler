@@ -9,6 +9,122 @@
 (require 'ert)
 (require 'cc-butler)
 
+;;;; ------------------------------------------------------------------
+;;;; MCP tool error guard: every registration goes through one wrapper
+;;;; ------------------------------------------------------------------
+;;;; claude-code-ide's own generic dispatcher (external, pinned package)
+;;;; returns an escaping error's FULL, UNBOUNDED message verbatim to the
+;;;; calling session's transcript. `cc-butler--mcp-tool-guard' /
+;;;; `cc-butler--make-guarded-tool' close that: every cc-butler tool
+;;;; registration must route :function through the guard.
+
+(ert-deftest cc-butler-mcp-tool-guard/user-error-passes-through-unchanged ()
+  "A `user-error' is text authored for the human/caller (e.g.
+`record_principle''s duplicate-candidate guidance) -- returned verbatim,
+never truncated or re-wrapped."
+  (let* ((fn (lambda () (user-error "Duplicate candidate: pick one of foo, bar")))
+         (guarded (cc-butler--mcp-tool-guard "some_tool" fn)))
+    (should (equal (funcall guarded)
+                   "Duplicate candidate: pick one of foo, bar"))))
+
+(ert-deftest cc-butler-mcp-tool-guard/ordinary-error-is-bounded-name-symbol-first-line-only ()
+  "A plain `error' returns only the tool NAME, the error SYMBOL, and the
+FIRST LINE of the message, truncated to ~200 chars -- never later lines,
+never the whole thing."
+  (let* ((fn (lambda () (error "first line only\nsecond line must never appear\nthird line either")))
+         (guarded (cc-butler--mcp-tool-guard "some_tool" fn))
+         (out (funcall guarded)))
+    (should (string-match-p "some_tool" out))
+    (should (string-match-p "error" out))
+    (should (string-match-p "first line only" out))
+    (should-not (string-match-p "second line" out))
+    (should-not (string-match-p "third line" out))))
+
+(ert-deftest cc-butler-mcp-tool-guard/sentinel-on-a-later-line-never-escapes-the-return-value ()
+  "SENTINEL test: a fixture error whose SECOND line carries a unique marker
+\(simulating the real leak class -- a terminal-buffer dump appended after
+a safe first line, e.g. `cc-butler--accept-trust-dialog-new-shape''s
+settle-timeout error). The sentinel must be absent from the guarded
+return; the first line must be present. The FULL error (sentinel
+included) still reaches *Messages* via `message' -- logged locally only."
+  (let* ((sentinel "SENTINEL-DO-NOT-LEAK-9c1e")
+         (fn (lambda ()
+               (error "settle timeout: highlight did not move\nScreen:\n%s and more terminal text"
+                      sentinel)))
+         (guarded (cc-butler--mcp-tool-guard "new_topic" fn))
+         (messages nil))
+    (cl-letf (((symbol-function 'message)
+               (lambda (fmt &rest args) (push (apply #'format fmt args) messages))))
+      (let ((out (funcall guarded)))
+        (should-not (string-match-p sentinel out))
+        (should (string-match-p "settle timeout: highlight did not move" out))
+        (should (string-match-p "new_topic" out))
+        ;; The full error, sentinel included, DOES reach *Messages* (local only).
+        (should (seq-some (lambda (m) (string-match-p sentinel m)) messages))))))
+
+(ert-deftest cc-butler-mcp-tool-guard/first-line-truncated-to-roughly-200-chars ()
+  (let* ((long-first-line (make-string 400 ?x))
+         (fn (lambda () (error "%s" long-first-line)))
+         (guarded (cc-butler--mcp-tool-guard "some_tool" fn))
+         (out (funcall guarded)))
+    (should (< (length out) 250))
+    (should-not (string-match-p (regexp-quote long-first-line) out))))
+
+(ert-deftest cc-butler-mcp-tool-guard/quit-still-propagates-uncaught ()
+  "`quit' (C-g) is not an `error' -- claude-code-ide's own generic handler
+already turns it into \"Operation cancelled by user\"; the guard must not
+intercept it or that behavior silently changes."
+  (let* ((fn (lambda () (signal 'quit nil)))
+         (guarded (cc-butler--mcp-tool-guard "some_tool" fn)))
+    (should-error (funcall guarded) :type 'quit)))
+
+(ert-deftest cc-butler-mcp-tool-guard/success-path-is-untouched ()
+  (let* ((fn (lambda (a b) (+ a b)))
+         (guarded (cc-butler--mcp-tool-guard "some_tool" fn)))
+    (should (= 5 (funcall guarded 2 3)))))
+
+(ert-deftest cc-butler-mcp-tool-guard/new-topic-registration-is-wrapped-and-sentinel-safe ()
+  "The REAL, production `new_topic' registration -- not a generic
+mechanism test. Stubs `cc-butler-create-topic' (the one thing
+`cc-butler-tool-new-topic' itself calls) to raise the exact shape of
+error the real launch chain can produce: a safe first line, then a
+terminal-buffer dump on later lines carrying a sentinel. Looks the tool
+up from the LIVE registry (`claude-code-ide-mcp-server-tools') and calls
+its actual registered :function, proving the production registration --
+not just the mechanism in isolation -- is guarded."
+  (let* ((spec (seq-find (lambda (s)
+                           (equal (plist-get (claude-code-ide--normalize-tool-spec s) :name)
+                                  "new_topic"))
+                         (bound-and-true-p claude-code-ide-mcp-server-tools)))
+         (sentinel "SENTINEL-DO-NOT-LEAK-9c1e"))
+    (should spec)
+    (let* ((norm (claude-code-ide--normalize-tool-spec spec))
+           (fn (plist-get norm :function)))
+      (should-not (eq fn #'cc-butler-tool-new-topic))
+      (cl-letf (((symbol-function 'cc-butler-create-topic)
+                 (lambda (&rest _)
+                   (error "sent Down but highlight did not move within 3.0s -- Return NOT sent. Screen:\n%s and more terminal text"
+                          sentinel))))
+        (let ((out (funcall fn "template" "topic")))
+          (should-not (string-match-p sentinel out))
+          (should (string-match-p "sent Down but highlight did not move" out))
+          (should (string-match-p "new_topic" out)))))))
+
+(ert-deftest cc-butler-mcp-tool-guard/every-registration-in-the-repo-goes-through-the-wrapper ()
+  "REGRESSION GUARD: every `claude-code-ide-make-tool' CALL in this repo's
+root .el files must be `cc-butler--make-guarded-tool' instead --
+literally zero direct calls anywhere. A new tool registration that skips
+the wrapper (copy-pasted from claude-code-ide's own docs, say) fails
+here, not silently in production."
+  (let (hits)
+    (dolist (f (directory-files cc-butler--dir t "\\`[^.].*\\.el\\'"))
+      (with-temp-buffer
+        (insert-file-contents f)
+        (goto-char (point-min))
+        (while (search-forward "(claude-code-ide-make-tool" nil t)
+          (push (format "%s:%d" (file-name-nondirectory f) (line-number-at-pos)) hits))))
+    (should (equal hits nil))))
+
 (ert-deftest cc-butler-session/configure-installs-refit-hook ()
   "The single session-config path installs a BUFFER-LOCAL window-refit hook, so
 any layout change (windmove / C-x o) re-fits the PTY to the largest window (no
@@ -281,7 +397,7 @@ onto \"Yes, I trust this folder\" (the post-Down state, also captured
 live); otherwise the as-rendered default (\"No, exit\" highlighted)."
   (insert (make-string 24 cc-butler--border-rule-char) "\n")
   (insert " Accessing workspace:\n\n")
-  (insert " /Users/jeongsoopark/projects/monocle-wiki-engine-sdd\n\n")
+  (insert " /home/user/projects/example-project\n\n")
   (insert " Quick safety check: Is this a project you created or one you trust? (Like your own code, a\n")
   (insert " well-known open source project, or work from your team). If not, take a moment to review what's in\n")
   (insert " this folder first.\n\n")
@@ -369,6 +485,95 @@ folder-trust screen in its as-rendered (\"No, exit\" highlighted) state."
           (with-current-buffer buf (cc-butler-session-test--insert-trust-dialog-new-shape))
           (should (cc-butler--trust-dialog-new-shape-p buf))
           (should-not (cc-butler--trust-dialog-new-shape-yes-selected-p buf)))
+      (kill-buffer buf))))
+
+(defun cc-butler-session-test--insert-trust-dialog-new-shape-full-height ()
+  "Insert the v2.1.260+ folder-trust screen exactly as it renders on a
+FRESH ghostel session with nothing else on screen yet — verbatim capture
+(`get_buffer_content', 2026-09-11, `example-topic'
+after `new_topic'): 39 total lines, dialog content in lines 1-19, then 20
+blank lines padding down to the full terminal height. Regression fixture
+for the bug this padding caused: the trust marker (line 8) sat above the
+naive last-`cc-butler--live-screen-tail-lines'-lines window, which counted
+back from the literal end of this blank padding rather than from the
+dialog content — `cc-butler--wait-for-session-ready' /
+`cc-butler--accept-trust-dialog-new-shape' silently never fired and the
+launch sat stuck on \"No, exit\" forever."
+  (insert (make-string 24 cc-butler--border-rule-char) "\n")
+  (insert " Accessing workspace:\n\n")
+  (insert " /home/user/projects/example-project\n\n")
+  (insert " Quick safety check: Is this a project you created or one you trust? (Like your\n")
+  (insert " own code, a well-known open source project, or work from your team). If not,\n")
+  (insert " take a moment to review what's in this folder first.\n\n")
+  (insert " Claude Code'll be able to read, edit, and execute files here.\n\n")
+  (insert " Security guide\n\n")
+  (insert "❯ No, exit\n")
+  (insert "  Yes, I trust this folder\n\n")
+  (insert " Enter to confirm · Esc to cancel\n")
+  (dotimes (_ 20) (insert "\n")))
+
+(ert-deftest cc-butler-session/trust-dialog-new-shape-p-detects-real-screen-with-blank-padding-below ()
+  "Regression for the 2026-09-11 `new_topic' launch hang: the real screen
+pads with blank rows below the dialog to fill the terminal height, and
+detection must still fire — not just on the unpadded fixture above."
+  (let ((buf (get-buffer-create " *cc-butler-test-trust-new-padded*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (cc-butler-session-test--insert-trust-dialog-new-shape-full-height))
+          (should (cc-butler--trust-dialog-marker-present-p buf))
+          (should (cc-butler--trust-dialog-new-shape-p buf))
+          (should-not (cc-butler--trust-dialog-new-shape-yes-selected-p buf)))
+      (kill-buffer buf))))
+
+(defun cc-butler-session-test--insert-quoted-dialog-then-live-bottom-with-blank-padding ()
+  "Insert a screen combining both known scrollback shapes at once: the
+trust dialog QUOTED earlier in conversation (as in
+`cc-butler-session-test--insert-quoted-dialog-in-conversation'), then a
+REAL non-blank live bottom — ordinary prompt/status rows, the way a
+session actually looks mid-turn — and only THEN trailing blank padding
+underneath that, the way a freshly-rendered terminal pads down to its
+full height. The existing quoted-dialog fixture never has blank padding
+below its live bottom, and the padded-fixture above never has a quoted
+dialog above its live bottom — this combines both, since the fix skips
+trailing blank/whitespace before counting the tail window back, and must
+land on the real prompt/status rows, not skip far enough to expose the
+quoted dialog above them."
+  (insert " [스튜어드] 🔴 정정 — 내 배차문에 결함이 있었다.\n\n")
+  (insert "**실측 원문** (2026-09-05, `example-topic` 세션):\n")
+  (insert "```\n")
+  (insert " Quick safety check: Is this a project you created or one you trust? (Like your own code, a\n")
+  (insert " well-known open source project, or work from your team). If not, take a moment to review what's in\n")
+  (insert " this folder first.\n\n")
+  (insert " Claude Code'll be able to read, edit, and execute files here.\n\n")
+  (insert " Security guide\n\n")
+  (insert " ❯ No, exit\n")
+  (insert "   Yes, I trust this folder\n\n")
+  (insert " Enter to confirm · Esc to cancel\n")
+  (insert "```\n")
+  (insert "이대로 두면 세션을 죽인다.\n\n")
+  ;; Real, non-blank live bottom — status/prompt rows, not filler dots.
+  (dotimes (_ (cc-butler--live-screen-tail-lines))
+    (insert "cc-butler> ready\n"))
+  (insert (make-string 24 cc-butler--border-rule-char) "\n")
+  (insert "❯ \n")
+  (insert (make-string 24 cc-butler--border-rule-char) "\n")
+  ;; Then blank padding under that real bottom, filling out the terminal
+  ;; height the way a fresh render does.
+  (dotimes (_ 10) (insert "\n")))
+
+(ert-deftest cc-butler-session/trust-dialog-showing-p-nil-on-quoted-dialog-with-real-bottom-and-blank-padding-below ()
+  "Regression for the tail-window fix: a quoted dialog in scrollback, a
+real non-blank live bottom below it, and trailing blank padding below
+THAT must still resolve to the real bottom, not skip past it back into
+the quote. All three detectors must stay nil."
+  (let ((buf (get-buffer-create " *cc-butler-test-trust-quoted-then-blank-padding*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (cc-butler-session-test--insert-quoted-dialog-then-live-bottom-with-blank-padding))
+          (should-not (cc-butler--trust-dialog-marker-present-p buf))
+          (should-not (cc-butler--trust-dialog-new-shape-p buf))
+          (should-not (cc-butler--trust-dialog-showing-p buf)))
       (kill-buffer buf))))
 
 (ert-deftest cc-butler-session/trust-dialog-new-shape-p-nil-on-mcp-classifier-lookalike ()
@@ -664,6 +869,225 @@ than erroring."
             (should-not (cc-butler--accept-trust-dialog-new-shape "/worker/"))))
       (kill-buffer buf))))
 
+;;;; ---- accept-trust-dialog handle (safe, checked-live-screen) ---------
+;;;; The callable "press the trust dialog" handle: `cc-butler--accept-trust-dialog'.
+;;;; Unlike `cc-butler--accept-trust-dialog-new-shape' above (new shape only,
+;;;; called from the automatic launch-time gate), this handles BOTH known
+;;;; shapes and is meant for a remote caller (the `accept_trust_dialog' MCP
+;;;; tool) to unstick a session the automatic gate missed. The whole point is
+;;;; safety: it must act only when a dialog is actually showing, and refuse
+;;;; otherwise -- these tests prove the refusal path sends zero keys, not just
+;;;; that the accept path works.
+
+(ert-deftest cc-butler-session/accept-trust-dialog-old-shape-accepts-with-one-return ()
+  "Old-shape dialog (`❯ 1. Yes, I trust this folder' pre-highlighted):
+a single Return accepts it, and the result is `accepted' once a fresh
+re-read confirms the marker is gone."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-old*"))
+        (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (cc-butler-session-test--insert-trust-dialog))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda ()
+                       (cl-incf return-count)
+                       (with-current-buffer term-buf (erase-buffer) (insert "❯ \n")))))
+            (should (eq 'accepted (cc-butler--accept-trust-dialog "/worker/")))
+            (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-new-shape-accepts-and-confirms-gone ()
+  "New-shape dialog: delegates to `cc-butler--accept-trust-dialog-new-shape'
+for the Down + confirm-landing + Return sequence, then re-reads once more
+and reports `accepted' once the marker is confirmed gone."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-new*"))
+        (down-count 0) (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (cc-butler-session-test--insert-trust-dialog-new-shape))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down)
+                     (lambda (&optional _buf)
+                       (cl-incf down-count)
+                       (with-current-buffer term-buf
+                         (erase-buffer)
+                         (cc-butler-session-test--insert-trust-dialog-new-shape t))))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda ()
+                       (cl-incf return-count)
+                       (with-current-buffer term-buf (erase-buffer) (insert "❯ \n")))))
+            (should (eq 'accepted (cc-butler--accept-trust-dialog "/worker/")))
+            (should (= 1 down-count))
+            (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-new-shape-with-blank-padding-accepts ()
+  "Regression for the tail-window fix (#245): a freshly-rendered ghostel
+screen pads with blank rows below the dialog to fill the terminal
+height. `cc-butler--accept-trust-dialog' must still detect and accept it
+— proving this handle rides on the FIXED `cc-butler--live-screen-tail-start',
+not a stale assumption about where the live bottom sits."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-new-padded*"))
+        (down-count 0) (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (cc-butler-session-test--insert-trust-dialog-new-shape-full-height))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down)
+                     (lambda (&optional _buf)
+                       (cl-incf down-count)
+                       (with-current-buffer term-buf
+                         (erase-buffer)
+                         (cc-butler-session-test--insert-trust-dialog-new-shape t)
+                         (dotimes (_ 20) (insert "\n")))))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda ()
+                       (cl-incf return-count)
+                       (with-current-buffer term-buf (erase-buffer) (insert "❯ \n")))))
+            (should (eq 'accepted (cc-butler--accept-trust-dialog "/worker/")))
+            (should (= 1 down-count))
+            (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-refuses-on-unrelated-menu ()
+  "A screen showing an unrelated ❯/Yes-No menu (no trust marker) must be
+refused as `no-dialog', with ZERO keys sent — blindly sending Down+Return
+into whatever menu happens to be open would silently answer a different
+prompt, worse than doing nothing."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-unrelated*"))
+        (down-count 0) (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (cc-butler-session-test--insert-mcp-classifier-prompt))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down) (lambda (&optional _buf) (cl-incf down-count)))
+                    ((symbol-function 'claude-code-ide--terminal-send-return) (lambda () (cl-incf return-count))))
+            (should (eq 'no-dialog (cc-butler--accept-trust-dialog "/worker/")))
+            (should (= 0 down-count))
+            (should (= 0 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-refuses-on-plain-prompt ()
+  "An ordinary idle prompt with no dialog at all must be refused as
+`no-dialog', with zero keys sent."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-plain*"))
+        (down-count 0) (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (insert (make-string 24 cc-butler--border-rule-char) "\n")
+            (insert "❯ \n")
+            (insert (make-string 24 cc-butler--border-rule-char) "\n"))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down) (lambda (&optional _buf) (cl-incf down-count)))
+                    ((symbol-function 'claude-code-ide--terminal-send-return) (lambda () (cl-incf return-count))))
+            (should (eq 'no-dialog (cc-butler--accept-trust-dialog "/worker/")))
+            (should (= 0 down-count))
+            (should (= 0 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-still-showing-after-press-when-return-does-not-land ()
+  "If a key is sent but the marker is STILL present on a fresh re-read
+afterward (the terminal did not process it, or the same dialog
+re-rendered), the result must be `still-showing', not `accepted' — a
+caller must not assume success just because a key was sent."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-stuck*"))
+        (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf (cc-butler-session-test--insert-trust-dialog))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda () (cl-incf return-count))))
+            ;; Buffer content is deliberately left unchanged by the Return
+            ;; mock -- the dialog is still showing on the re-read.
+            (should (eq 'still-showing (cc-butler--accept-trust-dialog "/worker/")))
+            (should (= 1 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-errors-on-no-live-buffer ()
+  "No live terminal buffer for the session at all: errors loudly rather
+than silently doing nothing or acting on a stale/absent buffer."
+  (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+             (lambda (_d) " *cc-butler-test-accept-nonexistent-buf*")))
+    (should
+     (string-match-p
+      "no live terminal buffer for /some/unlaunched/dir/"
+      (condition-case e
+          (progn (cc-butler--accept-trust-dialog "/some/unlaunched/dir/") "")
+        (error (error-message-string e)))))))
+
+(defun cc-butler-session-test--insert-new-shape-yes-quoted-then-live-no-exit ()
+  "Insert a screen where \"❯ Yes, I trust this folder\" appears QUOTED in
+scrollback (as if relayed while discussing this very bug), followed by
+enough live-screen filler to push that quote well out of the tail window,
+and only THEN the REAL v2.1.260+ trust dialog live at the bottom of the
+screen — still in its default, as-rendered state (`❯ No, exit'
+highlighted; Down has not landed). Regression fixture for the 2026-09-11
+steward review of #248: `cc-butler--trust-dialog-new-shape-yes-selected-p'
+searched from `point-min' rather than the live tail, so the quoted line
+alone made it read \"landed\" while the real dialog below still selected
+\"No, exit\" — the Return that gate exists to gate would then be sent
+onto that live selection and exit the session."
+  (insert "이전에 이 문제를 논의하며 실제 화면을 인용한다:\n\n")
+  (insert "```\n")
+  (insert "❯ Yes, I trust this folder\n")
+  (insert "```\n\n")
+  (dotimes (_ (cc-butler--live-screen-tail-lines))
+    (insert "…\n"))
+  (cc-butler-session-test--insert-trust-dialog-new-shape))
+
+(ert-deftest cc-butler-session/new-shape-yes-selected-p-nil-when-yes-only-quoted-in-scrollback ()
+  "`cc-butler--trust-dialog-new-shape-yes-selected-p' must not read a
+quoted \"❯ Yes, I trust this folder\" in scrollback as the highlight
+having landed — the live dialog below it still selects \"No, exit\"."
+  (let ((buf (get-buffer-create " *cc-butler-test-yes-selected-scrollback*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (cc-butler-session-test--insert-new-shape-yes-quoted-then-live-no-exit))
+          (should-not (cc-butler--trust-dialog-new-shape-yes-selected-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/accept-trust-dialog-new-shape-never-sends-return-when-yes-only-quoted-in-scrollback ()
+  "Full accept flow, same fixture: since the highlight never actually
+lands on the live dialog (Down is a no-op here — the real terminal simply
+never registers it, standing in for the worst case), the settle poll must
+time out and error WITHOUT ever sending Return. Before the
+`--live-screen-tail-start' scoping fix, the first poll read would have
+seen the quoted \"❯ Yes, I trust this folder\" as landed and sent Return
+immediately, exiting the session onto its live \"No, exit\" selection."
+  (let ((term-buf (get-buffer-create " *cc-butler-test-accept-yes-quoted*"))
+        (return-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (cc-butler-session-test--insert-new-shape-yes-quoted-then-live-no-exit))
+          (cl-letf (((symbol-function 'claude-code-ide--get-buffer-name)
+                     (lambda (_d) (buffer-name term-buf)))
+                    ((symbol-function 'cc-butler--refresh-terminal-text) (lambda (_buf) t))
+                    ((symbol-function 'cc-butler--terminal-send-down) (lambda (&optional _buf) nil))
+                    ((symbol-function 'claude-code-ide--terminal-send-return)
+                     (lambda () (cl-incf return-count)))
+                    (cc-butler-trust-dialog-settle-timeout 0.2))
+            (should-error (cc-butler--accept-trust-dialog-new-shape "/worker/"))
+            (should (= 0 return-count))))
+      (when (buffer-live-p term-buf) (kill-buffer term-buf)))))
+
 ;;;; ---- resume gate (cc-butler#4, 2026-09-03) --------------------------
 ;;;; Claude Code's own `--continue' startup chooser, distinct from the
 ;;;; folder-trust screen above. Unlike the trust dialog, the highlighted
@@ -700,6 +1124,28 @@ regardless of which option is highlighted."
             (insert (make-string 24 cc-butler--border-rule-char))
             (insert "\n❯ \n")
             (insert (make-string 24 cc-butler--border-rule-char)))
+          (should-not (cc-butler--resume-gate-showing-p buf)))
+      (kill-buffer buf))))
+
+(ert-deftest cc-butler-session/resume-gate-showing-p-nil-when-quoted-in-scrollback-above-a-normal-live-prompt ()
+  "Both resume-gate phrases quoted in scrollback (e.g. relayed while
+discussing this gate), with enough live-screen filler to push them out of
+the tail window, and an ORDINARY idle prompt live at the bottom — must not
+read as the gate showing. Unscoped, this would mark an otherwise-idle
+session as stuck on the gate and block dispatch to it (2026-09-11 steward
+class sweep, same bug class as
+`cc-butler--trust-dialog-new-shape-yes-selected-p')."
+  (let ((buf (get-buffer-create " *cc-butler-test-gate-quoted*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert "이전에 이 게이트를 논의하며 화면을 인용한다:\n\n```\n")
+            (insert "❯ 1. Resume from summary (recommended)\n  2. Resume full session as-is\n  3. Don't ask me again\n")
+            (insert "```\n\n")
+            (dotimes (_ (cc-butler--live-screen-tail-lines)) (insert "…\n"))
+            (insert (make-string 24 cc-butler--border-rule-char) "\n")
+            (insert "❯ \n")
+            (insert (make-string 24 cc-butler--border-rule-char) "\n"))
           (should-not (cc-butler--resume-gate-showing-p buf)))
       (kill-buffer buf))))
 
@@ -2110,6 +2556,35 @@ body anywhere."
       (should (= 1 (length calls)))
       (should (equal (nth 0 (car calls)) "report")))))
 
+;;;; ---- 2026-09-11: `:dir' nil + NAME-OVERRIDE, for a non-interactive
+;;;; Lisp caller with no real session (`cc-butler-self-check--report') --
+
+(ert-deftest cc-butler-session/inbox-push-nil-dir-with-name-override-does-not-error ()
+  "DIR nil used to error inside `cc-butler--display-name'
+\(`expand-file-name' requires a string\) -- NAME-OVERRIDE must bypass that
+entirely, not merely catch the error."
+  (cc-butler-session-test--with-ops-log
+    (let ((cc-butler--inbox nil))
+      (cc-butler--inbox-push nil "self-check transition" "cc-butler (self-check)")
+      (should (= 1 (length cc-butler--inbox)))
+      (should (equal "cc-butler (self-check)" (plist-get (car cc-butler--inbox) :name)))
+      (should (null (plist-get (car cc-butler--inbox) :id)))
+      (should (null (plist-get (car cc-butler--inbox) :dir)))
+      (should (equal "self-check transition" (plist-get (car cc-butler--inbox) :body))))))
+
+(ert-deftest cc-butler-session/inbox-push-two-arg-callers-unchanged ()
+  "The existing 2-arg call shape (report_to_steward, the notification hook)
+must produce an entry identical to before this change -- NAME-OVERRIDE
+absent, `:name'/`:id' still derived from DIR the same way."
+  (cc-butler-session-test--with-ops-log
+    (let ((cc-butler--inbox nil))
+      (cc-butler--inbox-push "/worker-two-arg/" "unchanged body")
+      (let ((entry (car cc-butler--inbox)))
+        (should (equal "/worker-two-arg/" (plist-get entry :dir)))
+        (should (equal (cc-butler--display-name "/worker-two-arg/") (plist-get entry :name)))
+        (should (equal (cc-butler--session-id "/worker-two-arg/") (plist-get entry :id)))
+        (should (equal "unchanged body" (plist-get entry :body)))))))
+
 ;;;; ------------------------------------------------------------------
 ;;;; ghostel event-pipe deadlock workaround (cc-butler#104)
 ;;;; ------------------------------------------------------------------
@@ -2319,6 +2794,296 @@ one shared launch path, not an opt-in a caller could forget."
     (should mitigated)))
 
 ;;;; ------------------------------------------------------------------
+;;;; write-site token/key masking (msg-log)
+;;;; ------------------------------------------------------------------
+
+(defun cc-butler-session-test--logged-body (body)
+  "Call `cc-butler--log-message' with BODY and return the `body' field
+actually written to today's message log."
+  (cc-butler--log-message "report" "worker" "steward" body)
+  (let* ((got (cc-butler-session-test--msg-file-string))
+         (record (json-parse-string got :object-type 'alist)))
+    (alist-get 'body record)))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-openai-style-key ()
+  "An sk-... key must never reach the on-disk message log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ1234")
+           (logged (cc-butler-session-test--logged-body
+                    (format "here is a key %s in the body" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged))
+      (should (string-match-p "here is a key" logged))
+      (should (string-match-p "in the body" logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-github-pat ()
+  "A ghp_... GitHub token must never reach the log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "ghp_1234567890abcdefGHIJKLMNOPQR")
+           (logged (cc-butler-session-test--logged-body
+                    (format "token %s here" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-aws-access-key-id ()
+  "An AKIA... AWS access key id must never reach the log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "AKIAABCDEFGHIJKL1234")
+           (logged (cc-butler-session-test--logged-body
+                    (format "key %s in there" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-jwt ()
+  "A JWT (eyJ...) must never reach the log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret (concat "eyJhbGciOiJIUzI1NiJ9."
+                            "eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+                            "dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"))
+           (logged (cc-butler-session-test--logged-body
+                    (format "jwt %s here" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-generic-long-base64-run ()
+  "A generic long base64-looking blob (no specific prefix) must never
+reach the log verbatim."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret (concat "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVoxMjM0"
+                            "NTY3ODkwYWJjZGVmZ2hpams="))
+           (logged (cc-butler-session-test--logged-body
+                    (format "blob %s end" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-a-git-sha-alone ()
+  "A 40+-char lowercase-hex git commit SHA -- the same length class as
+the generic rule, and something this fleet's own reports quote
+constantly -- must survive unredacted, or the whole reason the rest of
+the body is preserved (investigative value) is lost on the single most
+common long token this log actually contains."
+  (cc-butler-session-test--with-ops-log
+    (let* ((sha "e429387abcdef1234567890abcdef1234567890ab")
+           (logged (cc-butler-session-test--logged-body
+                    (format "squash commit %s into main" sha))))
+      (should (string-match-p (regexp-quote sha) logged))
+      (should-not (string-match-p "<redacted:" logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-a-file-path-alone ()
+  "A long file path is not a token/key-shaped run and must survive
+unredacted -- the prior review's exact repro: with `/' inside the
+generic character class, an ordinary path this long was swallowed
+whole (`/home/toracle/.../dashboard.org' -> `<redacted:69>')."
+  (cc-butler-session-test--with-ops-log
+    (let* ((path "/home/toracle/emacsd/ccbutler/butler/docs/logs/September/dashboardorg")
+           (logged (cc-butler-session-test--logged-body
+                    (format "see %s for details" path))))
+      (should (string-match-p (regexp-quote path) logged))
+      (should-not (string-match-p "<redacted:" logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-a-url-alone ()
+  "A long URL is not a token/key-shaped run either -- same fix, same
+repro from the prior review (a cdnjs URL getting partially redacted)."
+  (cc-butler-session-test--with-ops-log
+    (let* ((url "https://cdnjs.cloudflare.com/ajax/libs/reactdom/production/reactdommin")
+           (logged (cc-butler-session-test--logged-body
+                    (format "fetch %s" url))))
+      (should (string-match-p (regexp-quote url) logged))
+      (should-not (string-match-p "<redacted:" logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-uppercase-hex-secret ()
+  "An uppercase-hex-shaped secret of git-SHA length must still be
+masked -- `cc-butler--looks-like-hex-only' must not case-fold its
+match and wrongly treat an uppercase secret as a lowercase SHA."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "DEADBEEF1234567890ABCDEF1234567890ABCDEF")
+           (logged (cc-butler-session-test--logged-body
+                    (format "key %s in there" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p (format "<redacted:%d>" (length secret)) logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-aws-secret-access-key ()
+  "AWS's documented example secret contains `/', so it splits into short
+runs under the generic pattern; the dedicated shape must still mask it."
+  (cc-butler-session-test--with-ops-log
+    (let* ((secret "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY")
+           (logged (cc-butler-session-test--logged-body
+                    (format "secret %s end" secret))))
+      (should-not (string-match-p (regexp-quote secret) logged))
+      (should (string-match-p "<redacted:40>" logged)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-40-char-paths-alone ()
+  "Adversarial path-like strings of exactly 40 chars must survive."
+  (cc-butler-session-test--with-ops-log
+    (dolist (s '("src/components/some/deeply/nested/path/file1"
+                 "src/Components/some/deeply/nested/File1xyz"
+                 "/Users/Foo/Projects/Bar2/src/components/x"
+                 "docs/Design/notes/2026/September/Report1"
+                 "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t9"))
+      (should (equal s (cc-butler--mask-secret-shapes s))))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-catches-aws-secret-after-equals ()
+  "`KEY=value', `?k=value' and alnum-prefixed forms must still mask the key."
+  (let ((secret "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"))
+    (dolist (s (list (concat "AWS_SECRET_ACCESS_KEY=" secret)
+                     (concat "xxKEY=" secret)
+                     (concat "https://h/x?k=" secret)))
+      (should-not (string-match-p (regexp-quote secret)
+                                  (cc-butler--mask-secret-shapes s)))
+      (should (string-match-p "<redacted:40>" (cc-butler--mask-secret-shapes s))))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-leaves-url-query-path-alone ()
+  "A 40-char path-ish value after `=' in a URL must survive."
+  (let ((s "https://x/a=docs/Design/notes/2026/September/Report1"))
+    (should (equal s (cc-butler--mask-secret-shapes s)))))
+
+(ert-deftest cc-butler-session/mask-secret-shapes-huge-run-never-drops-record ()
+  "A 1M-char alnum run must not overflow the regexp matcher and drop the record."
+  (cc-butler-session-test--with-ops-log
+    (let* ((run (make-string 1000000 ?a))
+           (logged (cc-butler-session-test--logged-body (concat "x " run " y"))))
+      (should (stringp logged))
+      (should-not (string-match-p "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" logged)))))
+
+;;;; ------------------------------------------------------------------
+;;;; inbox queue persistence across restarts
+;;;; ------------------------------------------------------------------
+
+(ert-deftest cc-butler-session/inbox-queue-survives-a-simulated-restart ()
+  "The confirmed-loss scenario this exists to fix: an Emacs restart while
+`cc-butler--inbox' still holds an undrained worker event must not lose it.
+Push an event, simulate a restart by wiping the in-memory queue, then
+reload -- the event must come back."
+  (let* ((cc-butler-inbox-queue-file
+          (make-temp-file "cc-butler-inbox-queue-test-" nil ".eld"))
+         (cc-butler--inbox nil))
+    (cc-butler--inbox-push "/worker-restart/" "undrained report")
+    (should cc-butler--inbox)
+    (setq cc-butler--inbox nil)
+    (cc-butler--inbox-queue-load)
+    (should (= 1 (length cc-butler--inbox)))
+    (should (equal (plist-get (car cc-butler--inbox) :body) "undrained report"))
+    (delete-file cc-butler-inbox-queue-file)))
+
+(ert-deftest cc-butler-session/inbox-queue-drained-items-do-not-survive-a-simulated-restart ()
+  "The persisted file mirrors the LIVE queue, not a history: once an item
+is drained from `cc-butler--inbox', its disk copy must be gone too, not
+left behind to reappear on the next restart."
+  (let* ((cc-butler-inbox-queue-file
+          (make-temp-file "cc-butler-inbox-queue-test-" nil ".eld"))
+         (cc-butler--inbox nil))
+    (cc-butler--inbox-push "/worker-drain/" "will be drained")
+    (should cc-butler--inbox)
+    (setq cc-butler--inbox nil)
+    (cc-butler--inbox-queue-save)          ; what the real drain site does
+    (cc-butler--inbox-queue-load)
+    (should-not cc-butler--inbox)
+    (delete-file cc-butler-inbox-queue-file)))
+
+(ert-deftest cc-butler-session/inbox-queue-file-is-created-0600 ()
+  "The queue mirrors worker report bodies verbatim; a plain `write-region'/
+`with-temp-file' creation would take the process umask (typically 644),
+silently widening it back open every save.  `cc-butler--inbox-queue-save'
+must set the mode explicitly at creation time, same precedent as
+`cc-butler--roster-write' (cc-butler-persist.el)."
+  (let* ((tmpdir (file-name-as-directory (make-temp-file "cc-butler-inbox-queue-test" t)))
+         (cc-butler-inbox-queue-file (expand-file-name "queue.eld" tmpdir))
+         (cc-butler--inbox (list (list :time (current-time) :dir "/w/"
+                                        :name "w" :id nil :body "x"))))
+    (unwind-protect
+        (progn
+          (cc-butler--inbox-queue-save)
+          (should (file-exists-p cc-butler-inbox-queue-file))
+          (should (= #o600 (file-modes cc-butler-inbox-queue-file))))
+      (delete-directory tmpdir t))))
+
+(ert-deftest cc-butler-session/inbox-queue-save-warns-past-the-backlog-threshold ()
+  "`cc-butler-inbox-queue-warn-threshold' is not just a number sitting next
+to the code -- crossing it must actually produce the ops-log backlog
+signal `cc-butler--inbox-queue-save' promises, and staying at or under it
+must stay silent.  (Replaces a prior version of this test that only
+compared this defcustom's default to `cc-butler-drained-keep''s, which
+caught neither value drifting from the real backlog behavior below.)"
+  (let* ((cc-butler-inbox-queue-file
+          (make-temp-file "cc-butler-inbox-queue-test-" nil ".eld"))
+         (cc-butler-inbox-queue-warn-threshold 2)
+         logged)
+    (unwind-protect
+        (cl-letf (((symbol-function 'cc-butler--log)
+                   (lambda (fmt &rest args) (push (apply #'format fmt args) logged))))
+          (let ((cc-butler--inbox '(:a :b)))    ; at threshold: silent
+            (cc-butler--inbox-queue-save))
+          (should-not (cl-some (lambda (l) (string-match-p "backlog" l)) logged))
+          (let ((cc-butler--inbox '(:a :b :c))) ; over threshold: warns
+            (cc-butler--inbox-queue-save))
+          (should (cl-some (lambda (l) (string-match-p "backlog" l)) logged)))
+      (delete-file cc-butler-inbox-queue-file))))
+
+;;; Load validation / save failure (review findings).
+
+(defmacro cc-butler-session-test--with-queue-file (contents &rest body)
+  "Run BODY with the queue file bound to a temp file holding CONTENTS (string
+or nil for absent), with `cc-butler--log' captured into `logged'."
+  (declare (indent 1))
+  `(let* ((tmpdir (file-name-as-directory (make-temp-file "cc-butler-iq-test" t)))
+          (cc-butler-inbox-queue-file (expand-file-name "q.eld" tmpdir))
+          (cc-butler--inbox nil)
+          logged)
+     (when ,contents (with-temp-file cc-butler-inbox-queue-file (insert ,contents)))
+     (unwind-protect
+         (cl-letf (((symbol-function 'cc-butler--log)
+                    (lambda (fmt &rest args) (push (apply #'format fmt args) logged))))
+           ,@body)
+       (delete-directory tmpdir t))))
+
+(defun cc-butler-session-test--corrupt-files ()
+  (directory-files (file-name-directory cc-butler-inbox-queue-file) nil "\\.corrupt"))
+
+(dolist (case '(("atom" . "42\n") ("string" . "\"str\"\n")
+                ("non-plist-list" . "(1 2 3)\n")
+                ("truncated" . "((:time (26 1) :dir \"/w/\" :bo")))
+  (let ((name (car case)) (text (cdr case)))
+    (eval `(ert-deftest ,(intern (format "cc-butler-session/inbox-queue-load-rejects-%s" name)) ()
+             (cc-butler-session-test--with-queue-file ,text
+               (cc-butler--inbox-queue-load)
+               (should-not cc-butler--inbox)
+               (should-not (file-exists-p cc-butler-inbox-queue-file))
+               (should (= 1 (length (cc-butler-session-test--corrupt-files))))
+               (should (cl-some (lambda (l) (string-match-p "invalid" l)) logged))
+               ;; a later push must still work (not wedged)
+               (cc-butler--inbox-push "/w/" "after")
+               (should (= 1 (length cc-butler--inbox)))))
+          t)))
+
+(ert-deftest cc-butler-session/inbox-queue-load-accepts-a-good-file ()
+  (cc-butler-session-test--with-queue-file
+      "((:time (26 1) :dir \"/w/\" :name \"w\" :id nil :body \"hi\"))\n"
+    (cc-butler--inbox-queue-load)
+    (should (equal "hi" (plist-get (car cc-butler--inbox) :body)))
+    (should-not (cc-butler-session-test--corrupt-files))))
+
+(ert-deftest cc-butler-session/inbox-queue-save-failure-cleans-temp-and-logs ()
+  (cc-butler-session-test--with-queue-file nil
+    ;; Target is a directory, so the rename over it fails.
+    (make-directory cc-butler-inbox-queue-file)
+    (let ((cc-butler--inbox (list (list :time (current-time) :dir "/w/" :body "x"))))
+      (cc-butler--inbox-queue-save))
+    (should-not (directory-files (file-name-directory cc-butler-inbox-queue-file)
+                                 nil "\\`cc-butler-inbox-queue-"))
+    (should (cl-some (lambda (l) (string-match-p "save failed" l)) logged))))
+
+(ert-deftest cc-butler-session/inbox-queue-backlog-warns-once-per-crossing ()
+  (cc-butler-session-test--with-queue-file nil
+    (let ((cc-butler-inbox-queue-warn-threshold 1)
+          (cc-butler--inbox-queue-warned nil))
+      (let ((cc-butler--inbox '(:a :b))) (cc-butler--inbox-queue-save))
+      (let ((cc-butler--inbox '(:a :b :c))) (cc-butler--inbox-queue-save))
+      (should (= 1 (cl-count-if (lambda (l) (string-match-p "backlog" l)) logged)))
+      (let ((cc-butler--inbox '(:a))) (cc-butler--inbox-queue-save))
+      (let ((cc-butler--inbox '(:a :b))) (cc-butler--inbox-queue-save))
+      (should (= 2 (cl-count-if (lambda (l) (string-match-p "backlog" l)) logged))))))
+
+;;;; ------------------------------------------------------------------
 ;;;; forward-only ops/msg log rotation
 ;;;; ------------------------------------------------------------------
 
@@ -2449,6 +3214,46 @@ deleted to compensate, silently working around the epoch guarantee."
     (cc-butler--ops-log-rotate)
     (should (file-exists-p a))
     (should (file-exists-p b))))
+
+;;;; ---- set_session_info fleet_status (design-fleet-utilization-2026-09-08 §2/§9) ----
+
+(ert-deftest cc-butler-session/set-session-info-accepts-valid-fleet-status ()
+  "Each of the 6 vocabulary values is accepted and stored under its own
+:fleet-status key, separate from the free-text :status (design §2 -- the
+same \"different facts, different columns\" principle already applied to
+:status vs :osc)."
+  (dolist (v cc-butler-fleet-status-values)
+    (let ((cc-butler--meta (make-hash-table :test 'equal)))
+      (cl-letf (((symbol-function 'claude-code-ide-mcp-server-get-session-context)
+                 (lambda () (list :project-dir "/fake/dir/")))
+                ((symbol-function 'cc-butler--maybe-refresh) (lambda ())))
+        (cc-butler-tool-set-session-info nil nil v)
+        (should (equal v (plist-get (cc-butler--meta-get "/fake/dir/") :fleet-status)))
+        ;; storing fleet_status must not clobber the existing free-text :status
+        (should (null (plist-get (cc-butler--meta-get "/fake/dir/") :status)))))))
+
+(ert-deftest cc-butler-session/set-session-info-rejects-invalid-fleet-status ()
+  "An unvalidated free-text value must not be silently accepted into the
+validated :fleet-status column -- it belongs in the existing free-text
+:status field instead."
+  (let ((cc-butler--meta (make-hash-table :test 'equal)))
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-server-get-session-context)
+               (lambda () (list :project-dir "/fake/dir/")))
+              ((symbol-function 'cc-butler--maybe-refresh) (lambda ())))
+      (should-error (cc-butler-tool-set-session-info nil nil "낮잠 자는 중") :type 'user-error)
+      (should (null (cc-butler--meta-get "/fake/dir/"))))))
+
+(ert-deftest cc-butler-session/set-session-info-fleet-status-optional ()
+  "Omitting fleet_status must leave any previously-set value unchanged --
+same \"omit to leave unchanged\" contract as title/status."
+  (let ((cc-butler--meta (make-hash-table :test 'equal)))
+    (cl-letf (((symbol-function 'claude-code-ide-mcp-server-get-session-context)
+               (lambda () (list :project-dir "/fake/dir/")))
+              ((symbol-function 'cc-butler--maybe-refresh) (lambda ())))
+      (cc-butler-tool-set-session-info nil nil "배차 대기")
+      (cc-butler-tool-set-session-info "new title" nil nil)
+      (should (equal "배차 대기" (plist-get (cc-butler--meta-get "/fake/dir/") :fleet-status)))
+      (should (equal "new title" (plist-get (cc-butler--meta-get "/fake/dir/") :title))))))
 
 (provide 'cc-butler-session-test)
 ;;; cc-butler-session-test.el ends here

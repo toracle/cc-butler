@@ -788,15 +788,21 @@ cross-test-file `require' for one macro)."
        (delete-directory cc-butler-mail-dir t)
        (delete-directory cc-butler-decision-dir t))))
 
-(defun cc-butler-self-check-test--seed-open-decision (id-suffix &optional event-id room)
+(defun cc-butler-self-check-test--seed-open-decision
+    (id-suffix &optional event-id room delivered-room delivered-thread held-until)
   "Write a `Kind: decision' open/ file, optionally with
-`:Delivered-to-matrix:'/`:Room:' properties."
+`:Delivered-to-matrix:'/`:Room:'/`:Delivered-room:'/`:Delivered-thread:'/
+`:Delivery-held-until:' properties.  HELD-UNTIL is inserted verbatim
+\(raw property value\), so a caller can pass a malformed one on purpose."
   (with-temp-file (expand-file-name
                     (format "%s-991-%s.org" (format-time-string "%Y%m%dT%H%M%S") id-suffix)
                     (cc-butler--decision-open-dir))
     (insert ":PROPERTIES:\n:Kind: decision\n"
             (if event-id (format ":Delivered-to-matrix: %s\n" event-id) "")
+            (if held-until (format ":Delivery-held-until: %s\n" held-until) "")
             (if room (format ":Room: %s\n" room) "")
+            (if delivered-room (format ":Delivered-room: %s\n" delivered-room) "")
+            (if delivered-thread (format ":Delivered-thread: %s\n" delivered-thread) "")
             ":END:\n#+TITLE: synthetic\n\n* Decision\nplaceholder\n")))
 
 (defmacro cc-butler-self-check-test--with-matrix-configured (&rest body)
@@ -821,6 +827,17 @@ the number of calls made, visible to BODY."
                         (1+ cc-butler-self-check-test--thread-replies-calls))
                   (funcall ,fn room event-id))))
        ,@body)))
+
+(defmacro cc-butler-self-check-test--with-file-age (age &rest body)
+  "Run BODY with `cc-butler--decision-file-time' stubbed so every candidate
+file is AGE seconds old, regardless of its real filename -- the seed
+helper always timestamps a file as \"now\", so this is how these tests
+control a no-delivery item's age without needing an artificially old
+filename."
+  (declare (indent 1))
+  `(cl-letf (((symbol-function 'cc-butler--decision-file-time)
+              (lambda (_filename) (- (float-time) ,age))))
+     ,@body))
 
 (ert-deftest cc-butler-self-check/queue-room-not-configured-self-user-id-nil ()
   "No Matrix identity set on this fleet at all -- a normal, valid state, not
@@ -877,9 +894,115 @@ check) and is named separately, not folded into `open'."
           (should (string-match-p "no :Room:" (plist-get r :detail)))
           (should (= 0 cc-butler-self-check-test--thread-replies-calls)))))))
 
+(ert-deftest cc-butler-self-check/queue-room-only-delivered-room-property-resolves ()
+  "The fix must not depend on the `:Room:' backfill -- a file carrying ONLY
+`:Delivered-room:' (the newer-convention shape the 4 newest live
+escalations actually use) must still resolve to a room and get fetched,
+not land in `no-room'."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "delroom" "$fake-event-delroom" nil "!fake-room:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (room _event-id)
+            (should (equal room "!fake-room:example.org"))
+            (list :status 'ok :events nil :scanned 0 :truncated nil))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+          (should (plist-get r :ok))
+          (should (string-match-p "open 1" (plist-get r :detail)))
+          (should (= 1 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-conflict-between-room-and-delivered-room ()
+  "`:Room:' and `:Delivered-room:' present and naming DIFFERENT rooms is its
+own unverifiable reason -- must not silently pick either value, and must
+never call out to Matrix with a guessed room."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "conflict" "$fake-event-conflict" "!fake-room-a:example.org" "!fake-room-b:example.org")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room _event-id) (error "must not be called -- room conflict is unverifiable"))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+          (should (plist-get r :ok))
+          (should (string-match-p "unverifiable 1" (plist-get r :detail)))
+          (should (string-match-p "disagree" (plist-get r :detail)))
+          (should (= 0 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-fetches-from-thread-root-not-leaf ()
+  "The leaf/root hypothesis, confirmed live 2026-09-11: when
+`:Delivered-to-matrix:' names a LEAF reply and `:Delivered-thread:' names
+the actual root, activity comes from the ROOT -- a human answer attaches
+there, not to the leaf.  Room membership is still verified on the LEAF
+first (the delivered event, the one this check exists to verify), so both
+calls happen: leaf then root."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "leafroot" "$fake-event-leaf" "!fake-room:example.org" nil "$fake-event-root")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room event-id)
+            (cond
+             ((equal event-id "$fake-event-leaf")
+              (list :status 'ok :events nil :scanned 0 :truncated nil))
+             ((equal event-id "$fake-event-root")
+              (list :status 'ok :events nil :scanned 5 :truncated nil))
+             (t (error "unexpected event-id %s" event-id))))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+          (should (plist-get r :ok))
+          (should (string-match-p "5 total thread message" (plist-get r :detail)))
+          (should (= 2 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-leaf-not-in-room-decides-before-root-is-touched ()
+  "The delivered event (leaf) is what this check verifies -- when leaf and
+root differ, the leaf is queried FIRST and decides room membership; the
+root must never be touched once the leaf has already failed.
+`:Delivered-thread:' is itself a hand-written record and cannot vouch for
+the delivery."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "leafwrong" "$fake-event-leafwrong" "!fake-room:example.org" nil "$fake-event-rootwrong")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room event-id)
+            (cond
+             ((equal event-id "$fake-event-leafwrong") (list :status 'not-in-room))
+             (t (error "root must not be queried once the leaf already failed"))))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+          (should-not (plist-get r :ok))
+          (should (string-match-p "unverifiable 1" (plist-get r :detail)))
+          (should (string-match-p "M_NOT_FOUND\\|does not contain" (plist-get r :detail)))
+          (should (= 1 cc-butler-self-check-test--thread-replies-calls)))))))
+
+(ert-deftest cc-butler-self-check/queue-room-root-only-failure-not-mislabeled-not-in-room ()
+  "A root-only fetch failure, AFTER the leaf already verified room
+membership, must never read as `not-in-room' -- that would misreport an
+already-confirmed delivery as a wrong-room one."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "rootfail" "$fake-event-rootfail-leaf" "!fake-room:example.org" nil "$fake-event-rootfail-root")
+      (cc-butler-self-check-test--with-thread-replies-stub
+          (lambda (_room event-id)
+            (cond
+             ((equal event-id "$fake-event-rootfail-leaf")
+              (list :status 'ok :events nil :scanned 0 :truncated nil))
+             ((equal event-id "$fake-event-rootfail-root")
+              (list :status 'not-in-room))
+             (t (error "unexpected event-id %s" event-id))))
+        (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+          (should (plist-get r :ok))
+          (should (string-match-p "unverifiable 1" (plist-get r :detail)))
+          ;; Every reason's label is always listed with its count (even 0) --
+          ;; so the assertion is on the COUNTS, not on label text presence.
+          (should (string-match-p "M_NOT_FOUND) 0" (plist-get r :detail)))
+          (should (string-match-p "thread root fetch failed 1" (plist-get r :detail)))
+          (should (= 2 cc-butler-self-check-test--thread-replies-calls)))))))
+
 (ert-deftest cc-butler-self-check/queue-room-unverifiable-not-in-room ()
   "The recorded room turns out wrong (M_NOT_FOUND) -- a data problem, kept
-distinct in `:detail' from \"never delivered\" or \"fetch failed\"."
+distinct in `:detail' from \"never delivered\" or \"fetch failed\", and (as
+of the level PR) a genuine FAIL: this fleet failed to get the decision in
+front of him, once, at all."
   (cc-butler-self-check-test--with-decision-dir
     (cc-butler-self-check-test--with-matrix-configured
       (cc-butler-self-check-test--seed-open-decision
@@ -887,7 +1010,7 @@ distinct in `:detail' from \"never delivered\" or \"fetch failed\"."
       (cc-butler-self-check-test--with-thread-replies-stub
           (lambda (_room _event-id) (list :status 'not-in-room))
         (let ((r (cc-butler-self-check--queue-room-thread-activity)))
-          (should (plist-get r :ok))
+          (should-not (plist-get r :ok))
           (should (string-match-p "unverifiable 1" (plist-get r :detail)))
           (should (string-match-p "M_NOT_FOUND\\|does not contain" (plist-get r :detail))))))))
 
@@ -945,6 +1068,143 @@ formatted distinctly per sender."
           (should (string-match-p "@fleet-a:example.org x3" (plist-get r :detail)))
           (should (string-match-p "@fleet-b:example.org x4" (plist-get r :detail)))
           (should (string-match-p "scanned 7" (plist-get r :detail))))))))
+
+;;;; ---- 2026-09-11: check 9 levels -- no-delivery age FAIL, with a
+;;;; `:Delivery-held-until:' escape hatch for a deliberate hold ---------
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-within-grace-stays-ok ()
+  "A no-delivery item younger than the threshold is normal, expected async
+delay -- acknowledged tier, not FAIL."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision "grace")
+      (cc-butler-self-check-test--with-file-age
+          (- cc-butler-self-check-no-delivery-age-threshold 60)
+        (cc-butler-self-check-test--with-thread-replies-stub
+            (lambda (_room _event-id) (error "must not be called -- never delivered"))
+          (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+            (should (plist-get r :ok))
+            (should (string-match-p "grace 1" (plist-get r :detail)))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-aged-past-threshold-fails ()
+  "A no-delivery item aged past the threshold, with no hold, is exactly the
+2026-09-11 defect this check exists to catch -- FAIL."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision "aged")
+      (cc-butler-self-check-test--with-file-age
+          (+ cc-butler-self-check-no-delivery-age-threshold 60)
+        (cc-butler-self-check-test--with-thread-replies-stub
+            (lambda (_room _event-id) (error "must not be called -- never delivered"))
+          (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "FAIL 1" (plist-get r :detail)))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-held-future-stays-ok-and-named ()
+  "A no-delivery item aged past the threshold BUT covered by a still-active
+`:Delivery-held-until:' hold must stay `:ok t' -- and its until-time and
+reason must be named in :detail, so a human sees a deliberate wait, not
+silence."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (let ((until (format-time-string "%Y-%m-%d %H:%M" (time-add (current-time) (seconds-to-time 3600)))))
+        (cc-butler-self-check-test--seed-open-decision
+         "heldfuture" nil nil nil nil (concat until " synthetic daylight hold"))
+        (cc-butler-self-check-test--with-file-age
+            (+ cc-butler-self-check-no-delivery-age-threshold 60)
+          (cc-butler-self-check-test--with-thread-replies-stub
+              (lambda (_room _event-id) (error "must not be called -- never delivered"))
+            (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+              (should (plist-get r :ok))
+              (should (string-match-p "held 1" (plist-get r :detail)))
+              (should (string-match-p (regexp-quote until) (plist-get r :detail)))
+              (should (string-match-p "synthetic daylight hold" (plist-get r :detail))))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-held-expired-fails ()
+  "A hold whose until-time has already passed must FAIL, same as unheld --
+the escape hatch stops covering it once it expires."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (let ((until (format-time-string "%Y-%m-%d %H:%M" (time-subtract (current-time) (seconds-to-time 3600)))))
+        (cc-butler-self-check-test--seed-open-decision
+         "heldexpired" nil nil nil nil (concat until " expired synthetic hold"))
+        (cc-butler-self-check-test--with-file-age
+            (+ cc-butler-self-check-no-delivery-age-threshold 60)
+          (cc-butler-self-check-test--with-thread-replies-stub
+              (lambda (_room _event-id) (error "must not be called -- never delivered"))
+            (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+              (should-not (plist-get r :ok))
+              (should (string-match-p "FAIL 1" (plist-get r :detail))))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-malformed-hold-fails ()
+  "A garbled `:Delivery-held-until:' must not suppress a FAIL -- malformed
+is treated exactly like absent: forgetting or garbling this marker has to
+err toward a push to the steward, never toward silence."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision
+       "heldmalformed" nil nil nil nil "not-a-real-timestamp synthetic reason")
+      (cc-butler-self-check-test--with-file-age
+          (+ cc-butler-self-check-no-delivery-age-threshold 60)
+        (cc-butler-self-check-test--with-thread-replies-stub
+            (lambda (_room _event-id) (error "must not be called -- never delivered"))
+          (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "FAIL 1" (plist-get r :detail)))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-hold-beyond-horizon-fails ()
+  "A hold more than `cc-butler-self-check-max-delivery-hold' seconds out
+(e.g. a mistyped year) is INVALID, not active -- evaluated as unheld, so
+an aged item still FAILs rather than being silenced for a year with only
+:detail as the record."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (let ((until (format-time-string "%Y-%m-%d %H:%M"
+                                        (time-add (current-time) (seconds-to-time (* 73 60 60))))))
+        (cc-butler-self-check-test--seed-open-decision
+         "heldbeyondhorizon" nil nil nil nil (concat until " too far out")))
+      (cc-butler-self-check-test--with-file-age
+          (+ cc-butler-self-check-no-delivery-age-threshold 60)
+        (cc-butler-self-check-test--with-thread-replies-stub
+            (lambda (_room _event-id) (error "must not be called -- never delivered"))
+          (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "FAIL 1" (plist-get r :detail)))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-hold-within-horizon-stays-ok ()
+  "Positive control for the horizon test above: a hold well within
+`cc-butler-self-check-max-delivery-hold' (here 12h, under the 72h
+default) still stays `:ok t' and named -- the horizon caps unreasonably
+far holds, it does not disable the escape hatch."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (let ((until (format-time-string "%Y-%m-%d %H:%M"
+                                        (time-add (current-time) (seconds-to-time (* 12 60 60))))))
+        (cc-butler-self-check-test--seed-open-decision
+         "heldwithinhorizon" nil nil nil nil (concat until " within horizon"))
+        (cc-butler-self-check-test--with-file-age
+            (+ cc-butler-self-check-no-delivery-age-threshold 60)
+          (cc-butler-self-check-test--with-thread-replies-stub
+              (lambda (_room _event-id) (error "must not be called -- never delivered"))
+            (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+              (should (plist-get r :ok))
+              (should (string-match-p "held 1" (plist-get r :detail)))
+              (should (string-match-p (regexp-quote until) (plist-get r :detail))))))))))
+
+(ert-deftest cc-butler-self-check/queue-room-no-delivery-unparseable-filename-fails ()
+  "A no-delivery item whose filename does not parse into an age (should
+never happen -- filenames are code-generated) must FAIL, not sit in
+`grace' forever uncounted: nil age means silence otherwise, which is
+exactly the wrong default for something that should never occur."
+  (cc-butler-self-check-test--with-decision-dir
+    (cc-butler-self-check-test--with-matrix-configured
+      (cc-butler-self-check-test--seed-open-decision "unparseable")
+      (cl-letf (((symbol-function 'cc-butler--decision-file-time) (lambda (_filename) nil)))
+        (cc-butler-self-check-test--with-thread-replies-stub
+            (lambda (_room _event-id) (error "must not be called -- never delivered"))
+          (let ((r (cc-butler-self-check--queue-room-thread-activity)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "FAIL 1" (plist-get r :detail)))))))))
 
 ;;;; ---- the four PERMANENT negative controls -----------------------
 
@@ -1051,14 +1311,18 @@ any sender -- pinned here as a permanent test rather than left implicit."
 
 (defmacro cc-butler-self-check-test--with-stubs (&rest body)
   "Run BODY with `cc-butler-tool-escalate-to-butler' / `cc-butler-tool-log'
-stubbed to record calls instead of touching any real butler state, and
-`cc-butler-self-check--previous' reset -- matching this repo's existing
-`cl-letf'-on-`symbol-function' stubbing style (see
-`cc-butler-north-star-test.el')."
+stubbed to record calls instead of touching any real butler state,
+`cc-butler-self-check--previous' reset, and `cc-butler--inbox' let-bound
+to nil (NOT stubbed -- the real `cc-butler--inbox-push' runs, the same
+convention already used elsewhere in this suite for testing that
+function's call sites directly, e.g. `cc-butler-session-test.el') --
+matching this repo's existing `cl-letf'-on-`symbol-function' stubbing
+style (see `cc-butler-north-star-test.el')."
   (declare (indent 0))
   `(let ((cc-butler-self-check-test--escalations nil)
          (cc-butler-self-check-test--logs nil)
-         (cc-butler-self-check--previous nil))
+         (cc-butler-self-check--previous nil)
+         (cc-butler--inbox nil))
      (cl-letf (((symbol-function 'cc-butler-tool-escalate-to-butler)
                 (lambda (summary &optional needs options kind sender-label)
                   (push (list :summary summary :needs needs :options options :kind kind
@@ -1134,6 +1398,253 @@ notification forever once the check actually recovers."
     (should (= 2 (length cc-butler-self-check-test--escalations)))
     (should (equal "notification" (plist-get (car cc-butler-self-check-test--escalations) :kind)))
     (should (string-match-p "RECOVERED" (plist-get (car cc-butler-self-check-test--escalations) :summary)))))
+
+;;;; ---- coordinator push: `cc-butler--inbox' / `pending_events', not
+;;;; the desktop/messenger/Matrix-adjacent escalate-to-butler path -------
+
+(ert-deftest cc-butler-self-check/report-transition-pushes-exactly-one-inbox-event ()
+  "An OK->FAIL transition must land exactly one event in `cc-butler--inbox'
+-- the same store `report_to_steward' writes to and `pending_events'
+drains -- so whichever session is currently steward sees it on its next
+`pending_events' call."
+  (cc-butler-self-check-test--with-stubs
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results t))
+    (should (= 0 (length cc-butler--inbox)))
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results nil))
+    (should (= 1 (length cc-butler--inbox)))
+    (should (string-match-p "started FAILING" (plist-get (car cc-butler--inbox) :body)))
+    (should (equal "cc-butler (self-check)" (plist-get (car cc-butler--inbox) :name)))
+    (should (null (plist-get (car cc-butler--inbox) :id)))))
+
+(ert-deftest cc-butler-self-check/report-steady-fail-pushes-no-inbox-event ()
+  "A steady FAIL between ticks (no flip) must push ZERO further inbox
+events -- only the actual transition does, never every tick."
+  (cc-butler-self-check-test--with-stubs
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results t))
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results nil))
+    (should (= 1 (length cc-butler--inbox)))
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results nil))
+    (should (= 1 (length cc-butler--inbox)))))
+
+(ert-deftest cc-butler-self-check/report-recovery-pushes-a-second-inbox-event ()
+  "FAIL -> RECOVERED is its own transition and must push its own event,
+distinct from the FAIL one already pushed."
+  (cc-butler-self-check-test--with-stubs
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results t))
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results nil))
+    (should (= 1 (length cc-butler--inbox)))
+    (cc-butler-self-check--report (cc-butler-self-check-test--fake-results t))
+    (should (= 2 (length cc-butler--inbox)))
+    (should (string-match-p "RECOVERED" (plist-get (car cc-butler--inbox) :body)))))
+
+;;;; ------------------------------------------------------------------
+;;;; Check 10: code staleness numbers -- synthetic git repos
+;;;; ------------------------------------------------------------------
+;;;; Reuses `cc-butler-test--git' / `cc-butler-test--make-git-repo'
+;;;; (tests/cc-butler-reload-test.el) for fixture setup -- real `git'
+;;;; subprocess calls, batch tests only, never the daemon. No real remote
+;;;; is needed anywhere below: `git rev-list'/`merge-base' only read refs,
+;;;; and a remote-tracking ref is just a ref `git update-ref' can set
+;;;; directly (same trick the existing `cc-butler-runtime-source' fixture
+;;;; already relies on).
+
+(defun cc-butler-self-check-test--commit (dir msg)
+  "Create an empty commit MSG in DIR; return its full SHA."
+  (cc-butler-test--git dir "commit" "-q" "--allow-empty" "-m" msg)
+  (cc-butler--git dir "rev-parse" "HEAD"))
+
+(ert-deftest cc-butler-self-check/code-staleness-counts-behind-only ()
+  "Checkout HEAD is an ancestor of `origin/main': N behind, 0 ahead."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (a (cdr fix))
+         (b (cc-butler-self-check-test--commit dir "second"))
+         (c (cc-butler-self-check-test--commit dir "third")))
+    (cc-butler-test--git dir "update-ref" "refs/remotes/origin/main" c)
+    (cc-butler-test--git dir "reset" "-q" "--hard" a)
+    (let ((counts (cc-butler-self-check--code-staleness-counts dir a)))
+      (should (equal counts '(0 . 2)))
+      (ignore b))))
+
+(ert-deftest cc-butler-self-check/code-staleness-counts-ahead-only ()
+  "Checkout HEAD has commits `origin/main' does not: N ahead, 0 behind."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (a (cdr fix)))
+    (cc-butler-test--git dir "update-ref" "refs/remotes/origin/main" a)
+    (let ((b (cc-butler-self-check-test--commit dir "second")))
+      (let ((counts (cc-butler-self-check--code-staleness-counts dir b)))
+        (should (equal counts '(1 . 0)))))))
+
+(ert-deftest cc-butler-self-check/code-staleness-counts-diverged ()
+  "Checkout HEAD and `origin/main' both have commits the other lacks --
+neither is an ancestor of the other."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (a (cdr fix)))
+    (cc-butler-test--git dir "checkout" "-qb" "side")
+    (let ((b (cc-butler-self-check-test--commit dir "on side")))
+      (cc-butler-test--git dir "update-ref" "refs/remotes/origin/main" b)
+      (cc-butler-test--git dir "checkout" "-q" "main")
+      (let* ((c (cc-butler-self-check-test--commit dir "on main"))
+             (counts (cc-butler-self-check--code-staleness-counts dir c)))
+        (should (equal counts '(1 . 1)))
+        (should (> (car counts) 0))
+        (should (> (cdr counts) 0))
+        (ignore a)))))
+
+(ert-deftest cc-butler-self-check/code-staleness-counts-nil-when-sha-or-dir-missing ()
+  (should-not (cc-butler-self-check--code-staleness-counts nil "deadbeef"))
+  (should-not (cc-butler-self-check--code-staleness-counts "/some/dir/" nil)))
+
+(ert-deftest cc-butler-self-check/code-staleness-fetch-age-uses-fetch-head-mtime ()
+  "Prefers FETCH_HEAD's mtime when present."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix))
+         (fetch-head (expand-file-name ".git/FETCH_HEAD" dir))
+         (stamp (time-subtract (current-time) (seconds-to-time 500))))
+    (write-region "deadbeef\t\tbranch 'main' of somewhere\n" nil fetch-head)
+    (set-file-times fetch-head stamp)
+    (let ((age (cc-butler-self-check--code-staleness-fetch-age dir)))
+      (should age)
+      (should (< (abs (- age 500)) 30)))))
+
+(ert-deftest cc-butler-self-check/code-staleness-fetch-age-falls-back-to-reflog ()
+  "Falls back to the `origin/main' reflog's mtime when FETCH_HEAD is
+absent (e.g. a linked worktree)."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix))
+         (reflog (expand-file-name ".git/logs/refs/remotes/origin/main" dir))
+         (stamp (time-subtract (current-time) (seconds-to-time 900))))
+    (make-directory (file-name-directory reflog) t)
+    (write-region "0000000000000000000000000000000000000000 deadbeef test <test> 0 +0000\tfetch\n"
+                  nil reflog)
+    (set-file-times reflog stamp)
+    (let ((age (cc-butler-self-check--code-staleness-fetch-age dir)))
+      (should age)
+      (should (< (abs (- age 900)) 30)))))
+
+(ert-deftest cc-butler-self-check/code-staleness-fetch-age-nil-when-neither-exists ()
+  "No FETCH_HEAD and no reflog: nil, not a guess -- the \"unknown fetch
+time\" case."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)))
+    (should-not (cc-butler-self-check--code-staleness-fetch-age dir))))
+
+(ert-deftest cc-butler-self-check/code-staleness-fetch-age-detail-never-blank-on-nil ()
+  "A missing fetch age must read as a literal explanation, never a blank
+or a silent \"0 behind\" look-alike."
+  (should (equal (cc-butler-self-check--code-staleness-fetch-age-detail nil)
+                 "unknown (no FETCH_HEAD and no origin/main reflog found)")))
+
+(ert-deftest cc-butler-self-check/code-staleness-integration-reports-diverged-with-numbers ()
+  "Full check, end to end, against a real diverged synthetic repo: :ok nil
+\(divergence is one of the flag-worthy conditions), and :detail still names
+the ref, the fetch age, and both ahead/behind pairs with a DIVERGED marker
+-- the verdict and the numbers are never in tension.
+
+`git update-ref' itself writes a reflog entry for the ref it touches
+(core.logAllRefUpdates defaults on for a non-bare repo), so this fixture's
+own `update-ref refs/remotes/origin/main' call means a fetch age IS
+determinable here -- a fresh one, from that reflog. The \"nil / unknown\"
+case is covered on its own, without that side effect, by
+`cc-butler-self-check/code-staleness-fetch-age-nil-when-neither-exists'."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (a (cdr fix)))
+    (cc-butler-test--git dir "checkout" "-qb" "side")
+    (let ((b (cc-butler-self-check-test--commit dir "on side")))
+      (cc-butler-test--git dir "update-ref" "refs/remotes/origin/main" b)
+      (cc-butler-test--git dir "checkout" "-q" "main")
+      (let ((c (cc-butler-self-check-test--commit dir "on main")))
+        (let ((cc-butler--runtime-source-dir dir)
+              (cc-butler--runtime-commit-sha c)
+              (cc-butler--runtime-commit-line (format "%s on main" (substring c 0 7))))
+          (let* ((r (cc-butler-self-check--code-staleness))
+                 (detail (plist-get r :detail)))
+            (should-not (plist-get r :ok))
+            (should (string-match-p "refs/remotes/origin/main" detail))
+            (should (string-match-p "1 ahead / 1 behind \\[DIVERGED\\]" detail))
+            (should (string-match-p "last fetched .* ago" detail))
+            (should (string-match-p (regexp-quote dir) detail))
+            (ignore a)))))))
+
+(ert-deftest cc-butler-self-check/code-staleness-integration-behind-only-stays-ok ()
+  "Plain lag with no divergence and no loaded/checkout mismatch must NOT
+flip :ok -- being N behind origin/main, alone, is normal and expected
+\(see the check's own docstring on why there is no single N that alone
+makes this a problem\); only the number belongs in :detail."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (a (cdr fix))
+         (b (cc-butler-self-check-test--commit dir "second"))
+         (c (cc-butler-self-check-test--commit dir "third")))
+    (cc-butler-test--git dir "update-ref" "refs/remotes/origin/main" c)
+    ;; Reset the checkout (and thus the "loaded" commit, set to match it
+    ;; below) BACK to the first commit -- behind origin/main by 2, ahead
+    ;; by 0, and loaded == checkout HEAD, so neither flag condition fires.
+    (cc-butler-test--git dir "reset" "-q" "--hard" a)
+    (let ((cc-butler--runtime-source-dir dir)
+          (cc-butler--runtime-commit-sha a)
+          (cc-butler--runtime-commit-line (format "%s first" (substring a 0 7))))
+      (let* ((r (cc-butler-self-check--code-staleness))
+             (detail (plist-get r :detail)))
+        (should (plist-get r :ok))
+        (should (string-match-p "0 ahead / 2 behind" detail))
+        (should-not (string-match-p "DIVERGED" detail))
+        (should-not (string-match-p "LOADED CODE DIFFERS" detail))
+        (ignore b)))))
+
+(ert-deftest cc-butler-self-check/code-staleness-integration-flags-loaded-differs-from-checkout ()
+  "REGRESSION scenario this check exists for: a hot-reload half-failed (or
+was simply never called after a `git pull'), so the LOADED commit and the
+on-disk checkout HEAD are two different commits. This must be :ok nil and
+must say so in :detail, in words, not just as two SHAs a reader has to
+diff by eye."
+  (skip-unless (executable-find "git"))
+  (let* ((fix (cc-butler-test--make-git-repo))
+         (dir (car fix)) (a (cdr fix))
+         (b (cc-butler-self-check-test--commit dir "second")))
+    (cc-butler-test--git dir "update-ref" "refs/remotes/origin/main" b)
+    ;; checkout HEAD is at b (the latest commit); the LOADED commit is
+    ;; still a -- exactly what a stale daemon that hasn't reloaded looks
+    ;; like.
+    (let ((cc-butler--runtime-source-dir dir)
+          (cc-butler--runtime-commit-sha a)
+          (cc-butler--runtime-commit-line (format "%s first" (substring a 0 7))))
+      (let* ((r (cc-butler-self-check--code-staleness))
+             (detail (plist-get r :detail)))
+        (should-not (plist-get r :ok))
+        (should (string-match-p "LOADED CODE DIFFERS FROM CHECKOUT HEAD" detail))))))
+
+(ert-deftest cc-butler-self-check/code-staleness-nil-ok-when-no-loaded-commit-at-all ()
+  "No loaded commit determinable at all (never a readable checkout): the
+one genuine FAIL this check has -- the check itself could not run, not a
+staleness judgment."
+  (let ((cc-butler--runtime-source-dir "/nonexistent/nowhere/")
+        (cc-butler--runtime-commit-sha nil)
+        (cc-butler--runtime-commit-line nil))
+    (let ((r (cc-butler-self-check--code-staleness)))
+      (should-not (plist-get r :ok))
+      (should (string-match-p "could not determine" (plist-get r :detail))))))
+
+(ert-deftest cc-butler-self-check/code-staleness-not-checked-when-runtime-source-vars-unbound ()
+  "Some fleets run self-check.el without PR #74's runtime-source vars
+loaded (older cc-butler.el) -- must report :ok t with an explicit \"not
+checked\" reason, never crash and never read as a real pass. Forces the
+unbound state directly (`makunbound', restored after)."
+  (let ((was-bound (boundp 'cc-butler--runtime-source-dir))
+        (orig (and (boundp 'cc-butler--runtime-source-dir) cc-butler--runtime-source-dir)))
+    (unwind-protect
+        (progn
+          (makunbound 'cc-butler--runtime-source-dir)
+          (let ((r (cc-butler-self-check--code-staleness)))
+            (should (plist-get r :ok))
+            (should (string-match-p "not checked" (plist-get r :detail)))))
+      (when was-bound (setq cc-butler--runtime-source-dir orig)))))
 
 (provide 'cc-butler-self-check-test)
 ;;; cc-butler-self-check-test.el ends here

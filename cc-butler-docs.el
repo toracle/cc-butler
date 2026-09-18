@@ -247,12 +247,18 @@ consulting it)."
 ;;;; Automatic capture: worker events -> daily log
 ;;;; ------------------------------------------------------------------
 
-(defun cc-butler-docs--auto-log (dir body)
-  "Advice on `cc-butler--inbox-push': mirror a worker event into the daily log."
+(defun cc-butler-docs--auto-log (dir body &optional name-override)
+  "Advice on `cc-butler--inbox-push': mirror a worker event into the daily
+log.  NAME-OVERRIDE mirrors that function's own optional third arg (DIR
+nil, e.g. a self-check transition) -- `:after' advice is called with
+every argument the advised function received, so this must accept it too
+or a 3-arg call errors here with wrong-number-of-arguments; and
+`cc-butler--who-dir' itself errors on a nil DIR, the same reason
+`cc-butler--inbox-push' needed the override in the first place."
   (when (and cc-butler-docs-auto-log (cc-butler-docs--home))
     (ignore-errors
       (cc-butler-docs--append-log
-       "event" (format "%s — %s" (cc-butler--who-dir dir) (or body ""))))))
+       "event" (format "%s — %s" (or name-override (cc-butler--who-dir dir)) (or body ""))))))
 
 (advice-add 'cc-butler--inbox-push :after #'cc-butler-docs--auto-log)
 
@@ -317,7 +323,7 @@ The Sessions table is always regenerated from live cc-butler state."
                  '("butler_log" "butler_dashboard")))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-log
  :name "butler_log"
  :description "Append a timestamped entry to the butler's append-only daily log (docs/log/YYYY-MM-DD.org under the butler home). Use it to record decisions you made, progress worth remembering, or notes — the durable timeline that survives the chat scrolling away. Worker reports/notifications are logged automatically; use this for the curated, higher-signal entries. Call it when something happens that future-you (or a fresh context) should be able to reconstruct."
@@ -329,7 +335,7 @@ The Sessions table is always regenerated from live cc-butler state."
                 :description "Entry kind: 'decision', 'progress', 'event', or 'note' (default 'note'). Optional."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-dashboard
  :name "butler_dashboard"
  :description "Update the butler's at-a-glance dashboard (docs/dashboard.org under the butler home). The per-session status table (running/waiting, branch, PR, model, live activity, and any status note left via set_session_info) is regenerated automatically from live session state — you do NOT supply it. You supply the human judgment: a short OVERVIEW of the current situation and the list of OPEN DECISIONS awaiting input. Call it whenever the big picture changes so the snapshot stays current. Omitting an argument keeps its previous text."

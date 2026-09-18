@@ -846,7 +846,7 @@ signalled, so the tool always returns a result."
                 (plist-get (claude-code-ide--normalize-tool-spec spec) :name)))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-show-document
  :name "show_document"
  :description "Open a reference document in THIS session's side document panel in the Emacs session manager, so the human can read it next to your terminal (and it stays pinned to this session when they switch away and back). Use it to surface the PR under review, the issue you are working, a failing CI run, or a design/markdown file. You can open several; they accumulate and the human can cycle through them. The panel persists per session."

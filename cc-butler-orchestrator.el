@@ -1389,17 +1389,31 @@ Progress = any transcript write since the event was recorded (the
 session resumed by itself — a sub-agent completed, a turn ran); such an
 event resolves silently.  A session still static after the window
 escalates through the normal wake gate.  Either way the entry is
-dropped: the durable inbox still holds the event, so nothing is lost."
+dropped: the durable inbox still holds the event, so nothing is lost.
+
+EXCEPTION: the butler is never escalated here.  Static/idle IS its
+healthy resting state — it waits on 정수님, not on transcript progress —
+so the progress test below can never resolve in its favor and would
+otherwise re-escalate every window forever (observed: three empty wakes
+in ~20 minutes, 2026-09-12).  `cc-butler-steward-inbox-design.md'
+already decided this direction for `escalate_to_butler' (\"deliver-only,
+no poke ... because nothing ever pokes the butler on arrival\"); this
+just extends it to the one caller that was still poking it."
   (when-let ((entry (gethash dir cc-butler--forward-deferred)))
     (remhash dir cc-butler--forward-deferred)
     (let ((last (cc-butler--session-last-activity dir)))
-      (if (and last (> last (plist-get entry :since)))
-          (cc-butler--log "forward: deferred %s self-resolved"
-                          (cc-butler--who-dir dir))
+      (cond
+       ((and (boundp 'cc-butler--butler) (equal dir cc-butler--butler))
+        (cc-butler--log "forward: deferred %s dropped (butler idle-on-human is healthy, not stalled)"
+                        (cc-butler--who-dir dir)))
+       ((and last (> last (plist-get entry :since)))
+        (cc-butler--log "forward: deferred %s self-resolved"
+                        (cc-butler--who-dir dir)))
+       (t
         (cc-butler--forward-wake ops dir
                                  (format "%s (idle %ss, no progress)"
                                          (plist-get entry :body)
-                                         cc-butler-forward-defer-window))))))
+                                         cc-butler-forward-defer-window)))))))
 
 (defun cc-butler--forward-backstop ()
   "Periodic sweep: push once if events sit undrained and nothing woke ops.
@@ -1806,7 +1820,7 @@ only says how many and how stale the oldest is."
                  '("escalate_to_butler" "pending_decisions")))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-escalate-to-butler
  :name "escalate_to_butler"
  :description "Steward only: raise a DECISION or send a NOTIFICATION to the user-facing butler's quiet queue. A decision needs a human answer (a choice, an approval, missing info) — use it for that, not routine progress. A notification (kind='notification') is for status that only needs to be READ — a correction, a completion, a 'you should know this' — and renders read-only, same as a decision, in the same open/ location; it is never answerable, and it does not count toward the ⚖ answer-required backlog (indicator or pending_decisions), but a human still closes it with one keypress (r) rather than it disappearing on its own. Ask yourself first: would anything the human could say change what happens next? If not, send it as a notification. Getting this wrong (sending status as a decision) silently accumulates as a backlog that looks like neglect but is really miscategorized FYIs. The butler drains decisions via pending_decisions and relays the answer back to you with send_to_session; a notification has nothing to relay back."
@@ -1826,7 +1840,7 @@ only says how many and how stale the oldest is."
                 :description "'decision' (default) if this needs a pick-one/approve answer; 'notification' if it's status only and should be READ, not answered. Anything other than exactly 'notification' is treated as a decision — when unsure, the default is the safe choice."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-pending-decisions
  :name "pending_decisions"
  :description "Butler only: drain your quiet decision queue — the decisions the steward has escalated for the human to decide. Call it at the start of a turn (and when nudged) to see what needs the boss's attention, without the worker firehose. Returns the decisions and clears them; present them cleanly to the human, then relay each answer down to the steward with send_to_session."
@@ -1894,6 +1908,70 @@ screen is worse than seeing none.  Check the cc-butler log for the refresh error
                   name))
          ((string-empty-p out) "(no output)")
          (t out))))))
+
+(defun cc-butler--accept-trust-dialog-error-facts (name dir err)
+  "Build a FACT-ONLY summary of ERR — a caught error from
+`cc-butler--accept-trust-dialog' for session NAME at DIR — for an MCP
+tool's return text: session name, which step failed, and (when the
+buffer is still readable) whether the trust marker/shape predicates hold
+and how many lines the live tail window covers.
+
+Deliberately never includes any buffer TEXT. An MCP tool's return value
+lands in the CALLING session's own transcript on disk — the two error
+paths inside `cc-butler--accept-trust-dialog-new-shape' embed the whole
+terminal buffer in their (LOCAL-only) error message precisely so a human
+debugging live can see the screen; repeating that into an MCP return
+would ship whatever that buffer held (credentials, client names, paths)
+to a different session's transcript. The step is classified by matching
+fixed substrings of THIS codebase's own error strings — never anything
+read from the buffer — and the caller is expected to also log the full
+error (buffer text included) locally via `message' before calling this
+(2026-09-11 steward review of #248)."
+  (let* ((msg (error-message-string err))
+         (step (cond
+                ((string-match-p "no live terminal buffer\\|no terminal buffer for" msg)
+                 "no live terminal buffer for the session")
+                ((string-match-p "did not move" msg)
+                 "settle timeout: highlight never landed on \"Yes, I trust this folder\"")
+                ((string-match-p "shape unrecognized" msg)
+                 "trust marker present but shape unrecognized (neither old nor new v2.1.260+ shape)")
+                (t "other (see this session's own *Messages* log for the full error)")))
+         (buf (ignore-errors (get-buffer (claude-code-ide--get-buffer-name dir)))))
+    (if (and buf (buffer-live-p buf))
+        (format "accept_trust_dialog on %s failed — %s.  marker present: %s, new-shape: %s, old-shape showing: %s, live tail window: %s lines."
+                name step
+                (if (cc-butler--trust-dialog-marker-present-p buf) "yes" "no")
+                (if (cc-butler--trust-dialog-new-shape-p buf) "yes" "no")
+                (if (cc-butler--trust-dialog-showing-p buf) "yes" "no")
+                (cc-butler--live-screen-tail-lines))
+      (format "accept_trust_dialog on %s failed — %s.  (no live terminal buffer left to inspect for further facts.)"
+              name step))))
+
+(defun cc-butler-tool-accept-trust-dialog (name)
+  "MCP tool: press \"Yes, I trust this folder\" on session NAME's trust
+dialog — ONLY if one is actually showing on its live screen right now.
+Refuses explicitly, with zero keys sent, when no trust dialog is showing.
+See `cc-butler--accept-trust-dialog' for the safety discipline (screen
+re-checked immediately before every key, both known dialog shapes
+recognized by their exact predicates, never a blind keypress).
+
+On error, the returned text carries FACTS about the screen, never the
+screen itself — see `cc-butler--accept-trust-dialog-error-facts'. The
+full error, buffer dump included, is logged locally only, via `message'."
+  (let ((dir (cc-butler--dir-by-name name)))
+    (if (not dir)
+        (format "No session named %S.  Call list_claude_sessions for names." name)
+      (condition-case err
+          (pcase (cc-butler--accept-trust-dialog dir)
+            ('accepted
+             (format "Trust dialog on %s accepted — confirmed gone from the screen." name))
+            ('no-dialog
+             (format "No trust dialog is showing on %s right now — refused, zero keys sent." name))
+            ('still-showing
+             (format "Sent a key to %s's trust dialog, but it is still on screen afterward — needs a human look, do not retry blindly." name)))
+        (error
+         (message "cc-butler: accept_trust_dialog on %s failed: %s" name (error-message-string err))
+         (cc-butler--accept-trust-dialog-error-facts name dir err))))))
 
 (defun cc-butler--relay-command-p (text)
   "Non-nil when TEXT is a bare slash command rather than a message.
@@ -2081,6 +2159,7 @@ durable log; only delivery to the steward is suppressed."
         (setq cc-butler--inbox-drained
               (cc-butler--archive-drained cc-butler--inbox-drained events))
         (setq cc-butler--inbox nil)
+        (cc-butler--inbox-queue-save)
         text))))
 
 ;; Idempotent (re)registration: drop prior copies before adding.
@@ -2090,16 +2169,17 @@ durable log; only delivery to the steward is suppressed."
          (member (plist-get (claude-code-ide--normalize-tool-spec spec) :name)
                  '("list_claude_sessions" "read_session_output"
                    "send_to_session" "pending_events"
-                   "report_to_steward" "report_to_butler")))
+                   "report_to_steward" "report_to_butler"
+                   "accept_trust_dialog")))
        claude-code-ide-mcp-server-tools))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-inbox
  :name "pending_events"
  :description "Steward only: drain your inbox of pending events from worker sessions that need attention (a worker asked a question, finished, reported via report_to_steward, or hit a prompt), newest last. Each line is a timestamped worker name (with its session id) and message. Call this at the start of each turn (and whenever you are nudged) to learn what changed without anything being typed into your input box. Returns the events and clears them."
  :args nil)
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-report-to-steward
  :name "report_to_steward"
  :description "Report up to the steward with real content — not just 'I need attention'. State WHAT happened / what you did, the current STATE, and exactly what you NEED (a decision, input, or nothing). Your session name and id are attached automatically; the steward drains this via pending_events and tracks/dispatches you from there. This does NOT reach the human/butler directly — the steward escalates to the butler only when something genuinely needs a human decision. Call it when you finish, get blocked, or have a status update."
@@ -2115,7 +2195,7 @@ durable log; only delivery to the steward is suppressed."
                 :description "What you need to proceed, e.g. 'review this PR' or 'which auth method to use'. Omit (or 'nothing') if you are only informing. Optional."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-report-to-butler
  :name "report_to_butler"
  :description "DEPRECATED — renamed to `report_to_steward' on 2026-07-09 (this tool never actually reached the butler; it always landed with the steward). Kept only so already-connected sessions don't hit a tool-not-found error. Use report_to_steward instead."
@@ -2131,13 +2211,13 @@ durable log; only delivery to the steward is suppressed."
                 :description "What you need to proceed. Omit (or 'nothing') if you are only informing. Optional."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-list-sessions
  :name "list_claude_sessions"
  :description "List the other live Claude Code sessions running in this Emacs (the workers you orchestrate): their stable name, whether each is WAITING-FOR-INPUT (idle at its prompt, dispatchable) or BLOCKED-ON-DIALOG (stuck inside an open dialog/confirmation menu it never resolved -- NOT dispatchable, and NOT answerable remotely either: sending it anything lands as prompt text and the trailing Enter falls on whatever the dialog's default happens to be, silently \"answering\" it wrong; this needs a human at the keyboard), its git branch, its live activity title (what it's doing right now), any status note it deliberately left via set_session_info (e.g. parked with a reason), and (when known) the model it's running. Call this first to learn the names used by read_session_output and send_to_session."
  :args nil)
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-read-session
  :name "read_session_output"
  :description "Read the recent terminal screen of another Claude session by name, to see what it is doing or asking. The text is that session's live TUI screen (may include UI chrome). The input row is returned only when the session's terminal cursor shows a human really typed into it; a ghost/autocomplete suggestion painted into an empty box is replaced with a plain marker, and a row whose state cannot be determined is replaced with an UNVERIFIED marker rather than shown as if it were real input."
@@ -2149,7 +2229,7 @@ durable log; only delivery to the steward is suppressed."
                 :description "How many trailing lines to return (default 40)."
                 :optional t)))
 
-(claude-code-ide-make-tool
+(cc-butler--make-guarded-tool
  :function #'cc-butler-tool-send-session
  :name "send_to_session"
  :description "Type a prompt/answer into another Claude session by name and submit it (press Enter), to direct that worker. Use to answer a worker's question, give it a task, or unblock it. You cannot send to yourself. Multi-line is supported: include newlines in text — they are delivered as a paste and stay literal, and Enter is pressed only once, at the end, to submit. CAUTION when sending free-form text (not answering a question you just asked): if the target has an open interactive prompt or menu (e.g. from AskUserQuestion), your one submit-Enter lands on whatever is highlighted there, not on your text — it is silently swallowed on both ends. Check with read_session_output first when unsure, and tell dispatched workers to prefer report_to_steward/escalate_to_butler over AskUserQuestion so this cannot happen."
@@ -2159,6 +2239,14 @@ durable log; only delivery to the steward is suppressed."
          (:name "text"
                 :type string
                 :description "The text to type into that session before submitting. May contain newlines for a multi-line prompt; only the final submit presses Enter.")))
+
+(cc-butler--make-guarded-tool
+ :function #'cc-butler-tool-accept-trust-dialog
+ :name "accept_trust_dialog"
+ :description "Press \"Yes, I trust this folder\" on session NAME's one-time folder-trust dialog — the safety handle for the case where the automatic launch-time gate missed it and the session is sitting stuck on \"No, exit\". Acts ONLY if a trust dialog is actually showing on that session's live screen right now; if not (an ordinary prompt, an unrelated menu, or nothing at all), it refuses explicitly and sends zero keys rather than guessing. Never use this speculatively — check read_session_output first if unsure what is actually on screen."
+ :args '((:name "name"
+                :type string
+                :description "Session name from list_claude_sessions whose screen is stuck on the trust dialog.")))
 
 (provide 'cc-butler-orchestrator)
 ;;; cc-butler-orchestrator.el ends here
