@@ -548,3 +548,182 @@ it correctly describes the observed symptom and the general hazard shape
 updated it to claim rule C's exact "N−2 for the oldest" detail as a proven
 mechanism, since that would overclaim past what Round 2 established. It
 remains unfiled, for steward/butler review.
+
+---
+
+# Round 3 pre-registration: fd-block reuse + reaper-close trace
+
+Written before any Round 3 run. Frozen once committed; results appended
+below it, never edited into it. Supersedes nothing above — Rounds 1 and 2
+stand as reported. Isolated `ccb-repro` daemon only; the live daemon is
+never touched, not even read-only, per the standing safety boundary.
+
+## Why this round, and why this order
+
+Round 2 falsified both creation-order hypotheses (A, B) and could not fit
+a single rule to both the isolated data and the live-fleet census (see the
+Correction on branch `repro/buffer-kill-bystander-death`, commit 6166757).
+Two live inputs since then narrow the search:
+
+- Relayed measurement (x600, re-verified read-only on the live daemon by
+  butler `[확인]`): each ghostel session owns a fixed **fd block** — a
+  dup'd pipe pair immediately followed by its ptmx fd (e.g. `16,17 → 18`;
+  `27,28 → 29`). The dup comes from Emacs's `open_channel_for_module`
+  (`process.c:8604` in Emacs 30 source, confirmed by butler
+  `[확인]`), so one fd of the pair is the module's `event_writer`.
+  `process.c:8599-8612` also shows `open_channel_for_module` returns
+  `dup(open_fd[SUBPROCESS_STDOUT])` — the module's `event_writer` fd is
+  its own distinct number, not the same fd Emacs closes on
+  `delete-process`. That specific double-close path (Emacs and the module
+  closing the *same* fd number) is therefore ruled out; a stale close
+  needs a module-side second close on some fd.
+- On the live daemon, slot order (fd-block position) is NOT the same as
+  creation order (steward's read-only `lsof`/`ps` census, 17:1x:
+  `ncloud`, created 16:07, holds `ttys006`, below `warmble-jumble` from
+  12:19 on `ttys007`). A **fresh** isolated daemon allocates fds
+  monotonically, so creation order and fd-block order coincide there —
+  which is a plausible reason Round 1/2's isolated data fit *some*
+  creation-order-shaped rule while the live census does not fit any of
+  them.
+
+Item (6) (fd-block reuse) therefore supersedes item (2) (plain fd/slot
+ordering) by incorporating it as instrumentation, and is combined with
+item (5) (native reaper-close trace) into one experiment: the block map is
+what item (5)'s trace needs anyway, to resolve a close()'d fd to its
+owning session. Item (1) (elisp-layer signal/delete-process/kill-process/
+process-send-eof advice) runs only if this experiment is inconclusive —
+Round 1 already cleared the elisp layer as *sufficient* cause via the
+double-cleanup treatment; re-running a broader elisp trace is only worth
+the time if the native trace fails to resolve the mechanism. Item (3) (see
+below) is answered now, for free, without a daemon run.
+
+## Item (3), answered now: does the stub harness reach cc-butler's session counter?
+
+Checked by reading the code (`cc-butler-orchestrator.el:54`, `:1008`,
+`cc-butler-session.el:304`, `:314`): cc-butler has **no separate
+session-liveness counter** of its own. Every site that needs "how many
+live sessions" reads `claude-code-ide--processes` directly (e.g.
+`(hash-table-count claude-code-ide--processes)`,
+`maphash ... claude-code-ide--processes`) — the same shared hash table
+`ccb-repro`'s `spawn3.sh` populates via the real
+`claude-code-ide--start-session`. There is also no hard-coded
+cap-enforcement code in this repo at all; the "10 workers + butler +
+steward, max 12" cap named in the docstring rider on
+`cc-butler-close-topic-refuse-concurrent-ghostel` is an operational/human
+policy, not a counter cc-butler evaluates itself. So: the stub harness
+*does* populate the exact structure any cc-butler code would read, and
+there is nothing separate to be out of sync with. Judged **unrelated** to
+the bystander-death mechanism, as x600 flagged as likely — no further
+action on this item.
+
+## Observations to make
+
+For every session, at every spawn and immediately before every kill, on
+the ccb-repro Emacs process (call it `$DPID`):
+
+1. Full fd-block map via `lsof -a -p $DPID -d0-1024` (or `lsof -p $DPID`
+   filtered to fd numbers), parsed into per-session blocks: pipe-pair fds
+   + immediately-following ptmx fd, matched to a session by spawn-order
+   correlation (the block that newly appears right after a given
+   `claude-code-ide--start-session` call belongs to that session).
+2. The `event_writer` fd specifically: whichever of the pipe-pair is not
+   the one already logged as the sentinel/filter fd Emacs itself uses for
+   the pipe process (best available proxy on this machine, since the
+   module does not expose the fd to Lisp directly) — logged at spawn, and
+   again at close if the reaper-close trace resolves it.
+3. A reaper-close trace: `dtruss`/`dtrace` attached to `$DPID`, filtering
+   `close()` syscalls, logging the fd number and the thread. Each closed
+   fd is resolved to an owning session by looking it up in the most
+   recent block map taken *before* the kill that triggered it (not by
+   `F_GETPATH` after the close, which is too late). If `dtrace`/`dtruss`
+   cannot attach on this machine (SIP or entitlement failure), that is
+   reported as a limitation, not silently substituted with something
+   weaker without saying so; the fallback is lsof-only before/after
+   diffing (shows which fd disappeared and roughly when, not which thread
+   or call closed it).
+4. Emacs version actually loaded in ccb-repro (`emacs-version`), checked
+   against the live daemon's Emacs 30.2 (per steward). Any difference is
+   stated, not silently assumed away.
+
+## Procedure
+
+### Fresh-daemon rows
+
+Start a brand-new `ccb-repro` daemon (fds allocate monotonically from
+session creation order). Spawn 3 sessions (X, Y, Z). For each of 3 rows,
+n=3 reps each (fresh daemon restarted between reps to keep "fresh"
+honest):
+
+- Row F1: kill the newest (Z).
+- Row F2: kill an old one, not newest, not before-newest (X, when ≥3 are
+  alive; with only X/Y/Z, this is X).
+- Row F3: kill the before-newest (Y).
+
+Record the block map immediately before each kill, run the kill, record
+victim + post-kill block map + reaper-close trace for that kill.
+
+### Aging procedure (butler refinement, folded in before any row runs)
+
+Between fresh-daemon rows and aged-daemon rows, age a **separate** fresh
+daemon so that churn is not confounded with the fresh-daemon measurement
+above:
+
+1. Spawn several ghostel sessions, kill some of them (freeing their fd
+   blocks), spawn new ones (some reusing freed blocks) — the churn step.
+2. Between spawns, interleave **non-ghostel** fd consumers: several
+   `make-process` subprocess spawns immediately deleted, a couple of
+   `make-network-process` connections opened and closed, and a couple of
+   plain pipe processes opened and closed — repeated until `lsof` on
+   `$DPID` shows **non-contiguous** ghostel session blocks (gaps between
+   them from the churn), not just reused-but-still-contiguous blocks from
+   ghostel churn alone.
+3. Record that `lsof` block map as the aging evidence, before any of the
+   pre-registered kill rows run on this daemon.
+
+Then run the **same three rows** (F1/F2/F3, renamed A1/A2/A3 for the aged
+daemon) on this aged daemon, n=3 reps each, with the same before/after
+block-map and reaper-close-trace instrumentation.
+
+## Interpretation rules (decided now)
+
+- A row's outcome is the victim that appears in ≥2 of its 3 reps. A row
+  with no ≥2/3 agreement is reported as "no stable outcome," not forced
+  into one.
+- The **fresh-vs-aged comparison** is per matching row (F1 vs A1, F2 vs
+  A2, F3 vs A3), comparing (a) which creation-order position dies and (b)
+  whether the victim's fd block is the one adjacent to the killed
+  session's freed block, when they differ.
+
+## Falsification / decision conditions
+
+- **H_fd-block-reuse (item 6)**: FALSIFIED (block reuse is not the
+  variable) if all three rows' outcomes are identical between fresh and
+  aged daemons, by both creation-order position and fd-adjacency. It is
+  SUPPORTED (implicated as at least a contributing variable) if any row's
+  outcome changes between fresh and aged in a way creation-order alone
+  does not predict but fd-adjacency does.
+- **H_reaper-cross-session-close (item 5)**: CONFIRMED as the mechanism if
+  any captured reaper-thread `close()` resolves, via the pre-kill block
+  map, to a fd inside a session's block OTHER than the one being killed.
+  FALSIFIED as the mechanism (for the captured trace) if every reaper
+  close in every captured kill resolves to the killed session's own
+  block — in which case the next suspect is an Emacs-side
+  `delete-process` on a dup'd module fd, and item (1)'s elisp-layer trace
+  runs next.
+- **INCONCLUSIVE**, reported as such and not forced into either verdict
+  above, if `dtrace`/`dtruss` cannot attach to `$DPID` on this machine at
+  all — in that case only the fd-block reuse comparison (not the
+  reaper-close smoking-gun test) is evaluable.
+
+## Sample-size limits (stated now)
+
+n=3 reps per row, 3 rows, 2 daemon states (fresh, aged) = 18 kill events
+targeted. One machine, one day, same Emacs/ghostel/claude-code-ide build
+as Rounds 1-2 (build match checked and stated per observation (4) above).
+This can show whether fd-block reuse changes the outcome ON THIS MACHINE
+and whether the reaper closes a fd outside its own session's block IN THE
+CAPTURED TRACES — it cannot prove the aged daemon reproduces the live
+fleet's actual fd-fragmentation shape exactly, only that it is
+non-contiguous by the same coarse measure the live census used. Discards
+(setup failure, dtrace non-attach, ambiguous block-map read) are counted
+and reported with reasons, not silently dropped.
