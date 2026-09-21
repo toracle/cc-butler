@@ -167,6 +167,44 @@ cache).  Discarding the cache is exactly what we want: `/compact' rewrites
 the context wholesale, so the cache is about to be worthless regardless."
   :type 'string :group 'cc-butler)
 
+(defcustom cc-butler-compact-resume t
+  "Whether to nudge a session back into its work once compaction succeeds.
+
+A compaction is something the fleet does TO a session, not something the
+session asked for.  `/compact' ends the turn, so the session is left sitting
+at an empty input box holding a fresh summary and no instruction — and
+nothing in the harness re-prompts it.  Measured across this driver's own
+history: the median gap between a compaction finishing and that session's
+next turn is 6.3 minutes against a 0.1-minute baseline, 41% exceed ten
+minutes and 17% exceed an hour.  That tail is not a session choosing to
+stop; it is a session waiting on a human who does not know it is waiting.
+
+Nil restores the pre-2026-09 behaviour: compact, and leave the session to
+whoever next types into it."
+  :type 'boolean :group 'cc-butler)
+
+(defcustom cc-butler-compact-resume-signal
+  "[cc-butler] Your context was just compacted by the fleet driver — no human typed this.\nRead the summary above, then continue the work that was in flight.\n\nIf you were waiting on a human answer, or the work was already finished, do not restart it: say so in one line and stop."
+  "Text typed into a session once its compaction has succeeded.
+
+Two paragraphs, and the second is the load-bearing one.  From outside, the
+driver cannot tell these three apart — they draw the identical screen: a
+session that fell silent because we compacted it mid-work, a session
+legitimately parked waiting on an answer from its operator, and a session
+whose work was genuinely finished.  Resuming the first is the entire point;
+resuming either of the others restarts work that was deliberately stopped,
+or re-raises a question already sitting on somebody's plate.
+
+So that judgment is handed to the session itself, which is the only party
+that actually holds it — it can read its own summary and knows what it was
+doing.  The signal therefore does not command work: it asks for a decision
+and explicitly licenses \"nothing to do here\" as an answer.
+
+The first line says a machine sent this.  Without it the session reads an
+unattributed imperative as its operator speaking, and a driver's nudge
+mistaken for the operator's instruction is worse than the stall it fixes."
+  :type 'string :group 'cc-butler)
+
 (defcustom cc-butler-compact-restore-retries 3
   "How many times the restore command may be re-sent before failing.
 
@@ -861,17 +899,67 @@ a tidy finish over a dirty screen."
                         (if left "FAILED to clear" "cleared") mine)
         (not left)))))
 
+(defun cc-butler-compact--maybe-resume (dir compacted)
+  "Nudge DIR back into its work after a compaction, if that is safe.
+COMPACTED is the state's `:compacted' flag — observed success, not merely
+\"we stopped watching\".  Returns non-nil when the signal was typed.
+
+Four guards, and every one of them is a refusal to type into a session that
+did not ask us to.  The input-box guard is the expensive one:
+`cc-butler-compact--clear-own-input' has already removed OUR text by the
+time this runs, so anything still in the box is a human's half-typed message
+— and this send submits, which would post their unfinished sentence.
+
+Both outcomes are logged, with the reason for a skip.  An idle-gated piece
+of housekeeping that skips silently is indistinguishable from one that is
+broken, and this codebase has already paid for that twice: the skip has to
+be as visible as the send."
+  (let* ((name (cc-butler--display-name dir))
+         (why (cond
+               ((not cc-butler-compact-resume)
+                "`cc-butler-compact-resume' is nil")
+               ((not compacted)
+                "compaction was not observed to finish")
+               ((ignore-errors (cc-butler-compact--typed-text dir))
+                "text is sitting in the input box — ours was already cleared, so it is a human's")
+               ;; IGNORE-BUSY, deliberately.  We compacted this session
+               ;; seconds ago, so its transcript is by definition fresh and
+               ;; `cc-butler--transcript-idle-p' reports BUSY for the next
+               ;; `cc-butler-idle-threshold' (600s by default) — every single
+               ;; time.  Gating on it would make this feature never fire in
+               ;; production while passing any test whose fixture backdates
+               ;; activity.  The blockers that matter here are the ones a
+               ;; Return would land on: an open menu, the trust dialog, a
+               ;; dead terminal.
+               ((cc-butler-compact--blocked-reason dir t)))))
+    (cond
+     (why
+      (cc-butler--log "compact: %s │ resume signal NOT sent — %s" name why)
+      nil)
+     ((ignore-errors (cc-butler--send-input dir cc-butler-compact-resume-signal t) t)
+      (cc-butler--log "compact: %s │ resume signal sent — session asked to continue the work in flight"
+                      name)
+      t)
+     (t
+      (cc-butler--log "compact: %s │ resume signal NOT sent — the send threw" name)
+      nil))))
+
 (defun cc-butler-compact--finish (dir fmt &rest args)
   "Conclude the compaction of DIR with a message/log built from FMT/ARGS."
   (cc-butler-compact--ensure-no-modal dir)
-  (when-let ((st (gethash dir cc-butler-compact--state)))
-    (cc-butler-compact--clear-own-input dir st))
-  (cc-butler-compact--end-state dir)
-  (let ((msg (apply #'format fmt args)))
-    (cc-butler--log "compact: %s │ %s" (cc-butler--display-name dir) msg)
-    (ignore-errors (cc-butler--maybe-refresh))
-    (message "cc-butler compact: %s — %s" (cc-butler--display-name dir) msg)
-    msg))
+  ;; Read `:compacted' before `--end-state' drops the plist that holds it.
+  (let ((compacted (plist-get (gethash dir cc-butler-compact--state) :compacted)))
+    (when-let ((st (gethash dir cc-butler-compact--state)))
+      (cc-butler-compact--clear-own-input dir st))
+    (cc-butler-compact--end-state dir)
+    (let ((msg (apply #'format fmt args)))
+      (cc-butler--log "compact: %s │ %s" (cc-butler--display-name dir) msg)
+      (ignore-errors (cc-butler--maybe-refresh))
+      (message "cc-butler compact: %s — %s" (cc-butler--display-name dir) msg)
+      ;; Last, and after the state is gone: the session is no longer locked,
+      ;; so `--blocked-reason' sees the world the next dispatcher will.
+      (cc-butler-compact--maybe-resume dir compacted)
+      msg)))
 
 ;;;###autoload
 (defun cc-butler-compact-reset (dir)
@@ -1207,10 +1295,16 @@ done instead of guessing at a threshold."
          (done (or shrunk (and (integerp before) (<= before 0)))))
     (cond
      (done
+      ;; `:compacted' marks OBSERVED success, and is the only thing
+      ;; `cc-butler-compact--maybe-resume' will resume on.  It is set here and
+      ;; deliberately NOT in the timeout branch below: a compaction we stopped
+      ;; watching may still be running, and typing into a session mid-`/compact'
+      ;; is the failure this whole driver is built to avoid.
       (cc-butler-compact--set-state
-       dir :note (if shrunk
-                     (format "ctx %s -> %s" before now)
-                   (format "ctx already %s at start — nothing to shrink" before)))
+       dir :compacted t
+       :note (if shrunk
+                 (format "ctx %s -> %s" before now)
+               (format "ctx already %s at start — nothing to shrink" before)))
       (cc-butler-compact--restore dir))
      ((> (- (float-time) sent) cc-butler-compact-timeout)
       ;; The compaction may still be running; we stop watching, but the model
