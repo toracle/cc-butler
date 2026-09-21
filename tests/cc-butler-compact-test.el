@@ -464,7 +464,13 @@ restored — it just compacts."
     (should (equal (cc-butler-compact-test--sent-in-order) '("/compact")))
     (setq cc-butler-compact-test--ctx 90000)
     (cc-butler-compact--poll "w")
-    (should (equal (cc-butler-compact-test--sent-in-order) '("/compact")))
+    ;; No `/model' in either direction.  Asserted on the model commands rather
+    ;; than the whole send list because a successful compaction now also types
+    ;; the resume nudge (`cc-butler-compact--maybe-resume'), which is not a
+    ;; model switch and is covered by its own tests below.
+    (should-not (seq-some (lambda (s) (string-prefix-p "/model" s))
+                          cc-butler-compact-test--sent))
+    (should (equal (car (cc-butler-compact-test--sent-in-order)) "/compact"))
     (should-not (cc-butler-compact--active-p "w"))))
 
 (ert-deftest cc-butler-compact/model-restored-even-when-compaction-times-out ()
@@ -2595,6 +2601,123 @@ through the on-disk ops log instead of the in-memory return value."
     (let ((got (cc-butler-compact-test--ops-log-string)))
       (should got)
       (should (string-match-p "NOT restored" got)))))
+
+;;;; ------------------------------------------------------------------
+;;;; Resuming the session after a successful compaction
+;;;; ------------------------------------------------------------------
+
+;; `/compact' ends the turn, so a compacted session sits at an empty box with
+;; a summary and no instruction, and nothing re-prompts it: median 6.3 minutes
+;; to its next turn against a 0.1-minute baseline, 17% over an hour.  The
+;; nudge below closes that, and every test here is about the four refusals
+;; that keep it from typing into a session that did not ask us to.
+
+(defmacro cc-butler-compact-test--capturing-log (var &rest body)
+  "Run BODY with `cc-butler--log' output collected into VAR, newest first."
+  (declare (indent 1))
+  `(let ((,var nil))
+     (cl-letf (((symbol-function 'cc-butler--log)
+                (lambda (fmt &rest args) (push (apply #'format fmt args) ,var))))
+       ,@body)))
+
+(defun cc-butler-compact-test--resume-count ()
+  "How many times the resume signal has been submitted."
+  (seq-count (lambda (s) (equal s cc-butler-compact-resume-signal))
+             cc-butler-compact-test--sent))
+
+(ert-deftest cc-butler-compact/resume-signal-sent-after-a-successful-compaction ()
+  "The whole point: a compaction that was OBSERVED to finish ends with the
+session told to pick its work back up — once, after the model is restored,
+so the nudge is the last thing typed and lands on the original model."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")            ; -> /compact
+    (setq cc-butler-compact-test--ctx 90000)
+    (cc-butler-compact--poll "w")            ; ctx dropped -> /model opus
+    (setq cc-butler-compact-test--model "Opus-4.8")
+    (cc-butler-compact--poll "w")            ; model back -> finish
+    (should-not (cc-butler-compact--active-p "w"))
+    (should (= 1 (cc-butler-compact-test--resume-count)))
+    (should (equal (car (last (cc-butler-compact-test--sent-in-order)))
+                   cc-butler-compact-resume-signal))))
+
+(ert-deftest cc-butler-compact/resume-not-sent-when-compaction-was-not-observed ()
+  "NEGATIVE CONTROL.  A timeout means we stopped watching, not that the
+compaction stopped running — it may still be mid-`/compact' — so `:compacted'
+is never set on that branch and the nudge must not fire.  Typing into a
+session that is still compacting is the failure this driver exists to avoid."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-session "w")
+    (setq cc-butler-compact-test--model "Sonnet-5")
+    (cc-butler-compact--poll "w")            ; -> /compact
+    (cc-butler-compact--set-state
+     "w" :sent-time (- (float-time) (1+ cc-butler-compact-timeout)))
+    (cc-butler-compact--poll "w")            ; timeout -> /model opus, no :compacted
+    (should-not (plist-get (gethash "w" cc-butler-compact--state) :compacted))
+    (setq cc-butler-compact-test--model "Opus-4.8")
+    (cc-butler-compact--poll "w")            ; model back -> finish
+    (should-not (cc-butler-compact--active-p "w"))
+    (should (= 0 (cc-butler-compact-test--resume-count)))))
+
+(ert-deftest cc-butler-compact/resume-refuses-to-submit-a-humans-half-typed-line ()
+  "The expensive one.  `--clear-own-input' has already taken OUR text out of
+the box by the time the nudge runs, so anything left is a human's unfinished
+message — and this send submits.  Anything in the box is a refusal."
+  (cc-butler-compact-test--with-session "w"
+    (cl-letf (((symbol-function 'cc-butler-compact--typed-text)
+               (lambda (_d) "was about to ask about the schema mig")))
+      (should-not (cc-butler-compact--maybe-resume "w" t))
+      (should (= 0 (cc-butler-compact-test--resume-count))))))
+
+(ert-deftest cc-butler-compact/resume-refuses-while-a-menu-or-trust-dialog-is-open ()
+  "A Return on an open dialog answers the dialog — on the folder-trust one
+the highlighted default is `No, exit', which kills the session outright."
+  (cc-butler-compact-test--with-session "w"
+    (setq cc-butler-compact-test--screen cc-butler-compact-test--modal-screen)
+    (should (cc-butler-compact--blocked-reason "w" t))
+    (should-not (cc-butler-compact--maybe-resume "w" t))
+    (should (= 0 (cc-butler-compact-test--resume-count)))))
+
+(ert-deftest cc-butler-compact/resume-respects-the-off-switch ()
+  "`cc-butler-compact-resume' nil restores the pre-2026-09 behaviour."
+  (cc-butler-compact-test--with-session "w"
+    (let ((cc-butler-compact-resume nil))
+      (should-not (cc-butler-compact--maybe-resume "w" t))
+      (should (= 0 (cc-butler-compact-test--resume-count))))))
+
+(ert-deftest cc-butler-compact/resume-fires-even-though-the-compaction-made-it-busy ()
+  "REGRESSION GUARD, and the reason the busy check is waived here: we wrote
+that session's transcript seconds ago, so `cc-butler--transcript-idle-p'
+reports BUSY for the next `cc-butler-idle-threshold' — every time, by
+construction.  Gating the nudge on it would mean it never fires in
+production while still passing every test whose fixture backdates activity."
+  (cc-butler-compact-test--with-session "w"
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (float-time))))   ; just written: busy
+      (should (cc-butler-compact--blocked-reason "w"))  ; plain gate WOULD block
+      (should (cc-butler-compact--maybe-resume "w" t))
+      (should (= 1 (cc-butler-compact-test--resume-count))))))
+
+(ert-deftest cc-butler-compact/resume-logs-both-outcomes-with-the-reason ()
+  "A skip that leaves no trace is indistinguishable from a device that is
+broken — this codebase has paid for that failure mode more than once.  Both
+the send and every refusal must name themselves in the log."
+  (cc-butler-compact-test--with-session "w"
+    ;; Skipped, and the log says WHICH guard stopped it.
+    (cc-butler-compact-test--capturing-log logged
+      (should-not (cc-butler-compact--maybe-resume "w" nil))
+      (should (seq-some (lambda (s) (string-match-p "resume signal NOT sent" s)) logged))
+      (should (seq-some (lambda (s) (string-match-p "not observed to finish" s)) logged)))
+    (cc-butler-compact-test--capturing-log logged
+      (let ((cc-butler-compact-resume nil))
+        (should-not (cc-butler-compact--maybe-resume "w" t)))
+      (should (seq-some (lambda (s) (string-match-p "cc-butler-compact-resume. is nil" s))
+                        logged)))
+    ;; And the send is just as visible as the skip.
+    (cc-butler-compact-test--capturing-log logged
+      (should (cc-butler-compact--maybe-resume "w" t))
+      (should (seq-some (lambda (s) (string-match-p "resume signal sent" s)) logged)))))
 
 (provide 'cc-butler-compact-test)
 ;;; cc-butler-compact-test.el ends here
