@@ -2719,5 +2719,43 @@ the send and every refusal must name themselves in the log."
       (should (cc-butler-compact--maybe-resume "w" t))
       (should (seq-some (lambda (s) (string-match-p "resume signal sent" s)) logged)))))
 
+;;;; ------------------------------------------------------------------
+;;;; The start line names the gate path it took
+;;;; ------------------------------------------------------------------
+
+;; The ops log is what we cite to answer "who typed this into session X".  It
+;; recorded every keystroke but not whether the compaction was FORCED past the
+;; idle gate -- measured on the live log, zero lines said either way against
+;; 223 `compact:' lines.  Forcing is precisely what our canon asks us to be
+;; able to count, so both cases are stated and both are greppable.
+
+(ert-deftest cc-butler-compact/forced-start-is-logged-as-forced ()
+  "A caller passing IGNORE-BUSY bypassed the idle gate, and the log has to
+say so loudly enough to be both read and counted: a run of individually
+justified forces is only visible as a run if each one left a mark."
+  (cc-butler-compact-test--with-session "w"
+    (cl-letf (((symbol-function 'cc-butler--session-last-activity)
+               (lambda (_d) (float-time))))     ; busy: the gate WOULD refuse
+      (should (cc-butler-compact--blocked-reason "w"))
+      (cc-butler-compact-test--capturing-log logged
+        (cc-butler-compact-session "w" t)
+        (let ((start (seq-find (lambda (s) (string-match-p "│ start" s)) logged)))
+          (should start)
+          (should (string-match-p "FORCED" start))
+          (should (string-match-p "idle gate bypassed" start)))))))
+
+(ert-deftest cc-butler-compact/unforced-start-is-logged-as-gate-honoured ()
+  "NEGATIVE CONTROL.  The ordinary path must not carry the forced marker —
+otherwise the marker counts everything and proves nothing — and it states
+the honoured case positively, so \"this ran unforced\" is provable from the
+log rather than merely unrefuted by it."
+  (cc-butler-compact-test--with-session "w"
+    (cc-butler-compact-test--capturing-log logged
+      (cc-butler-compact-session "w")
+      (let ((start (seq-find (lambda (s) (string-match-p "│ start" s)) logged)))
+        (should start)
+        (should-not (string-match-p "FORCED" start))
+        (should (string-match-p "idle gate honoured" start))))))
+
 (provide 'cc-butler-compact-test)
 ;;; cc-butler-compact-test.el ends here

@@ -1221,8 +1221,19 @@ because those do not resolve on their own the way busy does."
                     name (or tag "nothing")))
       (cc-butler-compact--set-state dir :orig-model tag :orig-args args :orig-arg arg
                                     :orig-ctx ctx :note nil)
-      (cc-butler--log "compact: %s │ start (ctx %s, model %s)"
-                      name (or ctx "?") tag)
+      ;; Say which gate path this took.  The ops log is what we cite to answer
+      ;; "who typed this into session X", and a forced compaction is the one
+      ;; the governance canon asks us to be able to COUNT: individually
+      ;; justified forces sum into a standing bypass nobody decided on.  A
+      ;; "queued — waiting for a safe idle point" line only proves how the
+      ;; compaction STARTED; a later forced call supersedes it and left
+      ;; unsaid here, the log could never show that happened.  Both cases are
+      ;; stated, so "this ran unforced" is provable and not merely unrefuted.
+      (cc-butler--log "compact: %s │ start (ctx %s, model %s) — %s"
+                      name (or ctx "?") tag
+                      (if ignore-busy
+                          "FORCED: idle gate bypassed by caller"
+                        "idle gate honoured"))
       (if (cc-butler-compact--model-is-p tag cc-butler-compact-model)
           ;; Already on the cheap model: nothing to switch, nothing to restore.
           (progn
