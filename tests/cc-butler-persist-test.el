@@ -268,22 +268,54 @@ default happens to be."
       (cc-butler--resume-in "/tmp/some-worker-topic/"))
     (should (string-match-p "--model sonnet\\b" captured-flags))))
 
-(ert-deftest cc-butler-persist/resume-in-does-not-pin-model-for-butler-or-steward ()
-  "`cc-butler--resume-in' must NOT append `--model' when resuming the
-butler's or steward's home -- their model is a human-owned value 정수님
-hand-changes, and this is the SHARED resume path for every role's dead
-session, so it must discriminate rather than pinning unconditionally."
-  (let (captured-flags
-        (cc-butler-home "/tmp/cc-butler-home-test/")
-        (cc-butler-steward-home "/tmp/cc-butler-steward-home-test/")
-        (cc-butler-worker-launch-model "sonnet"))
+(defun cc-butler-persist-test--resume-flags (dir)
+  "Flags `cc-butler--resume-in' hands `claude-code-ide' for DIR."
+  (let (captured-flags)
     (cl-letf (((symbol-function 'claude-code-ide)
                (lambda (&rest _) (setq captured-flags claude-code-ide-cli-extra-flags)))
               ((symbol-function 'cc-butler--configure-session) #'ignore)
               ((symbol-function 'cc-butler--ensure-pty-size) #'ignore)
               ((symbol-function 'cc-butler--wait-for-session-ready) #'ignore))
-      (cc-butler--resume-in cc-butler-home))
-    (should-not (string-match-p "--model" captured-flags))))
+      (cc-butler--resume-in dir))
+    captured-flags))
+
+(ert-deftest cc-butler-persist/resume-in-pins-coordinator-model-for-butler-and-steward ()
+  "Resuming the butler's or steward's home pins `cc-butler-coordinator-model'
+(token cost), and a custom value is honoured; the worker model is not used."
+  (let ((cc-butler-home "/tmp/cc-butler-home-test/")
+        (cc-butler-steward-home "/tmp/cc-butler-steward-home-test/")
+        (cc-butler-worker-launch-model "haiku")
+        (cc-butler-coordinator-model "sonnet"))
+    (dolist (d (list cc-butler-home cc-butler-steward-home))
+      (let ((f (cc-butler-persist-test--resume-flags d)))
+        (should (string-match-p "--model sonnet\\b" f))
+        (should-not (string-match-p "haiku" f))))
+    (let ((cc-butler-coordinator-model "opus"))
+      (should (string-match-p "--model opus\\b"
+                              (cc-butler-persist-test--resume-flags cc-butler-home))))))
+
+(ert-deftest cc-butler-persist/launch-pins-coordinator-model-for-butler-and-steward ()
+  "`cc-butler-start-butler' / `-steward' launch with `--model' set to
+`cc-butler-coordinator-model'."
+  (let ((cc-butler-home "/tmp/cc-butler-home-test/")
+        (cc-butler-steward-home "/tmp/cc-butler-steward-home-test/")
+        (cc-butler-coordinator-model "sonnet")
+        (cc-butler--butler nil) (cc-butler--steward nil)
+        flags)
+    (cl-letf (((symbol-function 'cc-butler--ensure-butler-home) (lambda () cc-butler-home))
+              ((symbol-function 'cc-butler--ensure-steward-home) (lambda () cc-butler-steward-home))
+              ((symbol-function 'cc-butler--live-dir-p) (lambda (_) nil))
+              ((symbol-function 'cc-butler) #'ignore)
+              ((symbol-function 'cc-butler--launch-session)
+               (lambda (_d) (push claude-code-ide-cli-extra-flags flags))))
+      (cc-butler-start-butler)
+      (cc-butler-start-steward)
+      (setq cc-butler-coordinator-model "opus")
+      (cc-butler-start-butler))
+    (setq flags (nreverse flags))
+    (should (string-match-p "--model sonnet\\b" (nth 0 flags)))
+    (should (string-match-p "--model sonnet\\b" (nth 1 flags)))
+    (should (string-match-p "--model opus\\b" (nth 2 flags)))))
 
 (provide 'cc-butler-persist-test)
 ;;; cc-butler-persist-test.el ends here

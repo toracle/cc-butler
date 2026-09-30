@@ -126,9 +126,7 @@ An empty string adds nothing."
 default.  Workers are the fleet's most frequently spawned sessions and the
 least supervised at the moment they start, so a corrupted global default
 (compaction's restore step rewrites it — see cc-butler-compact.el) must not
-silently mis-tier one.  Butler/steward are deliberately NOT pinned this way:
-their model is a human-owned value 정수님 hand-changes, and pinning it would
-silently revert his decision on every relaunch."
+silently mis-tier one.  Butler/steward use `cc-butler-coordinator-model'."
   :type 'string
   :group 'cc-butler)
 
@@ -138,6 +136,25 @@ silently revert his decision on every relaunch."
   `(let ((claude-code-ide-cli-extra-flags
           (string-trim (concat (or claude-code-ide-cli-extra-flags "")
                                " --model " cc-butler-worker-launch-model))))
+     ,@body))
+
+(defcustom cc-butler-coordinator-model "sonnet"
+  "Model the butler and steward are launched, resumed, and compacted onto.
+Previously they were left unpinned (a human-owned value), but an Opus
+coordinator that runs all day is a large token cost.  They are now pinned
+via `--model' at launch and resume, and compaction restores to this model
+instead of whatever the coordinator was on.  Hand-switching with `/model'
+inside a session still works until its next relaunch/compaction.  Not
+verified: whether `--model' or `/model' rewrite settings.json."
+  :type 'string
+  :group 'cc-butler)
+
+(defmacro cc-butler--with-coordinator-model (&rest body)
+  "Run BODY with `cc-butler-coordinator-model' pinned via `--model'."
+  (declare (indent 0))
+  `(let ((claude-code-ide-cli-extra-flags
+          (string-trim (concat (or claude-code-ide-cli-extra-flags "")
+                               " --model " cc-butler-coordinator-model))))
      ,@body))
 
 ;;;; ------------------------------------------------------------------

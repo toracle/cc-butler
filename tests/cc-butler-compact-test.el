@@ -445,6 +445,62 @@ state change rather than on elapsed time."
     (cc-butler-compact--poll "w")
     (should-not (cc-butler-compact--active-p "w"))))
 
+(defun cc-butler-compact-test--drive-opus-coordinator ()
+  "Compact an Opus coordinator \"w\" to completion; return the /model sends."
+  (cc-butler-compact-session "w")
+  (setq cc-butler-compact-test--screen cc-butler-compact-test--modal-screen)
+  (cc-butler-compact--poll "w")
+  (setq cc-butler-compact-test--model "Sonnet-5"
+        cc-butler-compact-test--screen cc-butler-compact-test--idle-screen)
+  (cc-butler-compact--poll "w")
+  (setq cc-butler-compact-test--ctx 90000)
+  (cc-butler-compact--poll "w")
+  (cl-remove-if-not (lambda (s) (string-prefix-p "/model" s))
+                    (cc-butler-compact-test--sent-in-order)))
+
+(ert-deftest cc-butler-compact/coordinator-never-restored-to-opus ()
+  "Default coordinator model equals the compact model, so the switch already
+lands there: the ONLY /model sent is the switch, no redundant restore, and
+no Opus id is ever sent."
+  (let ((cc-butler-home "w") (cc-butler-coordinator-model "sonnet"))
+    (cc-butler-compact-test--with-session "w"
+      (should (equal (cc-butler-compact-test--drive-opus-coordinator)
+                     '("/model sonnet")))
+      (should-not (cl-some (lambda (s) (string-match-p "opus" s))
+                           cc-butler-compact-test--sent)))))
+
+(ert-deftest cc-butler-compact/coordinator-restores-to-coordinator-model ()
+  "When the coordinator model differs from the compact model, the restore
+targets it -- the LAST /model sent -- not the Opus the session was on."
+  (let ((cc-butler-home "w") (cc-butler-coordinator-model "haiku"))
+    (cc-butler-compact-test--with-session "w"
+      (should (equal (cc-butler-compact-test--drive-opus-coordinator)
+                     '("/model sonnet" "/model haiku")))
+      (should-not (cl-some (lambda (s) (string-match-p "opus" s))
+                           cc-butler-compact-test--sent)))))
+
+(ert-deftest cc-butler-compact/coordinator-on-compact-model-sends-no-model ()
+  "A coordinator already on the compact model: no switch, no restore."
+  (let ((cc-butler-home "w") (cc-butler-coordinator-model "sonnet"))
+    (cc-butler-compact-test--with-session "w"
+      (setq cc-butler-compact-test--model "Sonnet-5")
+      (cc-butler-compact-session "w")
+      (setq cc-butler-compact-test--ctx 90000)
+      (cc-butler-compact--poll "w")
+      (should-not (cc-butler-compact--active-p "w"))
+      (should (member "/compact" cc-butler-compact-test--sent))
+      (should-not (cl-some (lambda (s) (string-prefix-p "/model" s))
+                           cc-butler-compact-test--sent)))))
+
+(ert-deftest cc-butler-compact/coordinator-with-unreadable-model-still-compacts ()
+  "Unknown current model is not a refusal for a coordinator: target is known."
+  (let ((cc-butler-home "w") (cc-butler-coordinator-model "sonnet"))
+    (cc-butler-compact-test--with-session "w"
+      (setq cc-butler-compact-test--model nil)
+      (cl-letf (((symbol-function 'cc-butler--transcript-model) (lambda (_d) nil)))
+        (cc-butler-compact-session "w"))
+      (should (equal (cc-butler-compact-test--sent-in-order) '("/model sonnet"))))))
+
 (ert-deftest cc-butler-compact/flow-without-modal ()
   "When /model switches with no confirmation, the driver proceeds straight to
 /compact — the modal is optional, not assumed."
