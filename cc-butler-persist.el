@@ -46,7 +46,7 @@ session's working directory (restore last state, non-interactive)."
   "Non-nil if DIR is a worker's directory — i.e. neither the butler's nor the
 steward's fixed home.  Scopes worker-only fixes (e.g. explicit model pinning
 at launch, see `cc-butler--with-worker-model') away from butler/steward,
-whose model is a human-owned value we must not silently override."
+which get `cc-butler-coordinator-model' instead."
   (let ((key (cc-butler--dir-key dir)))
     (not (or (and cc-butler-home (equal key (cc-butler--dir-key cc-butler-home)))
              (and cc-butler-steward-home
@@ -166,13 +166,13 @@ gets spawned, and the startup race that can drop a caller's first
   (let ((claude-code-ide-cli-extra-flags
          (string-trim (concat (or claude-code-ide-cli-extra-flags "")
                               " " (mapconcat #'identity cc-butler-resume-args " ")
-                              ;; Worker-only, same reasoning as
-                              ;; `cc-butler--with-worker-model': this is the
                               ;; SHARED resume path for every role's dead
-                              ;; session, so butler/steward must not be pinned.
+                              ;; session: workers get the worker model,
+                              ;; butler/steward the coordinator model.
+                              " --model "
                               (if (cc-butler--worker-dir-p dir)
-                                  (concat " --model " cc-butler-worker-launch-model)
-                                ""))))
+                                  cc-butler-worker-launch-model
+                                cc-butler-coordinator-model))))
         (default-directory (file-name-as-directory (expand-file-name dir))))
     (cc-butler--with-channel (claude-code-ide))
     ;; The second spawn site, so it needs the SAME uniform config as

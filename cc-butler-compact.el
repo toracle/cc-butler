@@ -1212,8 +1212,16 @@ because those do not resolve on their own the way busy does."
     ;; either alone is wrong -- without the first, a session whose screen is
     ;; illegible cannot be compacted at all; without the second, an unlisted
     ;; model family cannot be restored.
+    ;; Coordinators (butler/steward) are restored to
+    ;; `cc-butler-coordinator-model', not to the prior model (token cost), so
+    ;; an unreadable current model is no reason to refuse: the target is known.
+    ;; TAG stays the actual current model, used only for the skip decision.
     (let* ((tag (cc-butler-compact--model-for-restore dir))
-           (args (cc-butler-compact--model-args tag))
+           (coord (and (fboundp 'cc-butler--worker-dir-p)
+                       (not (cc-butler--worker-dir-p dir))))
+           (args (if coord
+                     (list cc-butler-coordinator-model)
+                   (cc-butler-compact--model-args tag)))
            (arg (car args))
            (ctx (cc-butler-compact--context-now dir)))
       (unless arg
@@ -1234,13 +1242,19 @@ because those do not resolve on their own the way busy does."
                       (if ignore-busy
                           "FORCED: idle gate bypassed by caller"
                         "idle gate honoured"))
-      (if (cc-butler-compact--model-is-p tag cc-butler-compact-model)
-          ;; Already on the cheap model: nothing to switch, nothing to restore.
-          (progn
-            (cc-butler-compact--set-state dir :orig-arg nil)
-            (cc-butler-compact--step dir 'compacting "/compact"))
+      (cond
+       ((cc-butler-compact--model-is-p tag cc-butler-compact-model)
+        ;; Already on the cheap model: nothing to switch, nothing to restore.
+        (cc-butler-compact--set-state dir :orig-arg nil)
+        (cc-butler-compact--step dir 'compacting "/compact"))
+       (t
+        ;; A coordinator whose restore target IS the compact model needs no
+        ;; restore either (it would be a redundant /model).
+        (when (and coord (cc-butler-compact--model-is-p
+                          cc-butler-coordinator-model cc-butler-compact-model))
+          (cc-butler-compact--set-state dir :orig-arg nil))
         (cc-butler-compact--step
-         dir 'switching (format "/model %s" cc-butler-compact-model)))
+         dir 'switching (format "/model %s" cc-butler-compact-model))))
       (message "cc-butler compact: %s — started (ctx %s)" name (or ctx "?")))))
 
 (defun cc-butler-compact--poll (dir)
